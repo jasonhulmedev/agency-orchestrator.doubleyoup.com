@@ -33,7 +33,7 @@
 #   4. Hit https://<worker>.workers.dev/validate until every result is green,
 #      then POST /complete to signal onboarding done.
 
-name = "doubleyoup-agency-orchestrator"
+name = "agencydoubleyoup"
 main = "src/index.ts"
 compatibility_date = "2026-01-01"
 
