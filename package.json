@@ -1,0 +1,21 @@
+{
+  "name": "@doubleyoup/agency-orchestrator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "doubleyoup agency-orchestrator — the agency-side glue Cloudflare Worker. Phase 1: onboarding + credential self-validation (GCP/S3/Stripe/AI) and Direction-A OAuth2 callbacks to our control-plane app. No infrastructure provisioning.",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260713.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.110.0"
+  }
+}

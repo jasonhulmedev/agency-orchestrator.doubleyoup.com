@@ -1,0 +1,24 @@
+# Local-only secrets for `wrangler dev`. Copy to `.dev.vars` (git-ignored) and
+# fill in real values. In production these are set with `wrangler secret put`,
+# NOT from this file. Do NOT commit `.dev.vars`.
+
+# Direction-A OAuth2 client credentials (issued by our app at onboarding)
+DY_CLIENT_ID=""
+DY_CLIENT_SECRET=""
+
+# Google Cloud service-account key — the ENTIRE downloaded JSON on one line
+GCP_SERVICE_ACCOUNT_KEY=""
+
+# S3 (or S3-compatible: set S3_ENDPOINT for R2/MinIO/Wasabi)
+S3_ACCESS_KEY_ID=""
+S3_SECRET_ACCESS_KEY=""
+S3_REGION="us-east-1"
+S3_BUCKET=""
+S3_ENDPOINT=""
+
+# Stripe (the agency's own account)
+STRIPE_SECRET_KEY=""
+
+# AI providers
+ANTHROPIC_API_KEY=""
+OPENROUTER_API_KEY=""

@@ -1,0 +1,41 @@
+# doubleyoup agency-orchestrator Worker.
+#
+# Deployed by each AGENCY into their OWN Cloudflare account (pulled from our
+# GitHub). Phase 1 = onboarding + credential self-validation only — no
+# infrastructure provisioning. Uses only Web APIs (fetch + Web Crypto), so no
+# nodejs_compat flag is needed.
+#
+# CONFIG lives entirely in Cloudflare vars/secrets — NEVER hardcode a secret here.
+#
+#   [vars] (public, committed):
+#     APP_BASE_URL   our control-plane app base (below)
+#
+#   Secrets (NOT committed — `wrangler secret put <NAME>`; for local `wrangler dev`
+#   put them in an untracked .dev.vars — see .dev.vars.example):
+#     Direction-A OAuth2 client credentials (issued by our app at onboarding):
+#       wrangler secret put DY_CLIENT_ID
+#       wrangler secret put DY_CLIENT_SECRET
+#     Agency service credentials (the agency's own accounts):
+#       wrangler secret put GCP_SERVICE_ACCOUNT_KEY   # the full service-account JSON
+#       wrangler secret put S3_ACCESS_KEY_ID
+#       wrangler secret put S3_SECRET_ACCESS_KEY
+#       wrangler secret put S3_REGION                 # e.g. us-east-1 (or "auto" for R2)
+#       wrangler secret put S3_BUCKET
+#       wrangler secret put S3_ENDPOINT               # optional — set for R2/MinIO/Wasabi
+#       wrangler secret put STRIPE_SECRET_KEY
+#       wrangler secret put ANTHROPIC_API_KEY
+#       wrangler secret put OPENROUTER_API_KEY
+#
+# Deploy (needs `wrangler login` against the agency's Cloudflare account):
+#   1. npm install
+#   2. Set the secrets above (`wrangler secret put ...`).
+#   3. npm run deploy      # wrangler deploy
+#   4. Hit https://<worker>.workers.dev/validate until every result is green,
+#      then POST /complete to signal onboarding done.
+
+name = "doubleyoup-agency-orchestrator"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+
+[vars]
+APP_BASE_URL = "https://app.doubleyoup.com"
