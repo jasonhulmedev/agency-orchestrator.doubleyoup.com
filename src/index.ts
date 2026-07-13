@@ -21,12 +21,22 @@
 import type { Env } from "./env.js";
 import { callApp } from "./app-client.js";
 import { validateAll, type AllValidations } from "./validators.js";
+import { renderSetupPage } from "./setup-page.js";
 import { errorMessage } from "./util.js";
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+// GET / — the guided, browser-only setup page. Instructs a non-terminal agency
+// owner how to generate each credential and add it as a Cloudflare secret via
+// the dashboard, and lets them validate live (the page's button calls /validate).
+function handleSetupPage(env: Env): Response {
+  return new Response(renderSetupPage(env), {
+    headers: { "content-type": "text/html; charset=utf-8" },
   });
 }
 
@@ -138,6 +148,9 @@ export default {
     const path = url.pathname.replace(/\/+$/, "") || "/";
     const method = request.method;
 
+    if (method === "GET" && path === "/") {
+      return handleSetupPage(env);
+    }
     if (method === "GET" && path === "/health") {
       return json({ ok: true, service: "agency-orchestrator" });
     }

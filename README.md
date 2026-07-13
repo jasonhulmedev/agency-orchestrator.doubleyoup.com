@@ -39,9 +39,46 @@ Worker never persists them anywhere else and we never hold them. See
 | `STRIPE_SECRET_KEY` | secret | the agency's Stripe secret key |
 | `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` | secrets | AI provider keys |
 
-## Deploy (agency)
+## Where setup instructions live
 
-You need `wrangler` and a login to **your** Cloudflare account
+The full, step-by-step setup — how to generate each credential and add it as a
+secret — lives in the **doubleyoup onboarding wizard** (in the app), not here, so
+it stays one central, instantly-updatable source of truth. Open the app's
+`/onboarding` and follow the wizard.
+
+The Worker's own root URL (`GET /`) is a **thin landing page**: a short intro, a
+link into the onboarding wizard, and one genuinely-standalone feature — a live
+**Check my setup** self-check button that tests this Worker's own secrets without
+needing an app login (it just calls `POST /validate` and shows a green ✓ / red ✗
+per credential; secret values are never shown).
+
+## Deploy (no terminal needed)
+
+Deploy the Worker into **your** Cloudflare account via **Cloudflare Workers
+Builds**: in the Cloudflare dashboard → **Workers & Pages** → **Create** →
+**Connect to Git**, pick this repository, and let Cloudflare build & deploy it.
+Every push to `main` re-deploys automatically. (`APP_BASE_URL` is already set in
+`wrangler.toml` and points at our app.) Add your secrets via the onboarding
+wizard's instructions, then open the Worker's root URL and press **Check my
+setup** until every item is green.
+
+## Onboarding flow
+
+The onboarding wizard in the app drives this end to end. Under the hood the
+Worker exposes three endpoints:
+
+1. **Validate.** `POST /validate` returns `{ok, detail}` for every credential.
+   The landing page's **Check my setup** button calls this and renders a green ✓
+   / red ✗ per credential (never the secret values).
+2. **Check the round-trip.** `GET /whoami` proves your Direction-A credentials
+   work by resolving your account against our app.
+3. **Complete.** `POST /complete` re-validates and, if everything is green,
+   calls our app to flip your status to onboarded and unlock the product.
+
+## Advanced / CLI alternative (`wrangler`)
+
+Prefer the command line? You can deploy and set secrets with `wrangler` instead
+of the dashboard. You need `wrangler` and a login to **your** Cloudflare account
 (`wrangler login`).
 
 ```
@@ -66,20 +103,11 @@ wrangler secret put OPENROUTER_API_KEY
 npm run deploy
 ```
 
-## Onboarding flow
-
-1. **Validate.** Hit `POST /validate`. Every credential comes back
-   `{ok, detail}`; fix anything red in your Cloudflare dashboard (re-`wrangler
-   secret put` the offending value) and re-run until all green.
-2. **Check the round-trip.** `GET /whoami` proves your Direction-A credentials
-   work by resolving your account against our app.
-3. **Complete.** `POST /complete` re-validates and, if everything is green,
-   calls our app to flip your status to onboarded and unlock the product.
-
 ## Endpoints
 
 | Method + path | Purpose |
 | --- | --- |
+| `GET /` | thin landing page (HTML): intro, onboarding-wizard link, and a live **Check my setup** self-check button |
 | `GET /health` | liveness — `{ok:true, service:"agency-orchestrator"}` |
 | `POST /validate` | run every validator; returns `{ok, gcp, s3, stripe, ai}`, each `{ok, detail}` |
 | `GET /whoami` | exercise Direction-A end-to-end; returns `{ok, accountId}` |
