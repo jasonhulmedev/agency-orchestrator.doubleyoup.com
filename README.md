@@ -85,10 +85,9 @@ npm run deploy
 | `GET /whoami` | exercise Direction-A end-to-end; returns `{ok, accountId}` |
 | `POST /complete` | if all green, call our app's onboarding-complete route; returns `{ok, validation, callback}` |
 
-> `POST /complete` is forward-compatible: the app's `onboarding-complete` route
-> is built in a later slice. Until it exists, `/complete` still validates and
-> reports `callback.ok:false` with a clear "not yet available" message instead
-> of failing.
+> `POST /complete` re-validates and calls our app's `onboarding-complete` route
+> (now live). It stays resilient — if that callback is ever unreachable it still
+> validates and reports `callback.ok:false` rather than failing outright.
 
 ## Local dev
 
