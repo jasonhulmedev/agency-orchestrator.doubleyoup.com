@@ -22,6 +22,7 @@ export interface AllValidations {
   s3: ValidationResult;
   stripe: ValidationResult;
   ai: ValidationResult;
+  r2Provision: ValidationResult;
 }
 
 // ── S3 ────────────────────────────────────────────────────────────────────────
@@ -143,6 +144,76 @@ export async function validateStripe(env: Env): Promise<ValidationResult> {
   }
 }
 
+// ── R2 provisioning ─────────────────────────────────────────────────────────
+
+// GET /user/tokens/verify only validates USER-owned tokens (My Profile → API
+// Tokens) — it returns a 401 "Invalid API Token" even for a perfectly valid
+// ACCOUNT-owned token (Manage Account → Account API Tokens), which is what
+// this credential must be. So instead we hit a cheap account-scoped read
+// (GET /accounts?per_page=1) that authenticates against account tokens: a
+// 200 with a non-empty result proves the token is valid, though — like the
+// user-tokens endpoint — it can't enumerate the permission groups the token
+// was minted with, so a green result here does not guarantee the R2 Storage
+// / Account API Tokens edit scopes are actually present. Those scopes are
+// only exercised for real on the first site provision (bucket create +
+// scoped-key mint).
+export async function validateR2Provision(env: Env): Promise<ValidationResult> {
+  if (!env.R2_PROVISION_API_TOKEN) {
+    return {
+      ok: false,
+      detail: "R2 provisioning not configured — set the R2_PROVISION_API_TOKEN secret.",
+    };
+  }
+
+  try {
+    const response = await fetch("https://api.cloudflare.com/client/v4/accounts?per_page=1", {
+      headers: {
+        authorization: `Bearer ${env.R2_PROVISION_API_TOKEN}`,
+        accept: "application/json",
+      },
+    });
+
+    if (response.status === 200) {
+      const body = (await response.json().catch(() => null)) as {
+        success?: boolean;
+        result?: Array<{ name?: string }>;
+      } | null;
+      if (body?.success && body.result && body.result.length > 0) {
+        const accountName = body.result[0]?.name;
+        return {
+          ok: true,
+          detail: `R2 provisioning token valid${accountName ? ` — account: ${accountName}` : ""}. Permissions are exercised on first site provision.`,
+        };
+      }
+      return {
+        ok: false,
+        detail: "R2 provisioning token check returned no accounts — check R2_PROVISION_API_TOKEN.",
+      };
+    }
+    if (response.status === 401 || response.status === 403) {
+      return {
+        ok: false,
+        detail:
+          "Cloudflare rejected the token — check R2_PROVISION_API_TOKEN (must be an ACCOUNT-owned token: Manage Account → Account API Tokens).",
+      };
+    }
+
+    const body = (await response.json().catch(() => null)) as {
+      errors?: Array<{ message?: string }>;
+    } | null;
+    const message = body?.errors?.[0]?.message;
+    return {
+      ok: false,
+      detail: `R2 provisioning token check failed with HTTP ${response.status}${message ? `: ${message}` : ""}.`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      detail: `R2 provisioning token check could not be sent (transient network error?): ${errorMessage(err)}.`,
+    };
+  }
+}
+
 // ── AI providers ──────────────────────────────────────────────────────────────
 
 // Anthropic: a minimal authenticated read of the models list.
@@ -200,21 +271,49 @@ export async function validateOpenRouter(env: Env): Promise<ValidationResult> {
   }
 }
 
-// Aggregate AI result surfaced at /validate. Both providers are optional; the
-// aggregate is green only when at least one AI key is configured and EVERY
+// OpenAI (also covers Codex, which authenticates with the same key): a
+// minimal authenticated read of the models list.
+export async function validateOpenAI(env: Env): Promise<ValidationResult> {
+  if (!env.OPENAI_API_KEY) {
+    return { ok: false, detail: "OpenAI not configured — set the OPENAI_API_KEY secret." };
+  }
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/models", {
+      headers: {
+        authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        accept: "application/json",
+      },
+    });
+
+    if (response.status === 200) {
+      return { ok: true, detail: "OpenAI API key authenticated." };
+    }
+    if (response.status === 401) {
+      return { ok: false, detail: "OpenAI rejected the key (401) — check OPENAI_API_KEY." };
+    }
+    return { ok: false, detail: `OpenAI check failed with HTTP ${response.status}.` };
+  } catch (err) {
+    return { ok: false, detail: `OpenAI request could not be sent: ${errorMessage(err)}.` };
+  }
+}
+
+// Aggregate AI result surfaced at /validate. All three providers are optional;
+// the aggregate is green only when at least one AI key is configured and EVERY
 // configured provider validates. A provider that isn't configured is neither
 // counted nor held against the agency.
 export async function validateAI(env: Env): Promise<ValidationResult> {
   const providers: Array<{ name: string; configured: boolean; result: ValidationResult }> = [
     { name: "Anthropic", configured: !!env.ANTHROPIC_API_KEY, result: await validateAnthropic(env) },
     { name: "OpenRouter", configured: !!env.OPENROUTER_API_KEY, result: await validateOpenRouter(env) },
+    { name: "OpenAI", configured: !!env.OPENAI_API_KEY, result: await validateOpenAI(env) },
   ];
 
   const configured = providers.filter((provider) => provider.configured);
   if (configured.length === 0) {
     return {
       ok: false,
-      detail: "No AI keys configured — set ANTHROPIC_API_KEY and/or OPENROUTER_API_KEY.",
+      detail: "No AI keys configured — set ANTHROPIC_API_KEY, OPENROUTER_API_KEY and/or OPENAI_API_KEY.",
     };
   }
 
@@ -410,11 +509,12 @@ export async function validateGCP(env: Env): Promise<ValidationResult> {
 // Run every validator in parallel. Independent network calls — no ordering
 // requirement — so Promise.all keeps /validate responsive.
 export async function validateAll(env: Env): Promise<AllValidations> {
-  const [gcp, s3, stripe, ai] = await Promise.all([
+  const [gcp, s3, stripe, ai, r2Provision] = await Promise.all([
     validateGCP(env),
     validateS3(env),
     validateStripe(env),
     validateAI(env),
+    validateR2Provision(env),
   ]);
-  return { gcp, s3, stripe, ai };
+  return { gcp, s3, stripe, ai, r2Provision };
 }

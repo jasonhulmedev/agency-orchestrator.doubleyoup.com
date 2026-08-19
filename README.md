@@ -14,8 +14,9 @@ Google Cloud; the Worker just dispatches and makes light API calls.
 provisioning.** The Worker:
 
 1. Validates each service credential the agency connected (Google Cloud, S3,
-   Stripe, and the AI provider keys) with a **real authenticated call** to each
-   provider, returning a specific, actionable error for anything that's wrong.
+   Stripe, R2 provisioning, and the AI provider keys) with a **real
+   authenticated call** to each provider, returning a specific, actionable
+   error for anything that's wrong.
 2. Talks back to our control-plane app over **Direction-A OAuth2** (a
    short-lived access token minted from the agency's client credentials) to
    prove the round-trip and signal onboarding complete.
@@ -37,7 +38,8 @@ Worker never persists them anywhere else and we never hold them. See
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_REGION` / `S3_BUCKET` | secrets | S3 credentials (region defaults to `us-east-1`) |
 | `S3_ENDPOINT` | secret (optional) | set for an S3-compatible store (R2/MinIO/Wasabi); uses path-style addressing |
 | `STRIPE_SECRET_KEY` | secret | the agency's Stripe secret key |
-| `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` | secrets | AI provider keys |
+| `R2_PROVISION_API_TOKEN` | secret | Cloudflare **account-owned** token (Manage Account → Account API Tokens in their account) with Workers R2 Storage: Edit + Account API Tokens: Edit — creates per-site media buckets + mints per-site keys. Must NOT be a My Profile → API Tokens (user) token — those fail the account-scoped check |
+| `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` | secrets | AI provider keys — set at least one (`OPENAI_API_KEY` also covers Codex) |
 
 ## Where setup instructions live
 
@@ -96,8 +98,10 @@ wrangler secret put S3_REGION                 # e.g. us-east-1 (or "auto" for R2
 wrangler secret put S3_BUCKET
 wrangler secret put S3_ENDPOINT               # optional — only for R2/MinIO/Wasabi
 wrangler secret put STRIPE_SECRET_KEY
+wrangler secret put R2_PROVISION_API_TOKEN  # ACCOUNT-owned token (Manage Account -> Account API Tokens): Workers R2 Storage: Edit + Account API Tokens: Edit
 wrangler secret put ANTHROPIC_API_KEY
 wrangler secret put OPENROUTER_API_KEY
+wrangler secret put OPENAI_API_KEY          # also covers Codex (same key/account)
 
 # 3. Confirm APP_BASE_URL in wrangler.toml points at our app, then deploy
 npm run deploy
@@ -109,7 +113,7 @@ npm run deploy
 | --- | --- |
 | `GET /` | thin landing page (HTML): intro, onboarding-wizard link, and a live **Check my setup** self-check button |
 | `GET /health` | liveness — `{ok:true, service:"agency-orchestrator"}` |
-| `POST /validate` | run every validator; returns `{ok, gcp, s3, stripe, ai}`, each `{ok, detail}` |
+| `POST /validate` | run every validator; returns `{ok, gcp, s3, stripe, ai, r2Provision}`, each `{ok, detail}` |
 | `GET /whoami` | exercise Direction-A end-to-end; returns `{ok, accountId}` |
 | `POST /complete` | if all green, call our app's onboarding-complete route; returns `{ok, validation, callback}` |
 

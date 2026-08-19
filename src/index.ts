@@ -41,7 +41,9 @@ function handleSetupPage(env: Env): Response {
 }
 
 function allGreen(results: AllValidations): boolean {
-  return results.gcp.ok && results.s3.ok && results.stripe.ok && results.ai.ok;
+  return (
+    results.gcp.ok && results.s3.ok && results.stripe.ok && results.ai.ok && results.r2Provision.ok
+  );
 }
 
 // POST /validate — run all validators and return each {ok, detail} plus an

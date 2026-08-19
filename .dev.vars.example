@@ -19,6 +19,12 @@ S3_ENDPOINT=""
 # Stripe (the agency's own account)
 STRIPE_SECRET_KEY=""
 
-# AI providers
+# R2 provisioning — Cloudflare ACCOUNT-owned token (Manage Account -> Account
+# API Tokens, in the agency's own account) with Workers R2 Storage: Edit +
+# Account API Tokens: Edit. NOT a My Profile -> API Tokens (user) token.
+R2_PROVISION_API_TOKEN=""
+
+# AI providers — set at least one (OPENAI_API_KEY also covers Codex)
 ANTHROPIC_API_KEY=""
 OPENROUTER_API_KEY=""
+OPENAI_API_KEY=""

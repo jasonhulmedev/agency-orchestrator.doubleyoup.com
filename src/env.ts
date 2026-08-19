@@ -34,7 +34,17 @@ export interface Env {
   // Stripe secret key (the agency's own account — used for the subscription).
   STRIPE_SECRET_KEY?: string;
 
+  // Cloudflare ACCOUNT-owned custom API token (created under Manage Account →
+  // Account API Tokens in the agency's own account — NOT My Profile → API
+  // Tokens, which fails) with "Workers R2 Storage: Edit" + "Account API
+  // Tokens: Edit" — used by the platform to create per-site R2 media buckets
+  // and mint per-site scoped keys in the agency's account. High-privilege:
+  // set only as a Worker secret, never in wrangler.toml [vars].
+  R2_PROVISION_API_TOKEN?: string;
+
   // AI provider keys.
   ANTHROPIC_API_KEY?: string;
   OPENROUTER_API_KEY?: string;
+  // OpenAI — also authenticates Codex (same key, same account).
+  OPENAI_API_KEY?: string;
 }

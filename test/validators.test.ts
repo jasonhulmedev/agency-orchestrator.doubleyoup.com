@@ -5,8 +5,10 @@ import {
   validateStripe,
   validateAnthropic,
   validateOpenRouter,
+  validateOpenAI,
   validateAI,
   validateGCP,
+  validateR2Provision,
 } from "../src/validators.js";
 
 // Minimal Env with only the Direction-A fields; each test spreads in the
@@ -184,6 +186,31 @@ describe("validateAnthropic / validateOpenRouter", () => {
     expect(result.ok).toBe(true);
     expect(result.detail).toContain("prod");
   });
+
+  it("OpenAI ok on 200", async () => {
+    vi.stubGlobal(
+      "fetch",
+      routedFetch([{ match: (u) => u === "https://api.openai.com/v1/models", respond: () => jsonResponse({ data: [] }) }]),
+    );
+    const result = await validateOpenAI({ ...baseEnv, OPENAI_API_KEY: "sk-oai-x" });
+    expect(result.ok).toBe(true);
+  });
+
+  it("OpenAI reports not-configured without hitting the network", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateOpenAI(baseEnv);
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/not configured/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("OpenAI 401 → key-check message", async () => {
+    vi.stubGlobal("fetch", routedFetch([{ match: () => true, respond: () => new Response("", { status: 401 }) }]));
+    const result = await validateOpenAI({ ...baseEnv, OPENAI_API_KEY: "bad" });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/OPENAI_API_KEY/);
+  });
 });
 
 describe("validateAI aggregate", () => {
@@ -191,6 +218,7 @@ describe("validateAI aggregate", () => {
     const result = await validateAI(baseEnv);
     expect(result.ok).toBe(false);
     expect(result.detail).toMatch(/No AI keys/);
+    expect(result.detail).toContain("OPENAI_API_KEY");
   });
 
   it("is ok when the only configured provider passes", async () => {
@@ -215,6 +243,63 @@ describe("validateAI aggregate", () => {
     expect(result.ok).toBe(false);
     expect(result.detail).toContain("Anthropic: ok");
     expect(result.detail).toContain("OpenRouter:");
+  });
+
+  it("is ok with all three providers configured and passing, and names all three", async () => {
+    vi.stubGlobal(
+      "fetch",
+      routedFetch([
+        { match: (u) => u.startsWith("https://api.anthropic.com"), respond: () => jsonResponse({ data: [] }) },
+        { match: (u) => u.startsWith("https://openrouter.ai"), respond: () => jsonResponse({ data: {} }) },
+        { match: (u) => u.startsWith("https://api.openai.com"), respond: () => jsonResponse({ data: [] }) },
+      ]),
+    );
+    const result = await validateAI({
+      ...baseEnv,
+      ANTHROPIC_API_KEY: "sk-ant-x",
+      OPENROUTER_API_KEY: "or-x",
+      OPENAI_API_KEY: "sk-oai-x",
+    });
+    expect(result.ok).toBe(true);
+    expect(result.detail).toContain("Anthropic: ok");
+    expect(result.detail).toContain("OpenRouter: ok");
+    expect(result.detail).toContain("OpenAI: ok");
+  });
+});
+
+// ── R2 provisioning ─────────────────────────────────────────────────────────
+
+describe("validateR2Provision", () => {
+  it("reports not-configured without hitting the network", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateR2Provision(baseEnv);
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/not configured/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("is ok when the token authenticates a scoped account read", async () => {
+    vi.stubGlobal(
+      "fetch",
+      routedFetch([
+        {
+          match: (u) => u === "https://api.cloudflare.com/client/v4/accounts?per_page=1",
+          respond: () => jsonResponse({ success: true, result: [{ name: "Acme Agency" }] }),
+        },
+      ]),
+    );
+    const result = await validateR2Provision({ ...baseEnv, R2_PROVISION_API_TOKEN: "cf-token" });
+    expect(result.ok).toBe(true);
+    expect(result.detail).toMatch(/valid/);
+    expect(result.detail).toContain("Acme Agency");
+  });
+
+  it("maps 401 to a token-check message", async () => {
+    vi.stubGlobal("fetch", routedFetch([{ match: () => true, respond: () => new Response("", { status: 401 }) }]));
+    const result = await validateR2Provision({ ...baseEnv, R2_PROVISION_API_TOKEN: "bad-token" });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/R2_PROVISION_API_TOKEN/);
   });
 });
 

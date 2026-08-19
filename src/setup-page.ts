@@ -39,9 +39,10 @@ const INLINE_SCRIPT = `
     gcp: "Google Cloud",
     s3: "S3 / object storage",
     stripe: "Stripe",
-    ai: "AI providers"
+    ai: "AI providers",
+    r2Provision: "R2 provisioning (media buckets)"
   };
-  var orderedKeys = ["gcp", "s3", "stripe", "ai"];
+  var orderedKeys = ["gcp", "s3", "stripe", "ai", "r2Provision"];
 
   function renderResult(key, result) {
     var ok = !!(result && result.ok === true);
