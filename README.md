@@ -35,8 +35,8 @@ Worker never persists them anywhere else and we never hold them. See
 | `APP_BASE_URL` | var | our control-plane app base, e.g. `https://app.doubleyoup.com` |
 | `DY_CLIENT_ID` / `DY_CLIENT_SECRET` | secrets | Direction-A OAuth2 client credentials issued by our app at onboarding |
 | `GCP_SERVICE_ACCOUNT_KEY` | secret | the entire Google Cloud service-account JSON |
-| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_REGION` / `S3_BUCKET` | secrets | S3 credentials (region defaults to `us-east-1`) |
-| `S3_ENDPOINT` | secret (optional) | set for an S3-compatible store (R2/MinIO/Wasabi); uses path-style addressing |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_REGION` / `S3_BUCKET` | secrets | object-store (backup) credentials — **Cloudflare R2 recommended**, or AWS S3 (region defaults to `us-east-1`; use `auto` for R2) |
+| `S3_ENDPOINT` | secret (optional) | set for Cloudflare R2 (recommended) or another S3-compatible store (MinIO/Wasabi); uses path-style addressing. When set, `/validate` proves connectivity with an **object-read probe (no bucket list)** so a normally-scoped R2 key — which is denied bucket-level `ListObjectsV2` — still validates green |
 | `STRIPE_SECRET_KEY` | secret | the agency's Stripe secret key |
 | `R2_PROVISION_API_TOKEN` | secret | Cloudflare **account-owned** token (Manage Account → Account API Tokens in their account) with Workers R2 Storage: Edit + Account API Tokens: Edit — creates per-site media buckets + mints per-site keys. Must NOT be a My Profile → API Tokens (user) token — those fail the account-scoped check |
 | `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` | secrets | AI provider keys — set at least one (`OPENAI_API_KEY` also covers Codex) |

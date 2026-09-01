@@ -87,17 +87,67 @@ describe("validateS3", () => {
     expect(headers.get("x-amz-date")).toBeTruthy();
   });
 
-  it("uses the custom endpoint (path-style) when S3_ENDPOINT is set", async () => {
+  // ── S3-compatible / R2 endpoint: object-probe path (no bucket list) ─────────
+  it("uses an object probe (never a bucket list) when S3_ENDPOINT is set, and is ok on 404 NoSuchKey", async () => {
     const fetchMock = routedFetch([
-      { match: (u) => u.startsWith("https://acct.r2.cloudflarestorage.com/my-bucket?"), respond: () => new Response("", { status: 200 }) },
+      {
+        match: (u) =>
+          u.startsWith("https://acct.r2.cloudflarestorage.com/my-bucket/.doubleyoup-connectivity-probe"),
+        respond: () => xmlResponse("<Code>NoSuchKey</Code>", 404),
+      },
     ]);
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await validateS3({ ...s3Env, S3_ENDPOINT: "https://acct.r2.cloudflarestorage.com" });
+    const result = await validateS3({
+      ...s3Env,
+      S3_ENDPOINT: "https://acct.r2.cloudflarestorage.com",
+      S3_REGION: "auto",
+    });
+    expect(result.ok).toBe(true);
+
+    // The whole point: a scoped R2 key 403s on ListObjectsV2, so we must NOT list.
+    const calledUrl = String((fetchMock.mock.calls[0] as unknown[])[0]);
+    expect(calledUrl).not.toContain("list-type=2");
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(new Headers(init.headers).get("authorization")).toMatch(/^AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE\//);
+  });
+
+  it("is ok when the probe object happens to exist (200) on a custom endpoint", async () => {
+    const fetchMock = routedFetch([
+      { match: (u) => u.includes("acct.r2.cloudflarestorage.com/my-bucket/"), respond: () => new Response("", { status: 200 }) },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateS3({ ...s3Env, S3_ENDPOINT: "https://acct.r2.cloudflarestorage.com", S3_REGION: "auto" });
     expect(result.ok).toBe(true);
   });
 
-  it("gives an actionable message on 403 AccessDenied", async () => {
+  it("maps a real AccessDenied on the R2 probe to a scope-check message", async () => {
+    const fetchMock = routedFetch([{ match: () => true, respond: () => xmlResponse("<Code>AccessDenied</Code>", 403) }]);
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateS3({ ...s3Env, S3_ENDPOINT: "https://acct.r2.cloudflarestorage.com", S3_REGION: "auto" });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/not authorized to read this bucket/i);
+    expect(result.detail).toMatch(/R2/);
+  });
+
+  it("maps NoSuchBucket on the R2 probe to a bucket-check message", async () => {
+    const fetchMock = routedFetch([{ match: () => true, respond: () => xmlResponse("<Code>NoSuchBucket</Code>", 404) }]);
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateS3({ ...s3Env, S3_ENDPOINT: "https://acct.r2.cloudflarestorage.com", S3_REGION: "auto" });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/NoSuchBucket/);
+    expect(result.detail).toMatch(/S3_BUCKET/);
+  });
+
+  it("maps InvalidAccessKeyId on the R2 probe to a key-specific message", async () => {
+    const fetchMock = routedFetch([{ match: () => true, respond: () => xmlResponse("<Code>InvalidAccessKeyId</Code>", 403) }]);
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateS3({ ...s3Env, S3_ENDPOINT: "https://acct.r2.cloudflarestorage.com", S3_REGION: "auto" });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/S3_ACCESS_KEY_ID/);
+  });
+
+  it("gives an actionable message on 403 AccessDenied (AWS list path)", async () => {
     const fetchMock = routedFetch([
       { match: () => true, respond: () => xmlResponse("<Code>AccessDenied</Code>", 403) },
     ]);
