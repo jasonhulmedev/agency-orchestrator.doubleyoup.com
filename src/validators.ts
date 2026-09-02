@@ -10,7 +10,7 @@
 
 import type { Env } from "./env.js";
 import { signS3Request } from "./sigv4.js";
-import { errorMessage, extractXmlTag } from "./util.js";
+import { errorMessage, extractXmlTag, stripTrailingSlash } from "./util.js";
 
 export interface ValidationResult {
   ok: boolean;
@@ -25,12 +25,46 @@ export interface AllValidations {
   r2Provision: ValidationResult;
 }
 
-// ── S3 ────────────────────────────────────────────────────────────────────────
+// ── S3 / object storage ────────────────────────────────────────────────────────
 
-// Prove the S3 credential can authenticate AND read the bucket by signing a
-// ListObjectsV2 with max-keys=1 (the cheapest read; needs s3:ListBucket). Works
-// against real AWS (virtual-hosted-style) or any S3-compatible endpoint
-// (path-style, e.g. R2) when S3_ENDPOINT is set.
+// The object-store credential (S3_*), resolved and defaulted from Env once so the
+// two validation strategies below don't each re-derive it. `endpoint` is set only
+// for an S3-compatible store (Cloudflare R2 / MinIO / Wasabi); it is undefined for
+// real AWS S3.
+interface ObjectStoreCredential {
+  accessKeyId: string;
+  secretAccessKey: string;
+  bucket: string;
+  region: string;
+  endpoint?: string;
+}
+
+// A key a real site is astronomically unlikely to hold, so a GET of it almost
+// always 404s — and that 404 is exactly our "authenticated + authorized to read
+// this bucket" success signal. Reading one object needs only object-read on the
+// bucket; it never needs the bucket-level ListBucket permission that a normally-
+// scoped R2 key lacks (see validateObjectStoreViaProbe).
+const OBJECT_STORE_PROBE_KEY = ".doubleyoup-connectivity-probe";
+
+// Prove the object-store credential can authenticate AND access the bucket.
+//
+// TWO strategies, chosen by whether a custom S3_ENDPOINT is set:
+//
+//   • AWS S3 (no S3_ENDPOINT) — sign a ListObjectsV2 (max-keys=1). It is the
+//     cheapest proof that the key both authenticates and can read the bucket,
+//     and a normal AWS key carries s3:ListBucket, so listing is the right probe.
+//
+//   • S3-compatible store (S3_ENDPOINT set — the recommended Cloudflare R2 path,
+//     also MinIO / Wasabi) — do NOT list. A normally-scoped R2 S3 key (the
+//     per-bucket read/write key doubleyoup mints for backups) is authorized for
+//     object GET/PUT within ONE bucket but is DENIED bucket-level ListObjectsV2
+//     — that needs an account-wide R2 read key. Listing would therefore 403 a
+//     perfectly good R2 key and wrongly block the clean R2 path. Instead we GET a
+//     single probe object that (almost certainly) doesn't exist: a 404/NoSuchKey
+//     means "the key authenticated and may read this bucket — the object just
+//     isn't there", which is the green signal. Only InvalidAccessKeyId,
+//     SignatureDoesNotMatch, a wrong bucket (NoSuchBucket) or a real AccessDenied
+//     on the object read count as failure.
 export async function validateS3(env: Env): Promise<ValidationResult> {
   if (!env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY || !env.S3_BUCKET) {
     return {
@@ -40,32 +74,37 @@ export async function validateS3(env: Env): Promise<ValidationResult> {
     };
   }
 
-  const region = env.S3_REGION || "us-east-1";
-  const bucket = env.S3_BUCKET;
+  const credential: ObjectStoreCredential = {
+    accessKeyId: env.S3_ACCESS_KEY_ID,
+    secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+    bucket: env.S3_BUCKET,
+    region: env.S3_REGION || "us-east-1",
+    endpoint: env.S3_ENDPOINT ? stripTrailingSlash(env.S3_ENDPOINT) : undefined,
+  };
 
-  let requestUrl: string;
-  if (env.S3_ENDPOINT) {
-    // Custom endpoint (R2 / MinIO / Wasabi) — path-style: <endpoint>/<bucket>.
-    const base = env.S3_ENDPOINT.replace(/\/+$/, "");
-    requestUrl = `${base}/${encodeURIComponent(bucket)}?list-type=2&max-keys=1`;
-  } else {
-    // AWS — virtual-hosted-style: <bucket>.s3.<region>.amazonaws.com.
-    requestUrl = `https://${bucket}.s3.${region}.amazonaws.com/?list-type=2&max-keys=1`;
+  if (credential.endpoint) {
+    return validateObjectStoreViaProbe(credential);
   }
+  return validateAwsS3ViaList(credential);
+}
+
+// AWS S3 path: virtual-hosted-style ListObjectsV2 (max-keys=1). Unchanged
+// behaviour — a real AWS key has s3:ListBucket, so a 200 proves read access.
+async function validateAwsS3ViaList(cred: ObjectStoreCredential): Promise<ValidationResult> {
+  const requestUrl = `https://${cred.bucket}.s3.${cred.region}.amazonaws.com/?list-type=2&max-keys=1`;
 
   try {
     const signed = await signS3Request({
       method: "GET",
       url: requestUrl,
-      region,
-      accessKeyId: env.S3_ACCESS_KEY_ID,
-      secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+      region: cred.region,
+      accessKeyId: cred.accessKeyId,
+      secretAccessKey: cred.secretAccessKey,
     });
     const response = await fetch(signed.url, { method: "GET", headers: signed.headers });
 
     if (response.status === 200) {
-      const where = env.S3_ENDPOINT ? env.S3_ENDPOINT : `s3.${region}.amazonaws.com`;
-      return { ok: true, detail: `S3 bucket "${bucket}" is readable at ${where}.` };
+      return { ok: true, detail: `S3 bucket "${cred.bucket}" is readable at s3.${cred.region}.amazonaws.com.` };
     }
 
     // Non-200: mine the S3 XML error for an actionable hint.
@@ -84,13 +123,13 @@ export async function validateS3(env: Env): Promise<ValidationResult> {
     if (response.status === 404 || code === "NoSuchBucket") {
       return {
         ok: false,
-        detail: `S3 bucket "${bucket}" not found (404) — check S3_BUCKET, S3_REGION and S3_ENDPOINT.`,
+        detail: `S3 bucket "${cred.bucket}" not found (404) — check S3_BUCKET, S3_REGION and S3_ENDPOINT.`,
       };
     }
     if (response.status === 403 || code === "AccessDenied") {
       return {
         ok: false,
-        detail: `S3 access denied (403) for bucket "${bucket}" — the key authenticated but lacks s3:ListBucket, or a bucket policy denies it.`,
+        detail: `S3 access denied (403) for bucket "${cred.bucket}" — the key authenticated but lacks s3:ListBucket, or a bucket policy denies it.`,
       };
     }
     return {
@@ -99,6 +138,80 @@ export async function validateS3(env: Env): Promise<ValidationResult> {
     };
   } catch (err) {
     return { ok: false, detail: `S3 request could not be sent: ${errorMessage(err)}.` };
+  }
+}
+
+// S3-compatible store path (Cloudflare R2 / MinIO / Wasabi): GET a single probe
+// object (path-style: <endpoint>/<bucket>/<probe-key>). This never lists, so a
+// bucket-scoped R2 key that lacks ListBucket still validates green.
+//
+// Result precedence is deliberate and unambiguous:
+//   200 .................... probe object happens to exist → authenticated + readable → ok
+//   InvalidAccessKeyId ..... bad access key id → fail
+//   SignatureDoesNotMatch .. bad secret / region → fail
+//   NoSuchBucket ........... wrong bucket or endpoint → fail (checked before the 404-ok case)
+//   404 (NoSuchKey/other) .. bucket readable, object absent → ok (the normal R2 green path)
+//   403 / AccessDenied ..... key authenticated but not authorized to read this bucket → fail
+//   anything else .......... generic failure with the HTTP status + any S3 code
+async function validateObjectStoreViaProbe(cred: ObjectStoreCredential): Promise<ValidationResult> {
+  const requestUrl = `${cred.endpoint}/${encodeURIComponent(cred.bucket)}/${OBJECT_STORE_PROBE_KEY}`;
+
+  try {
+    const signed = await signS3Request({
+      method: "GET",
+      url: requestUrl,
+      region: cred.region,
+      accessKeyId: cred.accessKeyId,
+      secretAccessKey: cred.secretAccessKey,
+    });
+    const response = await fetch(signed.url, { method: "GET", headers: signed.headers });
+
+    const okDetail = `Object store bucket "${cred.bucket}" is reachable at ${cred.endpoint} (authenticated; object read authorized).`;
+
+    if (response.status === 200) {
+      return { ok: true, detail: okDetail };
+    }
+
+    // Non-200: mine the S3 XML error for an actionable hint.
+    const body = (await response.text()).slice(0, 500);
+    const code = extractXmlTag(body, "Code");
+
+    if (code === "InvalidAccessKeyId") {
+      return { ok: false, detail: "S3 access key not recognised (InvalidAccessKeyId) — check S3_ACCESS_KEY_ID." };
+    }
+    if (code === "SignatureDoesNotMatch") {
+      return {
+        ok: false,
+        detail:
+          'S3 signature mismatch (SignatureDoesNotMatch) — check S3_SECRET_ACCESS_KEY and S3_REGION (use "auto" for Cloudflare R2).',
+      };
+    }
+    if (code === "NoSuchBucket") {
+      return {
+        ok: false,
+        detail: `Object store bucket "${cred.bucket}" not found (NoSuchBucket) — check S3_BUCKET and S3_ENDPOINT.`,
+      };
+    }
+    // A 404 that is NOT NoSuchBucket (NoSuchKey, or an unlabelled 404) means the
+    // bucket is present and readable; the probe object simply isn't there. This is
+    // the normal green path for a scoped R2 key.
+    if (response.status === 404) {
+      return { ok: true, detail: okDetail };
+    }
+    if (response.status === 403 || code === "AccessDenied") {
+      return {
+        ok: false,
+        detail:
+          `Object store access denied (403) for bucket "${cred.bucket}" — the key authenticated but is not authorized to read this bucket. ` +
+          "For Cloudflare R2, scope the API token to this bucket with Object Read & Write.",
+      };
+    }
+    return {
+      ok: false,
+      detail: `Object store check failed with HTTP ${response.status}${code ? ` (${code})` : ""}.`,
+    };
+  } catch (err) {
+    return { ok: false, detail: `Object store request could not be sent: ${errorMessage(err)}.` };
   }
 }
 

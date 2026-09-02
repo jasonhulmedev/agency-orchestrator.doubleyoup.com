@@ -37,7 +37,7 @@ const INLINE_SCRIPT = `
   // Human labels for each validator key returned by POST /validate.
   var labels = {
     gcp: "Google Cloud",
-    s3: "S3 / object storage",
+    s3: "Object store (AWS S3 or Cloudflare R2)",
     stripe: "Stripe",
     ai: "AI providers",
     r2Provision: "R2 provisioning (media buckets)"
