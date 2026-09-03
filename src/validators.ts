@@ -39,32 +39,33 @@ interface ObjectStoreCredential {
   endpoint?: string;
 }
 
-// A key a real site is astronomically unlikely to hold, so a GET of it almost
-// always 404s — and that 404 is exactly our "authenticated + authorized to read
-// this bucket" success signal. Reading one object needs only object-read on the
-// bucket; it never needs the bucket-level ListBucket permission that a normally-
-// scoped R2 key lacks (see validateObjectStoreViaProbe).
-const OBJECT_STORE_PROBE_KEY = ".doubleyoup-connectivity-probe";
+// The write probe uploads a tiny object under a UNIQUE key each run. Unique because a
+// WORM / Object-Lock bucket blocks OVERWRITE of an existing key — reusing a fixed key
+// would false-RED a locked bucket on the second validation; a fresh key is always a NEW
+// object (which WORM permits), so re-validation stays reliable. It is best-effort deleted
+// after (a locked bucket refuses the delete by design; the tiny marker is then retained —
+// harmless). A PUT (not a GET) is used deliberately: the store's only job is receiving
+// backup PUTs, so a read probe could go green on a key that can't actually write.
+const OBJECT_STORE_PROBE_KEY_PREFIX = ".doubleyoup-connectivity-probe";
+const OBJECT_STORE_PROBE_BODY = "doubleyoup object-store connectivity + write probe";
 
-// Prove the object-store credential can authenticate AND access the bucket.
+function objectStoreProbeKey(): string {
+  return `${OBJECT_STORE_PROBE_KEY_PREFIX}-${crypto.randomUUID()}`;
+}
+
+// Prove the object-store credential can authenticate AND actually WRITE to the bucket by
+// uploading (then best-effort deleting) a tiny probe object. WRITE — not read — because the
+// store's sole job is receiving backup PUTs: a read/list probe can pass on a key that then
+// can't write (a read-only token, or a bucket whose lock/policy blocks writes), i.e. a green
+// check that doesn't prove the thing that matters (review finding #3).
 //
-// TWO strategies, chosen by whether a custom S3_ENDPOINT is set:
-//
-//   • AWS S3 (no S3_ENDPOINT) — sign a ListObjectsV2 (max-keys=1). It is the
-//     cheapest proof that the key both authenticates and can read the bucket,
-//     and a normal AWS key carries s3:ListBucket, so listing is the right probe.
-//
-//   • S3-compatible store (S3_ENDPOINT set — the recommended Cloudflare R2 path,
-//     also MinIO / Wasabi) — do NOT list. A normally-scoped R2 S3 key (the
-//     per-bucket read/write key doubleyoup mints for backups) is authorized for
-//     object GET/PUT within ONE bucket but is DENIED bucket-level ListObjectsV2
-//     — that needs an account-wide R2 read key. Listing would therefore 403 a
-//     perfectly good R2 key and wrongly block the clean R2 path. Instead we GET a
-//     single probe object that (almost certainly) doesn't exist: a 404/NoSuchKey
-//     means "the key authenticated and may read this bucket — the object just
-//     isn't there", which is the green signal. Only InvalidAccessKeyId,
-//     SignatureDoesNotMatch, a wrong bucket (NoSuchBucket) or a real AccessDenied
-//     on the object read count as failure.
+// URL style differs by whether a custom S3_ENDPOINT is set:
+//   • custom endpoint (recommended Cloudflare R2 path, also MinIO / Wasabi) — path-style
+//     <endpoint>/<bucket>/<key>.
+//   • real AWS S3 (no endpoint) — virtual-hosted-style <bucket>.s3.<region>.amazonaws.com/<key>.
+// Both go through the same write probe (probeObjectStoreWithWrite), which fails CLOSED on any
+// response that isn't a genuine S3 one, so a mis-typed / non-S3 S3_ENDPOINT can't false-green
+// (review finding #1).
 export async function validateS3(env: Env): Promise<ValidationResult> {
   if (!env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY || !env.S3_BUCKET) {
     return {
@@ -82,136 +83,149 @@ export async function validateS3(env: Env): Promise<ValidationResult> {
     endpoint: env.S3_ENDPOINT ? stripTrailingSlash(env.S3_ENDPOINT) : undefined,
   };
 
-  if (credential.endpoint) {
-    return validateObjectStoreViaProbe(credential);
-  }
-  return validateAwsS3ViaList(credential);
+  const bucketUrl = credential.endpoint
+    ? `${credential.endpoint}/${encodeURIComponent(credential.bucket)}`
+    : `https://${credential.bucket}.s3.${credential.region}.amazonaws.com`;
+  const where = credential.endpoint ?? `s3.${credential.region}.amazonaws.com`;
+  return probeObjectStoreWithWrite(credential, bucketUrl, where);
 }
 
-// AWS S3 path: virtual-hosted-style ListObjectsV2 (max-keys=1). Unchanged
-// behaviour — a real AWS key has s3:ListBucket, so a 200 proves read access.
-async function validateAwsS3ViaList(cred: ObjectStoreCredential): Promise<ValidationResult> {
-  const requestUrl = `https://${cred.bucket}.s3.${cred.region}.amazonaws.com/?list-type=2&max-keys=1`;
-
-  try {
-    const signed = await signS3Request({
-      method: "GET",
-      url: requestUrl,
-      region: cred.region,
-      accessKeyId: cred.accessKeyId,
-      secretAccessKey: cred.secretAccessKey,
-    });
-    const response = await fetch(signed.url, { method: "GET", headers: signed.headers });
-
-    if (response.status === 200) {
-      return { ok: true, detail: `S3 bucket "${cred.bucket}" is readable at s3.${cred.region}.amazonaws.com.` };
-    }
-
-    // Non-200: mine the S3 XML error for an actionable hint.
-    const body = (await response.text()).slice(0, 500);
-    const code = extractXmlTag(body, "Code");
-
-    if (code === "InvalidAccessKeyId") {
-      return { ok: false, detail: "S3 access key not recognised (InvalidAccessKeyId) — check S3_ACCESS_KEY_ID." };
-    }
-    if (code === "SignatureDoesNotMatch") {
-      return {
-        ok: false,
-        detail: "S3 signature mismatch (SignatureDoesNotMatch) — check S3_SECRET_ACCESS_KEY and S3_REGION.",
-      };
-    }
-    if (response.status === 404 || code === "NoSuchBucket") {
-      return {
-        ok: false,
-        detail: `S3 bucket "${cred.bucket}" not found (404) — check S3_BUCKET, S3_REGION and S3_ENDPOINT.`,
-      };
-    }
-    if (response.status === 403 || code === "AccessDenied") {
-      return {
-        ok: false,
-        detail: `S3 access denied (403) for bucket "${cred.bucket}" — the key authenticated but lacks s3:ListBucket, or a bucket policy denies it.`,
-      };
-    }
-    return {
-      ok: false,
-      detail: `S3 check failed with HTTP ${response.status}${code ? ` (${code})` : ""}.`,
-    };
-  } catch (err) {
-    return { ok: false, detail: `S3 request could not be sent: ${errorMessage(err)}.` };
-  }
-}
-
-// S3-compatible store path (Cloudflare R2 / MinIO / Wasabi): GET a single probe
-// object (path-style: <endpoint>/<bucket>/<probe-key>). This never lists, so a
-// bucket-scoped R2 key that lacks ListBucket still validates green.
+// Both object-store paths (custom-endpoint R2/MinIO/Wasabi and real AWS S3) run this ONE
+// write probe: PUT a tiny unique object, judge the response, then best-effort delete it.
+// It fails CLOSED on anything that isn't a genuine S3 response so a mis-typed or non-S3
+// S3_ENDPOINT cannot false-green (#1), and it proves WRITE, not just read (#3).
 //
-// Result precedence is deliberate and unambiguous:
-//   200 .................... probe object happens to exist → authenticated + readable → ok
-//   InvalidAccessKeyId ..... bad access key id → fail
-//   SignatureDoesNotMatch .. bad secret / region → fail
-//   NoSuchBucket ........... wrong bucket or endpoint → fail (checked before the 404-ok case)
-//   404 (NoSuchKey/other) .. bucket readable, object absent → ok (the normal R2 green path)
-//   403 / AccessDenied ..... key authenticated but not authorized to read this bucket → fail
-//   anything else .......... generic failure with the HTTP status + any S3 code
-async function validateObjectStoreViaProbe(cred: ObjectStoreCredential): Promise<ValidationResult> {
-  const requestUrl = `${cred.endpoint}/${encodeURIComponent(cred.bucket)}/${OBJECT_STORE_PROBE_KEY}`;
+// Response precedence (deliberate + unambiguous):
+//   3xx / opaque redirect ... endpoint redirected (not a direct S3 API) -> fail (redirect:"manual")
+//   2xx WITH an ETag ........ genuine S3 PutObject succeeded -> writable -> ok
+//   2xx WITHOUT an ETag ..... not an S3 object store (proxy/SPA/health page) -> fail (#1)
+//   InvalidAccessKeyId ...... bad access key id -> fail
+//   SignatureDoesNotMatch ... bad secret / region -> fail
+//   NoSuchBucket ............ wrong bucket or endpoint -> fail
+//   403 / AccessDenied ...... authenticated but not authorized to WRITE -> fail (#3)
+//   4xx/5xx with NO S3 <Code> non-S3 endpoint -> fail (#1)
+//   any other S3 <Code> ..... generic failure with the HTTP status + code
+async function probeObjectStoreWithWrite(
+  cred: ObjectStoreCredential,
+  bucketUrl: string,
+  where: string,
+): Promise<ValidationResult> {
+  const probeUrl = `${bucketUrl}/${objectStoreProbeKey()}`;
 
+  let response: Response;
   try {
     const signed = await signS3Request({
-      method: "GET",
-      url: requestUrl,
+      method: "PUT",
+      url: probeUrl,
       region: cred.region,
       accessKeyId: cred.accessKeyId,
       secretAccessKey: cred.secretAccessKey,
+      body: OBJECT_STORE_PROBE_BODY,
     });
-    const response = await fetch(signed.url, { method: "GET", headers: signed.headers });
-
-    const okDetail = `Object store bucket "${cred.bucket}" is reachable at ${cred.endpoint} (authenticated; object read authorized).`;
-
-    if (response.status === 200) {
-      return { ok: true, detail: okDetail };
-    }
-
-    // Non-200: mine the S3 XML error for an actionable hint.
-    const body = (await response.text()).slice(0, 500);
-    const code = extractXmlTag(body, "Code");
-
-    if (code === "InvalidAccessKeyId") {
-      return { ok: false, detail: "S3 access key not recognised (InvalidAccessKeyId) — check S3_ACCESS_KEY_ID." };
-    }
-    if (code === "SignatureDoesNotMatch") {
-      return {
-        ok: false,
-        detail:
-          'S3 signature mismatch (SignatureDoesNotMatch) — check S3_SECRET_ACCESS_KEY and S3_REGION (use "auto" for Cloudflare R2).',
-      };
-    }
-    if (code === "NoSuchBucket") {
-      return {
-        ok: false,
-        detail: `Object store bucket "${cred.bucket}" not found (NoSuchBucket) — check S3_BUCKET and S3_ENDPOINT.`,
-      };
-    }
-    // A 404 that is NOT NoSuchBucket (NoSuchKey, or an unlabelled 404) means the
-    // bucket is present and readable; the probe object simply isn't there. This is
-    // the normal green path for a scoped R2 key.
-    if (response.status === 404) {
-      return { ok: true, detail: okDetail };
-    }
-    if (response.status === 403 || code === "AccessDenied") {
-      return {
-        ok: false,
-        detail:
-          `Object store access denied (403) for bucket "${cred.bucket}" — the key authenticated but is not authorized to read this bucket. ` +
-          "For Cloudflare R2, scope the API token to this bucket with Object Read & Write.",
-      };
-    }
-    return {
-      ok: false,
-      detail: `Object store check failed with HTTP ${response.status}${code ? ` (${code})` : ""}.`,
-    };
+    // redirect:"manual" so a redirecting host surfaces as a 3xx we can reject, rather than
+    // silently following to some 200 landing page (which would false-green — #1).
+    response = await fetch(signed.url, {
+      method: "PUT",
+      headers: signed.headers,
+      body: OBJECT_STORE_PROBE_BODY,
+      redirect: "manual",
+    });
   } catch (err) {
     return { ok: false, detail: `Object store request could not be sent: ${errorMessage(err)}.` };
+  }
+
+  // A redirect means S3_ENDPOINT points at a redirecting/proxy host, not the S3 API itself.
+  // With redirect:"manual" a real 3xx keeps its status; a runtime that instead yields an
+  // opaque-redirect filtered response reports status 0 — treat both as a redirect failure.
+  if (response.status === 0 || (response.status >= 300 && response.status < 400)) {
+    return {
+      ok: false,
+      detail: `Object store endpoint ${where} redirected the request (HTTP ${response.status || "3xx"}) — set S3_ENDPOINT to the direct S3/R2 API endpoint, not a redirecting or proxy host.`,
+    };
+  }
+
+  if (response.status >= 200 && response.status < 300) {
+    // A genuine S3 PutObject always returns an ETag of the stored object. Its ABSENCE means
+    // the 2xx came from something that is NOT an S3-compatible store (a proxy, SPA or health
+    // page answering 200 for any path), so we must NOT report success — that is the false
+    // green (#1). Drain the body either way so the connection frees.
+    const etag = response.headers.get("etag");
+    await response.text().catch(() => "");
+    if (!etag) {
+      return {
+        ok: false,
+        detail: `Object store endpoint ${where} returned HTTP ${response.status} but no S3 ETag — S3_ENDPOINT does not look like an S3-compatible object store. Check S3_ENDPOINT.`,
+      };
+    }
+    // Write proven. Best-effort remove the marker (a WORM/locked bucket refuses this — fine).
+    await bestEffortDeleteProbe(cred, probeUrl);
+    return {
+      ok: true,
+      detail: `Object store bucket "${cred.bucket}" at ${where} is writable (a probe object was uploaded with the credential).`,
+    };
+  }
+
+  // 4xx/5xx: a genuine S3 store returns an XML <Error><Code>. Map the known codes; the
+  // ABSENCE of any code is itself a signal the endpoint isn't S3-compatible (#1).
+  const body = (await response.text().catch(() => "")).slice(0, 500);
+  const code = extractXmlTag(body, "Code");
+
+  if (code === "InvalidAccessKeyId") {
+    return { ok: false, detail: "S3 access key not recognised (InvalidAccessKeyId) — check S3_ACCESS_KEY_ID." };
+  }
+  if (code === "SignatureDoesNotMatch") {
+    return {
+      ok: false,
+      detail:
+        'S3 signature mismatch (SignatureDoesNotMatch) — check S3_SECRET_ACCESS_KEY and S3_REGION (use "auto" for Cloudflare R2).',
+    };
+  }
+  if (code === "NoSuchBucket") {
+    return {
+      ok: false,
+      detail: `Object store bucket "${cred.bucket}" not found (NoSuchBucket) — check S3_BUCKET and S3_ENDPOINT.`,
+    };
+  }
+  if (response.status === 403 || code === "AccessDenied") {
+    return {
+      ok: false,
+      detail:
+        `Object store write denied (403) for bucket "${cred.bucket}" — the key authenticated but is not authorized to WRITE. ` +
+        "For Cloudflare R2, scope the API token to this bucket with Object Read & Write; for AWS the key needs s3:PutObject.",
+    };
+  }
+  if (!code) {
+    return {
+      ok: false,
+      detail: `Object store endpoint ${where} returned HTTP ${response.status} with no S3 error code — S3_ENDPOINT may not be an S3-compatible object store. Check S3_ENDPOINT.`,
+    };
+  }
+  return {
+    ok: false,
+    detail: `Object store write check failed with HTTP ${response.status} (${code}).`,
+  };
+}
+
+// Best-effort cleanup of the probe object. NEVER affects the validation result: a WORM /
+// Object-Lock bucket refuses the delete (by design) and any network hiccup is irrelevant —
+// the write already succeeded, which is what we validated.
+async function bestEffortDeleteProbe(cred: ObjectStoreCredential, probeUrl: string): Promise<void> {
+  try {
+    const signed = await signS3Request({
+      method: "DELETE",
+      url: probeUrl,
+      region: cred.region,
+      accessKeyId: cred.accessKeyId,
+      secretAccessKey: cred.secretAccessKey,
+    });
+    const response = await fetch(signed.url, {
+      method: "DELETE",
+      headers: signed.headers,
+      redirect: "manual",
+    });
+    await response.text().catch(() => "");
+  } catch {
+    // cleanup only — ignore
   }
 }
 

@@ -1,14 +1,16 @@
-// AWS Signature Version 4 signer for S3 (and S3-compatible) GET/HEAD requests.
+// AWS Signature Version 4 signer for S3 (and S3-compatible) requests.
 //
 // This is the same hand-rolled SigV4 scheme the doubleyoup media Worker uses to
-// read R2, generalized to (a) an arbitrary host/path/query and (b) any region,
-// so it can sign a ListObjectsV2 probe against either real AWS S3 or an
-// S3-compatible endpoint (R2, MinIO, Wasabi). We only ever sign empty-body
-// GET/HEAD reads here, so the payload hash is always the SHA-256 of "".
+// read R2, generalized to (a) an arbitrary host/path/query, (b) any region, and
+// (c) GET/HEAD reads OR a PUT/DELETE with a body — so it can sign both a
+// ListObjectsV2 read and the object PUT/DELETE the write-probe uses (against real
+// AWS S3 or an S3-compatible endpoint: R2, MinIO, Wasabi). The payload hash is the
+// SHA-256 of the body (the SHA-256 of "" for a bodyless request).
 //
 // INVARIANT: the headers we return to SEND are exactly the headers we SIGNED
 // (minus Host, which the runtime sets from the URL) and the wire path/query
-// byte-match the canonical request — otherwise the signature check fails.
+// byte-match the canonical request — otherwise the signature check fails. The
+// caller MUST send the same body it passed here (its hash is in x-amz-content-sha256).
 
 const textEncoder = new TextEncoder();
 
@@ -78,14 +80,16 @@ export interface SignedRequest {
   headers: Headers;
 }
 
-// Build a SigV4-signed GET/HEAD for the given S3 URL. The URL may carry a query
-// string (e.g. "?list-type=2&max-keys=1"); it is signed as-is.
+// Build a SigV4-signed request for the given S3 URL. The URL may carry a query
+// string (e.g. "?list-type=2&max-keys=1"); it is signed as-is. For a PUT, pass the
+// body so its hash goes into the signed x-amz-content-sha256 (send the same body).
 export async function signS3Request(options: {
-  method: "GET" | "HEAD";
+  method: "GET" | "HEAD" | "PUT" | "DELETE";
   url: string;
   region: string;
   accessKeyId: string;
   secretAccessKey: string;
+  body?: string;
 }): Promise<SignedRequest> {
   const parsed = new URL(options.url);
   const host = parsed.host; // includes a non-default port if present
@@ -96,7 +100,8 @@ export async function signS3Request(options: {
     .replace(/[:-]/g, "")
     .replace(/\.\d{3}Z$/, "Z");
   const dateStamp = amzDate.slice(0, 8);
-  const payloadHash = await sha256Hex(""); // GET/HEAD carry no body
+  // Hash of the request body — the SHA-256 of "" for a bodyless GET/HEAD/DELETE.
+  const payloadHash = await sha256Hex(options.body ?? "");
 
   // Minimal signed header set: host + the two mandatory x-amz-* headers.
   const signedValues = new Map<string, string>();
