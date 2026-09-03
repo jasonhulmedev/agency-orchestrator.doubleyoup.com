@@ -138,9 +138,15 @@ async function probeObjectStoreWithWrite(
   // With redirect:"manual" a real 3xx keeps its status; a runtime that instead yields an
   // opaque-redirect filtered response reports status 0 — treat both as a redirect failure.
   if (response.status === 0 || (response.status >= 300 && response.status < 400)) {
+    // On the custom-endpoint path a redirect means S3_ENDPOINT isn't the direct S3 API; on the
+    // AWS path a 301 PermanentRedirect means the bucket is in a different region (wrong S3_REGION),
+    // so point at the knob that actually applies.
+    const hint = cred.endpoint
+      ? "set S3_ENDPOINT to the direct S3/R2 API endpoint, not a redirecting or proxy host"
+      : "the bucket appears to be in a different region — set S3_REGION to the bucket's actual region";
     return {
       ok: false,
-      detail: `Object store endpoint ${where} redirected the request (HTTP ${response.status || "3xx"}) — set S3_ENDPOINT to the direct S3/R2 API endpoint, not a redirecting or proxy host.`,
+      detail: `Object store endpoint ${where} redirected the request (HTTP ${response.status || "3xx"}) — ${hint}.`,
     };
   }
 

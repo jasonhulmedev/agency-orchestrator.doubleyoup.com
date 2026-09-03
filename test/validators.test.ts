@@ -186,6 +186,21 @@ describe("validateS3", () => {
     const methods = fetchMock.mock.calls.map((c) => ((c as unknown[])[1] as RequestInit).method);
     expect(methods).toEqual(["PUT", "DELETE"]);
   });
+
+  // Guards the crux invariant: the signed x-amz-content-sha256 MUST equal the hash of the body
+  // actually sent. A regression that signs one body but sends another false-REDs every real
+  // store (SignatureDoesNotMatch) while every other test stays green.
+  it("signs the PUT body — x-amz-content-sha256 equals sha256 of the sent body", async () => {
+    const fetchMock = routedFetch([{ match: () => true, respond: putOk }]);
+    vi.stubGlobal("fetch", fetchMock);
+    await validateS3(r2Env);
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const sentBody = String(init.body);
+    const signedHash = new Headers(init.headers).get("x-amz-content-sha256");
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sentBody));
+    const expected = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    expect(signedHash).toBe(expected);
+  });
 });
 
 // ── Stripe ──────────────────────────────────────────────────────────────────
