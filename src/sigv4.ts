@@ -4,13 +4,15 @@
 // read R2, generalized to (a) an arbitrary host/path/query, (b) any region, and
 // (c) GET/HEAD reads OR a PUT/DELETE with a body — so it can sign both a
 // ListObjectsV2 read and the object PUT/DELETE the write-probe uses (against real
-// AWS S3 or an S3-compatible endpoint: R2, MinIO, Wasabi). The payload hash is the
-// SHA-256 of the body (the SHA-256 of "" for a bodyless request).
+// AWS S3 or an S3-compatible endpoint: R2, MinIO, Wasabi). A bodyless request signs
+// the SHA-256 of ""; a request WITH a body signs the literal "UNSIGNED-PAYLOAD" (see
+// the payload-hash comment below for why — it's the workerd edge write-probe fix).
 //
 // INVARIANT: the headers we return to SEND are exactly the headers we SIGNED
 // (minus Host, which the runtime sets from the URL) and the wire path/query
 // byte-match the canonical request — otherwise the signature check fails. The
-// caller MUST send the same body it passed here (its hash is in x-amz-content-sha256).
+// caller MUST still send a body on a body request, but because it is signed
+// UNSIGNED-PAYLOAD the exact bytes are no longer hash-verified by the store.
 
 const textEncoder = new TextEncoder();
 
@@ -82,7 +84,8 @@ export interface SignedRequest {
 
 // Build a SigV4-signed request for the given S3 URL. The URL may carry a query
 // string (e.g. "?list-type=2&max-keys=1"); it is signed as-is. For a PUT, pass the
-// body so its hash goes into the signed x-amz-content-sha256 (send the same body).
+// body — it is signed as UNSIGNED-PAYLOAD (the store won't hash-verify the bytes),
+// so the same body must still be sent, but its exact framing no longer matters.
 export async function signS3Request(options: {
   method: "GET" | "HEAD" | "PUT" | "DELETE";
   url: string;
@@ -100,8 +103,21 @@ export async function signS3Request(options: {
     .replace(/[:-]/g, "")
     .replace(/\.\d{3}Z$/, "Z");
   const dateStamp = amzDate.slice(0, 8);
-  // Hash of the request body — the SHA-256 of "" for a bodyless GET/HEAD/DELETE.
-  const payloadHash = await sha256Hex(options.body ?? "");
+
+  // Payload-hash choice — and the crux of the workerd write-probe fix:
+  //   • bodyless GET/HEAD/DELETE ... the SHA-256 of "" (these already work — unchanged).
+  //   • any request WITH a body .... the literal "UNSIGNED-PAYLOAD", NOT sha256(body).
+  //
+  // Why UNSIGNED-PAYLOAD for a body request: on Cloudflare's edge (workerd) the outbound
+  // fetch frames the PUT body differently than Node does, and R2's S3 API then rejects a
+  // PUT that carries a fixed body-hash with 400 InvalidArgument. Node and local
+  // `wrangler dev` egress to R2's lenient public endpoint and succeed (200 + ETag), so
+  // this only bites the DEPLOYED Worker. Signing the body as UNSIGNED-PAYLOAD tells R2 not
+  // to verify the body hash, so the runtime's body framing can no longer cause a mismatch.
+  // The request stays fully authenticated — the SigV4 signature still covers the method,
+  // path, query and every signed header — and the probe object's byte-integrity is
+  // irrelevant here (it's a throwaway connectivity/write check).
+  const payloadHash = options.body === undefined ? await sha256Hex("") : "UNSIGNED-PAYLOAD";
 
   // Minimal signed header set: host + the two mandatory x-amz-* headers.
   const signedValues = new Map<string, string>();

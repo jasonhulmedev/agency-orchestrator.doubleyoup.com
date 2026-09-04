@@ -187,19 +187,22 @@ describe("validateS3", () => {
     expect(methods).toEqual(["PUT", "DELETE"]);
   });
 
-  // Guards the crux invariant: the signed x-amz-content-sha256 MUST equal the hash of the body
-  // actually sent. A regression that signs one body but sends another false-REDs every real
-  // store (SignatureDoesNotMatch) while every other test stays green.
-  it("signs the PUT body — x-amz-content-sha256 equals sha256 of the sent body", async () => {
+  // Guards the workerd write-probe fix: a PUT (a request WITH a body) signs — and sends —
+  // the literal "UNSIGNED-PAYLOAD" as x-amz-content-sha256, NOT sha256(body). On Cloudflare's
+  // edge the runtime re-frames the PUT body, so a fixed body-hash makes R2 answer 400
+  // InvalidArgument (only on the deployed Worker; Node + local `wrangler dev` hit R2's lenient
+  // public endpoint and pass). UNSIGNED-PAYLOAD drops the body-hash check; the request stays
+  // authenticated by the SigV4 signature. The body must still be SENT — just no longer hash-bound.
+  it("signs the PUT body as UNSIGNED-PAYLOAD (workerd write-probe fix), and still sends the body", async () => {
     const fetchMock = routedFetch([{ match: () => true, respond: putOk }]);
     vi.stubGlobal("fetch", fetchMock);
     await validateS3(r2Env);
     const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
-    const sentBody = String(init.body);
+    // the body is still sent (a write probe with no body would prove nothing)
+    expect(String(init.body)).toBe("doubleyoup object-store connectivity + write probe");
+    // and it is signed UNSIGNED-PAYLOAD, not the body hash
     const signedHash = new Headers(init.headers).get("x-amz-content-sha256");
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sentBody));
-    const expected = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-    expect(signedHash).toBe(expected);
+    expect(signedHash).toBe("UNSIGNED-PAYLOAD");
   });
 });
 
