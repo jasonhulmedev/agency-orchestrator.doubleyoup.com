@@ -206,9 +206,15 @@ async function probeObjectStoreWithWrite(
       detail: `Object store endpoint ${where} returned HTTP ${response.status} with no S3 error code — S3_ENDPOINT may not be an S3-compatible object store. Check S3_ENDPOINT.`,
     };
   }
+  // Surface R2/S3's own <Message> for any code we don't special-case above — it names the
+  // exact rejected argument (e.g. an unsupported header or a malformed value), which is what
+  // an operator actually needs to fix a generic 4xx like InvalidArgument.
+  const message = extractXmlTag(body, "Message");
   return {
     ok: false,
-    detail: `Object store write check failed with HTTP ${response.status} (${code}).`,
+    detail: `Object store write check failed with HTTP ${response.status} (${code})${
+      message ? `: ${message}` : ""
+    }.`,
   };
 }
 
