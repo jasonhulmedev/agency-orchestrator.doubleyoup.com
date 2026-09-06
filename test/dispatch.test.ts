@@ -23,9 +23,11 @@ import {
   verifyDispatch,
 } from "../src/dispatch-verify.js";
 import {
+  CACHE_PURGE_MODES,
   isValidR2BucketName,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
+  validateCachePurgeParams,
 } from "../src/dispatch-params.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
 
@@ -95,6 +97,21 @@ function dnsJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
     op: "dns-record-upsert",
     params: JSON.stringify(DNS_PARAMS),
     nonce: "fedcba9876543210fedcba9876543210",
+    ...overrides,
+  });
+}
+
+// A cache-purge job — a SAFE targeted (files) purge of one in-zone URL by default.
+const CACHE_PARAMS = {
+  zone: "doubleyoup.com",
+  mode: "files",
+  files: ["https://doubleyoup.com/_dy-dirb-proof-cache"],
+};
+function cachePurgeJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "cache-purge",
+    params: JSON.stringify(CACHE_PARAMS),
+    nonce: "aa55aa55aa55aa55aa55aa55aa55aa55",
     ...overrides,
   });
 }
@@ -367,11 +384,76 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
   });
 
   it("the op registry has exactly the allowlisted ops, each with validateParams + actuate", () => {
-    expect(Object.keys(DISPATCH_OP_REGISTRY).sort()).toEqual(["dns-record-upsert", "provision-r2"]);
+    expect(Object.keys(DISPATCH_OP_REGISTRY).sort()).toEqual(["cache-purge", "dns-record-upsert", "provision-r2"]);
     for (const entry of Object.values(DISPATCH_OP_REGISTRY)) {
       expect(typeof entry.validateParams).toBe("function");
       expect(typeof entry.actuate).toBe("function");
     }
+  });
+
+  // ── cache-purge (twin of the app's rules) ─────────────────────────────────────────
+
+  it("cache-purge exposes exactly the three modes", () => {
+    expect([...CACHE_PURGE_MODES]).toEqual(["everything", "files", "hosts"]);
+  });
+
+  it("cache-purge: accepts everything / files / hosts and returns only known keys", () => {
+    expect(validateCachePurgeParams({ zone: "doubleyoup.com", mode: "everything", extra: "x" })).toEqual({
+      ok: true,
+      params: { zone: "doubleyoup.com", mode: "everything" },
+    });
+    expect(validateCachePurgeParams({ ...CACHE_PARAMS, extra: "x" })).toEqual({ ok: true, params: CACHE_PARAMS });
+    expect(
+      validateCachePurgeParams({ zone: "doubleyoup.com", mode: "hosts", hosts: ["doubleyoup.com", "cdn.doubleyoup.com"] }),
+    ).toEqual({ ok: true, params: { zone: "doubleyoup.com", mode: "hosts", hosts: ["doubleyoup.com", "cdn.doubleyoup.com"] } });
+  });
+
+  it("cache-purge: rejects bad input field by field", () => {
+    const bad = (overrides: Record<string, unknown>) =>
+      validateCachePurgeParams({ zone: "doubleyoup.com", mode: "everything", ...overrides });
+
+    expect(validateCachePurgeParams(null).ok).toBe(false);
+    expect(validateCachePurgeParams("string").ok).toBe(false);
+    expect(validateCachePurgeParams([]).ok).toBe(false);
+    // zone
+    expect(bad({ zone: "" }).ok).toBe(false);
+    expect(bad({ zone: "Doubleyoup.com" }).ok).toBe(false); // uppercase
+    expect(bad({ zone: "localhost" }).ok).toBe(false); // single label
+    expect(bad({ zone: "*.doubleyoup.com" }).ok).toBe(false); // wildcard zone
+    // mode
+    expect(bad({ mode: "all" }).ok).toBe(false);
+    expect(bad({ mode: "Everything" }).ok).toBe(false); // case-sensitive
+    expect(bad({ mode: undefined }).ok).toBe(false);
+    // everything must carry no list
+    expect(bad({ mode: "everything", files: ["https://doubleyoup.com/x"] }).ok).toBe(false);
+    expect(bad({ mode: "everything", hosts: ["doubleyoup.com"] }).ok).toBe(false);
+    // files list shape
+    expect(bad({ mode: "files" }).ok).toBe(false); // missing list
+    expect(bad({ mode: "files", files: [] }).ok).toBe(false); // empty
+    expect(bad({ mode: "files", files: Array.from({ length: 31 }, () => "https://doubleyoup.com/x") }).ok).toBe(false);
+    expect(bad({ mode: "files", files: ["https://doubleyoup.com/x"], hosts: ["doubleyoup.com"] }).ok).toBe(false);
+    // files entries
+    expect(bad({ mode: "files", files: [42] }).ok).toBe(false); // non-string
+    expect(bad({ mode: "files", files: ["http://doubleyoup.com/x"] }).ok).toBe(false); // not https
+    expect(bad({ mode: "files", files: ["ftp://doubleyoup.com/x"] }).ok).toBe(false); // not https
+    expect(bad({ mode: "files", files: ["/relative/path"] }).ok).toBe(false); // not absolute
+    expect(bad({ mode: "files", files: ["not a url"] }).ok).toBe(false); // malformed
+    expect(bad({ mode: "files", files: ["https://evil.com/x"] }).ok).toBe(false); // out of zone
+    expect(bad({ mode: "files", files: ["https://notdoubleyoup.com/x"] }).ok).toBe(false); // suffix trick
+    expect(bad({ mode: "files", files: [" https://doubleyoup.com/x "] }).ok).toBe(false); // padded
+    expect(bad({ mode: "files", files: [`https://doubleyoup.com/${"a".repeat(2100)}`] }).ok).toBe(false); // too long
+    // hosts list shape
+    expect(bad({ mode: "hosts" }).ok).toBe(false); // missing list
+    expect(bad({ mode: "hosts", hosts: [] }).ok).toBe(false); // empty
+    expect(bad({ mode: "hosts", hosts: Array.from({ length: 31 }, () => "doubleyoup.com") }).ok).toBe(false);
+    expect(bad({ mode: "hosts", hosts: ["doubleyoup.com"], files: ["https://doubleyoup.com/x"] }).ok).toBe(false);
+    // hosts entries
+    expect(bad({ mode: "hosts", hosts: [42] }).ok).toBe(false); // non-string
+    expect(bad({ mode: "hosts", hosts: ["Doubleyoup.com"] }).ok).toBe(false); // uppercase
+    expect(bad({ mode: "hosts", hosts: ["https://doubleyoup.com/x"] }).ok).toBe(false); // URL, not a hostname
+    expect(bad({ mode: "hosts", hosts: ["*.doubleyoup.com"] }).ok).toBe(false); // wildcard
+    expect(bad({ mode: "hosts", hosts: ["evil.com"] }).ok).toBe(false); // out of zone
+    expect(bad({ mode: "hosts", hosts: ["notdoubleyoup.com"] }).ok).toBe(false); // suffix trick
   });
 });
 
@@ -749,6 +831,153 @@ describe("POST /actuate route", () => {
     expect(response.status).toBe(400);
     const body = (await response.json()) as { reason: string };
     expect(body.reason).toMatch(/type must be one of/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── cache-purge through the registry ──────────────────────────────────────────────
+
+  // A routed CF cache-purge API mock: zone lookup, then the POST /zones/:id/purge_cache.
+  // Every call must carry the DNS token and never the R2 token — the op's own credential.
+  function mockCachePurgeApi() {
+    const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = urlOf(input);
+      const method = init?.method ?? "GET";
+      const auth = new Headers(init?.headers).get("authorization");
+      expect(auth).toBe("Bearer cf-dns-token-abc");
+      expect(auth).not.toContain("cf-token-xyz");
+      calls.push({ method, url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+
+      const parsed = new URL(url);
+      if (parsed.pathname === "/client/v4/zones" && method === "GET") {
+        expect(parsed.searchParams.get("name")).toBe("doubleyoup.com");
+        return jsonResponse({ success: true, result: [{ id: "zone-1", name: "doubleyoup.com" }] });
+      }
+      if (parsed.pathname === "/client/v4/zones/zone-1/purge_cache" && method === "POST") {
+        return jsonResponse({ success: true, result: { id: "zone-1" } });
+      }
+      throw new Error(`unexpected fetch ${method} ${url}`);
+    });
+    return calls;
+  }
+
+  it("cache-purge: files mode POSTs {files:[...]} using CF_DNS_API_TOKEN only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cachePurgeJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCachePurgeApi();
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "cache-purge",
+      mode: "files",
+      zone: "doubleyoup.com",
+      count: 1,
+    });
+    const write = calls.find((c) => c.method === "POST");
+    expect(write?.url).toMatch(/\/zones\/zone-1\/purge_cache$/);
+    expect(write?.body).toEqual({ files: ["https://doubleyoup.com/_dy-dirb-proof-cache"] });
+  });
+
+  it("cache-purge: everything mode POSTs {purge_everything:true}", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cachePurgeJob({ params: JSON.stringify({ zone: "doubleyoup.com", mode: "everything" }) });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCachePurgeApi();
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "cache-purge",
+      mode: "everything",
+      zone: "doubleyoup.com",
+      count: 0,
+    });
+    expect(calls.find((c) => c.method === "POST")?.body).toEqual({ purge_everything: true });
+  });
+
+  it("cache-purge: hosts mode POSTs {hosts:[...]}", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cachePurgeJob({
+      params: JSON.stringify({ zone: "doubleyoup.com", mode: "hosts", hosts: ["doubleyoup.com", "cdn.doubleyoup.com"] }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCachePurgeApi();
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; count: number };
+    expect(body.ok).toBe(true);
+    expect(body.count).toBe(2);
+    expect(calls.find((c) => c.method === "POST")?.body).toEqual({ hosts: ["doubleyoup.com", "cdn.doubleyoup.com"] });
+  });
+
+  it("cache-purge: fails cleanly when the token cannot see the zone (no purge)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cachePurgeJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      jsonResponse({ success: true, result: [] }),
+    );
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/not visible to CF_DNS_API_TOKEN/);
+    expect(fetchSpy).toHaveBeenCalledTimes(1); // the zone lookup only — no purge attempted
+  });
+
+  it("cache-purge: surfaces a Cloudflare purge error as ok:false (still HTTP 200)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cachePurgeJob();
+    const signature = await signAsApp(job, privateKey);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const parsed = new URL(urlOf(input));
+      if (parsed.pathname === "/client/v4/zones") {
+        return jsonResponse({ success: true, result: [{ id: "zone-1", name: "doubleyoup.com" }] });
+      }
+      if ((init?.method ?? "GET") === "POST") {
+        return jsonResponse({ success: false, errors: [{ code: 1012, message: "Request must contain one of..." }] }, 400);
+      }
+      throw new Error("unexpected");
+    });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/cache purge failed with HTTP 400/);
+  });
+
+  it("cache-purge: reports a clean failure and touches NO API when CF_DNS_API_TOKEN is missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cachePurgeJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    // R2 token IS present — it must not be used as a substitute.
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ CF_DNS_API_TOKEN: undefined }));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/CF_DNS_API_TOKEN is not configured/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("cache-purge: a signed job with invalid params is 400 with no API call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cachePurgeJob({ params: JSON.stringify({ zone: "doubleyoup.com", mode: "files", files: ["https://evil.com/x"] }) });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { reason: string };
+    expect(body.reason).toMatch(/within zone/);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

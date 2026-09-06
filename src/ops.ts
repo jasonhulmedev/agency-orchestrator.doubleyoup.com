@@ -17,10 +17,17 @@ import {
   type ParamsVerdict,
   type ProvisionR2Params,
   type DnsRecordUpsertParams,
+  type CachePurgeParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
+  validateCachePurgeParams,
 } from "./dispatch-params.js";
-import { type ActuateResult, actuateProvisionR2, actuateDnsRecordUpsert } from "./actuate.js";
+import {
+  type ActuateResult,
+  actuateProvisionR2,
+  actuateDnsRecordUpsert,
+  actuateCachePurge,
+} from "./actuate.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
 interface OpDefinition<P> {
@@ -54,6 +61,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "dns-record-upsert": defineOp<DnsRecordUpsertParams>({
     validateParams: validateDnsRecordUpsertParams,
     actuate: (params, env) => actuateDnsRecordUpsert(params, env),
+  }),
+  "cache-purge": defineOp<CachePurgeParams>({
+    validateParams: validateCachePurgeParams,
+    actuate: (params, env) => actuateCachePurge(params, env),
   }),
 };
 

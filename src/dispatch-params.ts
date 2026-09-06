@@ -148,6 +148,145 @@ export function validateDnsRecordUpsertParams(raw: unknown): ParamsVerdict<DnsRe
   };
 }
 
+// ── cache-purge ──────────────────────────────────────────────────────────────────────
+
+// The three ways Cloudflare can purge a zone's cache. Exactly ONE target selector applies
+// per mode: "everything" (whole zone, no list), "files" (a list of exact URLs), or "hosts"
+// (a list of hostnames). Deliberately small + explicit so a caller can't accidentally send
+// a whole-zone purge when it meant a targeted one, or mix selectors.
+export const CACHE_PURGE_MODES = ["everything", "files", "hosts"] as const;
+export type CachePurgeMode = (typeof CACHE_PURGE_MODES)[number];
+
+// Cloudflare caps a single purge_cache call at 30 URLs / 30 hosts on non-Enterprise zones;
+// we hold both list modes to 1..30 so an over-sized list fails here rather than at the edge.
+const CACHE_PURGE_LIST_MAX = 30;
+// A generous ceiling on a single file URL — long enough for real query-string cache keys,
+// short enough to reject a junk mega-string. (Cloudflare's own practical URL cap is ~2 KB.)
+const CACHE_PURGE_URL_MAX_LENGTH = 2048;
+
+/**
+ * A cache-purge job. The `params` field rides as an opaque SIGNED string, so unlike the
+ * older all-strings ops this one carries real arrays — validated strictly on BOTH sides.
+ * Modelled as a discriminated union on `mode` so exactly one selector is present:
+ *   - everything: whole-zone purge, no list;
+ *   - files: 1..30 absolute https URLs, each within `zone`;
+ *   - hosts: 1..30 lowercase hostnames, each within `zone`.
+ */
+export type CachePurgeParams =
+  | { zone: string; mode: "everything" }
+  | { zone: string; mode: "files"; files: string[] }
+  | { zone: string; mode: "hosts"; hosts: string[] };
+
+/**
+ * True when `entry` is an absolute https URL whose host is within `zone`. Parsing an
+ * untrusted URL genuinely needs the try/catch (there is no non-throwing WHATWG parse we
+ * can rely on identically across Node + workerd). The host is validated with the SAME zone
+ * grammar as the DNS op and must be equal to `zone` or a subdomain of it, so a purge can't
+ * be aimed at a URL outside the resolved zone (Cloudflare would reject it anyway).
+ */
+function isValidCachePurgeFileUrl(entry: unknown, zone: string): boolean {
+  if (
+    typeof entry !== "string" ||
+    entry.length === 0 ||
+    entry.length > CACHE_PURGE_URL_MAX_LENGTH ||
+    entry.trim() !== entry
+  ) {
+    return false;
+  }
+  let url: URL;
+  try {
+    url = new URL(entry);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "https:") return false;
+  const host = url.hostname;
+  if (host.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(host)) return false;
+  return host === zone || host.endsWith(`.${zone}`);
+}
+
+/**
+ * True when `entry` is a bare lowercase hostname (no scheme, no wildcard) within `zone`.
+ * Reuses the DNS zone grammar (lowercase, 2+ labels), matching the DNS op's "callers
+ * normalize before signing" rule rather than normalizing here.
+ */
+function isValidCachePurgeHostname(entry: unknown, zone: string): boolean {
+  if (
+    typeof entry !== "string" ||
+    entry.length === 0 ||
+    entry.length > DNS_NAME_MAX_LENGTH ||
+    entry.trim() !== entry
+  ) {
+    return false;
+  }
+  if (!DNS_ZONE_RE.test(entry)) return false;
+  return entry === zone || entry.endsWith(`.${zone}`);
+}
+
+export function validateCachePurgeParams(raw: unknown): ParamsVerdict<CachePurgeParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { zone, mode, files, hosts } = raw;
+
+  if (typeof zone !== "string" || zone.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a lowercase DNS zone name (e.g. example.com)" };
+  }
+  if (typeof mode !== "string" || !(CACHE_PURGE_MODES as readonly string[]).includes(mode)) {
+    return { ok: false, reason: `mode must be one of ${CACHE_PURGE_MODES.join(", ")}` };
+  }
+
+  // everything: whole-zone purge — neither target list may be present (a stray list here is
+  // almost always a caller bug: it MEANT a targeted purge but sent the wrong mode).
+  if (mode === "everything") {
+    if (files !== undefined || hosts !== undefined) {
+      return { ok: false, reason: 'mode "everything" must not carry a files or hosts list' };
+    }
+    return { ok: true, params: { zone, mode: "everything" } };
+  }
+
+  // files: 1..30 absolute https URLs within the zone; the hosts list must be absent.
+  if (mode === "files") {
+    if (hosts !== undefined) {
+      return { ok: false, reason: 'mode "files" must not carry a hosts list' };
+    }
+    if (!Array.isArray(files) || files.length < 1 || files.length > CACHE_PURGE_LIST_MAX) {
+      return { ok: false, reason: `files must be an array of 1-${CACHE_PURGE_LIST_MAX} absolute https URLs` };
+    }
+    // Build a FRESH array of only the validated string entries — never the caller's array —
+    // so an extra element property can't ride along into the signed params.
+    const cleanFiles: string[] = [];
+    for (const entry of files) {
+      if (!isValidCachePurgeFileUrl(entry, zone)) {
+        return { ok: false, reason: "each files entry must be an absolute https URL within zone" };
+      }
+      cleanFiles.push(entry as string);
+    }
+    return { ok: true, params: { zone, mode: "files", files: cleanFiles } };
+  }
+
+  // hosts: 1..30 lowercase hostnames within the zone; the files list must be absent.
+  if (mode === "hosts") {
+    if (files !== undefined) {
+      return { ok: false, reason: 'mode "hosts" must not carry a files list' };
+    }
+    if (!Array.isArray(hosts) || hosts.length < 1 || hosts.length > CACHE_PURGE_LIST_MAX) {
+      return { ok: false, reason: `hosts must be an array of 1-${CACHE_PURGE_LIST_MAX} hostnames` };
+    }
+    const cleanHosts: string[] = [];
+    for (const entry of hosts) {
+      if (!isValidCachePurgeHostname(entry, zone)) {
+        return { ok: false, reason: "each hosts entry must be a lowercase hostname within zone" };
+      }
+      cleanHosts.push(entry as string);
+    }
+    return { ok: true, params: { zone, mode: "hosts", hosts: cleanHosts } };
+  }
+
+  // Unreachable: `mode` was allowlisted above. Fail closed rather than fall through.
+  return { ok: false, reason: `mode must be one of ${CACHE_PURGE_MODES.join(", ")}` };
+}
+
 // ── shared ─────────────────────────────────────────────────────────────────────────
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

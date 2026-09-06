@@ -14,9 +14,10 @@
 //   POST /complete  — if all green, tell our app onboarding is complete.
 //   POST /actuate   — Direction-B: run a SIGNED job (ed25519) the platform dispatched
 //                     through us, using the AGENCY's own credentials. Ops live in the
-//                     registry (src/ops.ts): provision-r2 (create an R2 bucket) and
-//                     dns-record-upsert (upsert a record in an agency zone). Verified
-//                     before any side effect.
+//                     registry (src/ops.ts): provision-r2 (create an R2 bucket),
+//                     dns-record-upsert (upsert a record in an agency zone), and
+//                     cache-purge (purge an agency zone's cache). Verified before any
+//                     side effect.
 //
 // NOTE on inbound auth: /validate and /complete are Phase-1 endpoints the agency
 // triggers themselves, so they are intentionally open. /actuate is the Direction-B
