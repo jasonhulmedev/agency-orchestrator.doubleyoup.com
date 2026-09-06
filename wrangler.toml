@@ -39,3 +39,20 @@ compatibility_date = "2026-01-01"
 
 [vars]
 APP_BASE_URL = "https://app.doubleyoup.com"
+
+# ── Direction-B replay protection (Durable Object) ───────────────────────────
+# NONCE_STORE is the single-use nonce store that makes a signed /actuate job
+# actuatable at most once (src/nonce-store.ts). No per-account id is committed:
+# `wrangler deploy` auto-provisions the DO in whichever agency account runs it,
+# so this file stays identical across every agency deployment.
+#
+# NOTE: Durable Objects require the Workers PAID plan on the deploying account.
+[[durable_objects.bindings]]
+name = "NONCE_STORE"
+class_name = "NonceStore"
+
+# Applied automatically on `wrangler deploy`. `new_sqlite_classes` makes NonceStore
+# a SQLite-backed DO (state.storage.sql), so spent nonces survive DO restarts/evictions.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NonceStore"]

@@ -21,9 +21,11 @@
 import type { Env } from "./env.js";
 
 // The ops this Worker will actuate. Enforced INDEPENDENTLY of the app's copy (defense in
-// depth): a job whose `op` is not here is rejected before any side effect. Adding an op here
-// is gated on the replay-hardening prerequisite documented at FRESHNESS_WINDOW_SECONDS —
-// only idempotent ops are safe on the timestamp window alone.
+// depth): a job whose `op` is not here is rejected before any side effect. The replay-
+// hardening prerequisite documented at FRESHNESS_WINDOW_SECONDS is now IMPLEMENTED (the
+// single-use NonceStore DO in src/nonce-store.ts, enforced in index.ts::handleActuate), so
+// a signed job actuates at most once. Non-idempotent ops may now be added on that basis —
+// still keep this allowlist tight and add ops deliberately.
 export const DISPATCH_OPS = ["provision-r2"] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 
@@ -40,15 +42,13 @@ export interface DispatchJob {
 }
 
 // How far the job's `timestamp` may be from "now" (either direction) and still be fresh.
-// The timestamp window is the ONLY replay protection here: a captured job CAN be replayed
-// freely within this window.
 //
-// ⚠️ HARD PREREQUISITE before extending DISPATCH_OPS: the ±window admits replay, so it is
-// only safe today because the sole op — provision-r2 — is IDEMPOTENT (replaying it just
-// re-creates/no-ops the same bucket). A shared SINGLE-USE nonce store (Workers KV / D1 /
-// Durable Object, to remember spent nonces across isolates + requests — module scope is
-// NOT enough at the edge) is a REQUIRED precondition before adding ANY non-idempotent or
-// destructive op to the allowlist. Do not add such an op on the timestamp window alone.
+// Replay protection is now IMPLEMENTED via the single-use NonceStore Durable Object
+// (src/nonce-store.ts), enforced in index.ts::handleActuate after this verification passes:
+// each nonce actuates at most once, so a captured job cannot be replayed even within the
+// window. This timestamp window is now DEFENSE IN DEPTH alongside those single-use nonces —
+// it bounds how long any captured job is even a candidate for replay, which in turn bounds
+// how long the nonce store must retain each spent nonce (see nonce-store.ts::nonceExpiresAtMs).
 export const FRESHNESS_WINDOW_SECONDS = 120;
 
 // R2 bucket-name grammar, mirrored from the app so the actuator re-checks it (the app

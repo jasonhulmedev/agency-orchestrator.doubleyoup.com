@@ -211,6 +211,27 @@ describe("POST /actuate route", () => {
     ({ publicKeyPem, privateKey } = await makeKeypair());
   });
 
+  // A stand-in NONCE_STORE binding for these Node tests. They exercise the ACTUATE path
+  // (real actuate.ts, fetch mocked), NOT replay defense — that has dedicated real-DO tests
+  // under the workers pool (test/nonce-store.worker.test.ts). It always reports the nonce as
+  // fresh so actuation proceeds.
+  const freshNonceStore = {
+    idFromName: () => ({}),
+    get: () => ({ consume: async () => "fresh" as const }),
+  } as unknown as Env["NONCE_STORE"];
+
+  // A NONCE_STORE whose consume() rejects — models the DO being unavailable / a storage
+  // error. handleActuate deliberately has no try/catch around consume, so this must surface
+  // as a rejection (a 5xx over HTTP), never a 200, and must NOT actuate.
+  const throwingNonceStore = {
+    idFromName: () => ({}),
+    get: () => ({
+      consume: async () => {
+        throw new Error("nonce store unavailable");
+      },
+    }),
+  } as unknown as Env["NONCE_STORE"];
+
   function envWith(overrides: Partial<Env> = {}): Env {
     return {
       APP_BASE_URL: "https://app.example.test",
@@ -218,6 +239,7 @@ describe("POST /actuate route", () => {
       DY_CLIENT_SECRET: "secret-xyz",
       DY_SIGNING_PUBLIC_KEY: publicKeyPem,
       R2_PROVISION_API_TOKEN: "cf-token-xyz",
+      NONCE_STORE: freshNonceStore,
       ...overrides,
     };
   }
@@ -241,6 +263,24 @@ describe("POST /actuate route", () => {
     expect(body.ok).toBe(false);
     // Nothing was actuated: the CF API was never touched.
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("fails closed (no actuation, never 200) when the nonce store errors", async () => {
+    // Verification passes (valid signature + fresh timestamp), so control reaches the nonce
+    // consume — which here throws. A future refactor must never let this become a bypass:
+    // the request must fail (rejection / 5xx), and the actuator must not run.
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = sampleJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    await expect(
+      worker.fetch(actuateRequest({ job, signature }), envWith({ NONCE_STORE: throwingNonceStore })),
+    ).rejects.toThrow(/nonce store unavailable/);
+
+    // The actuator was never reached — no Cloudflare call, no side effect.
+    expect(fetchSpy).not.toHaveBeenCalled();
+    vi.useRealTimers();
   });
 
   it("actuates a verified provision-r2 job via the agency's own R2 token (created)", async () => {
