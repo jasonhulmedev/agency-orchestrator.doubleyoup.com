@@ -66,12 +66,16 @@ export class NonceStore extends DurableObject {
    * Record `nonce` as spent, atomically. Returns "fresh" the FIRST time a nonce is seen and
    * "replay" for every subsequent time until it expires and is pruned.
    *
-   * ATOMICITY: a DO instance is single-threaded — only one invocation runs at a time — and
-   * this method contains NO `await`, so the prune -> existence-check -> insert sequence runs
-   * as one uninterruptible synchronous turn. Nothing can interleave between the SELECT and
-   * the INSERT. The PRIMARY KEY on `nonce` is a hard backstop: even a logic slip could not
-   * create a duplicate. Because /actuate routes every request to the SAME singleton
-   * instance, this single-use guarantee holds globally, not merely per-isolate.
+   * ATOMICITY: correctness rests entirely on the single-threaded, no-await
+   * prune -> existence-check -> insert. A DO instance runs one invocation at a time, and
+   * this method contains NO `await`, so those three statements execute as one uninterruptible
+   * synchronous turn — nothing can interleave between the SELECT and the INSERT, so the
+   * SELECT alone always catches a duplicate and returns "replay". The PRIMARY KEY on `nonce`
+   * is ONLY a fail-closed backstop, not a second graceful classification: if a duplicate
+   * INSERT ever did fire (a future refactor introducing an await, say), sql.exec would THROW
+   * — surfacing as a rejected consume() and, in handleActuate, a non-200 with no actuation —
+   * rather than silently letting the job through. Because /actuate routes every request to
+   * the SAME singleton instance, this single-use guarantee holds globally, not per-isolate.
    *
    * @param notAfterMs wall-clock ms after which this nonce may be pruned — pass
    *                   nonceExpiresAtMs(Date.parse(job.timestamp)).
