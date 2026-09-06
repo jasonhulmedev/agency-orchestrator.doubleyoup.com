@@ -23,6 +23,7 @@ export interface AllValidations {
   stripe: ValidationResult;
   ai: ValidationResult;
   r2Provision: ValidationResult;
+  cfDns: ValidationResult;
 }
 
 // ── S3 / object storage ────────────────────────────────────────────────────────
@@ -353,6 +354,71 @@ export async function validateR2Provision(env: Env): Promise<ValidationResult> {
   }
 }
 
+// ── Cloudflare DNS (Direction-B dns-record-upsert) ───────────────────────────
+
+// READ-ONLY probe: GET /zones?per_page=1 proves CF_DNS_API_TOKEN authenticates and can
+// list at least one zone (Zone:Read). Like validateR2Provision, Cloudflare can't tell us
+// which permission groups a token was minted with, so a green here proves Zone:Read on
+// >= 1 zone but NOT Zone:DNS:Edit — the edit scope is exercised for real on the first
+// dns-record-upsert dispatch, which reports a clear denial if it is missing. We never
+// write a record from a validator.
+export async function validateCfDns(env: Env): Promise<ValidationResult> {
+  if (!env.CF_DNS_API_TOKEN) {
+    return {
+      ok: false,
+      detail: "Cloudflare DNS not configured — set the CF_DNS_API_TOKEN secret (Zone:DNS:Edit + Zone:Read).",
+    };
+  }
+
+  try {
+    const response = await fetch("https://api.cloudflare.com/client/v4/zones?per_page=1", {
+      headers: {
+        authorization: `Bearer ${env.CF_DNS_API_TOKEN}`,
+        accept: "application/json",
+      },
+    });
+
+    if (response.status === 200) {
+      const body = (await response.json().catch(() => null)) as {
+        success?: boolean;
+        result?: Array<{ name?: string }>;
+      } | null;
+      if (body?.success && body.result && body.result.length > 0) {
+        const zoneName = body.result[0]?.name;
+        return {
+          ok: true,
+          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch.`,
+        };
+      }
+      return {
+        ok: false,
+        detail:
+          "Cloudflare DNS token authenticated but can list no zones — scope CF_DNS_API_TOKEN to the zone(s) the platform should manage (Zone:Read + Zone:DNS:Edit).",
+      };
+    }
+    if (response.status === 401 || response.status === 403) {
+      return {
+        ok: false,
+        detail: "Cloudflare rejected the token — check CF_DNS_API_TOKEN (needs Zone:Read + Zone:DNS:Edit).",
+      };
+    }
+
+    const body = (await response.json().catch(() => null)) as {
+      errors?: Array<{ message?: string }>;
+    } | null;
+    const message = body?.errors?.[0]?.message;
+    return {
+      ok: false,
+      detail: `Cloudflare DNS token check failed with HTTP ${response.status}${message ? `: ${message}` : ""}.`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      detail: `Cloudflare DNS token check could not be sent (transient network error?): ${errorMessage(err)}.`,
+    };
+  }
+}
+
 // ── AI providers ──────────────────────────────────────────────────────────────
 
 // Anthropic: a minimal authenticated read of the models list.
@@ -648,12 +714,13 @@ export async function validateGCP(env: Env): Promise<ValidationResult> {
 // Run every validator in parallel. Independent network calls — no ordering
 // requirement — so Promise.all keeps /validate responsive.
 export async function validateAll(env: Env): Promise<AllValidations> {
-  const [gcp, s3, stripe, ai, r2Provision] = await Promise.all([
+  const [gcp, s3, stripe, ai, r2Provision, cfDns] = await Promise.all([
     validateGCP(env),
     validateS3(env),
     validateStripe(env),
     validateAI(env),
     validateR2Provision(env),
+    validateCfDns(env),
   ]);
-  return { gcp, s3, stripe, ai, r2Provision };
+  return { gcp, s3, stripe, ai, r2Provision, cfDns };
 }

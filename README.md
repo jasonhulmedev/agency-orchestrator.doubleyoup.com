@@ -39,6 +39,7 @@ Worker never persists them anywhere else and we never hold them. See
 | `S3_ENDPOINT` | secret (optional) | set for Cloudflare R2 (recommended) or another S3-compatible store (MinIO/Wasabi); uses path-style addressing. When set, `/validate` proves the credential can actually **write** the bucket with an object **PUT** probe (no bucket list, best-effort deleted after), so a normally-scoped R2 Object Read&Write key — which is denied bucket-level `ListObjectsV2` — still validates green, while a read-only key or a non-S3 endpoint is correctly caught |
 | `STRIPE_SECRET_KEY` | secret | the agency's Stripe secret key |
 | `R2_PROVISION_API_TOKEN` | secret | Cloudflare **account-owned** token (Manage Account → Account API Tokens in their account) with Workers R2 Storage: Edit + Account API Tokens: Edit — creates per-site media buckets + mints per-site keys. Must NOT be a My Profile → API Tokens (user) token — those fail the account-scoped check |
+| `CF_DNS_API_TOKEN` | secret | Cloudflare API token with **Zone:DNS:Edit + Zone:Read** on the agency zone(s) the platform may manage — used only by the Direction-B `dns-record-upsert` actuator (`POST /actuate`) so the platform creates/updates DNS records in your account **through this Worker**, never with direct access. `/validate` probes it read-only (zone list); the edit scope is exercised on the first DNS dispatch |
 | `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` | secrets | AI provider keys — set at least one (`OPENAI_API_KEY` also covers Codex) |
 
 ## Where setup instructions live
@@ -113,7 +114,7 @@ npm run deploy
 | --- | --- |
 | `GET /` | thin landing page (HTML): intro, onboarding-wizard link, and a live **Check my setup** self-check button |
 | `GET /health` | liveness — `{ok:true, service:"agency-orchestrator"}` |
-| `POST /validate` | run every validator; returns `{ok, gcp, s3, stripe, ai, r2Provision}`, each `{ok, detail}` |
+| `POST /validate` | run every validator; returns `{ok, gcp, s3, stripe, ai, r2Provision, cfDns}`, each `{ok, detail}` |
 | `GET /whoami` | exercise Direction-A end-to-end; returns `{ok, accountId}` |
 | `POST /complete` | if all green, call our app's onboarding-complete route; returns `{ok, validation, callback}` |
 

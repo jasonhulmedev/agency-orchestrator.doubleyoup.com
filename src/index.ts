@@ -13,8 +13,10 @@
 //   GET  /whoami     — exercise the Direction-A round-trip against our app.
 //   POST /complete  — if all green, tell our app onboarding is complete.
 //   POST /actuate   — Direction-B: run a SIGNED job (ed25519) the platform dispatched
-//                     through us, using the AGENCY's own credentials. First op:
-//                     provision-r2 (create an R2 bucket). Verified before any side effect.
+//                     through us, using the AGENCY's own credentials. Ops live in the
+//                     registry (src/ops.ts): provision-r2 (create an R2 bucket) and
+//                     dns-record-upsert (upsert a record in an agency zone). Verified
+//                     before any side effect.
 //
 // NOTE on inbound auth: /validate and /complete are Phase-1 endpoints the agency
 // triggers themselves, so they are intentionally open. /actuate is the Direction-B
@@ -27,8 +29,8 @@ import { callApp } from "./app-client.js";
 import { validateAll, type AllValidations } from "./validators.js";
 import { renderSetupPage } from "./setup-page.js";
 import { errorMessage } from "./util.js";
-import { verifyDispatch, isValidR2BucketName, signingPublicKey } from "./dispatch-verify.js";
-import { actuateProvisionR2 } from "./actuate.js";
+import { verifyDispatch, signingPublicKey } from "./dispatch-verify.js";
+import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "./ops.js";
 import { nonceExpiresAtMs } from "./nonce-store.js";
 
 // Re-exported so wrangler can bind the Durable Object class declared in wrangler.toml. The
@@ -53,7 +55,12 @@ function handleSetupPage(env: Env): Response {
 
 function allGreen(results: AllValidations): boolean {
   return (
-    results.gcp.ok && results.s3.ok && results.stripe.ok && results.ai.ok && results.r2Provision.ok
+    results.gcp.ok &&
+    results.s3.ok &&
+    results.stripe.ok &&
+    results.ai.ok &&
+    results.r2Provision.ok &&
+    results.cfDns.ok
   );
 }
 
@@ -157,8 +164,10 @@ async function handleComplete(env: Env): Promise<Response> {
 // POST /actuate — Direction-B signed dispatch. Body: { job, signature }. The job is
 // verified (ed25519 over the canonical bytes with the agency's own public key, a fresh
 // timestamp, an allowlisted op) BEFORE anything happens; a failed verification returns
-// 401 and does NOTHING. Only provision-r2 is wired today. The actuator uses the agency's
-// OWN R2_PROVISION_API_TOKEN — never a platform credential (there is none here).
+// 401 and does NOTHING. Then, in this fixed order: the nonce is consumed (single-use),
+// the op is looked up in DISPATCH_OP_REGISTRY, the signed `params` string is parsed and
+// validated for that op, and only then does the op's actuator run — with the agency's
+// OWN credentials, never a platform credential (there is none here).
 async function handleActuate(request: Request, env: Env): Promise<Response> {
   let payload: unknown;
   try {
@@ -196,19 +205,34 @@ async function handleActuate(request: Request, env: Env): Promise<Response> {
     return json({ ok: false, error: "unverified dispatch", reason: "replay" }, 401);
   }
 
-  // Verified and single-use confirmed. Dispatch on the (already allowlisted) op.
-  if (verdict.job.op === "provision-r2") {
-    if (!isValidR2BucketName(verdict.job.bucketName)) {
-      return json({ ok: false, error: "invalid bucket name", bucket: verdict.job.bucketName }, 400);
-    }
-    const result = await actuateProvisionR2(verdict.job.bucketName, env);
-    // Always 200 with a structured result: a CF failure is reported in ok:false + detail,
-    // not as a transport error, so the orchestrator classifies it (not the HTTP layer).
-    return json(result, 200);
+  // Verified and single-use confirmed. Look the (already allowlisted) op up in the registry.
+  // The registry is keyed on the same DISPATCH_OPS tuple verifyDispatch enforces, so a miss
+  // here is unreachable in practice — belt-and-braces, fail closed.
+  const registeredOp = Object.prototype.hasOwnProperty.call(DISPATCH_OP_REGISTRY, verdict.job.op)
+    ? DISPATCH_OP_REGISTRY[verdict.job.op]
+    : undefined;
+  if (!registeredOp) {
+    return json({ ok: false, error: `unsupported op "${verdict.job.op}"` }, 400);
   }
 
-  // Unreachable: verifyDispatch already rejects any non-allowlisted op. Belt-and-braces.
-  return json({ ok: false, error: `unsupported op "${verdict.job.op}"` }, 400);
+  // Only NOW parse the signed `params` string — its exact bytes were covered by the
+  // signature that just verified — then validate the parsed object for this op. Either
+  // failure is a 400 with nothing actuated. (The nonce is already spent: an authentic job
+  // with unusable params needs a fresh signature anyway, and burning it keeps "consume
+  // immediately after verify" the one invariant.)
+  const parsedParams = parseDispatchParams(verdict.job.params);
+  if (!parsedParams.ok) {
+    return json({ ok: false, error: "invalid params", reason: parsedParams.reason }, 400);
+  }
+  const validatedParams = registeredOp.validateParams(parsedParams.params);
+  if (!validatedParams.ok) {
+    return json({ ok: false, error: "invalid params", reason: validatedParams.reason }, 400);
+  }
+
+  const result = await registeredOp.actuate(validatedParams.params, env);
+  // Always 200 with a structured result: a CF failure is reported in ok:false + detail,
+  // not as a transport error, so the orchestrator classifies it (not the HTTP layer).
+  return json(result, 200);
 }
 
 export default {

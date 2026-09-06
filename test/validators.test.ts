@@ -9,6 +9,8 @@ import {
   validateAI,
   validateGCP,
   validateR2Provision,
+  validateCfDns,
+  validateAll,
 } from "../src/validators.js";
 
 // Minimal Env with only the Direction-A fields; each test spreads in the
@@ -387,6 +389,82 @@ describe("validateR2Provision", () => {
     const result = await validateR2Provision({ ...baseEnv, R2_PROVISION_API_TOKEN: "bad-token" });
     expect(result.ok).toBe(false);
     expect(result.detail).toMatch(/R2_PROVISION_API_TOKEN/);
+  });
+});
+
+// ── Cloudflare DNS (Direction-B dns-record-upsert credential) ────────────────
+
+describe("validateCfDns", () => {
+  it("reports not-configured without hitting the network", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateCfDns(baseEnv);
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/not configured/);
+    expect(result.detail).toContain("CF_DNS_API_TOKEN");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("is ok on a READ-ONLY zone list, names the zone, and says edit is exercised on first dispatch", async () => {
+    const fetchMock = routedFetch([
+      {
+        match: (u) => u === "https://api.cloudflare.com/client/v4/zones?per_page=1",
+        respond: () => jsonResponse({ success: true, result: [{ id: "z1", name: "jasonhulme.com" }] }),
+      },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
+    expect(result.ok).toBe(true);
+    expect(result.detail).toContain("jasonhulme.com");
+    expect(result.detail).toMatch(/edit permission is exercised on the first DNS dispatch/i);
+
+    // Strictly read-only: exactly one GET, the token as bearer, nothing written.
+    expect(fetchMock.mock.calls.length).toBe(1);
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit | undefined];
+    expect(init?.method ?? "GET").toBe("GET");
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer cf-dns-token");
+  });
+
+  it("fails closed when the token authenticates but can list NO zones (wrong scope)", async () => {
+    vi.stubGlobal("fetch", routedFetch([{ match: () => true, respond: () => jsonResponse({ success: true, result: [] }) }]));
+    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/no zones/);
+    expect(result.detail).toContain("CF_DNS_API_TOKEN");
+  });
+
+  it("maps 401/403 to a token-check message", async () => {
+    vi.stubGlobal("fetch", routedFetch([{ match: () => true, respond: () => new Response("", { status: 403 }) }]));
+    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "bad-token" });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/CF_DNS_API_TOKEN/);
+  });
+
+  it("reports a non-2xx/non-auth failure with the HTTP status and CF message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      routedFetch([{ match: () => true, respond: () => jsonResponse({ success: false, errors: [{ message: "boom" }] }, 500) }]),
+    );
+    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/HTTP 500: boom/);
+  });
+
+  it("reports a network failure as not-ok (never throws)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("ECONNRESET"); }));
+    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/could not be sent/);
+  });
+
+  it("validateAll includes cfDns alongside the other five results", async () => {
+    // No credentials configured: every validator short-circuits without network.
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const all = await validateAll(baseEnv);
+    expect(Object.keys(all).sort()).toEqual(["ai", "cfDns", "gcp", "r2Provision", "s3", "stripe"]);
+    expect(all.cfDns.ok).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

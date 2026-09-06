@@ -53,10 +53,17 @@ both work — only the base64 body between the armor matters.)
 ## 3. Deploy the three changes
 
 - **Agency Worker** (this repo): `npm install && npm run deploy` (adds `POST /actuate`).
-- **app**: deploy the branch (adds `POST /internal/agency/dispatch/provision-r2`) via the
-  normal app deploy. No DB migration — no schema change.
+- **app**: deploy the branch (adds the generic `POST /internal/agency/dispatch`
+  `{accountId, op, params}`) via the normal app deploy. No DB migration — no schema change.
 - **orchestrator**: deploy the branch (adds `src/agency-dispatch.ts` + the
-  `proof:agency-r2` script). No new env vars; it reuses `APP_BASE_URL` + the service token.
+  `proof:agency-r2` / `proof:agency-dns` scripts). No new env vars; it reuses `APP_BASE_URL`
+  + the service token.
+
+**Deploy all three together.** The signed job is the generic five-string-field schema
+`{accountId, nonce, op, params, timestamp}` (`params` = the op's JSON-stringified params
+object, signed as opaque bytes); a Worker on the old `bucketName` schema rejects a new app's
+jobs as `malformed job`, and vice versa. Internal-only path, not in any automatic flow, so a
+brief mismatch window only affects the manual proof scripts.
 
 ## 4. Trigger the proof
 
@@ -72,6 +79,24 @@ npm run proof:agency-r2 -- <accountId> dy-agency-proof-live1
 
 Success prints:
 `SUCCESS — bucket "dy-agency-proof-…" created in the agency account (<cfAccountId>).`
+
+### 4b. DNS proof (`dns-record-upsert`) — needs one more Worker secret
+
+Set **`CF_DNS_API_TOKEN`** on the agency Worker: a Cloudflare API token from the AGENCY's
+account with **Zone → DNS → Edit** + **Zone → Zone → Read**, scoped to the target zone(s)
+(`wrangler secret put CF_DNS_API_TOKEN`). `/validate` now reports it as `cfDns` (read-only
+zone-list probe; the edit scope is exercised by the first dispatch).
+
+```sh
+# defaults to a SAFE throwaway TXT: zone jasonhulme.com, name _dy-dirb-proof.jasonhulme.com,
+# content dy-dirb-proof-<random>, not proxied, TTL auto. Re-running UPDATES the same record.
+npm run proof:agency-dns -- <accountId> [zone] [name]
+```
+
+Success prints `SUCCESS — record "_dy-dirb-proof.jasonhulme.com" created|updated in the
+agency zone (record id …)` and `The platform token was NOT used`. Verify with
+`dig +short TXT _dy-dirb-proof.jasonhulme.com`; clean up by deleting the record in the
+agency's Cloudflare DNS dashboard.
 
 ## 5. Verify
 
@@ -113,5 +138,7 @@ wrangler r2 bucket delete dy-agency-proof-…
 - If the agency's `R2_PROVISION_API_TOKEN` lacks Workers R2 Storage: Edit → the Worker
   returns `ok:false` with a clear CF denial detail (no platform fallback). This proof only
   needs bucket-CREATE scope (it does NOT mint scoped keys — that stays deferred, H1).
-- Replay protection here is the ±120s timestamp window only; a true single-use nonce needs a
-  shared edge store (KV/D1/DO) and is noted as future hardening in `src/dispatch-verify.ts`.
+- Replay protection is the single-use nonce (NonceStore Durable Object, `src/nonce-store.ts`)
+  plus the ±120s timestamp window as defense in depth. The nonce is burned BEFORE actuation,
+  so re-POSTing the same signed envelope after a transient failure is a `replay` 401 — retry
+  by re-running the proof script (a freshly-signed job). Fine for today's idempotent ops.

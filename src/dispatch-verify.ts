@@ -17,25 +17,37 @@
 // signed/verified bytes are the UTF-8 encoding of that string. If these two functions
 // ever diverge by a single byte, every verification silently fails. Do not "tidy" one
 // without the other.
+//
+// ── `params` IS AN OPAQUE SIGNED STRING ─────────────────────────────────────────────
+// The op-specific arguments travel as ONE string field, `params`, whose value is the
+// app's JSON.stringify of the op's params object. The signature covers those exact
+// bytes, so there is deliberately NO second canonicalizer for the params object: the
+// Worker never re-serializes params, it only JSON.parses the identical string AFTER the
+// signature verifies (see ops.ts / index.ts::handleActuate) and then validates the parsed
+// object per op (dispatch-params.ts). Parsing after verification means a malformed
+// params string can never reach an actuator, and re-serialization drift between the two
+// runtimes cannot break verification because nothing is re-serialized.
 
 import type { Env } from "./env.js";
 
 // The ops this Worker will actuate. Enforced INDEPENDENTLY of the app's copy (defense in
-// depth): a job whose `op` is not here is rejected before any side effect. The replay-
-// hardening prerequisite documented at FRESHNESS_WINDOW_SECONDS is now IMPLEMENTED (the
-// single-use NonceStore DO in src/nonce-store.ts, enforced in index.ts::handleActuate), so
-// a signed job actuates at most once. Non-idempotent ops may now be added on that basis —
-// still keep this allowlist tight and add ops deliberately.
-export const DISPATCH_OPS = ["provision-r2"] as const;
+// depth): a job whose `op` is not here is rejected before any side effect. Each op here
+// MUST have an entry in ops.ts::DISPATCH_OP_REGISTRY (validateParams + actuate) — the
+// registry's type is keyed on this tuple, so adding an op without a registry entry is a
+// compile error. Single-use replay protection (NonceStore DO, src/nonce-store.ts) is
+// enforced in index.ts::handleActuate, so a signed job actuates at most once. Keep this
+// allowlist tight and add ops deliberately.
+export const DISPATCH_OPS = ["provision-r2", "dns-record-upsert"] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 
 // The five canonical job keys, in the FIXED ascending-codepoint order the serializer
 // emits them. Also the exact-key allowlist: a job with any other/missing key is rejected.
-export const DISPATCH_JOB_KEYS = ["accountId", "bucketName", "nonce", "op", "timestamp"] as const;
+export const DISPATCH_JOB_KEYS = ["accountId", "nonce", "op", "params", "timestamp"] as const;
 
 export interface DispatchJob {
   op: DispatchOp;
-  bucketName: string;
+  /** The op's params object as the app's JSON.stringify output — opaque here until verified. */
+  params: string;
   accountId: string;
   timestamp: string;
   nonce: string;
@@ -43,22 +55,13 @@ export interface DispatchJob {
 
 // How far the job's `timestamp` may be from "now" (either direction) and still be fresh.
 //
-// Replay protection is now IMPLEMENTED via the single-use NonceStore Durable Object
+// Replay protection is IMPLEMENTED via the single-use NonceStore Durable Object
 // (src/nonce-store.ts), enforced in index.ts::handleActuate after this verification passes:
 // each nonce actuates at most once, so a captured job cannot be replayed even within the
-// window. This timestamp window is now DEFENSE IN DEPTH alongside those single-use nonces —
+// window. This timestamp window is DEFENSE IN DEPTH alongside those single-use nonces —
 // it bounds how long any captured job is even a candidate for replay, which in turn bounds
 // how long the nonce store must retain each spent nonce (see nonce-store.ts::nonceExpiresAtMs).
 export const FRESHNESS_WINDOW_SECONDS = 120;
-
-// R2 bucket-name grammar, mirrored from the app so the actuator re-checks it (the app
-// won't sign an invalid name, but the Worker is the last line before the CF API call).
-const R2_BUCKET_NAME_RE = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/;
-
-/** True when `name` is a syntactically valid R2 bucket name. */
-export function isValidR2BucketName(name: string): boolean {
-  return R2_BUCKET_NAME_RE.test(name);
-}
 
 // Byte-for-byte twin of the app's canonicalizeDispatchJob (see the header note).
 export function canonicalizeDispatchJob(job: DispatchJob): string {
@@ -124,7 +127,7 @@ function coerceJob(raw: unknown): DispatchJob | null {
   }
   return {
     op: obj.op as DispatchOp,
-    bucketName: obj.bucketName as string,
+    params: obj.params as string,
     accountId: obj.accountId as string,
     timestamp: obj.timestamp as string,
     nonce: obj.nonce as string,
@@ -139,7 +142,7 @@ function coerceJob(raw: unknown): DispatchJob | null {
  *   - a timestamp outside the ±FRESHNESS_WINDOW_SECONDS window (or unparseable),
  *   - a bad base64 signature,
  *   - a signature that doesn't verify over the canonical bytes.
- * Only { ok: true } means the caller may actuate.
+ * Only { ok: true } means the caller may go on to parse `params` and actuate.
  *
  * `nowMs` and `freshnessWindowSeconds` are injectable for testing; they default to real
  * time and the standing window.
