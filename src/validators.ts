@@ -354,14 +354,14 @@ export async function validateR2Provision(env: Env): Promise<ValidationResult> {
   }
 }
 
-// ── Cloudflare DNS (Direction-B dns-record-upsert) ───────────────────────────
+// ── Cloudflare DNS (Direction-B dns-record-upsert + cache-purge) ─────────────
 
 // READ-ONLY probe: GET /zones?per_page=1 proves CF_DNS_API_TOKEN authenticates and can
 // list at least one zone (Zone:Read). Like validateR2Provision, Cloudflare can't tell us
 // which permission groups a token was minted with, so a green here proves Zone:Read on
-// >= 1 zone but NOT Zone:DNS:Edit — the edit scope is exercised for real on the first
-// dns-record-upsert dispatch, which reports a clear denial if it is missing. We never
-// write a record from a validator.
+// >= 1 zone but NOT Zone:DNS:Edit or Zone:Cache Purge — those scopes are exercised for
+// real on the first dns-record-upsert / cache-purge dispatch, which reports a clear denial
+// if the scope is missing. We never write a record or purge a cache from a validator.
 export async function validateCfDns(env: Env): Promise<ValidationResult> {
   if (!env.CF_DNS_API_TOKEN) {
     return {

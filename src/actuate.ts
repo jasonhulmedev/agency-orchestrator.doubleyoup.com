@@ -15,7 +15,7 @@
 // ever string-interpolated into a URL.
 
 import type { Env } from "./env.js";
-import type { DnsRecordUpsertParams } from "./dispatch-params.js";
+import type { DnsRecordUpsertParams, CachePurgeParams } from "./dispatch-params.js";
 import { errorMessage } from "./util.js";
 
 const CF_API = "https://api.cloudflare.com/client/v4";
@@ -28,7 +28,11 @@ export type DnsRecordUpsertResult =
   | { ok: true; op: "dns-record-upsert"; action: "created" | "updated"; recordId: string; name: string }
   | { ok: false; op: "dns-record-upsert"; name: string; detail: string };
 
-export type ActuateResult = ProvisionR2Result | DnsRecordUpsertResult;
+export type CachePurgeResult =
+  | { ok: true; op: "cache-purge"; mode: "everything" | "files" | "hosts"; zone: string; count: number }
+  | { ok: false; op: "cache-purge"; zone: string; detail: string };
+
+export type ActuateResult = ProvisionR2Result | DnsRecordUpsertResult | CachePurgeResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -344,4 +348,80 @@ export async function actuateDnsRecordUpsert(
   }
 
   return { ok: true, op: "dns-record-upsert", action, recordId: written.id, name: params.name };
+}
+
+// ── cache-purge ──────────────────────────────────────────────────────────────────────
+// Purge an agency zone's Cloudflare cache with the agency's own CF_DNS_API_TOKEN (which now
+// also carries Zone:Cache Purge — a deploy-time scope add, not a new secret):
+//   1. GET  /zones?name=<zone>          -> exactly one zone id, else fail (reuses resolveZoneId)
+//   2. POST /zones/:zid/purge_cache     -> {purge_everything:true} | {files:[...]} | {hosts:[...]}
+// No new onboarding validator: like the DNS edit scope, the Cache Purge scope is exercised
+// for real on the FIRST purge, which reports a clear denial (401/403) if it is missing.
+//
+// A cache purge is idempotent and safe to repeat, so the F1 replay-nonce note (handleActuate
+// burns the nonce before actuating) does not bite here: a retry means re-signing a fresh job,
+// and re-running a purge just re-evicts already-evicted content — zero additional effect.
+
+function cachePurgeFailure(zone: string, detail: string): CachePurgeResult {
+  return { ok: false, op: "cache-purge", zone, detail };
+}
+
+/**
+ * Purge the zone's cache with the agency's own CF_DNS_API_TOKEN. Returns a structured result;
+ * never throws for a Cloudflare-side failure. NEVER falls back to a platform credential
+ * (there is none). The purge body is chosen by `params.mode` and always built with
+ * JSON.stringify; the zone id is encodeURIComponent'd into the path.
+ */
+export async function actuateCachePurge(params: CachePurgeParams, env: Env): Promise<CachePurgeResult> {
+  const token = env.CF_DNS_API_TOKEN;
+  if (!token) {
+    return cachePurgeFailure(params.zone, "CF_DNS_API_TOKEN is not configured on this Worker.");
+  }
+
+  const zone = await resolveZoneId(token, params.zone);
+  if ("error" in zone) {
+    return cachePurgeFailure(params.zone, zone.error);
+  }
+
+  // Exactly one selector per mode. `count` is the number of targeted evictions, and 0 for a
+  // whole-zone ("everything") purge — reported back so the caller can log what happened.
+  let purgeBody: Record<string, unknown>;
+  let count: number;
+  if (params.mode === "everything") {
+    purgeBody = { purge_everything: true };
+    count = 0;
+  } else if (params.mode === "files") {
+    purgeBody = { files: params.files };
+    count = params.files.length;
+  } else {
+    purgeBody = { hosts: params.hosts };
+    count = params.hosts.length;
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zone.id)}/purge_cache`, {
+      method: "POST",
+      headers: cloudflareHeaders(token),
+      body: JSON.stringify(purgeBody),
+    });
+  } catch (err) {
+    return cachePurgeFailure(params.zone, `could not reach Cloudflare to purge the cache: ${errorMessage(err)}`);
+  }
+
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  if (response.status === 401 || response.status === 403) {
+    return cachePurgeFailure(
+      params.zone,
+      "Cloudflare denied the cache purge — CF_DNS_API_TOKEN needs Zone:Cache Purge on this zone.",
+    );
+  }
+  if (!body?.success) {
+    return cachePurgeFailure(
+      params.zone,
+      `cache purge failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.`,
+    );
+  }
+
+  return { ok: true, op: "cache-purge", mode: params.mode, zone: params.zone, count };
 }
