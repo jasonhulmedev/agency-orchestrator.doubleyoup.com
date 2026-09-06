@@ -66,12 +66,23 @@ describe("existing endpoints still work", () => {
       s3: { ok: boolean };
       stripe: { ok: boolean };
       ai: { ok: boolean };
+      r2Provision: { ok: boolean };
+      cfDns: { ok: boolean };
     };
     expect(body.ok).toBe(false);
     expect(body.gcp.ok).toBe(false);
     expect(body.s3.ok).toBe(false);
     expect(body.stripe.ok).toBe(false);
     expect(body.ai.ok).toBe(false);
+    expect(body.r2Provision.ok).toBe(false);
+    expect(body.cfDns.ok).toBe(false);
+  });
+
+  it("GET / setup page renders a row for the Cloudflare DNS credential", async () => {
+    const response = await worker.fetch(request("GET", "/"), baseEnv);
+    const html = await response.text();
+    expect(html).toContain('"cfDns"');
+    expect(html).toContain("Cloudflare DNS");
   });
 
   it("returns 404 for an unknown path", async () => {

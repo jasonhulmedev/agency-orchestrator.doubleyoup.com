@@ -40,9 +40,10 @@ const INLINE_SCRIPT = `
     s3: "Object store (AWS S3 or Cloudflare R2)",
     stripe: "Stripe",
     ai: "AI providers",
-    r2Provision: "R2 provisioning (media buckets)"
+    r2Provision: "R2 provisioning (media buckets)",
+    cfDns: "Cloudflare DNS (zone records)"
   };
-  var orderedKeys = ["gcp", "s3", "stripe", "ai", "r2Provision"];
+  var orderedKeys = ["gcp", "s3", "stripe", "ai", "r2Provision", "cfDns"];
 
   function renderResult(key, result) {
     var ok = !!(result && result.ok === true);

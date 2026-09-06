@@ -24,6 +24,10 @@ STRIPE_SECRET_KEY=""
 # Account API Tokens: Edit. NOT a My Profile -> API Tokens (user) token.
 R2_PROVISION_API_TOKEN=""
 
+# Cloudflare DNS — API token with Zone:DNS:Edit + Zone:Read on the agency zone(s)
+# the platform may manage (Direction-B dns-record-upsert actuator).
+CF_DNS_API_TOKEN=""
+
 # AI providers — set at least one (OPENAI_API_KEY also covers Codex)
 ANTHROPIC_API_KEY=""
 OPENROUTER_API_KEY=""

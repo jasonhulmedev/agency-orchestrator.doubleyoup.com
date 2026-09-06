@@ -1,29 +1,53 @@
 // Direction-B ACTUATION (agency Worker side). Runs a verified job using the AGENCY's
-// OWN credentials — here, creating an R2 bucket with R2_PROVISION_API_TOKEN (the
-// account-owned Cloudflare token the agency set at onboarding). There is deliberately
-// NO platform credential anywhere in this Worker to fall back to: if the agency's token
-// is missing or unauthorized, actuation fails cleanly rather than reaching for ours.
+// OWN credentials — R2_PROVISION_API_TOKEN to create an R2 bucket, CF_DNS_API_TOKEN to
+// upsert a DNS record in one of the agency's zones. There is deliberately NO platform
+// credential anywhere in this Worker to fall back to: if the agency's token is missing or
+// unauthorized, actuation fails cleanly rather than reaching for ours.
 //
-// This runs ONLY after dispatch-verify.ts::verifyDispatch returns ok:true.
+// Every actuator here runs ONLY after dispatch-verify.ts::verifyDispatch returned ok:true,
+// the nonce was consumed, and the op's params validated (index.ts::handleActuate via
+// ops.ts). Actuators return a structured result and NEVER throw for a Cloudflare-side
+// failure: the route answers 200 with ok:false + detail so the orchestrator classifies
+// the failure, not the HTTP layer.
 //
-// Worker-native only: fetch. Mirrors the orchestrator's own ensureR2Bucket
-// (orchestrator/src/cloudflare.ts): POST /accounts/{id}/r2/buckets, treating a 409
-// (bucket already exists) as idempotent success.
+// Worker-native only: fetch. Cloudflare request BODIES are always JSON.stringify'd
+// objects and QUERY strings always go through URLSearchParams — no value from a job is
+// ever string-interpolated into a URL.
 
 import type { Env } from "./env.js";
+import type { DnsRecordUpsertParams } from "./dispatch-params.js";
 import { errorMessage } from "./util.js";
 
 const CF_API = "https://api.cloudflare.com/client/v4";
 
-export type ActuateResult =
+export type ProvisionR2Result =
   | { ok: true; op: "provision-r2"; bucket: string; status: "created" | "already-existed"; accountId: string }
   | { ok: false; op: "provision-r2"; bucket: string; detail: string };
+
+export type DnsRecordUpsertResult =
+  | { ok: true; op: "dns-record-upsert"; action: "created" | "updated"; recordId: string; name: string }
+  | { ok: false; op: "dns-record-upsert"; name: string; detail: string };
+
+export type ActuateResult = ProvisionR2Result | DnsRecordUpsertResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
   errors?: Array<{ code?: number; message?: string }>;
   result?: unknown;
 }
+
+function cloudflareHeaders(token: string): Record<string, string> {
+  return {
+    authorization: `Bearer ${token}`,
+    "content-type": "application/json",
+    accept: "application/json",
+  };
+}
+
+// ── provision-r2 ───────────────────────────────────────────────────────────────────
+// Mirrors the orchestrator's own ensureR2Bucket (orchestrator/src/cloudflare.ts):
+// POST /accounts/{id}/r2/buckets, treating a 409 (bucket already exists) as idempotent
+// success.
 
 /**
  * Resolve the account id the R2_PROVISION_API_TOKEN belongs to. An account-owned token is
@@ -63,7 +87,7 @@ async function resolveAccountId(token: string): Promise<{ id: string } | { error
  * anything else => a clean failure with the CF message. NEVER falls back to a platform
  * credential (there is none).
  */
-export async function actuateProvisionR2(bucketName: string, env: Env): Promise<ActuateResult> {
+export async function actuateProvisionR2(bucketName: string, env: Env): Promise<ProvisionR2Result> {
   const token = env.R2_PROVISION_API_TOKEN;
   if (!token) {
     return {
@@ -81,13 +105,9 @@ export async function actuateProvisionR2(bucketName: string, env: Env): Promise<
 
   let response: Response;
   try {
-    response = await fetch(`${CF_API}/accounts/${account.id}/r2/buckets`, {
+    response = await fetch(`${CF_API}/accounts/${encodeURIComponent(account.id)}/r2/buckets`, {
       method: "POST",
-      headers: {
-        authorization: `Bearer ${token}`,
-        "content-type": "application/json",
-        accept: "application/json",
-      },
+      headers: cloudflareHeaders(token),
       body: JSON.stringify({ name: bucketName }),
     });
   } catch (err) {
@@ -137,4 +157,191 @@ export async function actuateProvisionR2(bucketName: string, env: Env): Promise<
     bucket: bucketName,
     detail: `bucket create failed with HTTP ${response.status}${message ? `: ${message}` : ""}.`,
   };
+}
+
+// ── dns-record-upsert ──────────────────────────────────────────────────────────────
+// Idempotent upsert of ONE record (type + name) in an agency zone, with the agency's own
+// CF_DNS_API_TOKEN (Zone:DNS:Edit + Zone:Read):
+//   1. GET  /zones?name=<zone>                       -> exactly one zone id, else fail
+//   2. GET  /zones/:zid/dns_records?type=&name=      -> 0 matches => create, 1 => update
+//   3. POST /zones/:zid/dns_records  |  PUT /zones/:zid/dns_records/:rid
+// Two or more existing records with the same type+name (legal for TXT/A) is AMBIGUOUS —
+// "update the first one" could clobber an unrelated record (an SPF TXT, a round-robin A),
+// so that fails closed with a clear detail instead of guessing.
+//
+// Idempotency matters for replay protection (review finding F1): handleActuate BURNS the
+// nonce before actuating, so a transient Cloudflare failure cannot be retried by re-POSTing
+// the same signed job — the platform must re-sign with a fresh nonce. That is harmless for
+// an upsert (re-running converges to the same record). A future NON-idempotent op must
+// solve this deliberately (e.g. bind the nonce to a completed side effect) before it is
+// added to the registry.
+
+interface CloudflareZoneSummary {
+  id?: string;
+  name?: string;
+}
+
+interface CloudflareDnsRecordSummary {
+  id?: string;
+  name?: string;
+  type?: string;
+}
+
+/** First Cloudflare error message from a response body, if any (for detail strings). */
+function cloudflareErrorMessage(body: CloudflareEnvelope | null): string {
+  const message = body?.errors?.[0]?.message;
+  return message ? `: ${message}` : "";
+}
+
+function dnsFailure(name: string, detail: string): DnsRecordUpsertResult {
+  return { ok: false, op: "dns-record-upsert", name, detail };
+}
+
+/**
+ * Resolve the zone NAME to the zone id the token can see. Exactly one match is required:
+ * zero means the token can't see the zone (wrong account or missing Zone:Read), more than
+ * one would be ambiguous (should not happen for an exact-name filter, but never guess).
+ */
+async function resolveZoneId(token: string, zoneName: string): Promise<{ id: string } | { error: string }> {
+  const query = new URLSearchParams({ name: zoneName, per_page: "2" });
+  let response: Response;
+  try {
+    response = await fetch(`${CF_API}/zones?${query.toString()}`, {
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+    });
+  } catch (err) {
+    return { error: `could not reach Cloudflare to resolve zone "${zoneName}": ${errorMessage(err)}` };
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    await response.text().catch(() => "");
+    return {
+      error:
+        "Cloudflare rejected CF_DNS_API_TOKEN — it needs Zone:Read + Zone:DNS:Edit on the target zone(s).",
+    };
+  }
+
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  if (!body?.success || !Array.isArray(body.result)) {
+    return { error: `zone lookup failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
+  }
+  // Cloudflare's `name` filter is an exact match, but re-check the name defensively so a
+  // looser server-side match can never pick a different zone.
+  const zones = (body.result as CloudflareZoneSummary[]).filter((zone) => zone.name === zoneName && zone.id);
+  if (zones.length === 0) {
+    return {
+      error: `zone "${zoneName}" is not visible to CF_DNS_API_TOKEN — check the zone name and the token's zone scope.`,
+    };
+  }
+  if (zones.length > 1) {
+    return { error: `zone lookup for "${zoneName}" returned ${zones.length} zones — refusing to guess.` };
+  }
+  return { id: zones[0].id as string };
+}
+
+/**
+ * Find the existing record(s) with this exact type + name. Returns the full match list so
+ * the caller can distinguish create (0) / update (1) / ambiguous (2+).
+ */
+async function findExistingRecords(
+  token: string,
+  zoneId: string,
+  params: DnsRecordUpsertParams,
+): Promise<{ records: CloudflareDnsRecordSummary[] } | { error: string }> {
+  const query = new URLSearchParams({ type: params.type, name: params.name, per_page: "5" });
+  let response: Response;
+  try {
+    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zoneId)}/dns_records?${query.toString()}`, {
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+    });
+  } catch (err) {
+    return { error: `could not reach Cloudflare to list DNS records: ${errorMessage(err)}` };
+  }
+
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  if (response.status === 401 || response.status === 403) {
+    return { error: "Cloudflare denied listing DNS records — CF_DNS_API_TOKEN needs Zone:DNS:Edit on this zone." };
+  }
+  if (!body?.success || !Array.isArray(body.result)) {
+    return { error: `DNS record lookup failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
+  }
+  // Re-check type + name on each row (defensive, as with the zone lookup).
+  const records = (body.result as CloudflareDnsRecordSummary[]).filter(
+    (record) => record.id && record.type === params.type && record.name === params.name,
+  );
+  return { records };
+}
+
+/**
+ * Upsert the record with the agency's own CF_DNS_API_TOKEN. Returns a structured result;
+ * never throws for a Cloudflare-side failure. NEVER falls back to a platform credential
+ * (there is none).
+ */
+export async function actuateDnsRecordUpsert(
+  params: DnsRecordUpsertParams,
+  env: Env,
+): Promise<DnsRecordUpsertResult> {
+  const token = env.CF_DNS_API_TOKEN;
+  if (!token) {
+    return dnsFailure(params.name, "CF_DNS_API_TOKEN is not configured on this Worker.");
+  }
+
+  const zone = await resolveZoneId(token, params.zone);
+  if ("error" in zone) {
+    return dnsFailure(params.name, zone.error);
+  }
+
+  const existing = await findExistingRecords(token, zone.id, params);
+  if ("error" in existing) {
+    return dnsFailure(params.name, existing.error);
+  }
+  if (existing.records.length > 1) {
+    return dnsFailure(
+      params.name,
+      `${existing.records.length} existing ${params.type} records already match "${params.name}" — ambiguous, refusing to update one of them.`,
+    );
+  }
+
+  // The signed params are all strings by convention; Cloudflare wants real JSON types here.
+  const recordBody = JSON.stringify({
+    type: params.type,
+    name: params.name,
+    content: params.content,
+    proxied: params.proxied === "true",
+    ttl: Number(params.ttl),
+  });
+
+  const existingRecord = existing.records[0];
+  const action: "created" | "updated" = existingRecord ? "updated" : "created";
+  const url = existingRecord
+    ? `${CF_API}/zones/${encodeURIComponent(zone.id)}/dns_records/${encodeURIComponent(existingRecord.id as string)}`
+    : `${CF_API}/zones/${encodeURIComponent(zone.id)}/dns_records`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: existingRecord ? "PUT" : "POST",
+      headers: cloudflareHeaders(token),
+      body: recordBody,
+    });
+  } catch (err) {
+    return dnsFailure(params.name, `could not reach Cloudflare to write the DNS record: ${errorMessage(err)}`);
+  }
+
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  if (response.status === 401 || response.status === 403) {
+    return dnsFailure(
+      params.name,
+      "Cloudflare denied the DNS write — CF_DNS_API_TOKEN needs Zone:DNS:Edit on this zone.",
+    );
+  }
+  const written = body?.success ? (body.result as CloudflareDnsRecordSummary | undefined) : undefined;
+  if (!written?.id) {
+    return dnsFailure(
+      params.name,
+      `DNS record ${action === "created" ? "create" : "update"} failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.`,
+    );
+  }
+
+  return { ok: true, op: "dns-record-upsert", action, recordId: written.id, name: params.name };
 }

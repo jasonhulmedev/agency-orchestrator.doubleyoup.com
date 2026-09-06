@@ -6,7 +6,8 @@
 // stores on Account.signingKeyPublic) MUST verify with the Worker's verifyDispatch — and
 // every negative case (tampered job, wrong key, stale timestamp, disallowed op) MUST fail
 // closed. Plus the /actuate route itself: an unverified request must actuate NOTHING (no
-// fetch to Cloudflare).
+// fetch to Cloudflare), and the op registry must route each op to its own validator +
+// actuator using ONLY the agency's own credential for that op.
 //
 // This test stays Worker-native (Web Crypto only, no node:crypto/Buffer) so the Worker
 // repo keeps its "fetch + Web Crypto only, no nodejs_compat" guarantee. Web Crypto's
@@ -21,6 +22,12 @@ import {
   canonicalizeDispatchJob,
   verifyDispatch,
 } from "../src/dispatch-verify.js";
+import {
+  isValidR2BucketName,
+  validateProvisionR2Params,
+  validateDnsRecordUpsertParams,
+} from "../src/dispatch-params.js";
+import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
 
 // ── Web-Crypto helpers (no Node APIs) ───────────────────────────────────────────────
 function bytesToBase64(bytes: Uint8Array): string {
@@ -61,10 +68,12 @@ async function signAsApp(job: DispatchJob, privateKey: CryptoKey): Promise<strin
 // A fixed job so the canonical-bytes assertion below is stable. FREEZE_MS is this job's
 // own timestamp, used as `nowMs` so the freshness window passes deterministically.
 const FREEZE_MS = Date.parse("2026-09-05T00:00:00.000Z");
+const R2_PARAMS = { bucketName: "dy-agency-proof-abc123" };
 function sampleJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
   return {
     op: "provision-r2",
-    bucketName: "dy-agency-proof-abc123",
+    // The app sets params = JSON.stringify(<op params object>) — mirror that exactly.
+    params: JSON.stringify(R2_PARAMS),
     accountId: "acct_test_1",
     timestamp: "2026-09-05T00:00:00.000Z",
     nonce: "0123456789abcdef0123456789abcdef",
@@ -72,23 +81,57 @@ function sampleJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
   };
 }
 
+// A dns-record-upsert job (all-string params, the signed-job convention).
+const DNS_PARAMS = {
+  zone: "jasonhulme.com",
+  type: "TXT",
+  name: "_dy-dirb-proof.jasonhulme.com",
+  content: "dy-dirb-proof-abc123",
+  proxied: "false",
+  ttl: "1",
+};
+function dnsJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "dns-record-upsert",
+    params: JSON.stringify(DNS_PARAMS),
+    nonce: "fedcba9876543210fedcba9876543210",
+    ...overrides,
+  });
+}
+
 // The ONE canonical byte-string both sides must agree on. This exact literal is also
 // pinned in the app's agency-dispatch-signing.test.ts — if either canonicalizer drifts,
-// one of the two tests breaks.
+// one of the two tests breaks. Note the params value is the app's JSON.stringify output,
+// re-escaped as a JSON string by the canonicalizer (hence the \" sequences).
 const EXPECTED_CANONICAL =
   `{"accountId":"acct_test_1",` +
-  `"bucketName":"dy-agency-proof-abc123",` +
   `"nonce":"0123456789abcdef0123456789abcdef",` +
   `"op":"provision-r2",` +
+  `"params":"{\\"bucketName\\":\\"dy-agency-proof-abc123\\"}",` +
   `"timestamp":"2026-09-05T00:00:00.000Z"}`;
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe("canonicalization agrees with the app (byte-for-byte)", () => {
   it("produces the pinned canonical string", () => {
     expect(canonicalizeDispatchJob(sampleJob())).toBe(EXPECTED_CANONICAL);
+  });
+
+  it("treats params as an opaque string — nested JSON survives canonicalize + parse exactly", () => {
+    // A params string with nested objects/arrays/unicode/escapes: the canonicalizer must
+    // not touch it (no re-serialization), and JSON.parse on the Worker must yield the
+    // identical structure the app stringified.
+    const nested = { a: { b: [1, "two", { c: null }] }, unicode: "zéro — ✓", quote: 'say "hi"' };
+    const paramsString = JSON.stringify(nested);
+    const job = sampleJob({ params: paramsString });
+    const canonical = canonicalizeDispatchJob(job);
+    expect(canonical).toContain(`"params":${JSON.stringify(paramsString)}`);
+    const parsed = parseDispatchParams(job.params);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.params).toEqual(nested);
   });
 });
 
@@ -105,15 +148,28 @@ describe("verifyDispatch — cross-side round trip + negatives", () => {
       nowMs: FREEZE_MS,
     });
     expect(verdict.ok).toBe(true);
-    if (verdict.ok) expect(verdict.job.bucketName).toBe("dy-agency-proof-abc123");
+    if (verdict.ok) expect(verdict.job.params).toBe(JSON.stringify(R2_PARAMS));
   });
 
-  it("rejects a tampered job (bucket swapped after signing)", async () => {
+  it("verifies a dns-record-upsert job whose params string carries nested JSON", async () => {
+    const { publicKeyPem, privateKey } = await makeKeypair();
+    const job = dnsJob();
+    const signature = await signAsApp(job, privateKey);
+
+    const verdict = await verifyDispatch({ rawJob: job, signatureB64: signature, publicKeyPem, nowMs: FREEZE_MS });
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) {
+      const parsed = parseDispatchParams(verdict.job.params);
+      expect(parsed.ok && parsed.params).toEqual(DNS_PARAMS);
+    }
+  });
+
+  it("rejects a tampered job (params swapped after signing)", async () => {
     const { publicKeyPem, privateKey } = await makeKeypair();
     const job = sampleJob();
     const signature = await signAsApp(job, privateKey);
 
-    const tampered = { ...job, bucketName: "attacker-bucket" };
+    const tampered = { ...job, params: JSON.stringify({ bucketName: "attacker-bucket" }) };
     const verdict = await verifyDispatch({
       rawJob: tampered,
       signatureB64: signature,
@@ -122,6 +178,17 @@ describe("verifyDispatch — cross-side round trip + negatives", () => {
     });
     expect(verdict.ok).toBe(false);
     if (!verdict.ok) expect(verdict.reason).toMatch(/does not verify/);
+  });
+
+  it("rejects a semantically-equal params string with different bytes (signature is over exact bytes)", async () => {
+    const { publicKeyPem, privateKey } = await makeKeypair();
+    const job = sampleJob();
+    const signature = await signAsApp(job, privateKey);
+
+    // Same JSON meaning, one extra space: NOT the signed bytes => must fail.
+    const respaced = { ...job, params: '{"bucketName": "dy-agency-proof-abc123"}' };
+    const verdict = await verifyDispatch({ rawJob: respaced, signatureB64: signature, publicKeyPem, nowMs: FREEZE_MS });
+    expect(verdict.ok).toBe(false);
   });
 
   it("rejects a signature made with a different key", async () => {
@@ -188,6 +255,17 @@ describe("verifyDispatch — cross-side round trip + negatives", () => {
     if (!verdict.ok) expect(verdict.reason).toMatch(/malformed job/);
   });
 
+  it("rejects the OLD five-field schema (bucketName instead of params)", async () => {
+    const { publicKeyPem, privateKey } = await makeKeypair();
+    const job = sampleJob();
+    const signature = await signAsApp(job, privateKey);
+
+    const legacy = { op: job.op, bucketName: "dy-agency-proof-abc123", accountId: job.accountId, timestamp: job.timestamp, nonce: job.nonce };
+    const verdict = await verifyDispatch({ rawJob: legacy, signatureB64: signature, publicKeyPem, nowMs: FREEZE_MS });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.reason).toMatch(/malformed job/);
+  });
+
   it("fails closed when no public key is configured", async () => {
     const { privateKey } = await makeKeypair();
     const job = sampleJob();
@@ -204,6 +282,99 @@ describe("verifyDispatch — cross-side round trip + negatives", () => {
   });
 });
 
+describe("per-op params validation (Worker side — twin of the app's rules)", () => {
+  it("parseDispatchParams fails closed on a malformed params string", () => {
+    expect(parseDispatchParams("{not json").ok).toBe(false);
+    expect(parseDispatchParams("").ok).toBe(false);
+    expect(parseDispatchParams('{"a":1}')).toEqual({ ok: true, params: { a: 1 } });
+  });
+
+  it("isValidR2BucketName enforces the R2 grammar", () => {
+    expect(isValidR2BucketName("dy-agency-proof-abc123")).toBe(true);
+    expect(isValidR2BucketName("abc")).toBe(true);
+    expect(isValidR2BucketName("AB-upper")).toBe(false);
+    expect(isValidR2BucketName("-leading")).toBe(false);
+    expect(isValidR2BucketName("trailing-")).toBe(false);
+    expect(isValidR2BucketName("ab")).toBe(false);
+    expect(isValidR2BucketName("a".repeat(64))).toBe(false);
+    expect(isValidR2BucketName("under_score")).toBe(false);
+  });
+
+  it("provision-r2: accepts a valid bucketName and returns ONLY the known key", () => {
+    const verdict = validateProvisionR2Params({ bucketName: "dy-ok-bucket", extra: "ignored" });
+    expect(verdict).toEqual({ ok: true, params: { bucketName: "dy-ok-bucket" } });
+  });
+
+  it("provision-r2: rejects a non-object, a missing name, and an invalid name", () => {
+    expect(validateProvisionR2Params("dy-ok-bucket").ok).toBe(false);
+    expect(validateProvisionR2Params(null).ok).toBe(false);
+    expect(validateProvisionR2Params([]).ok).toBe(false);
+    expect(validateProvisionR2Params({}).ok).toBe(false);
+    expect(validateProvisionR2Params({ bucketName: "Bad_Name" }).ok).toBe(false);
+    expect(validateProvisionR2Params({ bucketName: 42 }).ok).toBe(false);
+  });
+
+  it("dns-record-upsert: accepts valid params (TXT, A, wildcard CNAME, apex) and returns only known keys", () => {
+    expect(validateDnsRecordUpsertParams({ ...DNS_PARAMS, extra: "x" })).toEqual({ ok: true, params: DNS_PARAMS });
+
+    const apexA = { zone: "example.com", type: "A", name: "example.com", content: "203.0.113.10", proxied: "true", ttl: "1" };
+    expect(validateDnsRecordUpsertParams(apexA).ok).toBe(true);
+
+    const wildcard = { zone: "example.com", type: "CNAME", name: "*.example.com", content: "host.doubleyoup.com", proxied: "true", ttl: "300" };
+    expect(validateDnsRecordUpsertParams(wildcard).ok).toBe(true);
+
+    const aaaa = { zone: "example.com", type: "AAAA", name: "v6.example.com", content: "2001:db8::1", proxied: "false", ttl: "86400" };
+    expect(validateDnsRecordUpsertParams(aaaa).ok).toBe(true);
+  });
+
+  it("dns-record-upsert: rejects bad input field by field", () => {
+    const bad = (overrides: Record<string, unknown>) => validateDnsRecordUpsertParams({ ...DNS_PARAMS, ...overrides });
+
+    expect(validateDnsRecordUpsertParams(null).ok).toBe(false);
+    expect(validateDnsRecordUpsertParams("string").ok).toBe(false);
+    // type outside the allowlist
+    expect(bad({ type: "MX" }).ok).toBe(false);
+    expect(bad({ type: "txt" }).ok).toBe(false); // case-sensitive allowlist
+    expect(bad({ type: undefined }).ok).toBe(false);
+    // zone
+    expect(bad({ zone: "" }).ok).toBe(false);
+    expect(bad({ zone: "Jasonhulme.com" }).ok).toBe(false); // uppercase
+    expect(bad({ zone: "localhost" }).ok).toBe(false); // single label
+    expect(bad({ zone: "*.jasonhulme.com" }).ok).toBe(false); // wildcard zone
+    // name
+    expect(bad({ name: "" }).ok).toBe(false);
+    expect(bad({ name: "proof.other-zone.com" }).ok).toBe(false); // outside zone
+    expect(bad({ name: "notjasonhulme.com" }).ok).toBe(false); // suffix trick
+    expect(bad({ name: "bad host.jasonhulme.com" }).ok).toBe(false); // space
+    expect(bad({ name: "-lead.jasonhulme.com" }).ok).toBe(false);
+    // content
+    expect(bad({ content: "" }).ok).toBe(false);
+    expect(bad({ content: " padded " }).ok).toBe(false);
+    expect(bad({ content: 123 }).ok).toBe(false);
+    expect(bad({ content: "x".repeat(4097) }).ok).toBe(false);
+    // proxied (must be the STRING "true"/"false")
+    expect(bad({ proxied: true }).ok).toBe(false);
+    expect(bad({ proxied: "yes" }).ok).toBe(false);
+    expect(bad({ type: "TXT", proxied: "true" }).ok).toBe(false); // TXT can't be proxied
+    // ttl (numeric string: 1 or 30..86400)
+    expect(bad({ ttl: 1 }).ok).toBe(false);
+    expect(bad({ ttl: "auto" }).ok).toBe(false);
+    expect(bad({ ttl: "0" }).ok).toBe(false);
+    expect(bad({ ttl: "5" }).ok).toBe(false);
+    expect(bad({ ttl: "86401" }).ok).toBe(false);
+    expect(bad({ ttl: "-1" }).ok).toBe(false);
+    expect(bad({ ttl: "1.5" }).ok).toBe(false);
+  });
+
+  it("the op registry has exactly the allowlisted ops, each with validateParams + actuate", () => {
+    expect(Object.keys(DISPATCH_OP_REGISTRY).sort()).toEqual(["dns-record-upsert", "provision-r2"]);
+    for (const entry of Object.values(DISPATCH_OP_REGISTRY)) {
+      expect(typeof entry.validateParams).toBe("function");
+      expect(typeof entry.actuate).toBe("function");
+    }
+  });
+});
+
 describe("POST /actuate route", () => {
   let publicKeyPem: string;
   let privateKey: CryptoKey;
@@ -212,7 +383,7 @@ describe("POST /actuate route", () => {
   });
 
   // A stand-in NONCE_STORE binding for these Node tests. They exercise the ACTUATE path
-  // (real actuate.ts, fetch mocked), NOT replay defense — that has dedicated real-DO tests
+  // (real actuators, fetch mocked), NOT replay defense — that has dedicated real-DO tests
   // under the workers pool (test/nonce-store.worker.test.ts). It always reports the nonce as
   // fresh so actuation proceeds.
   const freshNonceStore = {
@@ -239,6 +410,7 @@ describe("POST /actuate route", () => {
       DY_CLIENT_SECRET: "secret-xyz",
       DY_SIGNING_PUBLIC_KEY: publicKeyPem,
       R2_PROVISION_API_TOKEN: "cf-token-xyz",
+      CF_DNS_API_TOKEN: "cf-dns-token-abc",
       NONCE_STORE: freshNonceStore,
       ...overrides,
     };
@@ -250,6 +422,16 @@ describe("POST /actuate route", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
+  }
+
+  function jsonResponse(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  }
+
+  function urlOf(input: RequestInfo | URL): string {
+    if (typeof input === "string") return input;
+    if (input instanceof URL) return input.toString();
+    return input.url;
   }
 
   it("returns 401 and calls NO Cloudflare API for an unverified (unsigned) request", async () => {
@@ -280,7 +462,47 @@ describe("POST /actuate route", () => {
 
     // The actuator was never reached — no Cloudflare call, no side effect.
     expect(fetchSpy).not.toHaveBeenCalled();
-    vi.useRealTimers();
+  });
+
+  it("returns 400 and actuates NOTHING for a correctly-signed job whose params is not JSON", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = sampleJob({ params: "{not json" });
+    const signature = await signAsApp(job, privateKey); // authentic, but params unusable
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { ok: boolean; error: string; reason: string };
+    expect(body).toMatchObject({ ok: false, error: "invalid params" });
+    expect(body.reason).toMatch(/not valid JSON/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 and actuates NOTHING for a correctly-signed job whose params fail the op's validation", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = sampleJob({ params: JSON.stringify({ bucketName: "Bad_Name" }) });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { ok: boolean; error: string; reason: string };
+    expect(body).toMatchObject({ ok: false, error: "invalid params" });
+    expect(body.reason).toMatch(/bucketName/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 and actuates NOTHING when a valid op is given ANOTHER op's params", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    // dns params under the provision-r2 op: the registry routes to the R2 validator, which
+    // must reject (no bucketName), so the op/params pairing can't be crossed.
+    const job = sampleJob({ params: JSON.stringify(DNS_PARAMS) });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(400);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it("actuates a verified provision-r2 job via the agency's own R2 token (created)", async () => {
@@ -291,23 +513,18 @@ describe("POST /actuate route", () => {
 
     const calls: string[] = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
-      const url = typeof input === "string" ? input : (input as Request).url ?? String(input);
+      const url = urlOf(input);
       calls.push(url);
       // 1) account resolution
       if (url.includes("/accounts?per_page=1")) {
-        return new Response(JSON.stringify({ success: true, result: [{ id: "acct-cf-1", name: "Agency" }] }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
+        return jsonResponse({ success: true, result: [{ id: "acct-cf-1", name: "Agency" }] });
       }
       // 2) bucket create — assert it used the agency token, not any platform credential
       if (/\/accounts\/acct-cf-1\/r2\/buckets$/.test(url)) {
         const auth = new Headers(init?.headers).get("authorization");
         expect(auth).toBe("Bearer cf-token-xyz");
-        return new Response(JSON.stringify({ success: true, result: { name: job.bucketName } }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
+        expect(JSON.parse(String(init?.body))).toEqual({ name: R2_PARAMS.bucketName });
+        return jsonResponse({ success: true, result: { name: R2_PARAMS.bucketName } });
       }
       throw new Error(`unexpected fetch to ${url}`);
     });
@@ -329,7 +546,6 @@ describe("POST /actuate route", () => {
       accountId: "acct-cf-1",
     });
     expect(calls.some((u) => u.includes("/r2/buckets"))).toBe(true);
-    vi.useRealTimers();
   });
 
   it("treats an existing bucket (409) as idempotent success", async () => {
@@ -338,13 +554,11 @@ describe("POST /actuate route", () => {
     const signature = await signAsApp(job, privateKey);
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-      const url = typeof input === "string" ? input : (input as Request).url ?? String(input);
+      const url = urlOf(input);
       if (url.includes("/accounts?per_page=1")) {
-        return new Response(JSON.stringify({ success: true, result: [{ id: "acct-cf-1" }] }), { status: 200 });
+        return jsonResponse({ success: true, result: [{ id: "acct-cf-1" }] });
       }
-      return new Response(JSON.stringify({ success: false, errors: [{ code: 10004, message: "The bucket already exists." }] }), {
-        status: 409,
-      });
+      return jsonResponse({ success: false, errors: [{ code: 10004, message: "The bucket already exists." }] }, 409);
     });
 
     const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
@@ -352,7 +566,6 @@ describe("POST /actuate route", () => {
     const body = (await response.json()) as { ok: boolean; status: string };
     expect(body.ok).toBe(true);
     expect(body.status).toBe("already-existed");
-    vi.useRealTimers();
   });
 
   it("reports a clean failure (no platform fallback) when the agency R2 token is missing", async () => {
@@ -371,6 +584,171 @@ describe("POST /actuate route", () => {
     expect(body.detail).toMatch(/R2_PROVISION_API_TOKEN is not configured/);
     // It did not try to reach Cloudflare with some other credential.
     expect(fetchSpy).not.toHaveBeenCalled();
-    vi.useRealTimers();
+  });
+
+  // ── dns-record-upsert through the registry ────────────────────────────────────────
+
+  // A routed CF DNS API mock: zone lookup, record list (configurable matches), then the
+  // create (POST) or update (PUT) call. Every call must carry the DNS token and never
+  // the R2 token — the op's own credential, no cross-credential leakage.
+  function mockDnsApi(existing: Array<{ id: string; type: string; name: string }>) {
+    const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = urlOf(input);
+      const method = init?.method ?? "GET";
+      const auth = new Headers(init?.headers).get("authorization");
+      expect(auth).toBe("Bearer cf-dns-token-abc");
+      expect(auth).not.toContain("cf-token-xyz");
+      calls.push({ method, url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+
+      const parsed = new URL(url);
+      if (parsed.pathname === "/client/v4/zones" && method === "GET") {
+        expect(parsed.searchParams.get("name")).toBe("jasonhulme.com");
+        return jsonResponse({ success: true, result: [{ id: "zone-1", name: "jasonhulme.com" }] });
+      }
+      if (parsed.pathname === "/client/v4/zones/zone-1/dns_records" && method === "GET") {
+        expect(parsed.searchParams.get("type")).toBe("TXT");
+        expect(parsed.searchParams.get("name")).toBe("_dy-dirb-proof.jasonhulme.com");
+        return jsonResponse({ success: true, result: existing });
+      }
+      if (parsed.pathname === "/client/v4/zones/zone-1/dns_records" && method === "POST") {
+        return jsonResponse({ success: true, result: { id: "rec-new", name: "_dy-dirb-proof.jasonhulme.com" } });
+      }
+      if (parsed.pathname === "/client/v4/zones/zone-1/dns_records/rec-existing" && method === "PUT") {
+        return jsonResponse({ success: true, result: { id: "rec-existing", name: "_dy-dirb-proof.jasonhulme.com" } });
+      }
+      throw new Error(`unexpected fetch ${method} ${url}`);
+    });
+    return calls;
+  }
+
+  it("dns-record-upsert: CREATES (POST) when no record matches, using CF_DNS_API_TOKEN only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dnsJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockDnsApi([]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({
+      ok: true,
+      op: "dns-record-upsert",
+      action: "created",
+      recordId: "rec-new",
+      name: "_dy-dirb-proof.jasonhulme.com",
+    });
+
+    const write = calls.find((c) => c.method === "POST");
+    expect(write).toBeDefined();
+    // Real JSON types on the wire (proxied boolean, ttl number), built with JSON.stringify.
+    expect(write?.body).toEqual({
+      type: "TXT",
+      name: "_dy-dirb-proof.jasonhulme.com",
+      content: "dy-dirb-proof-abc123",
+      proxied: false,
+      ttl: 1,
+    });
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  it("dns-record-upsert: UPDATES (PUT) the one matching record when it already exists", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dnsJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockDnsApi([{ id: "rec-existing", type: "TXT", name: "_dy-dirb-proof.jasonhulme.com" }]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "dns-record-upsert",
+      action: "updated",
+      recordId: "rec-existing",
+      name: "_dy-dirb-proof.jasonhulme.com",
+    });
+    expect(calls.some((c) => c.method === "POST")).toBe(false);
+    expect(calls.filter((c) => c.method === "PUT")).toHaveLength(1);
+  });
+
+  it("dns-record-upsert: refuses to guess when 2+ records match (no write)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dnsJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockDnsApi([
+      { id: "rec-a", type: "TXT", name: "_dy-dirb-proof.jasonhulme.com" },
+      { id: "rec-b", type: "TXT", name: "_dy-dirb-proof.jasonhulme.com" },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/ambiguous/);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
+  });
+
+  it("dns-record-upsert: fails cleanly when the token cannot see the zone (no write)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dnsJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      jsonResponse({ success: true, result: [] }),
+    );
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/not visible to CF_DNS_API_TOKEN/);
+    expect(fetchSpy).toHaveBeenCalledTimes(1); // the zone lookup only
+  });
+
+  it("dns-record-upsert: surfaces a Cloudflare write error as ok:false (still HTTP 200)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dnsJob();
+    const signature = await signAsApp(job, privateKey);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const parsed = new URL(urlOf(input));
+      if (parsed.pathname === "/client/v4/zones") {
+        return jsonResponse({ success: true, result: [{ id: "zone-1", name: "jasonhulme.com" }] });
+      }
+      if ((init?.method ?? "GET") === "GET") return jsonResponse({ success: true, result: [] });
+      return jsonResponse({ success: false, errors: [{ code: 9005, message: "Content for TXT record is invalid." }] }, 400);
+    });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/create failed with HTTP 400: Content for TXT record is invalid/);
+  });
+
+  it("dns-record-upsert: reports a clean failure and touches NO API when CF_DNS_API_TOKEN is missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dnsJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    // R2 token IS present — it must not be used as a substitute.
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ CF_DNS_API_TOKEN: undefined }));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/CF_DNS_API_TOKEN is not configured/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("dns-record-upsert: a signed job with invalid DNS params is 400 with no API call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dnsJob({ params: JSON.stringify({ ...DNS_PARAMS, type: "MX" }) });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { reason: string };
+    expect(body.reason).toMatch(/type must be one of/);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

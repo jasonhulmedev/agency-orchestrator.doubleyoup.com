@@ -1,21 +1,22 @@
 // Direction-B replay-protection tests that MUST run under the real workerd runtime (the
 // "workers" project in vitest.config.ts). This is the correct home for:
 //   • the NonceStore Durable Object (SQLite storage) — a DO cannot be exercised under Node;
-//   • the /actuate single-use replay guard end-to-end (real DO in the request path);
+//   • the /actuate single-use replay guard end-to-end (real DO in the request path), for
+//     BOTH registered ops;
 //   • ed25519 verification under workerd — a prior review flagged that the Worker's crypto
 //     was only ever tested under Node, so here we verify a Node-produced signature under the
 //     actual edge runtime.
 //
-// The R2 actuator is mocked so nothing reaches Cloudflare and we can assert exactly how many
-// times actuation ran. Everything else (verifyDispatch crypto, the DO, the route wiring) is
-// the real code path.
+// The actuators are mocked so nothing reaches Cloudflare and we can assert exactly how many
+// times actuation ran. Everything else (verifyDispatch crypto, the DO, the op registry, the
+// params parse/validate, the route wiring) is the real code path.
 
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// Mock the R2 actuator: the replay test asserts on how many times it runs, and we never want
-// a test to hit the real Cloudflare API. Hoisted above the imports by Vitest, so the Worker
-// entry (which imports "./actuate.js") also picks up this mock.
+// Mock BOTH actuators: the replay tests assert on how many times each runs, and we never want
+// a test to hit the real Cloudflare API. Hoisted above the imports by Vitest, so the op
+// registry (which imports "./actuate.js") also picks up these mocks.
 vi.mock("../src/actuate.js", () => ({
   actuateProvisionR2: vi.fn(async (bucketName: string) => ({
     ok: true as const,
@@ -24,10 +25,17 @@ vi.mock("../src/actuate.js", () => ({
     status: "created" as const,
     accountId: "acct-mock",
   })),
+  actuateDnsRecordUpsert: vi.fn(async (params: { name: string }) => ({
+    ok: true as const,
+    op: "dns-record-upsert" as const,
+    action: "created" as const,
+    recordId: "rec-mock",
+    name: params.name,
+  })),
 }));
 
 import worker from "../src/index.js";
-import { actuateProvisionR2 } from "../src/actuate.js";
+import { actuateProvisionR2, actuateDnsRecordUpsert } from "../src/actuate.js";
 import type { Env } from "../src/env.js";
 import type { NonceStore } from "../src/nonce-store.js";
 import { nonceExpiresAtMs } from "../src/nonce-store.js";
@@ -74,6 +82,21 @@ function nonceStub() {
   return ns.get(ns.idFromName("dirb-nonce"));
 }
 
+// POST the identical signed envelope twice and return both responses — the replay shape
+// shared by both ops' end-to-end tests.
+async function postTwice(job: DispatchJob, signature: string, testEnv: Env): Promise<[Response, Response]> {
+  const bodyText = JSON.stringify({ job, signature });
+  const makeRequest = () =>
+    new Request("https://worker.test/actuate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: bodyText,
+    });
+  const first = await worker.fetch(makeRequest(), testEnv);
+  const second = await worker.fetch(makeRequest(), testEnv);
+  return [first, second];
+}
+
 describe("NonceStore.consume — real Durable Object, SQLite-backed", () => {
   it("is fresh on first use, replay on the same nonce, fresh on a distinct nonce", async () => {
     const stub = nonceStub();
@@ -112,17 +135,19 @@ describe("NonceStore.consume — real Durable Object, SQLite-backed", () => {
 });
 
 describe("POST /actuate — single-use replay protection end-to-end (real DO)", () => {
-  const actuateSpy = vi.mocked(actuateProvisionR2);
+  const r2Spy = vi.mocked(actuateProvisionR2);
+  const dnsSpy = vi.mocked(actuateDnsRecordUpsert);
 
   beforeEach(() => {
-    actuateSpy.mockClear();
+    r2Spy.mockClear();
+    dnsSpy.mockClear();
   });
 
-  it("actuates a valid job once (200), then rejects the identical replay (401) with no second actuation", async () => {
+  it("provision-r2: actuates a valid job once (200), then rejects the identical replay (401) with no second actuation", async () => {
     const { publicKeyPem, privateKey } = await makeKeypair();
     const job: DispatchJob = {
       op: "provision-r2",
-      bucketName: "dy-agency-replay-e2e-01",
+      params: JSON.stringify({ bucketName: "dy-agency-replay-e2e-01" }),
       accountId: "acct_replay_e2e",
       // Fresh "now" so the timestamp window passes without faking time.
       timestamp: new Date().toISOString(),
@@ -135,31 +160,66 @@ describe("POST /actuate — single-use replay protection end-to-end (real DO)", 
       R2_PROVISION_API_TOKEN: "cf-token-xyz",
     };
 
-    const bodyText = JSON.stringify({ job, signature });
-    const makeRequest = () =>
-      new Request("https://worker.test/actuate", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: bodyText,
-      });
+    const [first, second] = await postTwice(job, signature, testEnv);
 
     // First dispatch: verified, fresh nonce -> actuates once, 200.
-    const first = await worker.fetch(makeRequest(), testEnv);
     expect(first.status).toBe(200);
     const firstBody = (await first.json()) as { ok: boolean; status?: string };
     expect(firstBody.ok).toBe(true);
-    expect(actuateSpy).toHaveBeenCalledTimes(1);
+    expect(r2Spy).toHaveBeenCalledTimes(1);
+    expect(r2Spy).toHaveBeenCalledWith("dy-agency-replay-e2e-01", expect.anything());
 
     // Exact same {job, signature}: still verifies + still fresh by timestamp, but the nonce
     // is now spent -> rejected as a replay BEFORE any side effect.
-    const second = await worker.fetch(makeRequest(), testEnv);
     expect(second.status).toBe(401);
     const secondBody = (await second.json()) as { ok: boolean; reason?: string; error?: string };
     expect(secondBody.ok).toBe(false);
     expect(secondBody.reason).toBe("replay");
 
-    // The actuator did NOT run a second time.
-    expect(actuateSpy).toHaveBeenCalledTimes(1);
+    // The actuator did NOT run a second time, and the other op's actuator never ran.
+    expect(r2Spy).toHaveBeenCalledTimes(1);
+    expect(dnsSpy).not.toHaveBeenCalled();
+  });
+
+  it("dns-record-upsert: actuates once (200) with the validated params, then rejects the replay (401)", async () => {
+    const { publicKeyPem, privateKey } = await makeKeypair();
+    const dnsParams = {
+      zone: "jasonhulme.com",
+      type: "TXT",
+      name: "_dy-dirb-proof.jasonhulme.com",
+      content: "dy-dirb-proof-replay-e2e",
+      proxied: "false",
+      ttl: "1",
+    };
+    const job: DispatchJob = {
+      op: "dns-record-upsert",
+      params: JSON.stringify(dnsParams),
+      accountId: "acct_replay_e2e",
+      timestamp: new Date().toISOString(),
+      nonce: `e2e-dns-${crypto.randomUUID().replace(/-/g, "")}`,
+    };
+    const signature = await signAsApp(job, privateKey);
+    const testEnv: Env = {
+      ...workerEnv,
+      DY_SIGNING_PUBLIC_KEY: publicKeyPem,
+      CF_DNS_API_TOKEN: "cf-dns-token-abc",
+    };
+
+    const [first, second] = await postTwice(job, signature, testEnv);
+
+    expect(first.status).toBe(200);
+    const firstBody = (await first.json()) as { ok: boolean; op?: string; action?: string };
+    expect(firstBody).toMatchObject({ ok: true, op: "dns-record-upsert", action: "created" });
+    // The registry handed the actuator the PARSED + VALIDATED params object (not the string).
+    expect(dnsSpy).toHaveBeenCalledTimes(1);
+    expect(dnsSpy).toHaveBeenCalledWith(dnsParams, expect.anything());
+
+    expect(second.status).toBe(401);
+    const secondBody = (await second.json()) as { ok: boolean; reason?: string };
+    expect(secondBody).toEqual({ ok: false, error: "unverified dispatch", reason: "replay" });
+
+    expect(dnsSpy).toHaveBeenCalledTimes(1);
+    expect(r2Spy).not.toHaveBeenCalled();
   });
 });
 
@@ -167,22 +227,23 @@ describe("ed25519 verification under the real workerd runtime", () => {
   // A signature produced OFFLINE by Node's crypto.sign (node:crypto) over the canonical
   // bytes, alongside the matching SPKI-PEM public key. Verifying it here proves an app-side
   // (Node) signature verifies under workerd — the cross-runtime guarantee a prior review
-  // flagged (crypto was previously only tested under Node). To regenerate if the
-  // canonicalization ever changes, sign canonicalizeDispatchJob(NODE_JOB) with
-  // crypto.sign(null, ...) using a fresh ed25519 keypair and paste the SPKI PEM + base64 sig.
+  // flagged (crypto was previously only tested under Node). Regenerated for the five-key
+  // {accountId, nonce, op, params, timestamp} schema. To regenerate if the canonicalization
+  // ever changes again, sign canonicalizeDispatchJob(NODE_JOB) with crypto.sign(null, ...)
+  // using a fresh ed25519 keypair and paste the SPKI PEM + base64 sig.
   const NODE_JOB: DispatchJob = {
     op: "provision-r2",
-    bucketName: "dy-agency-nodefixture-abc123",
+    params: JSON.stringify({ bucketName: "dy-agency-nodefixture-abc123" }),
     accountId: "acct_node_fixture",
     timestamp: "2026-09-05T00:00:00.000Z",
     nonce: "aaaabbbbccccddddeeeeffff00001111",
   };
   const NODE_PUBLIC_KEY_PEM =
     "-----BEGIN PUBLIC KEY-----\n" +
-    "MCowBQYDK2VwAyEAaGITBMvdr02R8MQUvew/aTF5XWg+ZVe3rrVDo3gPpE4=\n" +
+    "MCowBQYDK2VwAyEA/XacejTltnvq6mJZ2VRTtNktni9ywCgBthR+vh9WVXI=\n" +
     "-----END PUBLIC KEY-----\n";
   const NODE_SIGNATURE_B64 =
-    "NntHDj10VQvL9yusIeiSmufKibE2vWYL+1CzikvLpIlxKEl/LVrN/VtroyYmRc31Mb/kUXkZSU12t7G0iPp3Cw==";
+    "52I4aFlH/LXljbFDy/CjwD3RGqQL8OZfYvsks7jD6jhHbKMU9Ii5+3MmnRR6REBAX1Towx7/72DAaSuZ4rlxAQ==";
   const NODE_JOB_MS = Date.parse(NODE_JOB.timestamp);
 
   it("verifies a Node-produced ed25519 signature (cross-runtime app -> Worker)", async () => {

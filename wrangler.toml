@@ -23,6 +23,7 @@
 #       wrangler secret put S3_BUCKET
 #       wrangler secret put S3_ENDPOINT               # optional — set for R2/MinIO/Wasabi
 #       wrangler secret put STRIPE_SECRET_KEY
+#       wrangler secret put CF_DNS_API_TOKEN           # Zone:DNS:Edit + Zone:Read (Direction-B dns-record-upsert)
 #       wrangler secret put ANTHROPIC_API_KEY
 #       wrangler secret put OPENROUTER_API_KEY
 #
