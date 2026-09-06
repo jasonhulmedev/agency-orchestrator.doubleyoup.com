@@ -18,6 +18,16 @@ export interface Env {
   DY_CLIENT_ID: string;
   DY_CLIENT_SECRET: string;
 
+  // ── Direction-B signed-dispatch verification (secret) ─────────────────────
+  // The agency's OWN ed25519 PUBLIC key (SPKI PEM) — the public half of the
+  // per-account keypair our app generated at onboarding (Account.signingKeyPublic).
+  // Used ONLY to verify the signature on inbound POST /actuate jobs: the platform
+  // (orchestrator) hands this Worker a job signed with the matching PRIVATE key,
+  // which never leaves our app. Set with `wrangler secret put DY_SIGNING_PUBLIC_KEY`
+  // (value = the account's signingKeyPublic). Unset => /actuate fails closed
+  // (verification is impossible, so nothing is actuated).
+  DY_SIGNING_PUBLIC_KEY?: string;
+
   // ── Agency service credentials (secrets) ──────────────────────────────────
   // Google Cloud service-account key — the entire downloaded JSON as one string.
   GCP_SERVICE_ACCOUNT_KEY?: string;

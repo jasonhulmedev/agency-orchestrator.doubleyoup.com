@@ -12,17 +12,23 @@
 //   POST /validate  — run every credential validator; the agency iterates until green.
 //   GET  /whoami     — exercise the Direction-A round-trip against our app.
 //   POST /complete  — if all green, tell our app onboarding is complete.
+//   POST /actuate   — Direction-B: run a SIGNED job (ed25519) the platform dispatched
+//                     through us, using the AGENCY's own credentials. First op:
+//                     provision-r2 (create an R2 bucket). Verified before any side effect.
 //
-// NOTE on inbound auth: the direction OUR app → this Worker (so the wizard can
-// display live status) is the Direction-B signed handshake, which is PHASE 2.
-// In Phase 1 the agency triggers /validate and /complete themselves, so these
-// routes are intentionally left open (no Direction-B signature verification yet).
+// NOTE on inbound auth: /validate and /complete are Phase-1 endpoints the agency
+// triggers themselves, so they are intentionally open. /actuate is the Direction-B
+// (platform → Worker) surface: it is NOT open — every request must carry a valid
+// ed25519 signature over the canonical job, verified with the agency's own public key
+// (DY_SIGNING_PUBLIC_KEY). An unverified request actuates NOTHING.
 
 import type { Env } from "./env.js";
 import { callApp } from "./app-client.js";
 import { validateAll, type AllValidations } from "./validators.js";
 import { renderSetupPage } from "./setup-page.js";
 import { errorMessage } from "./util.js";
+import { verifyDispatch, isValidR2BucketName, signingPublicKey } from "./dispatch-verify.js";
+import { actuateProvisionR2 } from "./actuate.js";
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -143,6 +149,49 @@ async function handleComplete(env: Env): Promise<Response> {
   }
 }
 
+// POST /actuate — Direction-B signed dispatch. Body: { job, signature }. The job is
+// verified (ed25519 over the canonical bytes with the agency's own public key, a fresh
+// timestamp, an allowlisted op) BEFORE anything happens; a failed verification returns
+// 401 and does NOTHING. Only provision-r2 is wired today. The actuator uses the agency's
+// OWN R2_PROVISION_API_TOKEN — never a platform credential (there is none here).
+async function handleActuate(request: Request, env: Env): Promise<Response> {
+  let payload: unknown;
+  try {
+    payload = await request.json();
+  } catch {
+    return json({ ok: false, error: "body must be JSON" }, 400);
+  }
+  if (!payload || typeof payload !== "object") {
+    return json({ ok: false, error: "body must be a JSON object { job, signature }" }, 400);
+  }
+  const { job, signature } = payload as { job?: unknown; signature?: unknown };
+
+  const verdict = await verifyDispatch({
+    rawJob: job,
+    signatureB64: signature,
+    publicKeyPem: signingPublicKey(env),
+  });
+  if (!verdict.ok) {
+    // Fail closed: nothing is actuated. 401 for any verification failure (bad signature,
+    // stale timestamp, disallowed op, missing key) — the reason is a non-secret code.
+    return json({ ok: false, error: "unverified dispatch", reason: verdict.reason }, 401);
+  }
+
+  // Verified. Dispatch on the (already allowlisted) op.
+  if (verdict.job.op === "provision-r2") {
+    if (!isValidR2BucketName(verdict.job.bucketName)) {
+      return json({ ok: false, error: "invalid bucket name", bucket: verdict.job.bucketName }, 400);
+    }
+    const result = await actuateProvisionR2(verdict.job.bucketName, env);
+    // Always 200 with a structured result: a CF failure is reported in ok:false + detail,
+    // not as a transport error, so the orchestrator classifies it (not the HTTP layer).
+    return json(result, 200);
+  }
+
+  // Unreachable: verifyDispatch already rejects any non-allowlisted op. Belt-and-braces.
+  return json({ ok: false, error: `unsupported op "${verdict.job.op}"` }, 400);
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -164,6 +213,9 @@ export default {
     }
     if (method === "POST" && path === "/complete") {
       return handleComplete(env);
+    }
+    if (method === "POST" && path === "/actuate") {
+      return handleActuate(request, env);
     }
 
     return json({ ok: false, error: "not found" }, 404);
