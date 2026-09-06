@@ -8,6 +8,8 @@ const baseEnv: Env = {
   APP_BASE_URL: "https://app.example.test",
   DY_CLIENT_ID: "client-abc",
   DY_CLIENT_SECRET: "secret-xyz",
+  // These routing tests never reach /actuate; present only to satisfy the Env type.
+  NONCE_STORE: undefined as unknown as Env["NONCE_STORE"],
 };
 
 function request(method: string, path: string): Request {

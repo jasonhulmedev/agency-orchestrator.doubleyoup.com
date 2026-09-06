@@ -211,6 +211,15 @@ describe("POST /actuate route", () => {
     ({ publicKeyPem, privateKey } = await makeKeypair());
   });
 
+  // A stand-in NONCE_STORE binding for these Node tests. They exercise the ACTUATE path
+  // (real actuate.ts, fetch mocked), NOT replay defense — that has dedicated real-DO tests
+  // under the workers pool (test/nonce-store.worker.test.ts). It always reports the nonce as
+  // fresh so actuation proceeds.
+  const freshNonceStore = {
+    idFromName: () => ({}),
+    get: () => ({ consume: async () => "fresh" as const }),
+  } as unknown as Env["NONCE_STORE"];
+
   function envWith(overrides: Partial<Env> = {}): Env {
     return {
       APP_BASE_URL: "https://app.example.test",
@@ -218,6 +227,7 @@ describe("POST /actuate route", () => {
       DY_CLIENT_SECRET: "secret-xyz",
       DY_SIGNING_PUBLIC_KEY: publicKeyPem,
       R2_PROVISION_API_TOKEN: "cf-token-xyz",
+      NONCE_STORE: freshNonceStore,
       ...overrides,
     };
   }

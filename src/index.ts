@@ -29,6 +29,11 @@ import { renderSetupPage } from "./setup-page.js";
 import { errorMessage } from "./util.js";
 import { verifyDispatch, isValidR2BucketName, signingPublicKey } from "./dispatch-verify.js";
 import { actuateProvisionR2 } from "./actuate.js";
+import { nonceExpiresAtMs } from "./nonce-store.js";
+
+// Re-exported so wrangler can bind the Durable Object class declared in wrangler.toml. The
+// DO must be an export of the configured `main` worker script.
+export { NonceStore } from "./nonce-store.js";
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -177,7 +182,21 @@ async function handleActuate(request: Request, env: Env): Promise<Response> {
     return json({ ok: false, error: "unverified dispatch", reason: verdict.reason }, 401);
   }
 
-  // Verified. Dispatch on the (already allowlisted) op.
+  // Verified: authentic + fresh + allowlisted op. Now enforce SINGLE-USE via the nonce DO,
+  // BEFORE any side effect — the freshness window alone admits replay, so a captured signed
+  // job must actuate at most once. Consuming happens only AFTER verification, so an unsigned
+  // or invalid request can never spend a nonce or flood the store. Every actuation routes to
+  // one singleton instance so nonces are checked against a single, strongly-consistent store
+  // (see nonce-store.ts). The freshness-window check above stays in place as defense in depth.
+  const nonceStore = env.NONCE_STORE.get(env.NONCE_STORE.idFromName("dirb-nonce"));
+  const expiresAtMs = nonceExpiresAtMs(Date.parse(verdict.job.timestamp));
+  const nonceOutcome = await nonceStore.consume(verdict.job.nonce, expiresAtMs);
+  if (nonceOutcome === "replay") {
+    // A replayed job actuates NOTHING. Same fail-closed shape as a verification failure.
+    return json({ ok: false, error: "unverified dispatch", reason: "replay" }, 401);
+  }
+
+  // Verified and single-use confirmed. Dispatch on the (already allowlisted) op.
   if (verdict.job.op === "provision-r2") {
     if (!isValidR2BucketName(verdict.job.bucketName)) {
       return json({ ok: false, error: "invalid bucket name", bucket: verdict.job.bucketName }, 400);

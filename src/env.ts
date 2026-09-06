@@ -12,6 +12,14 @@ export interface Env {
   // Our control-plane app base URL, e.g. "https://app.doubleyoup.com".
   APP_BASE_URL: string;
 
+  // ── Direction-B replay protection (Durable Object binding) ────────────────
+  // The single-use nonce store that makes a signed /actuate job actuatable at
+  // most once (see src/nonce-store.ts). Declared in wrangler.toml and auto-
+  // provisioned by `wrangler deploy` in whichever account runs it — it needs
+  // NO per-account id, preserving the identical-config-per-agency model. Durable
+  // Objects require the Workers Paid plan on the deploying account.
+  NONCE_STORE: DurableObjectNamespace<import("./nonce-store.js").NonceStore>;
+
   // ── Direction-A OAuth2 client credentials (secrets) ───────────────────────
   // Issued by our app at onboarding. Exchanged for a short-lived access token
   // (client_credentials grant) that authenticates this Worker's calls back to us.
