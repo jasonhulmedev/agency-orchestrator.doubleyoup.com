@@ -21,7 +21,9 @@
 import type { Env } from "./env.js";
 
 // The ops this Worker will actuate. Enforced INDEPENDENTLY of the app's copy (defense in
-// depth): a job whose `op` is not here is rejected before any side effect.
+// depth): a job whose `op` is not here is rejected before any side effect. Adding an op here
+// is gated on the replay-hardening prerequisite documented at FRESHNESS_WINDOW_SECONDS —
+// only idempotent ops are safe on the timestamp window alone.
 export const DISPATCH_OPS = ["provision-r2"] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 
@@ -38,14 +40,15 @@ export interface DispatchJob {
 }
 
 // How far the job's `timestamp` may be from "now" (either direction) and still be fresh.
-// The timestamp window is the proof-level replay protection: a captured job can only be
-// replayed inside this window.
+// The timestamp window is the ONLY replay protection here: a captured job CAN be replayed
+// freely within this window.
 //
-// REPLAY HARDENING (future): a true single-use nonce needs a shared store (Workers KV /
-// D1 / Durable Object) to remember spent nonces across isolates and requests. The edge
-// here has no such store wired, so within the freshness window a captured job COULD be
-// replayed. That is acceptable for this proof (a throwaway idempotent bucket create);
-// add a nonce-store before Direction-B actuates anything non-idempotent or destructive.
+// ⚠️ HARD PREREQUISITE before extending DISPATCH_OPS: the ±window admits replay, so it is
+// only safe today because the sole op — provision-r2 — is IDEMPOTENT (replaying it just
+// re-creates/no-ops the same bucket). A shared SINGLE-USE nonce store (Workers KV / D1 /
+// Durable Object, to remember spent nonces across isolates + requests — module scope is
+// NOT enough at the edge) is a REQUIRED precondition before adding ANY non-idempotent or
+// destructive op to the allowlist. Do not add such an op on the timestamp window alone.
 export const FRESHNESS_WINDOW_SECONDS = 120;
 
 // R2 bucket-name grammar, mirrored from the app so the actuator re-checks it (the app
@@ -195,12 +198,20 @@ export async function verifyDispatch(input: {
   }
 
   const canonical = canonicalizeDispatchJob(job);
-  const verified = await crypto.subtle.verify(
-    { name: "Ed25519" },
-    key,
-    signatureBytes,
-    new TextEncoder().encode(canonical),
-  );
+  // Wrap the verify: a throw (e.g. a malformed key/signature the importKey didn't catch, or
+  // a runtime crypto error) must surface as a fail-closed {ok:false, reason} — the module's
+  // uniform contract — NOT propagate out as a 500. Either way, nothing is actuated.
+  let verified: boolean;
+  try {
+    verified = await crypto.subtle.verify(
+      { name: "Ed25519" },
+      key,
+      signatureBytes,
+      new TextEncoder().encode(canonical),
+    );
+  } catch {
+    return { ok: false, reason: "signature verify error" };
+  }
   if (!verified) {
     return { ok: false, reason: "signature does not verify" };
   }
