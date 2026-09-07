@@ -293,10 +293,11 @@ export function validateCachePurgeParams(raw: unknown): ParamsVerdict<CachePurge
 // ops above, this actuates ON THE AGENCY's cell, so the security burden shifts:
 //
 //   1. `docroot` is the ONLY thing that selects WHICH site runs the command, so it is pinned
-//      to a strict grammar — an absolute /var/www/<slug> path, lowercase slug, NOTHING else.
-//      The grammar admits no "..", no trailing slash, no second path segment, and no shell
-//      metacharacter, so a traversal or an injected-path attack cannot pass this gate (the
-//      cell-agent then re-guards it with realpath-under-/var/www).
+//      to a strict grammar — an absolute /var/www/<slug> OR /sites/<slug>/public path,
+//      lowercase slug, NOTHING else. The grammar admits no "..", no trailing slash, no extra
+//      path segment, and no shell metacharacter, so a traversal or an injected-path attack
+//      cannot pass this gate (the cell-agent then re-guards it with realpath under its allowed
+//      roots; a /sites/<slug>/public docroot runs under the site's own per-site OS user).
 //   2. `args` are the wp-cli arguments and are DELIBERATELY not charset-restricted — a real
 //      wp-cli value can legitimately contain spaces, quotes, "$", ";", etc. (e.g.
 //      `wp option update blogname "A; B & C"`). They are made safe NOT by rejecting
@@ -310,11 +311,15 @@ export interface WpCliParams {
   args: string[];
 }
 
-// An absolute cell docroot: exactly "/var/www/<slug>" where <slug> is a lowercase DNS-style
-// label (starts alphanumeric, then up to 63 of [a-z0-9-]). Anchored at both ends, so there is
-// no "..", no trailing slash, no extra path segment, and no shell metacharacter — the docroot
-// can only ever name one site directory under /var/www.
-const WP_CLI_DOCROOT_RE = /^\/var\/www\/[a-z0-9][a-z0-9-]{0,63}$/;
+// An absolute cell docroot in one of the two forms the cell-agent's /exec guard accepts:
+//   - /var/www/<slug>       (Docker-era sites), OR
+//   - /sites/<slug>/public  (storage-tier sites — the live cell layout, run under the site's
+//                            own per-site OS user via the agent's setpriv path).
+// <slug> is a lowercase DNS-style label (starts alphanumeric, then up to 63 of [a-z0-9-]).
+// Anchored at both ends, so there is no "..", no trailing slash, no extra path segment, and no
+// shell metacharacter — the docroot can only ever name one real site directory.
+const WP_CLI_DOCROOT_RE =
+  /^(\/var\/www\/[a-z0-9][a-z0-9-]{0,63}|\/sites\/[a-z0-9][a-z0-9-]{0,63}\/public)$/;
 // A wp-cli invocation is a handful of short arguments; 30 is generous and stops a junk mega-list.
 const WP_CLI_ARGS_MAX = 30;
 // A generous per-argument ceiling — long enough for a real option value or a serialized blob,
@@ -331,7 +336,7 @@ export function validateWpCliParams(raw: unknown): ParamsVerdict<WpCliParams> {
     return {
       ok: false,
       reason:
-        "docroot must be an absolute cell docroot like /var/www/<slug> (lowercase slug, no '..', no trailing slash, no extra path segment)",
+        "docroot must be an absolute cell docroot (/var/www/<slug> or /sites/<slug>/public) with a lowercase slug, no '..', no trailing slash, no extra path segment",
     };
   }
   if (!Array.isArray(args) || args.length < 1 || args.length > WP_CLI_ARGS_MAX) {

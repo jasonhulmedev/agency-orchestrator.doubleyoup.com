@@ -478,32 +478,47 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
 
   // ── wp-cli (twin of the app's rules) ──────────────────────────────────────────────
 
-  it("wp-cli: accepts a valid {docroot, args} and returns only known keys", () => {
+  it("wp-cli: accepts BOTH docroot forms (/var/www/<slug> and /sites/<slug>/public) and returns only known keys", () => {
     expect(validateWpCliParams({ ...WP_CLI_PARAMS, extra: "x" })).toEqual({ ok: true, params: WP_CLI_PARAMS });
-    // A single arg is fine; a 30-arg list is the max.
+    // Docker-era /var/www form.
     expect(validateWpCliParams({ docroot: "/var/www/site1", args: ["cache"] }).ok).toBe(true);
+    // Storage-tier /sites/<slug>/public form — the live cell layout, incl. real dogfood slugs.
+    expect(validateWpCliParams({ docroot: "/sites/geelongns/public", args: ["option", "get", "siteurl"] }).ok).toBe(true);
+    expect(validateWpCliParams({ docroot: "/sites/docs-892769/public", args: ["cache"] }).ok).toBe(true);
+    expect(validateWpCliParams({ docroot: "/sites/rareepicgamer-19f933/public", args: ["cache"] }).ok).toBe(true);
+    // A 30-arg list is the max.
     expect(
       validateWpCliParams({ docroot: "/var/www/a", args: Array.from({ length: 30 }, (_, i) => `a${i}`) }).ok,
     ).toBe(true);
   });
 
-  it("wp-cli: rejects a bad docroot (traversal, trailing slash, extra segment, wrong root, metachars)", () => {
+  it("wp-cli: rejects a bad docroot (wrong root, traversal, trailing slash, extra/short segment, bad slug, metachars)", () => {
     const bad = (docroot: unknown) => validateWpCliParams({ docroot, args: ["option", "get", "siteurl"] });
     expect(validateWpCliParams(null).ok).toBe(false);
     expect(validateWpCliParams("string").ok).toBe(false);
     expect(bad(42).ok).toBe(false);
     expect(bad("").ok).toBe(false);
     expect(bad("/etc/passwd").ok).toBe(false); // wrong root
+    expect(bad("relative/path").ok).toBe(false); // not absolute
+    // /var/www/<slug> form
     expect(bad("/var/www/").ok).toBe(false); // no slug
     expect(bad("/var/www/site/").ok).toBe(false); // trailing slash
     expect(bad("/var/www/site/public").ok).toBe(false); // extra path segment
     expect(bad("/var/www/../etc").ok).toBe(false); // traversal
     expect(bad("/var/www/../../etc/passwd").ok).toBe(false); // traversal
-    expect(bad("/sites/site/public").ok).toBe(false); // storage-tier root not allowed by this op
-    expect(bad("/var/www/Site").ok).toBe(false); // uppercase
+    expect(bad("/var/www/Site").ok).toBe(false); // uppercase slug
     expect(bad("/var/www/site;rm").ok).toBe(false); // shell metachar
     expect(bad("/var/www/site space").ok).toBe(false); // space
-    expect(bad("relative/path").ok).toBe(false); // not absolute
+    // /sites/<slug>/public form
+    expect(bad("/sites//public").ok).toBe(false); // empty slug
+    expect(bad("/sites/site").ok).toBe(false); // missing /public suffix
+    expect(bad("/sites/site/private").ok).toBe(false); // non-/public suffix
+    expect(bad("/sites/site/public/").ok).toBe(false); // trailing slash
+    expect(bad("/sites/site/public/wp").ok).toBe(false); // extra path segment past /public
+    expect(bad("/sites/x/public/../..").ok).toBe(false); // traversal
+    expect(bad("/sites/Site/public").ok).toBe(false); // uppercase slug
+    expect(bad("/sites/site;rm/public").ok).toBe(false); // shell metachar in slug
+    expect(bad("/sites/site space/public").ok).toBe(false); // space
   });
 
   it("wp-cli: rejects a bad args list (missing, empty, oversized, non-string, empty entry, mega-string)", () => {
