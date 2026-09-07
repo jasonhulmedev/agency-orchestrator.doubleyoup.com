@@ -1,8 +1,10 @@
 // Direction-B ACTUATION (agency Worker side). Runs a verified job using the AGENCY's
 // OWN credentials — R2_PROVISION_API_TOKEN to create an R2 bucket, CF_DNS_API_TOKEN to
-// upsert a DNS record in one of the agency's zones. There is deliberately NO platform
-// credential anywhere in this Worker to fall back to: if the agency's token is missing or
-// unauthorized, actuation fails cleanly rather than reaching for ours.
+// upsert a DNS record / purge cache in one of the agency's zones, and (the first "heavy"
+// data-plane op) CELL_AGENT_TOKEN to run a wp-cli command on the agency's own cell via its
+// on-VM cell-agent. There is deliberately NO platform credential anywhere in this Worker to
+// fall back to: if the agency's token is missing or unauthorized, actuation fails cleanly
+// rather than reaching for ours.
 //
 // Every actuator here runs ONLY after dispatch-verify.ts::verifyDispatch returned ok:true,
 // the nonce was consumed, and the op's params validated (index.ts::handleActuate via
@@ -15,7 +17,7 @@
 // ever string-interpolated into a URL.
 
 import type { Env } from "./env.js";
-import type { DnsRecordUpsertParams, CachePurgeParams } from "./dispatch-params.js";
+import type { DnsRecordUpsertParams, CachePurgeParams, WpCliParams } from "./dispatch-params.js";
 import { errorMessage } from "./util.js";
 
 const CF_API = "https://api.cloudflare.com/client/v4";
@@ -32,7 +34,11 @@ export type CachePurgeResult =
   | { ok: true; op: "cache-purge"; mode: "everything" | "files" | "hosts"; zone: string; count: number }
   | { ok: false; op: "cache-purge"; zone: string; detail: string };
 
-export type ActuateResult = ProvisionR2Result | DnsRecordUpsertResult | CachePurgeResult;
+export type WpCliResult =
+  | { ok: true; op: "wp-cli"; exitCode: number; stdout: string; stderr: string }
+  | { ok: false; op: "wp-cli"; detail: string };
+
+export type ActuateResult = ProvisionR2Result | DnsRecordUpsertResult | CachePurgeResult | WpCliResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -424,4 +430,200 @@ export async function actuateCachePurge(params: CachePurgeParams, env: Env): Pro
   }
 
   return { ok: true, op: "cache-purge", mode: params.mode, zone: params.zone, count };
+}
+
+// ── wp-cli ─────────────────────────────────────────────────────────────────────────────
+// The first "heavy"/data-plane Direction-B op: run a wp-cli command in a cell site's docroot
+// through the agency's OWN on-VM cell-agent, authenticated with the agency's OWN
+// CELL_AGENT_TOKEN. This re-authenticates, through the signed-Worker path, the exec power the
+// platform's orchestrator already has directly (cells.ts::execOnCell) — so it MUST stay behind
+// the same verify + single-use-nonce gate (index.ts::handleActuate). It proves the rewiring
+// pattern (orchestrator -> signed job -> agency Worker -> cell-agent -> executes on the cell)
+// that later carries backups/DB/migrations/provisioning.
+//
+// COMMAND INJECTION is the main risk here. The cell-agent runs the command we send under
+// `sh -lc "cd <docroot> && <cmd>"`, so an unquoted argument is a shell-injection hole: an arg
+// like `; rm -rf /` or `$(...)` would be interpreted by the shell, not handed to wp-cli. We
+// defuse that by SHELL-QUOTING every argument (shellQuoteArg): each becomes exactly one literal
+// wp-cli token. This per-arg quoting + the strict docroot grammar (dispatch-params.ts) are the
+// load-bearing security controls of this op.
+//
+// F1 (retry / nonce) NOTE: wp-cli is NOT idempotent in general (e.g. `wp plugin update`), and
+// handleActuate BURNS the job's nonce on receipt, so a TRANSIENT failure of a non-idempotent
+// command cannot be retried by re-POSTing — it needs a re-signed job with a fresh nonce, which
+// for a non-idempotent command could double-apply. The Direction-B proof deliberately uses a
+// READ-ONLY command (`option get siteurl`), so F1 does not bite here. Before wiring a
+// non-idempotent wp-cli use into an automatic flow, the F1 dispatcher contract (bind the nonce
+// to a completed side effect, or gate re-sign on a confirmed non-effect) must land first.
+//
+// v1 LIMITATION: CELL_AGENT_URL / CELL_AGENT_TOKEN are SINGLE-CELL (one agency cell). A
+// multi-cell agency needs per-cell resolution (a cell selector in the params + a map of
+// URL/token pairs) before this op can target more than one cell.
+
+// A conservative cap on how much stdout/stderr the Worker RELAYS BACK to the orchestrator.
+// This bounds the RETURN payload ONLY — it does NOT bound the Worker's memory (by the time
+// truncateOutput runs, the whole reply is already parsed in memory). Worker memory is bounded
+// separately by WP_CLI_RESPONSE_MAX_BYTES below, which stops reading the stream before a huge
+// reply can be buffered.
+const WP_CLI_OUTPUT_MAX_CHARS = 64 * 1024;
+// A HARD cap on how many bytes of the cell-agent reply the Worker will buffer at all. A signed
+// command with very large output (e.g. `wp db export -`, or `wp eval` echoing a big string)
+// makes the agent return a multi-MB/GB body; buffering it whole would exhaust the Worker's
+// 128 MB and turn a success into a 500. We read the response as a STREAM and abort past this
+// cap, failing closed rather than OOMing. GENUINELY large-output ops (DB export, media dumps)
+// must stream to R2 directly, NOT return through the Worker — this op is for small-output
+// commands (reads, single option writes), and this cap enforces that.
+const WP_CLI_RESPONSE_MAX_BYTES = 1024 * 1024;
+// The cell-agent's /exec default timeout is 60s; send the same explicit bound. A read-only
+// command finishes well inside this.
+const WP_CLI_EXEC_TIMEOUT_MS = 60_000;
+
+/**
+ * POSIX single-quote one argument so the cell-agent's `sh -lc` treats it as ONE literal token.
+ * Inside single quotes the shell interprets EVERY character literally (no $, backtick, ;, glob,
+ * or whitespace splitting); the only character single quotes cannot contain is a single quote,
+ * so an embedded one is closed, escaped as \', and reopened ('\''). This is the standard,
+ * complete POSIX-sh single-quoting rule — the load-bearing anti-injection control for this op.
+ */
+function shellQuoteArg(arg: string): string {
+  return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
+/** Truncate relayed command output to a bounded size, marking when it was cut. */
+function truncateOutput(text: string): string {
+  if (text.length <= WP_CLI_OUTPUT_MAX_CHARS) return text;
+  return text.slice(0, WP_CLI_OUTPUT_MAX_CHARS) + "\n…[truncated]";
+}
+
+/**
+ * Read a Response body as a STREAM, accumulating at most `capBytes` bytes. If the body exceeds
+ * the cap, STOP reading (cancel the stream — never buffer the rest) and report overflow. This is
+ * what keeps a huge cell-agent reply from exhausting the Worker's memory: we fail closed instead
+ * of OOMing. On success the accumulated bytes (<= cap) are decoded to a UTF-8 string for the
+ * caller to JSON.parse.
+ */
+async function readBodyCapped(
+  response: Response,
+  capBytes: number,
+): Promise<{ ok: true; text: string } | { ok: false; detail: string }> {
+  const stream = response.body;
+  if (!stream) {
+    return { ok: false, detail: "cell-agent returned no response body." };
+  }
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > capBytes) {
+        // Past the cap: drop what we have and stop reading — do NOT buffer the rest (the whole
+        // point of the cap is that a huge reply never lands in Worker memory).
+        await reader.cancel().catch(() => {});
+        return {
+          ok: false,
+          detail: `cell-agent output exceeded ${capBytes} bytes (${Math.round(capBytes / 1024)} KiB) — this op is for small-output commands; large-output ops (e.g. wp db export) must stream to R2, not return through the Worker.`,
+        };
+      }
+      chunks.push(value);
+    }
+  } catch (err) {
+    return { ok: false, detail: `error reading cell-agent response: ${errorMessage(err)}` };
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { ok: true, text: new TextDecoder().decode(merged) };
+}
+
+function wpCliFailure(detail: string): WpCliResult {
+  return { ok: false, op: "wp-cli", detail };
+}
+
+/**
+ * Run `wp <args>` in `params.docroot` on the agency's cell via the cell-agent's /exec endpoint,
+ * using the agency's OWN CELL_AGENT_TOKEN. Returns a structured result; a cell-agent-side
+ * failure is reported as ok:false + detail (the route still answers HTTP 200, so the
+ * orchestrator classifies it), never a thrown 500. NEVER uses a platform credential (there is
+ * none here). A NON-ZERO wp-cli exit is NOT a failure of this actuator — it is a successful exec
+ * whose exitCode is carried back for the caller to interpret.
+ */
+export async function actuateWpCli(params: WpCliParams, env: Env): Promise<WpCliResult> {
+  const cellAgentUrl = env.CELL_AGENT_URL;
+  const cellAgentToken = env.CELL_AGENT_TOKEN;
+  if (!cellAgentUrl || !cellAgentToken) {
+    return wpCliFailure("CELL_AGENT_URL / CELL_AGENT_TOKEN are not configured on this Worker.");
+  }
+
+  // Build the command by shell-quoting EACH argument. Every element becomes one literal wp-cli
+  // token, so a metacharacter-laden arg can never be interpreted by the cell-agent's shell.
+  const command = `wp ${params.args.map(shellQuoteArg).join(" ")}`;
+
+  // The exact request shape the cell-agent's /exec endpoint accepts (infra/cell-agent/agent.php):
+  // POST /exec, Authorization: Bearer <token>, body { script, docroot, timeoutMs }. It answers
+  // HTTP 200 with { code, stdout, stderr } even when the command's exit code is non-zero.
+  let response: Response;
+  try {
+    response = await fetch(cellAgentUrl.replace(/\/+$/, "") + "/exec", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${cellAgentToken}`,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify({
+        script: command,
+        docroot: params.docroot,
+        timeoutMs: WP_CLI_EXEC_TIMEOUT_MS,
+      }),
+      redirect: "error",
+    });
+  } catch (err) {
+    return wpCliFailure(`could not reach the cell-agent to run wp-cli: ${errorMessage(err)}`);
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    await response.body?.cancel().catch(() => {});
+    return wpCliFailure("the cell-agent rejected CELL_AGENT_TOKEN (bearer auth failed).");
+  }
+
+  // Read the reply as a STREAM with a hard byte cap so a very large output cannot make the
+  // Worker buffer a multi-MB/GB body and exhaust its 128 MB memory (see WP_CLI_RESPONSE_MAX_BYTES).
+  // The cell-agent's own error bodies (bad json / bad docroot / spawn failure) are tiny, so this
+  // cap only ever trips on a genuinely huge command output — which this op is not for.
+  const read = await readBodyCapped(response, WP_CLI_RESPONSE_MAX_BYTES);
+  if (!read.ok) {
+    return wpCliFailure(read.detail);
+  }
+
+  // Only NOW parse — the buffered text is bounded (<= cap). JSON.parse needs the try/catch (no
+  // non-throwing parse); a non-JSON reply is treated as a cell-agent-side error below.
+  let body: { code?: number; stdout?: string; stderr?: string; error?: string } | null;
+  try {
+    body = JSON.parse(read.text) as { code?: number; stdout?: string; stderr?: string; error?: string };
+  } catch {
+    body = null;
+  }
+
+  // A non-200, a missing/non-JSON body, or a body without a numeric `code` is a cell-agent-side
+  // error (bad json, bad docroot, spawn failure, ...), not a completed exec — report it as ok:false.
+  if (!response.ok || !body || typeof body.code !== "number") {
+    const detail = body?.error ? `: ${body.error}` : "";
+    return wpCliFailure(`cell-agent /exec failed with HTTP ${response.status}${detail}.`);
+  }
+
+  return {
+    ok: true,
+    op: "wp-cli",
+    exitCode: body.code,
+    stdout: truncateOutput(body.stdout ?? ""),
+    stderr: truncateOutput(body.stderr ?? ""),
+  };
 }

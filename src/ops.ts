@@ -7,9 +7,11 @@
 // record type below is keyed on that tuple, so the compiler enforces the pairing) + the
 // twin validator in the app (which refuses to sign what this side would reject).
 //
-// Only IDEMPOTENT ops belong here for now: the nonce is burned before actuation, so a
-// transient failure needs a re-signed job, which is only safe when re-running converges
-// (see the F1 note in actuate.ts).
+// The Cloudflare ops here are IDEMPOTENT on purpose: the nonce is burned before actuation, so
+// a transient failure needs a re-signed job, which is only safe when re-running converges. The
+// `wp-cli` op is the exception — a wp-cli command is not idempotent in general — so it is used
+// only for READ-ONLY commands in the Direction-B proof; a non-idempotent wp-cli use needs the
+// F1 dispatcher contract first (see the F1 note in actuate.ts::actuateWpCli).
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -18,15 +20,18 @@ import {
   type ProvisionR2Params,
   type DnsRecordUpsertParams,
   type CachePurgeParams,
+  type WpCliParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
+  validateWpCliParams,
 } from "./dispatch-params.js";
 import {
   type ActuateResult,
   actuateProvisionR2,
   actuateDnsRecordUpsert,
   actuateCachePurge,
+  actuateWpCli,
 } from "./actuate.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
@@ -65,6 +70,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "cache-purge": defineOp<CachePurgeParams>({
     validateParams: validateCachePurgeParams,
     actuate: (params, env) => actuateCachePurge(params, env),
+  }),
+  "wp-cli": defineOp<WpCliParams>({
+    validateParams: validateWpCliParams,
+    actuate: (params, env) => actuateWpCli(params, env),
   }),
 };
 

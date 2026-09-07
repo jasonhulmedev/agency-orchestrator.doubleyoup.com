@@ -28,6 +28,7 @@ import {
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
+  validateWpCliParams,
 } from "../src/dispatch-params.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
 
@@ -112,6 +113,20 @@ function cachePurgeJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
     op: "cache-purge",
     params: JSON.stringify(CACHE_PARAMS),
     nonce: "aa55aa55aa55aa55aa55aa55aa55aa55",
+    ...overrides,
+  });
+}
+
+// A wp-cli job — a SAFE read-only command (option get siteurl) by default.
+const WP_CLI_PARAMS = {
+  docroot: "/var/www/example",
+  args: ["option", "get", "siteurl"],
+};
+function wpCliJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "wp-cli",
+    params: JSON.stringify(WP_CLI_PARAMS),
+    nonce: "bb66bb66bb66bb66bb66bb66bb66bb66",
     ...overrides,
   });
 }
@@ -384,7 +399,12 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
   });
 
   it("the op registry has exactly the allowlisted ops, each with validateParams + actuate", () => {
-    expect(Object.keys(DISPATCH_OP_REGISTRY).sort()).toEqual(["cache-purge", "dns-record-upsert", "provision-r2"]);
+    expect(Object.keys(DISPATCH_OP_REGISTRY).sort()).toEqual([
+      "cache-purge",
+      "dns-record-upsert",
+      "provision-r2",
+      "wp-cli",
+    ]);
     for (const entry of Object.values(DISPATCH_OP_REGISTRY)) {
       expect(typeof entry.validateParams).toBe("function");
       expect(typeof entry.actuate).toBe("function");
@@ -455,6 +475,71 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(bad({ mode: "hosts", hosts: ["evil.com"] }).ok).toBe(false); // out of zone
     expect(bad({ mode: "hosts", hosts: ["notdoubleyoup.com"] }).ok).toBe(false); // suffix trick
   });
+
+  // ── wp-cli (twin of the app's rules) ──────────────────────────────────────────────
+
+  it("wp-cli: accepts BOTH docroot forms (/var/www/<slug> and /sites/<slug>/public) and returns only known keys", () => {
+    expect(validateWpCliParams({ ...WP_CLI_PARAMS, extra: "x" })).toEqual({ ok: true, params: WP_CLI_PARAMS });
+    // Docker-era /var/www form.
+    expect(validateWpCliParams({ docroot: "/var/www/site1", args: ["cache"] }).ok).toBe(true);
+    // Storage-tier /sites/<slug>/public form — the live cell layout, incl. real dogfood slugs.
+    expect(validateWpCliParams({ docroot: "/sites/geelongns/public", args: ["option", "get", "siteurl"] }).ok).toBe(true);
+    expect(validateWpCliParams({ docroot: "/sites/docs-892769/public", args: ["cache"] }).ok).toBe(true);
+    expect(validateWpCliParams({ docroot: "/sites/rareepicgamer-19f933/public", args: ["cache"] }).ok).toBe(true);
+    // A 30-arg list is the max.
+    expect(
+      validateWpCliParams({ docroot: "/var/www/a", args: Array.from({ length: 30 }, (_, i) => `a${i}`) }).ok,
+    ).toBe(true);
+  });
+
+  it("wp-cli: rejects a bad docroot (wrong root, traversal, trailing slash, extra/short segment, bad slug, metachars)", () => {
+    const bad = (docroot: unknown) => validateWpCliParams({ docroot, args: ["option", "get", "siteurl"] });
+    expect(validateWpCliParams(null).ok).toBe(false);
+    expect(validateWpCliParams("string").ok).toBe(false);
+    expect(bad(42).ok).toBe(false);
+    expect(bad("").ok).toBe(false);
+    expect(bad("/etc/passwd").ok).toBe(false); // wrong root
+    expect(bad("relative/path").ok).toBe(false); // not absolute
+    // /var/www/<slug> form
+    expect(bad("/var/www/").ok).toBe(false); // no slug
+    expect(bad("/var/www/site/").ok).toBe(false); // trailing slash
+    expect(bad("/var/www/site/public").ok).toBe(false); // extra path segment
+    expect(bad("/var/www/../etc").ok).toBe(false); // traversal
+    expect(bad("/var/www/../../etc/passwd").ok).toBe(false); // traversal
+    expect(bad("/var/www/Site").ok).toBe(false); // uppercase slug
+    expect(bad("/var/www/site;rm").ok).toBe(false); // shell metachar
+    expect(bad("/var/www/site space").ok).toBe(false); // space
+    // /sites/<slug>/public form
+    expect(bad("/sites//public").ok).toBe(false); // empty slug
+    expect(bad("/sites/site").ok).toBe(false); // missing /public suffix
+    expect(bad("/sites/site/private").ok).toBe(false); // non-/public suffix
+    expect(bad("/sites/site/public/").ok).toBe(false); // trailing slash
+    expect(bad("/sites/site/public/wp").ok).toBe(false); // extra path segment past /public
+    expect(bad("/sites/x/public/../..").ok).toBe(false); // traversal
+    expect(bad("/sites/Site/public").ok).toBe(false); // uppercase slug
+    expect(bad("/sites/site;rm/public").ok).toBe(false); // shell metachar in slug
+    expect(bad("/sites/site space/public").ok).toBe(false); // space
+  });
+
+  it("wp-cli: rejects a bad args list (missing, empty, oversized, non-string, empty entry, mega-string)", () => {
+    const bad = (args: unknown) => validateWpCliParams({ docroot: "/var/www/example", args });
+    expect(bad(undefined).ok).toBe(false); // missing
+    expect(bad("option get siteurl").ok).toBe(false); // not an array
+    expect(bad([]).ok).toBe(false); // empty
+    expect(bad(Array.from({ length: 31 }, () => "x")).ok).toBe(false); // oversized
+    expect(bad(["option", 42]).ok).toBe(false); // non-string entry
+    expect(bad(["option", ""]).ok).toBe(false); // empty entry
+    expect(bad(["option", "a".repeat(8193)]).ok).toBe(false); // over per-arg cap
+  });
+
+  it("wp-cli: does NOT reject metacharacters in args (they are shell-quoted by the actuator, not banned here)", () => {
+    // The injection defense is per-arg shell-quoting in the actuator, NOT charset-banning here —
+    // a real wp-cli value can legitimately contain these characters, so validation must accept them.
+    expect(validateWpCliParams({ docroot: "/var/www/example", args: ["option", "update", "blogname", "A; B & C"] }).ok).toBe(true);
+    expect(validateWpCliParams({ docroot: "/var/www/example", args: ["eval", "$(reboot)"] }).ok).toBe(true);
+    expect(validateWpCliParams({ docroot: "/var/www/example", args: ["x", "`id`"] }).ok).toBe(true);
+    expect(validateWpCliParams({ docroot: "/var/www/example", args: ["say", "it's \"quoted\""] }).ok).toBe(true);
+  });
 });
 
 describe("POST /actuate route", () => {
@@ -493,6 +578,8 @@ describe("POST /actuate route", () => {
       DY_SIGNING_PUBLIC_KEY: publicKeyPem,
       R2_PROVISION_API_TOKEN: "cf-token-xyz",
       CF_DNS_API_TOKEN: "cf-dns-token-abc",
+      CELL_AGENT_URL: "https://cell.example.test",
+      CELL_AGENT_TOKEN: "cell-token-123",
       NONCE_STORE: freshNonceStore,
       ...overrides,
     };
@@ -978,6 +1065,212 @@ describe("POST /actuate route", () => {
     expect(response.status).toBe(400);
     const body = (await response.json()) as { reason: string };
     expect(body.reason).toMatch(/within zone/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── wp-cli through the registry ───────────────────────────────────────────────────
+  // The cell-agent's /exec: POST { script, docroot, timeoutMs }, Authorization: Bearer <token>,
+  // answers HTTP 200 with { code, stdout, stderr } (even for a non-zero code). The critical
+  // assertions here are that a metacharacter-laden arg is SHELL-QUOTED into one literal token
+  // (command-injection defense), and that the agency's OWN cell token is used, never a platform
+  // credential.
+  function mockCellAgent(
+    reply: { code?: number; stdout?: string; stderr?: string; error?: string },
+    status = 200,
+  ) {
+    const calls: Array<{
+      url: string;
+      method: string;
+      auth: string | null;
+      body: { script?: string; docroot?: string; timeoutMs?: number };
+    }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = urlOf(input);
+      const method = init?.method ?? "GET";
+      const auth = new Headers(init?.headers).get("authorization");
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      calls.push({ url, method, auth, body });
+      if (url.endsWith("/exec") && method === "POST") {
+        return jsonResponse(reply, status);
+      }
+      throw new Error(`unexpected fetch ${method} ${url}`);
+    });
+    return calls;
+  }
+
+  it("wp-cli: relays `wp <args>` to the cell-agent /exec using CELL_AGENT_TOKEN only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCellAgent({ code: 0, stdout: "https://example.test\n", stderr: "" });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "wp-cli",
+      exitCode: 0,
+      stdout: "https://example.test\n",
+      stderr: "",
+    });
+    expect(calls).toHaveLength(1);
+    const call = calls[0];
+    expect(call.url).toBe("https://cell.example.test/exec");
+    expect(call.method).toBe("POST");
+    // The agency's OWN cell token — never a platform / Cloudflare credential.
+    expect(call.auth).toBe("Bearer cell-token-123");
+    expect(call.auth).not.toContain("cf-token-xyz");
+    expect(call.auth).not.toContain("cf-dns-token-abc");
+    expect(call.body.docroot).toBe("/var/www/example");
+    // Each arg is single-quoted: `wp 'option' 'get' 'siteurl'`.
+    expect(call.body.script).toBe("wp 'option' 'get' 'siteurl'");
+  });
+
+  it("wp-cli: SHELL-QUOTES a metacharacter-laden arg into ONE literal token (command-injection defense)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob({
+      params: JSON.stringify({ docroot: "/var/www/example", args: ["option", "get", "; rm -rf /"] }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCellAgent({ code: 0, stdout: "", stderr: "" });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    // The dangerous arg is a SINGLE single-quoted token — the cell-agent's `sh -lc` hands it to
+    // wp-cli literally and never interprets the `;` or runs `rm`.
+    expect(calls[0].body.script).toBe("wp 'option' 'get' '; rm -rf /'");
+  });
+
+  it("wp-cli: command-substitution + backtick args are quoted literally (no shell interpretation)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob({
+      params: JSON.stringify({ docroot: "/var/www/example", args: ["eval", "$(reboot)", "`id`"] }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCellAgent({ code: 0, stdout: "", stderr: "" });
+
+    await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(calls[0].body.script).toBe("wp 'eval' '$(reboot)' '`id`'");
+  });
+
+  it("wp-cli: an embedded single quote is escaped as '\\'' and stays one token", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob({
+      params: JSON.stringify({ docroot: "/var/www/example", args: ["eval", "echo 'pwned'"] }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCellAgent({ code: 0, stdout: "", stderr: "" });
+
+    await worker.fetch(actuateRequest({ job, signature }), envWith());
+    // POSIX close-quote / escaped-quote / reopen-quote: 'echo '\''pwned'\''' is one literal arg.
+    expect(calls[0].body.script).toBe("wp 'eval' 'echo '\\''pwned'\\'''");
+  });
+
+  it("wp-cli: fails closed (ok:false) when the cell-agent reply exceeds the byte cap (no OOM)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob();
+    const signature = await signAsApp(job, privateKey);
+    // A reply whose stdout alone is > 1 MiB — the Worker must STOP reading the stream and fail,
+    // never buffer the whole body (that is the OOM footgun this cap closes).
+    const huge = "a".repeat(1024 * 1024 + 1024);
+    mockCellAgent({ code: 0, stdout: huge, stderr: "" });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/output exceeded/);
+  });
+
+  it("wp-cli: a large-but-under-cap reply streams + parses; the RETURN is truncated to the relay cap", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob();
+    const signature = await signAsApp(job, privateKey);
+    // 100 KiB stdout: under the 1 MiB memory cap (so it succeeds) but over the 64 KiB relay cap
+    // (so the RETURN payload is truncated — the two caps are different concerns).
+    const bigButOk = "b".repeat(100 * 1024);
+    mockCellAgent({ code: 0, stdout: bigButOk, stderr: "" });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; stdout: string };
+    expect(body.ok).toBe(true);
+    expect(body.stdout.length).toBeLessThan(100 * 1024);
+    expect(body.stdout).toMatch(/\[truncated\]$/);
+  });
+
+  it("wp-cli: a non-zero exit code is a successful exec (ok:true) with the code carried back", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob();
+    const signature = await signAsApp(job, privateKey);
+    mockCellAgent({ code: 1, stdout: "", stderr: "Error: option not found" });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "wp-cli",
+      exitCode: 1,
+      stdout: "",
+      stderr: "Error: option not found",
+    });
+  });
+
+  it("wp-cli: a cell-agent 401 becomes a clean ok:false (no bypass)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob();
+    const signature = await signAsApp(job, privateKey);
+    mockCellAgent({ error: "unauthorized" }, 401);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/rejected CELL_AGENT_TOKEN/);
+  });
+
+  it("wp-cli: a cell-agent 400 (e.g. bad docroot on the VM) surfaces as ok:false, still HTTP 200", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob();
+    const signature = await signAsApp(job, privateKey);
+    mockCellAgent({ error: "docroot must be under /var/www or /sites/<slug>/public" }, 400);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/cell-agent \/exec failed with HTTP 400/);
+  });
+
+  it("wp-cli: reports a clean failure and touches NO cell-agent when CELL_AGENT_URL/TOKEN are missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ CELL_AGENT_URL: undefined, CELL_AGENT_TOKEN: undefined }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/CELL_AGENT_URL \/ CELL_AGENT_TOKEN are not configured/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("wp-cli: a signed job with an invalid docroot is 400 with no cell-agent call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob({
+      params: JSON.stringify({ docroot: "/var/www/../etc", args: ["option", "get", "siteurl"] }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { reason: string };
+    expect(body.reason).toMatch(/docroot must be/);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

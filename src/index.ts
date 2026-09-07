@@ -15,9 +15,10 @@
 //   POST /actuate   — Direction-B: run a SIGNED job (ed25519) the platform dispatched
 //                     through us, using the AGENCY's own credentials. Ops live in the
 //                     registry (src/ops.ts): provision-r2 (create an R2 bucket),
-//                     dns-record-upsert (upsert a record in an agency zone), and
-//                     cache-purge (purge an agency zone's cache). Verified before any
-//                     side effect.
+//                     dns-record-upsert (upsert a record in an agency zone),
+//                     cache-purge (purge an agency zone's cache), and wp-cli (run a
+//                     wp-cli command on the agency's cell via its on-VM cell-agent).
+//                     Verified before any side effect.
 //
 // NOTE on inbound auth: /validate and /complete are Phase-1 endpoints the agency
 // triggers themselves, so they are intentionally open. /actuate is the Direction-B

@@ -287,6 +287,86 @@ export function validateCachePurgeParams(raw: unknown): ParamsVerdict<CachePurge
   return { ok: false, reason: `mode must be one of ${CACHE_PURGE_MODES.join(", ")}` };
 }
 
+// ── wp-cli ─────────────────────────────────────────────────────────────────────────
+// Run a wp-cli command in a cell site's docroot, through the on-VM cell-agent (the first
+// "heavy"/data-plane Direction-B op — see actuate.ts::actuateWpCli). Unlike the Cloudflare
+// ops above, this actuates ON THE AGENCY's cell, so the security burden shifts:
+//
+//   1. `docroot` selects the WORKING DIRECTORY the command runs in, pinned to a strict grammar —
+//      an absolute /var/www/<slug> OR /sites/<slug>/public path, lowercase slug, NOTHING else.
+//      The grammar admits no "..", no trailing slash, no extra path segment, and no shell
+//      metacharacter, so a traversal or an injected-path attack cannot pass this gate (the
+//      cell-agent then re-guards it with realpath under its allowed roots). But `docroot` is NOT
+//      the only thing that selects which SITE the command touches: `args` are unrestricted by
+//      design (safety is the quoting, not a charset), so a wp-cli flag like
+//      `--path=/var/www/otherslug` is passed literally and would redirect wp-cli elsewhere. On
+//      the storage tier the per-site OS user + NFS root_squash contain such a cross-site
+//      `--path`; on the /var/www Docker-era path the command runs as shared `www-data`, so
+//      `docroot` alone does NOT isolate. A future caller that forwards tenant-influenced args
+//      must not rely on `docroot` for cross-tenant isolation.
+//   2. `args` are the wp-cli arguments and are DELIBERATELY not charset-restricted — a real
+//      wp-cli value can legitimately contain spaces, quotes, "$", ";", etc. (e.g.
+//      `wp option update blogname "A; B & C"`). They are made safe NOT by rejecting
+//      metacharacters here but by SHELL-QUOTING each one in the actuator (actuate.ts), so
+//      every arg reaches wp-cli as exactly one literal token. We only bound the count + size.
+
+export interface WpCliParams {
+  /** The site's docroot on the cell, e.g. "/var/www/<slug>" — selects the target site. */
+  docroot: string;
+  /** The wp-cli arguments, e.g. ["option","get","siteurl"] — 1..30 non-empty strings. */
+  args: string[];
+}
+
+// An absolute cell docroot in one of the two forms the cell-agent's /exec guard accepts:
+//   - /var/www/<slug>       (Docker-era sites), OR
+//   - /sites/<slug>/public  (storage-tier sites — the live cell layout, run under the site's
+//                            own per-site OS user via the agent's setpriv path).
+// <slug> is a lowercase DNS-style label (starts alphanumeric, then up to 63 of [a-z0-9-]).
+// Anchored at both ends, so there is no "..", no trailing slash, no extra path segment, and no
+// shell metacharacter — the docroot can only ever name one real site directory.
+const WP_CLI_DOCROOT_RE =
+  /^(\/var\/www\/[a-z0-9][a-z0-9-]{0,63}|\/sites\/[a-z0-9][a-z0-9-]{0,63}\/public)$/;
+// A wp-cli invocation is a handful of short arguments; 30 is generous and stops a junk mega-list.
+const WP_CLI_ARGS_MAX = 30;
+// A generous per-argument ceiling — long enough for a real option value or a serialized blob,
+// short enough to reject a junk mega-string.
+const WP_CLI_ARG_MAX_LENGTH = 8192;
+
+export function validateWpCliParams(raw: unknown): ParamsVerdict<WpCliParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { docroot, args } = raw;
+
+  if (typeof docroot !== "string" || !WP_CLI_DOCROOT_RE.test(docroot)) {
+    return {
+      ok: false,
+      reason:
+        "docroot must be an absolute cell docroot (/var/www/<slug> or /sites/<slug>/public) with a lowercase slug, no '..', no trailing slash, no extra path segment",
+    };
+  }
+  if (!Array.isArray(args) || args.length < 1 || args.length > WP_CLI_ARGS_MAX) {
+    return { ok: false, reason: `args must be an array of 1-${WP_CLI_ARGS_MAX} wp-cli argument strings` };
+  }
+  // Build a FRESH array of only the validated string entries — never the caller's array — so an
+  // extra element property can't ride along into the signed params. Reject empty/oversized/
+  // non-string entries, but NOT metacharacters: the actuator shell-quotes each arg (that is
+  // what makes an arbitrary value safe), so charset-restricting here would only break valid
+  // wp-cli values without adding safety.
+  const cleanArgs: string[] = [];
+  for (const entry of args) {
+    if (typeof entry !== "string" || entry.length === 0 || entry.length > WP_CLI_ARG_MAX_LENGTH) {
+      return {
+        ok: false,
+        reason: `each args entry must be a non-empty string (max ${WP_CLI_ARG_MAX_LENGTH} chars)`,
+      };
+    }
+    cleanArgs.push(entry);
+  }
+
+  return { ok: true, params: { docroot, args: cleanArgs } };
+}
+
 // ── shared ─────────────────────────────────────────────────────────────────────────
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
