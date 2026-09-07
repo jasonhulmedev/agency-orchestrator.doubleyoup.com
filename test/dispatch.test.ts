@@ -1166,6 +1166,39 @@ describe("POST /actuate route", () => {
     expect(calls[0].body.script).toBe("wp 'eval' 'echo '\\''pwned'\\'''");
   });
 
+  it("wp-cli: fails closed (ok:false) when the cell-agent reply exceeds the byte cap (no OOM)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob();
+    const signature = await signAsApp(job, privateKey);
+    // A reply whose stdout alone is > 1 MiB — the Worker must STOP reading the stream and fail,
+    // never buffer the whole body (that is the OOM footgun this cap closes).
+    const huge = "a".repeat(1024 * 1024 + 1024);
+    mockCellAgent({ code: 0, stdout: huge, stderr: "" });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/output exceeded/);
+  });
+
+  it("wp-cli: a large-but-under-cap reply streams + parses; the RETURN is truncated to the relay cap", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob();
+    const signature = await signAsApp(job, privateKey);
+    // 100 KiB stdout: under the 1 MiB memory cap (so it succeeds) but over the 64 KiB relay cap
+    // (so the RETURN payload is truncated — the two caps are different concerns).
+    const bigButOk = "b".repeat(100 * 1024);
+    mockCellAgent({ code: 0, stdout: bigButOk, stderr: "" });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; stdout: string };
+    expect(body.ok).toBe(true);
+    expect(body.stdout.length).toBeLessThan(100 * 1024);
+    expect(body.stdout).toMatch(/\[truncated\]$/);
+  });
+
   it("wp-cli: a non-zero exit code is a successful exec (ok:true) with the code carried back", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const job = wpCliJob();

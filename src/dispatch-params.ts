@@ -292,12 +292,18 @@ export function validateCachePurgeParams(raw: unknown): ParamsVerdict<CachePurge
 // "heavy"/data-plane Direction-B op — see actuate.ts::actuateWpCli). Unlike the Cloudflare
 // ops above, this actuates ON THE AGENCY's cell, so the security burden shifts:
 //
-//   1. `docroot` is the ONLY thing that selects WHICH site runs the command, so it is pinned
-//      to a strict grammar — an absolute /var/www/<slug> OR /sites/<slug>/public path,
-//      lowercase slug, NOTHING else. The grammar admits no "..", no trailing slash, no extra
-//      path segment, and no shell metacharacter, so a traversal or an injected-path attack
-//      cannot pass this gate (the cell-agent then re-guards it with realpath under its allowed
-//      roots; a /sites/<slug>/public docroot runs under the site's own per-site OS user).
+//   1. `docroot` selects the WORKING DIRECTORY the command runs in, pinned to a strict grammar —
+//      an absolute /var/www/<slug> OR /sites/<slug>/public path, lowercase slug, NOTHING else.
+//      The grammar admits no "..", no trailing slash, no extra path segment, and no shell
+//      metacharacter, so a traversal or an injected-path attack cannot pass this gate (the
+//      cell-agent then re-guards it with realpath under its allowed roots). But `docroot` is NOT
+//      the only thing that selects which SITE the command touches: `args` are unrestricted by
+//      design (safety is the quoting, not a charset), so a wp-cli flag like
+//      `--path=/var/www/otherslug` is passed literally and would redirect wp-cli elsewhere. On
+//      the storage tier the per-site OS user + NFS root_squash contain such a cross-site
+//      `--path`; on the /var/www Docker-era path the command runs as shared `www-data`, so
+//      `docroot` alone does NOT isolate. A future caller that forwards tenant-influenced args
+//      must not rely on `docroot` for cross-tenant isolation.
 //   2. `args` are the wp-cli arguments and are DELIBERATELY not charset-restricted — a real
 //      wp-cli value can legitimately contain spaces, quotes, "$", ";", etc. (e.g.
 //      `wp option update blogname "A; B & C"`). They are made safe NOT by rejecting

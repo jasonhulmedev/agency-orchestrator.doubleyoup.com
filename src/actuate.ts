@@ -460,9 +460,20 @@ export async function actuateCachePurge(params: CachePurgeParams, env: Env): Pro
 // multi-cell agency needs per-cell resolution (a cell selector in the params + a map of
 // URL/token pairs) before this op can target more than one cell.
 
-// A conservative cap on how much stdout/stderr the Worker relays back. wp-cli output can be
-// large (e.g. a DB export echoed to stdout); truncate so the actuate response stays bounded.
+// A conservative cap on how much stdout/stderr the Worker RELAYS BACK to the orchestrator.
+// This bounds the RETURN payload ONLY — it does NOT bound the Worker's memory (by the time
+// truncateOutput runs, the whole reply is already parsed in memory). Worker memory is bounded
+// separately by WP_CLI_RESPONSE_MAX_BYTES below, which stops reading the stream before a huge
+// reply can be buffered.
 const WP_CLI_OUTPUT_MAX_CHARS = 64 * 1024;
+// A HARD cap on how many bytes of the cell-agent reply the Worker will buffer at all. A signed
+// command with very large output (e.g. `wp db export -`, or `wp eval` echoing a big string)
+// makes the agent return a multi-MB/GB body; buffering it whole would exhaust the Worker's
+// 128 MB and turn a success into a 500. We read the response as a STREAM and abort past this
+// cap, failing closed rather than OOMing. GENUINELY large-output ops (DB export, media dumps)
+// must stream to R2 directly, NOT return through the Worker — this op is for small-output
+// commands (reads, single option writes), and this cap enforces that.
+const WP_CLI_RESPONSE_MAX_BYTES = 1024 * 1024;
 // The cell-agent's /exec default timeout is 60s; send the same explicit bound. A read-only
 // command finishes well inside this.
 const WP_CLI_EXEC_TIMEOUT_MS = 60_000;
@@ -482,6 +493,54 @@ function shellQuoteArg(arg: string): string {
 function truncateOutput(text: string): string {
   if (text.length <= WP_CLI_OUTPUT_MAX_CHARS) return text;
   return text.slice(0, WP_CLI_OUTPUT_MAX_CHARS) + "\n…[truncated]";
+}
+
+/**
+ * Read a Response body as a STREAM, accumulating at most `capBytes` bytes. If the body exceeds
+ * the cap, STOP reading (cancel the stream — never buffer the rest) and report overflow. This is
+ * what keeps a huge cell-agent reply from exhausting the Worker's memory: we fail closed instead
+ * of OOMing. On success the accumulated bytes (<= cap) are decoded to a UTF-8 string for the
+ * caller to JSON.parse.
+ */
+async function readBodyCapped(
+  response: Response,
+  capBytes: number,
+): Promise<{ ok: true; text: string } | { ok: false; detail: string }> {
+  const stream = response.body;
+  if (!stream) {
+    return { ok: false, detail: "cell-agent returned no response body." };
+  }
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > capBytes) {
+        // Past the cap: drop what we have and stop reading — do NOT buffer the rest (the whole
+        // point of the cap is that a huge reply never lands in Worker memory).
+        await reader.cancel().catch(() => {});
+        return {
+          ok: false,
+          detail: `cell-agent output exceeded ${capBytes} bytes (${Math.round(capBytes / 1024)} KiB) — this op is for small-output commands; large-output ops (e.g. wp db export) must stream to R2, not return through the Worker.`,
+        };
+      }
+      chunks.push(value);
+    }
+  } catch (err) {
+    return { ok: false, detail: `error reading cell-agent response: ${errorMessage(err)}` };
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { ok: true, text: new TextDecoder().decode(merged) };
 }
 
 function wpCliFailure(detail: string): WpCliResult {
@@ -531,16 +590,30 @@ export async function actuateWpCli(params: WpCliParams, env: Env): Promise<WpCli
   }
 
   if (response.status === 401 || response.status === 403) {
-    await response.text().catch(() => "");
+    await response.body?.cancel().catch(() => {});
     return wpCliFailure("the cell-agent rejected CELL_AGENT_TOKEN (bearer auth failed).");
   }
 
-  const body = (await response.json().catch(() => null)) as
-    | { code?: number; stdout?: string; stderr?: string; error?: string }
-    | null;
+  // Read the reply as a STREAM with a hard byte cap so a very large output cannot make the
+  // Worker buffer a multi-MB/GB body and exhaust its 128 MB memory (see WP_CLI_RESPONSE_MAX_BYTES).
+  // The cell-agent's own error bodies (bad json / bad docroot / spawn failure) are tiny, so this
+  // cap only ever trips on a genuinely huge command output — which this op is not for.
+  const read = await readBodyCapped(response, WP_CLI_RESPONSE_MAX_BYTES);
+  if (!read.ok) {
+    return wpCliFailure(read.detail);
+  }
 
-  // A non-200, a missing body, or a body without a numeric `code` is a cell-agent-side error
-  // (bad json, bad docroot, spawn failure, ...), not a completed exec — report it as ok:false.
+  // Only NOW parse — the buffered text is bounded (<= cap). JSON.parse needs the try/catch (no
+  // non-throwing parse); a non-JSON reply is treated as a cell-agent-side error below.
+  let body: { code?: number; stdout?: string; stderr?: string; error?: string } | null;
+  try {
+    body = JSON.parse(read.text) as { code?: number; stdout?: string; stderr?: string; error?: string };
+  } catch {
+    body = null;
+  }
+
+  // A non-200, a missing/non-JSON body, or a body without a numeric `code` is a cell-agent-side
+  // error (bad json, bad docroot, spawn failure, ...), not a completed exec — report it as ok:false.
   if (!response.ok || !body || typeof body.code !== "number") {
     const detail = body?.error ? `: ${body.error}` : "";
     return wpCliFailure(`cell-agent /exec failed with HTTP ${response.status}${detail}.`);
