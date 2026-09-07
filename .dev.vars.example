@@ -28,6 +28,12 @@ R2_PROVISION_API_TOKEN=""
 # the platform may manage (Direction-B dns-record-upsert actuator).
 CF_DNS_API_TOKEN=""
 
+# Cell-agent access (Direction-B wp-cli actuator) — the base URL of the agency's OWN
+# on-VM cell-agent and its bearer token. The wp-cli op POSTs a shell-quoted `wp <args>`
+# to ${CELL_AGENT_URL}/exec with this bearer token. Single-cell in v1. Set BOTH together.
+CELL_AGENT_URL=""
+CELL_AGENT_TOKEN=""
+
 # AI providers — set at least one (OPENAI_API_KEY also covers Codex)
 ANTHROPIC_API_KEY=""
 OPENROUTER_API_KEY=""

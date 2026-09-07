@@ -69,6 +69,22 @@ export interface Env {
   // for real on first use. Set only as a Worker secret, never in [vars].
   CF_DNS_API_TOKEN?: string;
 
+  // ── Direction-B cell-agent access (secrets) ───────────────────────────────
+  // The agency's OWN on-VM cell-agent — the base URL of the cell-agent this
+  // agency runs (e.g. "https://cell-syd.doubleyoup.com") and its bearer token.
+  // Used ONLY by the Direction-B `wp-cli` actuator (src/actuate.ts::actuateWpCli),
+  // which POSTs a shell-quoted `wp <args>` command to `${CELL_AGENT_URL}/exec`
+  // with `Authorization: Bearer ${CELL_AGENT_TOKEN}` — the agency's own cell
+  // credential, never a platform credential. If EITHER is missing the actuator
+  // returns a clean ok:false and makes no call. Set only as Worker secrets, never
+  // in wrangler.toml [vars].
+  //
+  // v1 LIMITATION: single-cell (one agency cell). A multi-cell agency needs
+  // per-cell resolution (a cell selector + a map of URL/token pairs) before
+  // wp-cli can target more than one cell.
+  CELL_AGENT_URL?: string;
+  CELL_AGENT_TOKEN?: string;
+
   // AI provider keys.
   ANTHROPIC_API_KEY?: string;
   OPENROUTER_API_KEY?: string;
