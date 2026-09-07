@@ -40,7 +40,10 @@ export interface Env {
   // Google Cloud service-account key — the entire downloaded JSON as one string.
   GCP_SERVICE_ACCOUNT_KEY?: string;
 
-  // S3 (or any S3-compatible store, e.g. R2 via S3_ENDPOINT).
+  // S3 (or any S3-compatible store, e.g. R2 via S3_ENDPOINT). Probed by /validate's
+  // write probe, and used by the Direction-B `db-export` actuator to PRESIGN a
+  // single-object PUT URL the agency's cell uploads a DB dump to — the credential
+  // itself never leaves this Worker (only the derived, short-lived URL reaches the cell).
   S3_ACCESS_KEY_ID?: string;
   S3_SECRET_ACCESS_KEY?: string;
   S3_REGION?: string;
@@ -72,16 +75,16 @@ export interface Env {
   // ── Direction-B cell-agent access (secrets) ───────────────────────────────
   // The agency's OWN on-VM cell-agent — the base URL of the cell-agent this
   // agency runs (e.g. "https://cell-syd.doubleyoup.com") and its bearer token.
-  // Used ONLY by the Direction-B `wp-cli` actuator (src/actuate.ts::actuateWpCli),
-  // which POSTs a shell-quoted `wp <args>` command to `${CELL_AGENT_URL}/exec`
-  // with `Authorization: Bearer ${CELL_AGENT_TOKEN}` — the agency's own cell
-  // credential, never a platform credential. If EITHER is missing the actuator
-  // returns a clean ok:false and makes no call. Set only as Worker secrets, never
-  // in wrangler.toml [vars].
+  // Used ONLY by the Direction-B cell actuators (src/actuate.ts): `wp-cli` POSTs a
+  // shell-quoted `wp <args>` command and `db-export` POSTs a DB-export-and-upload
+  // script, both to `${CELL_AGENT_URL}/exec` with `Authorization: Bearer
+  // ${CELL_AGENT_TOKEN}` — the agency's own cell credential, never a platform
+  // credential. If EITHER is missing the actuator returns a clean ok:false and
+  // makes no call. Set only as Worker secrets, never in wrangler.toml [vars].
   //
   // v1 LIMITATION: single-cell (one agency cell). A multi-cell agency needs
   // per-cell resolution (a cell selector + a map of URL/token pairs) before
-  // wp-cli can target more than one cell.
+  // these ops can target more than one cell.
   CELL_AGENT_URL?: string;
   CELL_AGENT_TOKEN?: string;
 

@@ -1,10 +1,11 @@
 // Direction-B ACTUATION (agency Worker side). Runs a verified job using the AGENCY's
 // OWN credentials — R2_PROVISION_API_TOKEN to create an R2 bucket, CF_DNS_API_TOKEN to
-// upsert a DNS record / purge cache in one of the agency's zones, and (the first "heavy"
-// data-plane op) CELL_AGENT_TOKEN to run a wp-cli command on the agency's own cell via its
-// on-VM cell-agent. There is deliberately NO platform credential anywhere in this Worker to
-// fall back to: if the agency's token is missing or unauthorized, actuation fails cleanly
-// rather than reaching for ours.
+// upsert a DNS record / purge cache in one of the agency's zones, CELL_AGENT_TOKEN to run
+// a wp-cli command on the agency's own cell via its on-VM cell-agent (the first "heavy"
+// data-plane op), and — for `db-export` — the agency's S3_* object-store credential to
+// PRESIGN a URL the cell uploads a DB dump to. There is deliberately NO platform
+// credential anywhere in this Worker to fall back to: if the agency's token is missing or
+// unauthorized, actuation fails cleanly rather than reaching for ours.
 //
 // Every actuator here runs ONLY after dispatch-verify.ts::verifyDispatch returned ok:true,
 // the nonce was consumed, and the op's params validated (index.ts::handleActuate via
@@ -17,8 +18,9 @@
 // ever string-interpolated into a URL.
 
 import type { Env } from "./env.js";
-import type { DnsRecordUpsertParams, CachePurgeParams, WpCliParams } from "./dispatch-params.js";
-import { errorMessage } from "./util.js";
+import type { DnsRecordUpsertParams, CachePurgeParams, WpCliParams, DbExportParams } from "./dispatch-params.js";
+import { presignS3Put } from "./sigv4.js";
+import { errorMessage, stripTrailingSlash } from "./util.js";
 
 const CF_API = "https://api.cloudflare.com/client/v4";
 
@@ -38,7 +40,18 @@ export type WpCliResult =
   | { ok: true; op: "wp-cli"; exitCode: number; stdout: string; stderr: string }
   | { ok: false; op: "wp-cli"; detail: string };
 
-export type ActuateResult = ProvisionR2Result | DnsRecordUpsertResult | CachePurgeResult | WpCliResult;
+// Deliberately SMALL: the dump itself never comes back through the Worker (it went cell -> object
+// store), and the presigned URL is never echoed — only the key the caller already chose.
+export type DbExportResult =
+  | { ok: true; op: "db-export"; objectKey: string; exitCode: 0 }
+  | { ok: false; op: "db-export"; objectKey: string; detail: string; exitCode?: number };
+
+export type ActuateResult =
+  | ProvisionR2Result
+  | DnsRecordUpsertResult
+  | CachePurgeResult
+  | WpCliResult
+  | DbExportResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -548,6 +561,96 @@ function wpCliFailure(detail: string): WpCliResult {
 }
 
 /**
+ * The outcome of ONE cell-agent /exec call, as the cell ops see it: either the exec COMPLETED
+ * (any exit code — interpreting it is the op's job) or the relay itself failed (unreachable,
+ * redirected, auth rejected, oversized reply, agent-side error) with a ready-to-return detail.
+ */
+type CellAgentExecOutcome =
+  | { ok: true; code: number; stdout: string; stderr: string }
+  | { ok: false; detail: string };
+
+/**
+ * POST a script to the agency's cell-agent /exec and read the bounded reply. This is the ONE
+ * relay both cell ops (wp-cli, db-export) share, so the fail-closed rules live in one place:
+ * refuse redirects, surface an auth rejection cleanly, cap the reply in memory, and treat any
+ * non-200 / non-JSON / code-less body as a cell-agent-side error rather than a completed exec.
+ * The caller has already checked CELL_AGENT_URL / CELL_AGENT_TOKEN are configured.
+ */
+async function execOnCellAgent(
+  cellAgentUrl: string,
+  cellAgentToken: string,
+  request: { script: string; docroot: string; timeoutMs: number },
+): Promise<CellAgentExecOutcome> {
+  // The exact request shape the cell-agent's /exec endpoint accepts (infra/cell-agent/agent.php):
+  // POST /exec, Authorization: Bearer <token>, body { script, docroot, timeoutMs }. It answers
+  // HTTP 200 with { code, stdout, stderr } even when the command's exit code is non-zero.
+  let response: Response;
+  try {
+    response = await fetch(stripTrailingSlash(cellAgentUrl) + "/exec", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${cellAgentToken}`,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify({
+        script: request.script,
+        docroot: request.docroot,
+        timeoutMs: request.timeoutMs,
+      }),
+      // "manual", NOT "error": workerd does not implement redirect:"error" and throws at runtime
+      // ("Invalid redirect value ... use manual and check the response status code"). We still
+      // refuse to FOLLOW a redirect (a signed job must reach the configured cell-agent, not be
+      // bounced elsewhere), so we ask for the redirect verbatim and reject it below — preserving
+      // the original "don't silently follow" intent that redirect:"error" was reaching for.
+      redirect: "manual",
+    });
+  } catch (err) {
+    return { ok: false, detail: `could not reach the cell-agent /exec: ${errorMessage(err)}` };
+  }
+
+  // The cell-agent should never 3xx. With redirect:"manual" a redirect surfaces as either an
+  // opaqueredirect response (status 0) or a 3xx status — treat EITHER as a fail-closed error
+  // rather than following it: a redirect means a misconfigured CELL_AGENT_URL, not a valid exec.
+  if (response.status === 0 || (response.status >= 300 && response.status < 400)) {
+    await response.body?.cancel().catch(() => {});
+    return { ok: false, detail: `cell-agent redirected unexpectedly (HTTP ${response.status}) — refusing to follow.` };
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    await response.body?.cancel().catch(() => {});
+    return { ok: false, detail: "the cell-agent rejected CELL_AGENT_TOKEN (bearer auth failed)." };
+  }
+
+  // Read the reply as a STREAM with a hard byte cap so a very large output cannot make the
+  // Worker buffer a multi-MB/GB body and exhaust its 128 MB memory (see WP_CLI_RESPONSE_MAX_BYTES).
+  // The cell-agent's own error bodies (bad json / bad docroot / spawn failure) are tiny, so this
+  // cap only ever trips on a genuinely huge command output — which neither cell op is for.
+  const read = await readBodyCapped(response, WP_CLI_RESPONSE_MAX_BYTES);
+  if (!read.ok) {
+    return { ok: false, detail: read.detail };
+  }
+
+  // Only NOW parse — the buffered text is bounded (<= cap). JSON.parse needs the try/catch (no
+  // non-throwing parse); a non-JSON reply is treated as a cell-agent-side error below.
+  let body: { code?: number; stdout?: string; stderr?: string; error?: string } | null;
+  try {
+    body = JSON.parse(read.text) as { code?: number; stdout?: string; stderr?: string; error?: string };
+  } catch {
+    body = null;
+  }
+
+  // A non-200, a missing/non-JSON body, or a body without a numeric `code` is a cell-agent-side
+  // error (bad json, bad docroot, spawn failure, ...), not a completed exec — report it as ok:false.
+  if (!response.ok || !body || typeof body.code !== "number") {
+    const detail = body?.error ? `: ${body.error}` : "";
+    return { ok: false, detail: `cell-agent /exec failed with HTTP ${response.status}${detail}.` };
+  }
+
+  return { ok: true, code: body.code, stdout: body.stdout ?? "", stderr: body.stderr ?? "" };
+}
+
+/**
  * Run `wp <args>` in `params.docroot` on the agency's cell via the cell-agent's /exec endpoint,
  * using the agency's OWN CELL_AGENT_TOKEN. Returns a structured result; a cell-agent-side
  * failure is reported as ok:false + detail (the route still answers HTTP 200, so the
@@ -566,77 +669,166 @@ export async function actuateWpCli(params: WpCliParams, env: Env): Promise<WpCli
   // token, so a metacharacter-laden arg can never be interpreted by the cell-agent's shell.
   const command = `wp ${params.args.map(shellQuoteArg).join(" ")}`;
 
-  // The exact request shape the cell-agent's /exec endpoint accepts (infra/cell-agent/agent.php):
-  // POST /exec, Authorization: Bearer <token>, body { script, docroot, timeoutMs }. It answers
-  // HTTP 200 with { code, stdout, stderr } even when the command's exit code is non-zero.
-  let response: Response;
-  try {
-    response = await fetch(cellAgentUrl.replace(/\/+$/, "") + "/exec", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${cellAgentToken}`,
-        "content-type": "application/json",
-        accept: "application/json",
-      },
-      body: JSON.stringify({
-        script: command,
-        docroot: params.docroot,
-        timeoutMs: WP_CLI_EXEC_TIMEOUT_MS,
-      }),
-      // "manual", NOT "error": workerd does not implement redirect:"error" and throws at runtime
-      // ("Invalid redirect value ... use manual and check the response status code"). We still
-      // refuse to FOLLOW a redirect (a signed job must reach the configured cell-agent, not be
-      // bounced elsewhere), so we ask for the redirect verbatim and reject it below — preserving
-      // the original "don't silently follow" intent that redirect:"error" was reaching for.
-      redirect: "manual",
-    });
-  } catch (err) {
-    return wpCliFailure(`could not reach the cell-agent to run wp-cli: ${errorMessage(err)}`);
-  }
-
-  // The cell-agent should never 3xx. With redirect:"manual" a redirect surfaces as either an
-  // opaqueredirect response (status 0) or a 3xx status — treat EITHER as a fail-closed error
-  // rather than following it: a redirect means a misconfigured CELL_AGENT_URL, not a valid exec.
-  if (response.status === 0 || (response.status >= 300 && response.status < 400)) {
-    await response.body?.cancel().catch(() => {});
-    return wpCliFailure(`cell-agent redirected unexpectedly (HTTP ${response.status}) — refusing to follow.`);
-  }
-
-  if (response.status === 401 || response.status === 403) {
-    await response.body?.cancel().catch(() => {});
-    return wpCliFailure("the cell-agent rejected CELL_AGENT_TOKEN (bearer auth failed).");
-  }
-
-  // Read the reply as a STREAM with a hard byte cap so a very large output cannot make the
-  // Worker buffer a multi-MB/GB body and exhaust its 128 MB memory (see WP_CLI_RESPONSE_MAX_BYTES).
-  // The cell-agent's own error bodies (bad json / bad docroot / spawn failure) are tiny, so this
-  // cap only ever trips on a genuinely huge command output — which this op is not for.
-  const read = await readBodyCapped(response, WP_CLI_RESPONSE_MAX_BYTES);
-  if (!read.ok) {
-    return wpCliFailure(read.detail);
-  }
-
-  // Only NOW parse — the buffered text is bounded (<= cap). JSON.parse needs the try/catch (no
-  // non-throwing parse); a non-JSON reply is treated as a cell-agent-side error below.
-  let body: { code?: number; stdout?: string; stderr?: string; error?: string } | null;
-  try {
-    body = JSON.parse(read.text) as { code?: number; stdout?: string; stderr?: string; error?: string };
-  } catch {
-    body = null;
-  }
-
-  // A non-200, a missing/non-JSON body, or a body without a numeric `code` is a cell-agent-side
-  // error (bad json, bad docroot, spawn failure, ...), not a completed exec — report it as ok:false.
-  if (!response.ok || !body || typeof body.code !== "number") {
-    const detail = body?.error ? `: ${body.error}` : "";
-    return wpCliFailure(`cell-agent /exec failed with HTTP ${response.status}${detail}.`);
+  const exec = await execOnCellAgent(cellAgentUrl, cellAgentToken, {
+    script: command,
+    docroot: params.docroot,
+    timeoutMs: WP_CLI_EXEC_TIMEOUT_MS,
+  });
+  if (!exec.ok) {
+    return wpCliFailure(exec.detail);
   }
 
   return {
     ok: true,
     op: "wp-cli",
-    exitCode: body.code,
-    stdout: truncateOutput(body.stdout ?? ""),
-    stderr: truncateOutput(body.stderr ?? ""),
+    exitCode: exec.code,
+    stdout: truncateOutput(exec.stdout),
+    stderr: truncateOutput(exec.stderr),
   };
+}
+
+// ── db-export ──────────────────────────────────────────────────────────────────────────
+// The first LARGE-OUTPUT Direction-B op: the agency's cell exports a site's WordPress DB and
+// uploads the dump STRAIGHT to the agency's own object store (S3_* — R2 in practice). The dump
+// flows cell -> R2 and never through this Worker (the wp-cli op's byte cap exists precisely
+// because a DB dump must not come back through here). The Worker's only jobs are to:
+//   1. PRESIGN a single-object PUT URL with the agency's S3_* credential (sigv4.ts::presignS3Put).
+//      The URL is the ONLY thing that reaches the cell — it embeds a derived signature, NOT the
+//      secret key, is valid for DB_EXPORT_PRESIGN_EXPIRES_SECONDS, and can do exactly one thing:
+//      PUT that one key. No object-store credential ever lands on the cell.
+//   2. Relay a short script to the cell-agent's /exec (the SAME relay wp-cli uses, with the
+//      agency's own CELL_AGENT_TOKEN) that exports the DB to a temp FILE, `curl --upload-file`s
+//      that file to the presigned URL, and removes the file. A file, not a stream: curl then sends
+//      a Content-Length, whereas a chunked/streamed PUT can be rejected by a presigned S3 PUT.
+//   3. Return a SMALL result: {ok, op, objectKey, exitCode}. Never the dump, never the URL.
+//
+// IDEMPOTENCY (F1): the orchestrator generates `objectKey` ONCE before its retry loop, so a
+// re-signed retry after a transient failure PUTs to the SAME key — an overwrite that converges.
+// That is why `db-export` is registered idempotent (AGENCY_OP_IDEMPOTENT) while wp-cli is not.
+//
+// TIME BUDGET: the presign expiry is the effective export+upload window — R2 checks
+// X-Amz-Date + X-Amz-Expires when the PUT ARRIVES, so the export must finish and the upload
+// begin within it. The exec timeout is set just inside that window. A very large DB may need a
+// wider window, or a streaming/multipart approach, later.
+
+// How long the presigned PUT stays valid, from the moment this Worker mints it.
+const DB_EXPORT_PRESIGN_EXPIRES_SECONDS = 600;
+// The cell-agent kills the exec at this bound. Held just inside the presign window so a slow
+// export is cut off by the agent rather than left uploading to an already-expired URL.
+const DB_EXPORT_EXEC_TIMEOUT_MS = 540_000;
+// How much of the cell's stderr/stdout we quote into a FAILURE detail (each). Enough to see a
+// mysqldump / curl error, small enough to keep the result small.
+const DB_EXPORT_DETAIL_OUTPUT_MAX_CHARS = 2048;
+
+/**
+ * The POSIX-sh script the cell runs (under the cell-agent's `sh -lc "cd <docroot> && <script>"`,
+ * dash on the Debian cells — so no `pipefail`, and one `;`-joined line). Steps:
+ *   set -eu                       fail fast on any error or unset variable
+ *   T=$(mktemp)                   a temp FILE for the dump (local /tmp, not the NFS docroot)
+ *   trap 'rm -f "$T"' EXIT INT TERM  remove the dump on EVERY exit path — success, a failed
+ *                                 export/upload (set -e exits still run EXIT), or a signal
+ *   wp db export "$T" ...         dump the DB to the file (--add-drop-table matches the
+ *                                 platform's own backup dumps; --quiet drops the success line)
+ *   curl --upload-file "$T" URL   PUT the file to the presigned URL (--upload-file implies PUT
+ *                                 and sends Content-Length; --fail-with-body turns an HTTP >= 400
+ *                                 into a non-zero exit AND keeps the store's error body on stdout
+ *                                 for the failure detail; -sS = no progress bar, errors shown)
+ * The presigned URL is single-quoted (shellQuoteArg): it carries `&` and `=`, and although it is
+ * Worker-generated (not attacker data) it is quoted like every other value we hand to a shell.
+ */
+export function buildDbExportScript(presignedUrl: string): string {
+  return [
+    "set -eu",
+    "T=$(mktemp)",
+    `trap 'rm -f "$T"' EXIT INT TERM`,
+    'wp db export "$T" --add-drop-table --quiet',
+    `curl -sS --fail-with-body --upload-file "$T" ${shellQuoteArg(presignedUrl)}`,
+  ].join("; ");
+}
+
+/**
+ * Scrub the presigned URL — and, belt-and-braces, any SigV4 query credential/signature — out of
+ * text we are about to return as a failure detail. curl's error lines do not normally echo the
+ * URL, but the detail must never carry a still-valid upload capability or the access-key ID.
+ */
+function redactPresignedUrl(text: string, presignedUrl: string): string {
+  return text
+    .split(presignedUrl)
+    .join("[presigned-url]")
+    .replace(/X-Amz-Signature=[0-9a-fA-F]+/g, "X-Amz-Signature=[redacted]")
+    .replace(/X-Amz-Credential=[^&\s'"]+/g, "X-Amz-Credential=[redacted]");
+}
+
+/** Bound one output stream for inclusion in a failure detail, marking when it was cut. */
+function truncateForDetail(text: string): string {
+  if (text.length <= DB_EXPORT_DETAIL_OUTPUT_MAX_CHARS) return text;
+  return text.slice(0, DB_EXPORT_DETAIL_OUTPUT_MAX_CHARS) + "…[truncated]";
+}
+
+function dbExportFailure(objectKey: string, detail: string, exitCode?: number): DbExportResult {
+  if (exitCode === undefined) {
+    return { ok: false, op: "db-export", objectKey, detail };
+  }
+  return { ok: false, op: "db-export", objectKey, detail, exitCode };
+}
+
+/**
+ * Export the DB of the site at `params.docroot` on the agency's cell and upload it to
+ * `params.objectKey` in the agency's S3_BUCKET, via a presigned PUT the cell uses. Returns a
+ * structured result; every failure (missing config, presign/relay error, a non-zero exit from
+ * the export or the upload) is ok:false + detail, never a thrown 500. NEVER uses a platform
+ * credential (there is none here), and NEVER returns the dump or the presigned URL.
+ */
+export async function actuateDbExport(params: DbExportParams, env: Env): Promise<DbExportResult> {
+  const objectKey = params.objectKey;
+
+  if (!env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY || !env.S3_BUCKET) {
+    return dbExportFailure(
+      objectKey,
+      "S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY / S3_BUCKET are not configured on this Worker.",
+    );
+  }
+  const cellAgentUrl = env.CELL_AGENT_URL;
+  const cellAgentToken = env.CELL_AGENT_TOKEN;
+  if (!cellAgentUrl || !cellAgentToken) {
+    return dbExportFailure(objectKey, "CELL_AGENT_URL / CELL_AGENT_TOKEN are not configured on this Worker.");
+  }
+
+  // Same store resolution as the /validate write probe (validators.ts::validateS3): a custom
+  // endpoint (R2/MinIO/Wasabi) is path-style, no endpoint is real AWS; region defaults like there.
+  const presigned = await presignS3Put({
+    endpoint: env.S3_ENDPOINT ? stripTrailingSlash(env.S3_ENDPOINT) : undefined,
+    bucket: env.S3_BUCKET,
+    region: env.S3_REGION || "us-east-1",
+    accessKeyId: env.S3_ACCESS_KEY_ID,
+    secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+    key: objectKey,
+    expiresSeconds: DB_EXPORT_PRESIGN_EXPIRES_SECONDS,
+  });
+
+  const exec = await execOnCellAgent(cellAgentUrl, cellAgentToken, {
+    script: buildDbExportScript(presigned.url),
+    docroot: params.docroot,
+    timeoutMs: DB_EXPORT_EXEC_TIMEOUT_MS,
+  });
+  if (!exec.ok) {
+    return dbExportFailure(objectKey, exec.detail);
+  }
+
+  // Unlike wp-cli, a non-zero exit IS a failure here: `set -e` means the export or the upload
+  // did not complete, so the object may be missing or partial. Quote the cell's (bounded,
+  // redacted) output so the operator can see WHICH step failed and why.
+  if (exec.code !== 0) {
+    const outputParts: string[] = [];
+    if (exec.stderr) outputParts.push(`stderr: ${truncateForDetail(exec.stderr)}`);
+    if (exec.stdout) outputParts.push(`stdout: ${truncateForDetail(exec.stdout)}`);
+    const output = outputParts.length > 0 ? ` — ${outputParts.join(" | ")}` : "";
+    return dbExportFailure(
+      objectKey,
+      redactPresignedUrl(`DB export or upload failed on the cell (exit ${exec.code})${output}`, presigned.url),
+      exec.code,
+    );
+  }
+
+  return { ok: true, op: "db-export", objectKey, exitCode: 0 };
 }

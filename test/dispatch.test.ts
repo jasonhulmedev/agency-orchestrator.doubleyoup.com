@@ -29,8 +29,10 @@ import {
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
   validateWpCliParams,
+  validateDbExportParams,
 } from "../src/dispatch-params.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
+import { buildDbExportScript } from "../src/actuate.js";
 
 // ── Web-Crypto helpers (no Node APIs) ───────────────────────────────────────────────
 function bytesToBase64(bytes: Uint8Array): string {
@@ -127,6 +129,20 @@ function wpCliJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
     op: "wp-cli",
     params: JSON.stringify(WP_CLI_PARAMS),
     nonce: "bb66bb66bb66bb66bb66bb66bb66bb66",
+    ...overrides,
+  });
+}
+
+// A db-export job — the orchestrator-generated object key for a real storage-tier dogfood site.
+const DB_EXPORT_PARAMS = {
+  docroot: "/sites/geelongns/public",
+  objectKey: "db-exports/geelongns-2026-09-07t01-02-03z.sql",
+};
+function dbExportJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "db-export",
+    params: JSON.stringify(DB_EXPORT_PARAMS),
+    nonce: "cc77cc77cc77cc77cc77cc77cc77cc77",
     ...overrides,
   });
 }
@@ -401,6 +417,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
   it("the op registry has exactly the allowlisted ops, each with validateParams + actuate", () => {
     expect(Object.keys(DISPATCH_OP_REGISTRY).sort()).toEqual([
       "cache-purge",
+      "db-export",
       "dns-record-upsert",
       "provision-r2",
       "wp-cli",
@@ -540,6 +557,67 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(validateWpCliParams({ docroot: "/var/www/example", args: ["x", "`id`"] }).ok).toBe(true);
     expect(validateWpCliParams({ docroot: "/var/www/example", args: ["say", "it's \"quoted\""] }).ok).toBe(true);
   });
+
+  // ── db-export (twin of the app's rules) ───────────────────────────────────────────
+
+  it("db-export: accepts BOTH docroot forms + a well-formed objectKey and returns only known keys", () => {
+    expect(validateDbExportParams({ ...DB_EXPORT_PARAMS, extra: "x" })).toEqual({ ok: true, params: DB_EXPORT_PARAMS });
+    expect(validateDbExportParams({ docroot: "/var/www/site1", objectKey: "db-exports/site1-2026-09-07t01-02-03z.sql" }).ok).toBe(true);
+    expect(validateDbExportParams({ docroot: "/sites/docs-892769/public", objectKey: "db-exports/docs-892769-20260907.sql" }).ok).toBe(true);
+    // Dots and underscores are legitimate inside the filename; the shortest name is one char.
+    expect(validateDbExportParams({ docroot: "/var/www/a", objectKey: "db-exports/a.sql" }).ok).toBe(true);
+    expect(validateDbExportParams({ docroot: "/var/www/a", objectKey: "db-exports/a_b.c-d.sql" }).ok).toBe(true);
+    // The longest admissible name: 1 + 120 chars before ".sql".
+    expect(validateDbExportParams({ docroot: "/var/www/a", objectKey: `db-exports/a${"b".repeat(120)}.sql` }).ok).toBe(true);
+  });
+
+  it("db-export: rejects a bad docroot with the same grammar as wp-cli", () => {
+    const bad = (docroot: unknown) => validateDbExportParams({ docroot, objectKey: DB_EXPORT_PARAMS.objectKey });
+    expect(validateDbExportParams(null).ok).toBe(false);
+    expect(validateDbExportParams("string").ok).toBe(false);
+    expect(bad(undefined).ok).toBe(false);
+    expect(bad("/etc/passwd").ok).toBe(false); // wrong root
+    expect(bad("/var/www/../etc").ok).toBe(false); // traversal
+    expect(bad("/var/www/site/").ok).toBe(false); // trailing slash
+    expect(bad("/sites/site").ok).toBe(false); // missing /public
+    expect(bad("/sites/x/public/../..").ok).toBe(false); // traversal
+    expect(bad("/sites/Site/public").ok).toBe(false); // uppercase slug
+    expect(bad("/sites/site;rm/public").ok).toBe(false); // shell metachar
+  });
+
+  it("db-export: rejects a bad objectKey (prefix, leading slash, extra segment, '..', case, suffix, charset, length)", () => {
+    const bad = (objectKey: unknown) => validateDbExportParams({ docroot: DB_EXPORT_PARAMS.docroot, objectKey });
+    expect(bad(undefined).ok).toBe(false); // missing
+    expect(bad(42).ok).toBe(false); // non-string
+    expect(bad("").ok).toBe(false);
+    expect(bad("geelongns.sql").ok).toBe(false); // outside the db-exports/ prefix
+    expect(bad("backups/geelongns.sql").ok).toBe(false); // wrong prefix
+    expect(bad("/db-exports/geelongns.sql").ok).toBe(false); // leading slash
+    expect(bad("db-exports/").ok).toBe(false); // no name
+    expect(bad("db-exports/.sql").ok).toBe(false); // empty name
+    expect(bad("db-exports/sub/geelongns.sql").ok).toBe(false); // extra path segment
+    expect(bad("db-exports/../etc/passwd.sql").ok).toBe(false); // traversal
+    expect(bad("db-exports/a..sql").ok).toBe(false); // ".." inside the name (explicit rule)
+    expect(bad("db-exports/-lead.sql").ok).toBe(false); // must start alphanumeric
+    expect(bad("db-exports/Geelongns.sql").ok).toBe(false); // uppercase
+    expect(bad("db-exports/geelongns.SQL").ok).toBe(false); // uppercase suffix
+    expect(bad("db-exports/geelongns.sql.gz").ok).toBe(false); // not .sql
+    expect(bad("db-exports/geelongns").ok).toBe(false); // no suffix
+    expect(bad("db-exports/geelongns 1.sql").ok).toBe(false); // space
+    expect(bad("db-exports/geelongns;rm.sql").ok).toBe(false); // shell metachar
+    expect(bad("db-exports/geelongns?x=1.sql").ok).toBe(false); // URL metachar
+    expect(bad("db-exports/geelongns%2f.sql").ok).toBe(false); // percent-encoding
+    expect(bad(`db-exports/a${"b".repeat(121)}.sql`).ok).toBe(false); // one over the length cap
+  });
+
+  it("db-export: a verdict names the offending field", () => {
+    const docrootVerdict = validateDbExportParams({ docroot: "/etc", objectKey: DB_EXPORT_PARAMS.objectKey });
+    expect(docrootVerdict.ok).toBe(false);
+    if (!docrootVerdict.ok) expect(docrootVerdict.reason).toMatch(/^docroot must be/);
+    const keyVerdict = validateDbExportParams({ docroot: DB_EXPORT_PARAMS.docroot, objectKey: "x.sql" });
+    expect(keyVerdict.ok).toBe(false);
+    if (!keyVerdict.ok) expect(keyVerdict.reason).toMatch(/^objectKey must be db-exports\//);
+  });
 });
 
 describe("POST /actuate route", () => {
@@ -580,6 +658,12 @@ describe("POST /actuate route", () => {
       CF_DNS_API_TOKEN: "cf-dns-token-abc",
       CELL_AGENT_URL: "https://cell.example.test",
       CELL_AGENT_TOKEN: "cell-token-123",
+      // The agency's object store (R2-shaped), as the db-export actuator presigns against it.
+      S3_ACCESS_KEY_ID: "s3-akid-example",
+      S3_SECRET_ACCESS_KEY: "s3-secret-example",
+      S3_REGION: "auto",
+      S3_BUCKET: "agency-backups",
+      S3_ENDPOINT: "https://acct123.r2.example.test",
       NONCE_STORE: freshNonceStore,
       ...overrides,
     };
@@ -1082,6 +1166,7 @@ describe("POST /actuate route", () => {
       url: string;
       method: string;
       auth: string | null;
+      redirect: RequestInit["redirect"];
       body: { script?: string; docroot?: string; timeoutMs?: number };
     }> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -1089,7 +1174,7 @@ describe("POST /actuate route", () => {
       const method = init?.method ?? "GET";
       const auth = new Headers(init?.headers).get("authorization");
       const body = init?.body ? JSON.parse(String(init.body)) : {};
-      calls.push({ url, method, auth, body });
+      calls.push({ url, method, auth, redirect: init?.redirect, body });
       if (url.endsWith("/exec") && method === "POST") {
         return jsonResponse(reply, status);
       }
@@ -1293,6 +1378,244 @@ describe("POST /actuate route", () => {
     expect(response.status).toBe(400);
     const body = (await response.json()) as { reason: string };
     expect(body.reason).toMatch(/docroot must be/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── db-export through the registry ────────────────────────────────────────────────
+  // The Worker presigns a single-object PUT with the agency's S3_* credential and relays ONE
+  // script to the cell-agent /exec (same relay + CELL_AGENT_TOKEN as wp-cli). The load-bearing
+  // assertions: the presigned URL is the ONLY store-related thing in the script (no S3 secret),
+  // the script exports to a temp FILE then uploads then cleans up, the result is small and never
+  // echoes the URL, and every relay failure mode is fail-closed exactly like wp-cli.
+
+  /** Pull the single-quoted presigned URL back out of the relayed script. */
+  function presignedUrlIn(script: string): string {
+    const match = /--upload-file "\$T" '([^']+)'$/.exec(script);
+    if (!match) throw new Error(`no quoted presigned URL at the end of the script: ${script}`);
+    return match[1];
+  }
+
+  it("db-export: relays export -> upload-to-presigned-URL -> cleanup to the cell-agent using CELL_AGENT_TOKEN only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbExportJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCellAgent({ code: 0, stdout: "", stderr: "" });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    // A SMALL result: exactly these four keys — never the dump, never the presigned URL.
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "db-export",
+      objectKey: DB_EXPORT_PARAMS.objectKey,
+      exitCode: 0,
+    });
+
+    expect(calls).toHaveLength(1);
+    const call = calls[0];
+    expect(call.url).toBe("https://cell.example.test/exec");
+    expect(call.method).toBe("POST");
+    // The agency's OWN cell token — never a platform / Cloudflare / S3 credential.
+    expect(call.auth).toBe("Bearer cell-token-123");
+    // workerd: redirect:"manual" (never follow; a 3xx is rejected below).
+    expect(call.redirect).toBe("manual");
+    expect(call.body.docroot).toBe("/sites/geelongns/public");
+    // The exec timeout sits just inside the 600 s presign window.
+    expect(call.body.timeoutMs).toBe(540_000);
+
+    const script = call.body.script ?? "";
+    const presignedUrl = presignedUrlIn(script);
+    // The exact script shape (buildDbExportScript is the single source of truth for it).
+    expect(script).toBe(buildDbExportScript(presignedUrl));
+    expect(script).toBe(
+      "set -eu; " +
+        "T=$(mktemp); " +
+        `trap 'rm -f "$T"' EXIT INT TERM; ` +
+        'wp db export "$T" --add-drop-table --quiet; ' +
+        `curl -sS --fail-with-body --upload-file "$T" '${presignedUrl}'`,
+    );
+
+    // The presigned URL targets the agency's bucket + the signed objectKey, path-style at the
+    // configured endpoint, with the full SigV4 query set and a 600 s expiry.
+    const url = new URL(presignedUrl);
+    expect(url.origin).toBe("https://acct123.r2.example.test");
+    expect(url.pathname).toBe(`/agency-backups/${DB_EXPORT_PARAMS.objectKey}`);
+    expect(url.searchParams.get("X-Amz-Algorithm")).toBe("AWS4-HMAC-SHA256");
+    expect(url.searchParams.get("X-Amz-Credential")).toMatch(/^s3-akid-example\/\d{8}\/auto\/s3\/aws4_request$/);
+    expect(url.searchParams.get("X-Amz-Expires")).toBe("600");
+    expect(url.searchParams.get("X-Amz-SignedHeaders")).toBe("host");
+    expect(url.searchParams.get("X-Amz-Signature")).toMatch(/^[0-9a-f]{64}$/);
+    // NO object-store credential reaches the cell — only the derived URL.
+    expect(script).not.toContain("s3-secret-example");
+    expect(JSON.stringify(call.body)).not.toContain("s3-secret-example");
+  });
+
+  it("db-export: targets AWS virtual-hosted-style when the agency has no S3_ENDPOINT", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbExportJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCellAgent({ code: 0, stdout: "", stderr: "" });
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ S3_ENDPOINT: undefined, S3_REGION: "us-east-1" }),
+    );
+    expect(response.status).toBe(200);
+    const url = new URL(presignedUrlIn(calls[0].body.script ?? ""));
+    expect(url.host).toBe("agency-backups.s3.us-east-1.amazonaws.com");
+    expect(url.pathname).toBe(`/${DB_EXPORT_PARAMS.objectKey}`);
+  });
+
+  it("db-export: a NON-ZERO exit is ok:false (unlike wp-cli) with the cell's output quoted and the URL redacted", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbExportJob();
+    const signature = await signAsApp(job, privateKey);
+    // A store rejection: --fail-with-body exits 22 with the S3 error XML on stdout; make the
+    // stderr ALSO echo the full presigned URL (curl does not normally, but the detail must be
+    // safe even if a future curl/wp did) to prove the redaction.
+    let relayedScript = "";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as { script: string };
+      relayedScript = body.script;
+      const presignedUrl = presignedUrlIn(body.script);
+      return jsonResponse({
+        code: 22,
+        stdout: "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+        stderr: `curl: (22) The requested URL returned error: 403 for ${presignedUrl}`,
+      });
+    });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; op: string; objectKey: string; exitCode: number; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("db-export");
+    expect(body.objectKey).toBe(DB_EXPORT_PARAMS.objectKey);
+    expect(body.exitCode).toBe(22);
+    expect(body.detail).toMatch(/DB export or upload failed on the cell \(exit 22\)/);
+    // The operator sees WHICH step failed and the store's reason ...
+    expect(body.detail).toContain("curl: (22)");
+    expect(body.detail).toContain("AccessDenied");
+    // ... but NEVER the still-valid upload capability or the access-key ID.
+    const presignedUrl = presignedUrlIn(relayedScript);
+    expect(body.detail).not.toContain(presignedUrl);
+    expect(body.detail).not.toMatch(/X-Amz-Signature=[0-9a-f]{64}/);
+    expect(body.detail).not.toContain("s3-akid-example");
+    expect(body.detail).toContain("[presigned-url]");
+  });
+
+  it("db-export: a wp-cli/mysqldump failure (export step) surfaces stderr in the detail", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbExportJob();
+    const signature = await signAsApp(job, privateKey);
+    mockCellAgent({ code: 1, stdout: "", stderr: "Error: Failed to get current SQL modes. Reason: Access denied for user" });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    const body = (await response.json()) as { ok: boolean; exitCode: number; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.exitCode).toBe(1);
+    expect(body.detail).toMatch(/exit 1\) — stderr: Error: Failed to get current SQL modes/);
+  });
+
+  it("db-export: a cell-agent 3xx redirect is fail-closed (ok:false), not followed", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbExportJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      calls.push(urlOf(input));
+      return new Response(null, { status: 302, headers: { location: "https://elsewhere.example/exec" } });
+    });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/redirected unexpectedly \(HTTP 302\)/);
+    expect(calls).toEqual(["https://cell.example.test/exec"]);
+  });
+
+  it("db-export: a cell-agent 401 becomes a clean ok:false (no bypass)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbExportJob();
+    const signature = await signAsApp(job, privateKey);
+    mockCellAgent({ error: "unauthorized" }, 401);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/rejected CELL_AGENT_TOKEN/);
+  });
+
+  it("db-export: a cell-agent 400 (e.g. bad docroot on the VM) surfaces as ok:false, still HTTP 200", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbExportJob();
+    const signature = await signAsApp(job, privateKey);
+    mockCellAgent({ error: "docroot must be under /var/www or /sites/<slug>/public" }, 400);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/cell-agent \/exec failed with HTTP 400/);
+  });
+
+  it("db-export: reports a clean failure and touches NOTHING when the S3_* credential is missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbExportJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    for (const missing of ["S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_BUCKET"] as const) {
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ [missing]: undefined }));
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { ok: boolean; detail: string };
+      expect(body.ok).toBe(false);
+      expect(body.detail).toMatch(/S3_ACCESS_KEY_ID \/ S3_SECRET_ACCESS_KEY \/ S3_BUCKET are not configured/);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("db-export: reports a clean failure and touches NO cell-agent when CELL_AGENT_URL/TOKEN are missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbExportJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ CELL_AGENT_URL: undefined, CELL_AGENT_TOKEN: undefined }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/CELL_AGENT_URL \/ CELL_AGENT_TOKEN are not configured/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("db-export: a signed job with an invalid objectKey is 400 with no presign and no cell-agent call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbExportJob({
+      params: JSON.stringify({ docroot: "/sites/geelongns/public", objectKey: "../../etc/passwd.sql" }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { reason: string };
+    expect(body.reason).toMatch(/objectKey must be db-exports\//);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("db-export: a valid op given wp-cli's params is 400 with no cell-agent call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbExportJob({ params: JSON.stringify(WP_CLI_PARAMS) });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(400);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

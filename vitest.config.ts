@@ -36,6 +36,7 @@ export default defineConfig({
             "test/app-client.test.ts",
             "test/index.test.ts",
             "test/dispatch.test.ts",
+            "test/sigv4-presign.test.ts",
           ],
         },
       },

@@ -367,6 +367,58 @@ export function validateWpCliParams(raw: unknown): ParamsVerdict<WpCliParams> {
   return { ok: true, params: { docroot, args: cleanArgs } };
 }
 
+// ── db-export ──────────────────────────────────────────────────────────────────────
+// Export a cell site's WordPress DB and upload it STRAIGHT from the cell to the agency's own
+// object store via a presigned PUT URL — the dump never passes through the Worker (the Worker's
+// actuate.ts::actuateDbExport mints the URL and relays only a small script). Two params, both
+// platform-generated and both strictly grammared:
+//   1. `docroot` — the SAME grammar as wp-cli (an absolute /var/www/<slug> or /sites/<slug>/public
+//      path): selects the site whose DB is exported and the working directory the export runs in.
+//   2. `objectKey` — the object key the dump lands under. The ORCHESTRATOR generates it ONCE,
+//      before its retry loop (db-exports/<slug>-<timestamp>.sql), so a re-signed retry re-uploads
+//      to the SAME key: a true overwrite, which is what makes this op idempotent (F1). The grammar
+//      pins it under the db-exports/ prefix as ONE lowercase filename segment ending in .sql — no
+//      leading slash, no "/" after the prefix, no "..", no whitespace or shell metacharacter — so a
+//      signed key can never name an object outside that prefix and is safe to place in a URL path.
+
+export interface DbExportParams {
+  /** The site's docroot on the cell — selects the site + the export's working directory. */
+  docroot: string;
+  /** The object key the dump is uploaded to, e.g. "db-exports/<slug>-<timestamp>.sql". */
+  objectKey: string;
+}
+
+// db-exports/<name>.sql where <name> is 1..121 chars of [a-z0-9._-] starting alphanumeric. Anchored
+// at both ends and no "/" admitted after the prefix, so the key can only ever be one object directly
+// under db-exports/.
+const DB_EXPORT_OBJECT_KEY_RE = /^db-exports\/[a-z0-9][a-z0-9._-]{0,120}\.sql$/;
+
+export function validateDbExportParams(raw: unknown): ParamsVerdict<DbExportParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { docroot, objectKey } = raw;
+
+  if (typeof docroot !== "string" || !WP_CLI_DOCROOT_RE.test(docroot)) {
+    return {
+      ok: false,
+      reason:
+        "docroot must be an absolute cell docroot (/var/www/<slug> or /sites/<slug>/public) with a lowercase slug, no '..', no trailing slash, no extra path segment",
+    };
+  }
+  // The grammar admits "." inside <name> (a dotted timestamp is legitimate); the explicit ".."
+  // check keeps the "no traversal-looking key" rule literal even though no "/" can follow the prefix.
+  if (typeof objectKey !== "string" || !DB_EXPORT_OBJECT_KEY_RE.test(objectKey) || objectKey.includes("..")) {
+    return {
+      ok: false,
+      reason:
+        "objectKey must be db-exports/<name>.sql with a lowercase <name> of [a-z0-9._-] (1-121 chars), no '..', no leading slash, no extra path segment",
+    };
+  }
+
+  return { ok: true, params: { docroot, objectKey } };
+}
+
 // ── shared ─────────────────────────────────────────────────────────────────────────
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
