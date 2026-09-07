@@ -583,10 +583,23 @@ export async function actuateWpCli(params: WpCliParams, env: Env): Promise<WpCli
         docroot: params.docroot,
         timeoutMs: WP_CLI_EXEC_TIMEOUT_MS,
       }),
-      redirect: "error",
+      // "manual", NOT "error": workerd does not implement redirect:"error" and throws at runtime
+      // ("Invalid redirect value ... use manual and check the response status code"). We still
+      // refuse to FOLLOW a redirect (a signed job must reach the configured cell-agent, not be
+      // bounced elsewhere), so we ask for the redirect verbatim and reject it below — preserving
+      // the original "don't silently follow" intent that redirect:"error" was reaching for.
+      redirect: "manual",
     });
   } catch (err) {
     return wpCliFailure(`could not reach the cell-agent to run wp-cli: ${errorMessage(err)}`);
+  }
+
+  // The cell-agent should never 3xx. With redirect:"manual" a redirect surfaces as either an
+  // opaqueredirect response (status 0) or a 3xx status — treat EITHER as a fail-closed error
+  // rather than following it: a redirect means a misconfigured CELL_AGENT_URL, not a valid exec.
+  if (response.status === 0 || (response.status >= 300 && response.status < 400)) {
+    await response.body?.cancel().catch(() => {});
+    return wpCliFailure(`cell-agent redirected unexpectedly (HTTP ${response.status}) — refusing to follow.`);
   }
 
   if (response.status === 401 || response.status === 403) {

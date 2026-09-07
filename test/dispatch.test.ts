@@ -1229,6 +1229,28 @@ describe("POST /actuate route", () => {
     expect(body.detail).toMatch(/rejected CELL_AGENT_TOKEN/);
   });
 
+  it("wp-cli: a cell-agent 3xx redirect is fail-closed (ok:false), not followed", async () => {
+    // The fetch uses redirect:"manual" (workerd rejects redirect:"error" at runtime), so a
+    // redirect surfaces as a 3xx (or an opaqueredirect status 0). Either way the Worker must
+    // REFUSE to follow it — a redirect means a misconfigured CELL_AGENT_URL, not a valid exec.
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wpCliJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      calls.push(urlOf(input));
+      return new Response(null, { status: 302, headers: { location: "https://elsewhere.example/exec" } });
+    });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/redirected unexpectedly \(HTTP 302\)/);
+    // Exactly one request was issued (the /exec) — the redirect target was NOT fetched.
+    expect(calls).toEqual(["https://cell.example.test/exec"]);
+  });
+
   it("wp-cli: a cell-agent 400 (e.g. bad docroot on the VM) surfaces as ok:false, still HTTP 200", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const job = wpCliJob();
