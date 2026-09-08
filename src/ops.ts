@@ -11,7 +11,9 @@
 // a transient failure needs a re-signed job, which is only safe when re-running converges. The
 // `wp-cli` op is the exception — a wp-cli command is not idempotent in general — so it is used
 // only for READ-ONLY commands in the Direction-B proof; a non-idempotent wp-cli use needs the
-// F1 dispatcher contract first (see the F1 note in actuate.ts::actuateWpCli).
+// F1 dispatcher contract first (see the F1 note in actuate.ts::actuateWpCli). `db-export` IS
+// idempotent: the orchestrator fixes the object key before retrying, so a re-run overwrites the
+// same object (see actuate.ts::actuateDbExport).
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -21,10 +23,12 @@ import {
   type DnsRecordUpsertParams,
   type CachePurgeParams,
   type WpCliParams,
+  type DbExportParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
   validateWpCliParams,
+  validateDbExportParams,
 } from "./dispatch-params.js";
 import {
   type ActuateResult,
@@ -32,6 +36,7 @@ import {
   actuateDnsRecordUpsert,
   actuateCachePurge,
   actuateWpCli,
+  actuateDbExport,
 } from "./actuate.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
@@ -74,6 +79,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "wp-cli": defineOp<WpCliParams>({
     validateParams: validateWpCliParams,
     actuate: (params, env) => actuateWpCli(params, env),
+  }),
+  "db-export": defineOp<DbExportParams>({
+    validateParams: validateDbExportParams,
+    actuate: (params, env) => actuateDbExport(params, env),
   }),
 };
 

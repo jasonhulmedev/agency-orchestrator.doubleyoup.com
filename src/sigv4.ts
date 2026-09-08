@@ -7,6 +7,9 @@
 // AWS S3 or an S3-compatible endpoint: R2, MinIO, Wasabi). A bodyless request signs
 // the SHA-256 of ""; a request WITH a body signs the literal "UNSIGNED-PAYLOAD" (see
 // the payload-hash comment below for why — it's the workerd edge write-probe fix).
+// The second half of the file is the QUERY-PARAMETER PRESIGNER (presignS3Url /
+// presignS3Put): a URL a third party (the agency's cell) can PUT to without holding the
+// credential — used by the Direction-B `db-export` actuator.
 //
 // INVARIANT: the headers we return to SEND are exactly the headers we SIGNED
 // (minus Host, which the runtime sets from the URL) and the wire path/query
@@ -161,4 +164,155 @@ export async function signS3Request(options: {
   outHeaders.set("authorization", authorization);
 
   return { url: options.url, headers: outHeaders };
+}
+
+// ── Query-parameter PRESIGNING (a URL a THIRD PARTY can use, no credential attached) ──────
+//
+// The auth-HEADER signer above is for requests THIS Worker sends. A PRESIGNED URL is different:
+// the signature travels in the QUERY STRING (X-Amz-Signature=...) so that someone WITHOUT the
+// S3 credential — here, the agency's cell, running `curl --upload-file` — can make exactly one
+// kind of request (one method, one object) until the URL expires. The secret key never leaves
+// this Worker; the URL carries only a derived signature, the access-key ID, and the expiry.
+//
+// The scheme is the standard SigV4 "Authenticating Requests: Using Query Parameters":
+//   canonical request = <METHOD>\n<encoded path>\n<canonical query WITHOUT X-Amz-Signature>\n
+//                       host:<host>\n\nhost\nUNSIGNED-PAYLOAD
+//   canonical query   = X-Amz-Algorithm=AWS4-HMAC-SHA256
+//                     & X-Amz-Credential=<akid>/<date>/<region>/s3/aws4_request   (slashes %2F)
+//                     & X-Amz-Date=<YYYYMMDDTHHMMSSZ> & X-Amz-Expires=<seconds>
+//                     & X-Amz-SignedHeaders=host                                    (sorted)
+//   string to sign    = AWS4-HMAC-SHA256\n<amzDate>\n<scope>\nsha256(canonical request)
+//   signature         = hex(HMAC(kSigning, string to sign)), appended as X-Amz-Signature.
+//
+// Payload: ALWAYS "UNSIGNED-PAYLOAD". For a presigned URL the signer never sees the body (the
+// cell produces it later), so the body hash cannot be part of the signature — this is the ONLY
+// payload mode that makes sense for a presign, and it is also exactly the mode the header signer
+// above had to adopt for its PUT (see the workerd write-probe note): R2 then does not hash-verify
+// the bytes, but the signature still binds the method, path, query, host and expiry.
+//
+// Only `host` is a signed header — the uploader (curl) adds its own Content-Length / User-Agent /
+// Expect headers, and none of those may be covered by the signature or the upload would fail.
+
+/** A presigned URL plus the two intermediate strings it was derived from (for the pin test +
+ *  diagnostics — neither contains the secret key; the signature is derived FROM them WITH it). */
+export interface PresignedUrl {
+  url: string;
+  canonicalRequest: string;
+  stringToSign: string;
+}
+
+// Amazon-format timestamp: "YYYYMMDDTHHMMSSZ" (no punctuation, no millis).
+function formatAmzDate(date: Date): string {
+  return date
+    .toISOString()
+    .replace(/[:-]/g, "")
+    .replace(/\.\d{3}Z$/, "Z");
+}
+
+// Derive the SigV4 signing key: HMAC chain over date → region → service → "aws4_request".
+async function deriveSigningKey(secretAccessKey: string, dateStamp: string, region: string): Promise<Uint8Array> {
+  const kDate = await hmacSha256(textEncoder.encode("AWS4" + secretAccessKey), dateStamp);
+  const kRegion = await hmacSha256(kDate, region);
+  const kService = await hmacSha256(kRegion, S3_SERVICE);
+  return hmacSha256(kService, "aws4_request");
+}
+
+/**
+ * Presign an S3 URL (query-parameter SigV4) for `method`, valid for `expiresSeconds` from
+ * `nowMs` (default: now — injectable so a test can pin the exact output).
+ *
+ * `url` is `<scheme>://<host>[:port]<path>` with an OPTIONAL existing query. The PATH must
+ * already be AWS-URI-encoded (presignS3Put does this): for S3 the canonical URI is the wire
+ * path taken byte-for-byte (single encoding, no re-encoding), so we sign `pathname` verbatim
+ * — re-encoding it here would turn an intended "%2A" into "%252A" and break the signature.
+ * Any query already on `url` is folded into the canonical (sorted) query and re-emitted on the
+ * wire in that same sorted form, so wire bytes == signed bytes.
+ */
+export async function presignS3Url(options: {
+  method: "GET" | "PUT";
+  url: string;
+  region: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  expiresSeconds: number;
+  nowMs?: number;
+}): Promise<PresignedUrl> {
+  const parsed = new URL(options.url);
+  const host = parsed.host; // includes a non-default port if present
+
+  const amzDate = formatAmzDate(new Date(options.nowMs ?? Date.now()));
+  const dateStamp = amzDate.slice(0, 8);
+  const scope = `${dateStamp}/${options.region}/${S3_SERVICE}/aws4_request`;
+
+  // The signed query: everything already on the URL plus the five X-Amz-* auth parameters.
+  // X-Amz-Signature is deliberately NOT here — it is computed FROM this query and appended after.
+  const query = new URLSearchParams(parsed.searchParams);
+  query.set("X-Amz-Algorithm", "AWS4-HMAC-SHA256");
+  query.set("X-Amz-Credential", `${options.accessKeyId}/${scope}`);
+  query.set("X-Amz-Date", amzDate);
+  query.set("X-Amz-Expires", String(options.expiresSeconds));
+  query.set("X-Amz-SignedHeaders", "host");
+  const canonicalQuery = canonicalQueryString(query);
+
+  const canonicalRequest =
+    `${options.method}\n` +
+    `${parsed.pathname}\n` +
+    `${canonicalQuery}\n` +
+    `host:${host}\n` +
+    `\n` +
+    `host\n` +
+    `UNSIGNED-PAYLOAD`;
+
+  const stringToSign =
+    `AWS4-HMAC-SHA256\n${amzDate}\n${scope}\n${await sha256Hex(canonicalRequest)}`;
+
+  const signingKey = await deriveSigningKey(options.secretAccessKey, dateStamp, options.region);
+  const signature = toHex(await hmacSha256(signingKey, stringToSign));
+
+  // Wire URL: the SAME sorted, AWS-encoded query we signed, then the signature last.
+  const url = `${parsed.protocol}//${host}${parsed.pathname}?${canonicalQuery}&X-Amz-Signature=${signature}`;
+  return { url, canonicalRequest, stringToSign };
+}
+
+/**
+ * Presign a PUT of ONE object so a third party can upload it without the credential.
+ *
+ * URL style follows the validate write-probe (validators.ts::validateS3):
+ *   • `endpoint` set (Cloudflare R2, MinIO, Wasabi) — path-style `<endpoint>/<bucket>/<key>`;
+ *   • no `endpoint` (real AWS S3) — virtual-hosted `https://<bucket>.s3.<region>.amazonaws.com/<key>`.
+ * The bucket and each `/`-separated key segment are AWS-URI-encoded exactly once here; the
+ * path then goes to presignS3Url verbatim (see its encoding contract).
+ */
+export async function presignS3Put(options: {
+  endpoint?: string;
+  bucket: string;
+  region: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  key: string;
+  expiresSeconds: number;
+  nowMs?: number;
+}): Promise<PresignedUrl> {
+  const encodedKey = options.key.split("/").map(awsUriEncodeComponent).join("/");
+
+  let objectUrl: string;
+  if (options.endpoint) {
+    const endpoint = new URL(options.endpoint);
+    // Keep any path prefix the endpoint carries (normally none — R2 endpoints are bare hosts),
+    // minus a trailing slash so the join never produces "//".
+    const basePath = endpoint.pathname.replace(/\/+$/, "");
+    objectUrl = `${endpoint.protocol}//${endpoint.host}${basePath}/${awsUriEncodeComponent(options.bucket)}/${encodedKey}`;
+  } else {
+    objectUrl = `https://${options.bucket}.s3.${options.region}.amazonaws.com/${encodedKey}`;
+  }
+
+  return presignS3Url({
+    method: "PUT",
+    url: objectUrl,
+    region: options.region,
+    accessKeyId: options.accessKeyId,
+    secretAccessKey: options.secretAccessKey,
+    expiresSeconds: options.expiresSeconds,
+    nowMs: options.nowMs,
+  });
 }

@@ -37,7 +37,7 @@ import type { Env } from "./env.js";
 // compile error. Single-use replay protection (NonceStore DO, src/nonce-store.ts) is
 // enforced in index.ts::handleActuate, so a signed job actuates at most once. Keep this
 // allowlist tight and add ops deliberately.
-export const DISPATCH_OPS = ["provision-r2", "dns-record-upsert", "cache-purge", "wp-cli"] as const;
+export const DISPATCH_OPS = ["provision-r2", "dns-record-upsert", "cache-purge", "wp-cli", "db-export"] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 
 // The five canonical job keys, in the FIXED ascending-codepoint order the serializer
