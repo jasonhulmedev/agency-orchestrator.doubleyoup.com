@@ -18,8 +18,8 @@
 // ever string-interpolated into a URL.
 
 import type { Env } from "./env.js";
-import type { DnsRecordUpsertParams, CachePurgeParams, WpCliParams, DbExportParams } from "./dispatch-params.js";
-import { presignS3Put } from "./sigv4.js";
+import type { DnsRecordUpsertParams, CachePurgeParams, WpCliParams, DbExportParams, DbImportParams } from "./dispatch-params.js";
+import { presignS3Put, presignS3Get } from "./sigv4.js";
 import { errorMessage, stripTrailingSlash } from "./util.js";
 
 const CF_API = "https://api.cloudflare.com/client/v4";
@@ -46,12 +46,19 @@ export type DbExportResult =
   | { ok: true; op: "db-export"; objectKey: string; exitCode: 0 }
   | { ok: false; op: "db-export"; objectKey: string; detail: string; exitCode?: number };
 
+// Symmetric with DbExportResult: the dump never comes back through the Worker (it went object
+// store -> cell), and the presigned URL is never echoed — only the key the caller already chose.
+export type DbImportResult =
+  | { ok: true; op: "db-import"; objectKey: string; exitCode: 0 }
+  | { ok: false; op: "db-import"; objectKey: string; detail: string; exitCode?: number };
+
 export type ActuateResult =
   | ProvisionR2Result
   | DnsRecordUpsertResult
   | CachePurgeResult
   | WpCliResult
-  | DbExportResult;
+  | DbExportResult
+  | DbImportResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -831,4 +838,136 @@ export async function actuateDbExport(params: DbExportParams, env: Env): Promise
   }
 
   return { ok: true, op: "db-export", objectKey, exitCode: 0 };
+}
+
+// ── db-import ────────────────────────────────────────────────────────────────────────────
+// The reverse of db-export: the agency's cell DOWNLOADS a DB dump from the agency's own object
+// store and loads it into the site's WordPress DB with `wp db import`. The dump flows object store
+// -> cell and never through this Worker (symmetric with db-export's cell -> object store). The
+// Worker's only jobs are to:
+//   1. PRESIGN a single-object GET URL with the agency's S3_* credential (sigv4.ts::presignS3Get) —
+//      the ONLY thing that reaches the cell: it grants exactly one GET of one key, expires, and
+//      embeds a derived signature, not the secret key. No object-store credential lands on the cell.
+//   2. Relay a short script to the cell-agent's /exec (the SAME relay wp-cli/db-export use, with the
+//      agency's own CELL_AGENT_TOKEN) that `curl`s the dump to a temp FILE, `wp db import`s it, and
+//      removes the file. The DOWNLOAD happens BEFORE the import, and `set -e` aborts on a failed
+//      download — so a bad/expired URL or a missing object can never leave the DB half-replaced.
+//   3. Return a SMALL result: {ok, op, objectKey, exitCode}. Never the dump, never the URL.
+//
+// DESTRUCTIVE + NON-IDEMPOTENT (F1): `wp db import` REPLACES the site's DB. The orchestrator
+// registers db-import NON-idempotent (AGENCY_OP_IDEMPOTENT), so dispatchWithRetry runs it exactly
+// once and never auto-retries a transient failure — a re-apply of a dump without DROP TABLE would
+// double-insert. handleActuate burns the nonce on receipt, so a re-run needs a fresh-signed job,
+// which the F1 contract deliberately withholds for a non-idempotent op.
+//
+// TIME BUDGET: same as db-export — the presign expiry bounds the download+import window, and the
+// exec timeout is held just inside it. A very large dump may need a wider window later.
+
+// How long the presigned GET stays valid, from the moment this Worker mints it.
+const DB_IMPORT_PRESIGN_EXPIRES_SECONDS = 600;
+// The cell-agent kills the exec at this bound, held just inside the presign window so a slow
+// download+import is cut off by the agent rather than left reading an already-expired URL.
+const DB_IMPORT_EXEC_TIMEOUT_MS = 540_000;
+// How much of the cell's stderr/stdout we quote into a FAILURE detail (each). Enough to see a
+// curl / wp-db-import error, small enough to keep the result small.
+const DB_IMPORT_DETAIL_OUTPUT_MAX_CHARS = 2048;
+
+/**
+ * The POSIX-sh script the cell runs (under the cell-agent's `sh -lc "cd <docroot> && <script>"`,
+ * dash on the Debian cells — so no `pipefail`, and one `;`-joined line). Steps:
+ *   set -eu                       fail fast on any error or unset variable
+ *   T=$(mktemp)                   a temp FILE for the dump (local /tmp, not the NFS docroot)
+ *   trap 'rm -f "$T"' EXIT INT TERM  remove the dump on EVERY exit path — success, a failed
+ *                                 download/import (set -e exits still run EXIT), or a signal
+ *   curl ... -o "$T" URL          DOWNLOAD the dump to the file FIRST (--fail-with-body turns an
+ *                                 HTTP >= 400 into a non-zero exit AND keeps the store's error body
+ *                                 for the failure detail; -sS = no progress bar, errors shown). set
+ *                                 -e means a failed download aborts BEFORE the DB is touched.
+ *   wp db import "$T"             load the dump into the site's DB (only reached on a good download)
+ * The presigned URL is single-quoted (shellQuoteArg): it carries `&` and `=`, and although it is
+ * Worker-generated (not attacker data) it is quoted like every other value we hand to a shell.
+ */
+export function buildDbImportScript(presignedUrl: string): string {
+  return [
+    "set -eu",
+    "T=$(mktemp)",
+    `trap 'rm -f "$T"' EXIT INT TERM`,
+    `curl -sS --fail-with-body -o "$T" ${shellQuoteArg(presignedUrl)}`,
+    'wp db import "$T"',
+  ].join("; ");
+}
+
+/** Bound one output stream for a db-import failure detail, marking when it was cut. */
+function truncateForImportDetail(text: string): string {
+  if (text.length <= DB_IMPORT_DETAIL_OUTPUT_MAX_CHARS) return text;
+  return text.slice(0, DB_IMPORT_DETAIL_OUTPUT_MAX_CHARS) + "…[truncated]";
+}
+
+function dbImportFailure(objectKey: string, detail: string, exitCode?: number): DbImportResult {
+  if (exitCode === undefined) {
+    return { ok: false, op: "db-import", objectKey, detail };
+  }
+  return { ok: false, op: "db-import", objectKey, detail, exitCode };
+}
+
+/**
+ * Download the dump at `params.objectKey` in the agency's S3_BUCKET and import it into the DB of the
+ * site at `params.docroot` on the agency's cell, via a presigned GET the cell uses. Returns a
+ * structured result; every failure (missing config, presign/relay error, a non-zero exit from the
+ * download or the import) is ok:false + detail, never a thrown 500. NEVER uses a platform credential
+ * (there is none here), and NEVER returns the dump or the presigned URL.
+ */
+export async function actuateDbImport(params: DbImportParams, env: Env): Promise<DbImportResult> {
+  const objectKey = params.objectKey;
+
+  if (!env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY || !env.S3_BUCKET) {
+    return dbImportFailure(
+      objectKey,
+      "S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY / S3_BUCKET are not configured on this Worker.",
+    );
+  }
+  const cellAgentUrl = env.CELL_AGENT_URL;
+  const cellAgentToken = env.CELL_AGENT_TOKEN;
+  if (!cellAgentUrl || !cellAgentToken) {
+    return dbImportFailure(objectKey, "CELL_AGENT_URL / CELL_AGENT_TOKEN are not configured on this Worker.");
+  }
+
+  // Same store resolution as db-export / the /validate write probe: a custom endpoint
+  // (R2/MinIO/Wasabi) is path-style, no endpoint is real AWS; region defaults the same way.
+  const presigned = await presignS3Get({
+    endpoint: env.S3_ENDPOINT ? stripTrailingSlash(env.S3_ENDPOINT) : undefined,
+    bucket: env.S3_BUCKET,
+    region: env.S3_REGION || "us-east-1",
+    accessKeyId: env.S3_ACCESS_KEY_ID,
+    secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+    key: objectKey,
+    expiresSeconds: DB_IMPORT_PRESIGN_EXPIRES_SECONDS,
+  });
+
+  const exec = await execOnCellAgent(cellAgentUrl, cellAgentToken, {
+    script: buildDbImportScript(presigned.url),
+    docroot: params.docroot,
+    timeoutMs: DB_IMPORT_EXEC_TIMEOUT_MS,
+  });
+  if (!exec.ok) {
+    return dbImportFailure(objectKey, exec.detail);
+  }
+
+  // A non-zero exit IS a failure here: `set -e` means the download or the import did not complete,
+  // so the DB may be untouched (download failed first — the safe case) or partially replaced (the
+  // import failed mid-file). Quote the cell's (bounded, redacted) output so the operator can see
+  // WHICH step failed and why.
+  if (exec.code !== 0) {
+    const outputParts: string[] = [];
+    if (exec.stderr) outputParts.push(`stderr: ${truncateForImportDetail(exec.stderr)}`);
+    if (exec.stdout) outputParts.push(`stdout: ${truncateForImportDetail(exec.stdout)}`);
+    const output = outputParts.length > 0 ? ` — ${outputParts.join(" | ")}` : "";
+    return dbImportFailure(
+      objectKey,
+      redactPresignedUrl(`DB download or import failed on the cell (exit ${exec.code})${output}`, presigned.url),
+      exec.code,
+    );
+  }
+
+  return { ok: true, op: "db-import", objectKey, exitCode: 0 };
 }

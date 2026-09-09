@@ -30,9 +30,10 @@ import {
   validateCachePurgeParams,
   validateWpCliParams,
   validateDbExportParams,
+  validateDbImportParams,
 } from "../src/dispatch-params.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
-import { buildDbExportScript } from "../src/actuate.js";
+import { buildDbExportScript, buildDbImportScript } from "../src/actuate.js";
 
 // ── Web-Crypto helpers (no Node APIs) ───────────────────────────────────────────────
 function bytesToBase64(bytes: Uint8Array): string {
@@ -143,6 +144,20 @@ function dbExportJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
     op: "db-export",
     params: JSON.stringify(DB_EXPORT_PARAMS),
     nonce: "cc77cc77cc77cc77cc77cc77cc77cc77",
+    ...overrides,
+  });
+}
+
+// A db-import job — the caller names an EXISTING dump (same object-key grammar as db-export).
+const DB_IMPORT_PARAMS = {
+  docroot: "/sites/geelongns/public",
+  objectKey: "db-exports/geelongns-2026-09-07t01-02-03z.sql",
+};
+function dbImportJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "db-import",
+    params: JSON.stringify(DB_IMPORT_PARAMS),
+    nonce: "dd88dd88dd88dd88dd88dd88dd88dd88",
     ...overrides,
   });
 }
@@ -418,6 +433,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(Object.keys(DISPATCH_OP_REGISTRY).sort()).toEqual([
       "cache-purge",
       "db-export",
+      "db-import",
       "dns-record-upsert",
       "provision-r2",
       "wp-cli",
@@ -615,6 +631,45 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(docrootVerdict.ok).toBe(false);
     if (!docrootVerdict.ok) expect(docrootVerdict.reason).toMatch(/^docroot must be/);
     const keyVerdict = validateDbExportParams({ docroot: DB_EXPORT_PARAMS.docroot, objectKey: "x.sql" });
+    expect(keyVerdict.ok).toBe(false);
+    if (!keyVerdict.ok) expect(keyVerdict.reason).toMatch(/^objectKey must be db-exports\//);
+  });
+
+  // ── db-import (twin of the app's rules; same two-field shape as db-export) ─────────
+  it("db-import: accepts BOTH docroot forms + a well-formed objectKey and returns only known keys", () => {
+    expect(validateDbImportParams({ ...DB_IMPORT_PARAMS, extra: "x" })).toEqual({ ok: true, params: DB_IMPORT_PARAMS });
+    expect(validateDbImportParams({ docroot: "/var/www/site1", objectKey: "db-exports/site1-2026-09-07t01-02-03z.sql" }).ok).toBe(true);
+    expect(validateDbImportParams({ docroot: "/sites/docs-892769/public", objectKey: "db-exports/docs-892769-20260907.sql" }).ok).toBe(true);
+  });
+
+  it("db-import: rejects a bad docroot with the same grammar as wp-cli/db-export", () => {
+    const bad = (docroot: unknown) => validateDbImportParams({ docroot, objectKey: DB_IMPORT_PARAMS.objectKey });
+    expect(validateDbImportParams(null).ok).toBe(false);
+    expect(bad("/etc").ok).toBe(false);
+    expect(bad("/var/www/../etc").ok).toBe(false);
+    expect(bad("/sites/geelongns").ok).toBe(false); // missing /public
+    expect(bad("/var/www/Site").ok).toBe(false); // uppercase slug
+    expect(bad("/var/www/site/").ok).toBe(false); // trailing slash
+  });
+
+  it("db-import: rejects a bad objectKey (prefix, leading slash, extra segment, '..', case, suffix, charset)", () => {
+    const bad = (objectKey: unknown) => validateDbImportParams({ docroot: DB_IMPORT_PARAMS.docroot, objectKey });
+    expect(bad("geelongns.sql").ok).toBe(false); // outside the db-exports/ prefix
+    expect(bad("/db-exports/geelongns.sql").ok).toBe(false); // leading slash
+    expect(bad("db-exports/sub/geelongns.sql").ok).toBe(false); // extra path segment
+    expect(bad("db-exports/../etc/passwd.sql").ok).toBe(false); // traversal
+    expect(bad("db-exports/a..sql").ok).toBe(false); // ".." inside the name
+    expect(bad("db-exports/Geelongns.sql").ok).toBe(false); // uppercase
+    expect(bad("db-exports/geelongns.SQL").ok).toBe(false); // uppercase suffix
+    expect(bad("db-exports/geelongns.sql.gz").ok).toBe(false); // not .sql
+    expect(bad("db-exports/geelongns;rm.sql").ok).toBe(false); // shell metachar
+  });
+
+  it("db-import: a verdict names the offending field", () => {
+    const docrootVerdict = validateDbImportParams({ docroot: "/etc", objectKey: DB_IMPORT_PARAMS.objectKey });
+    expect(docrootVerdict.ok).toBe(false);
+    if (!docrootVerdict.ok) expect(docrootVerdict.reason).toMatch(/^docroot must be/);
+    const keyVerdict = validateDbImportParams({ docroot: DB_IMPORT_PARAMS.docroot, objectKey: "x.sql" });
     expect(keyVerdict.ok).toBe(false);
     if (!keyVerdict.ok) expect(keyVerdict.reason).toMatch(/^objectKey must be db-exports\//);
   });
@@ -1616,6 +1671,188 @@ describe("POST /actuate route", () => {
 
     const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
     expect(response.status).toBe(400);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── db-import through the registry ──────────────────────────────────────────────────
+  // The reverse of db-export: the Worker presigns a single-object GET with the agency's S3_*
+  // credential and relays ONE script to the cell-agent /exec (same relay + CELL_AGENT_TOKEN).
+  // Load-bearing assertions: the presigned GET URL is the ONLY store-related thing in the script
+  // (no S3 secret), the script DOWNLOADS to a temp FILE BEFORE `wp db import` (so a failed download
+  // never half-replaces the DB), the result is small and never echoes the URL, and a non-zero exit
+  // is ok:false with the URL redacted.
+
+  /** Pull the single-quoted presigned GET URL back out of the relayed import script. */
+  function presignedGetUrlIn(script: string): string {
+    const match = /-o "\$T" '([^']+)'/.exec(script);
+    if (!match) throw new Error(`no quoted presigned URL in the download step: ${script}`);
+    return match[1];
+  }
+
+  it("db-import: relays download-to-file -> wp db import to the cell-agent using CELL_AGENT_TOKEN only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbImportJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCellAgent({ code: 0, stdout: "", stderr: "" });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    // A SMALL result: exactly these four keys — never the dump, never the presigned URL.
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "db-import",
+      objectKey: DB_IMPORT_PARAMS.objectKey,
+      exitCode: 0,
+    });
+
+    expect(calls).toHaveLength(1);
+    const call = calls[0];
+    expect(call.url).toBe("https://cell.example.test/exec");
+    expect(call.method).toBe("POST");
+    // The agency's OWN cell token — never a platform / Cloudflare / S3 credential.
+    expect(call.auth).toBe("Bearer cell-token-123");
+    expect(call.redirect).toBe("manual");
+    expect(call.body.docroot).toBe("/sites/geelongns/public");
+    expect(call.body.timeoutMs).toBe(540_000);
+
+    const script = call.body.script ?? "";
+    const presignedUrl = presignedGetUrlIn(script);
+    // The exact script shape (buildDbImportScript is the single source of truth for it): DOWNLOAD
+    // (curl -o) comes BEFORE the import (wp db import), so a failed download aborts under set -e.
+    expect(script).toBe(buildDbImportScript(presignedUrl));
+    expect(script).toBe(
+      "set -eu; " +
+        "T=$(mktemp); " +
+        `trap 'rm -f "$T"' EXIT INT TERM; ` +
+        `curl -sS --fail-with-body -o "$T" '${presignedUrl}'; ` +
+        'wp db import "$T"',
+    );
+    expect(script.indexOf("curl")).toBeLessThan(script.indexOf("wp db import"));
+
+    // The presigned URL is a GET, targets the agency's bucket + the signed objectKey, path-style at
+    // the configured endpoint, with the full SigV4 query set and a 600 s expiry.
+    const url = new URL(presignedUrl);
+    expect(url.origin).toBe("https://acct123.r2.example.test");
+    expect(url.pathname).toBe(`/agency-backups/${DB_IMPORT_PARAMS.objectKey}`);
+    expect(url.searchParams.get("X-Amz-Algorithm")).toBe("AWS4-HMAC-SHA256");
+    expect(url.searchParams.get("X-Amz-Credential")).toMatch(/^s3-akid-example\/\d{8}\/auto\/s3\/aws4_request$/);
+    expect(url.searchParams.get("X-Amz-Expires")).toBe("600");
+    expect(url.searchParams.get("X-Amz-SignedHeaders")).toBe("host");
+    expect(url.searchParams.get("X-Amz-Signature")).toMatch(/^[0-9a-f]{64}$/);
+    // NO object-store credential reaches the cell — only the derived URL.
+    expect(script).not.toContain("s3-secret-example");
+    expect(JSON.stringify(call.body)).not.toContain("s3-secret-example");
+  });
+
+  it("db-import: targets AWS virtual-hosted-style when the agency has no S3_ENDPOINT", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbImportJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCellAgent({ code: 0, stdout: "", stderr: "" });
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ S3_ENDPOINT: undefined, S3_REGION: "us-east-1" }),
+    );
+    expect(response.status).toBe(200);
+    const url = new URL(presignedGetUrlIn(calls[0].body.script ?? ""));
+    expect(url.host).toBe("agency-backups.s3.us-east-1.amazonaws.com");
+    expect(url.pathname).toBe(`/${DB_IMPORT_PARAMS.objectKey}`);
+  });
+
+  it("db-import: a NON-ZERO exit is ok:false with the cell's output quoted and the URL redacted", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbImportJob();
+    const signature = await signAsApp(job, privateKey);
+    // A download rejection: --fail-with-body exits 22; make stderr echo the full presigned URL to
+    // prove the redaction (curl does not normally, but the detail must be safe even if it did).
+    let relayedScript = "";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as { script: string };
+      relayedScript = body.script;
+      const presignedUrl = presignedGetUrlIn(body.script);
+      return jsonResponse({
+        code: 22,
+        stdout: "",
+        stderr: `curl: (22) The requested URL returned error: 403 for ${presignedUrl}`,
+      });
+    });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; op: string; objectKey: string; exitCode: number; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("db-import");
+    expect(body.objectKey).toBe(DB_IMPORT_PARAMS.objectKey);
+    expect(body.exitCode).toBe(22);
+    expect(body.detail).toMatch(/DB download or import failed on the cell \(exit 22\)/);
+    expect(body.detail).toContain("curl: (22)");
+    // ... but NEVER the still-valid download capability or the access-key ID.
+    const presignedUrl = presignedGetUrlIn(relayedScript);
+    expect(body.detail).not.toContain(presignedUrl);
+    expect(body.detail).not.toMatch(/X-Amz-Signature=[0-9a-f]{64}/);
+    expect(body.detail).not.toContain("s3-akid-example");
+    expect(body.detail).toContain("[presigned-url]");
+  });
+
+  it("db-import: a cell-agent 401 becomes a clean ok:false (no bypass)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbImportJob();
+    const signature = await signAsApp(job, privateKey);
+    mockCellAgent({ error: "unauthorized" }, 401);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/rejected CELL_AGENT_TOKEN/);
+  });
+
+  it("db-import: reports a clean failure and touches NOTHING when the S3_* credential is missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbImportJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    for (const missing of ["S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_BUCKET"] as const) {
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ [missing]: undefined }));
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { ok: boolean; detail: string };
+      expect(body.ok).toBe(false);
+      expect(body.detail).toMatch(/S3_ACCESS_KEY_ID \/ S3_SECRET_ACCESS_KEY \/ S3_BUCKET are not configured/);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("db-import: reports a clean failure and touches NO cell-agent when CELL_AGENT_URL/TOKEN are missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbImportJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ CELL_AGENT_URL: undefined, CELL_AGENT_TOKEN: undefined }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/CELL_AGENT_URL \/ CELL_AGENT_TOKEN are not configured/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("db-import: a signed job with an invalid objectKey is 400 with no presign and no cell-agent call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dbImportJob({
+      params: JSON.stringify({ docroot: "/sites/geelongns/public", objectKey: "../../etc/passwd.sql" }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { reason: string };
+    expect(body.reason).toMatch(/objectKey must be db-exports\//);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

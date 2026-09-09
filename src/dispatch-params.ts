@@ -419,6 +419,57 @@ export function validateDbExportParams(raw: unknown): ParamsVerdict<DbExportPara
   return { ok: true, params: { docroot, objectKey } };
 }
 
+// ── db-import ────────────────────────────────────────────────────────────────────────
+// Import a SQL dump from the agency's own object store INTO a cell site's WordPress DB — the
+// reverse of db-export. The dump flows object store -> cell (the Worker's actuate.ts::actuateDbImport
+// PRESIGNS a single-object GET URL the cell `curl`s down, then runs `wp db import`); the dump never
+// passes through the Worker. Two params, both strictly grammared — the SAME two db-export carries:
+//   1. `docroot` — the wp-cli/db-export docroot grammar: selects the site whose DB is REPLACED.
+//   2. `objectKey` — the object key of the dump to read, under the same db-exports/ prefix + .sql
+//      grammar db-export writes (a db-import normally re-loads a dump db-export produced). The
+//      caller (orchestrator) supplies it — unlike db-export it is NOT generated here, because a
+//      db-import names an EXISTING dump to restore.
+//
+// DESTRUCTIVE + NON-IDEMPOTENT: `wp db import` REPLACES the site's DB with the dump's contents. The
+// orchestrator registers db-import non-idempotent (AGENCY_OP_IDEMPOTENT), so the F1 dispatcher runs
+// it exactly once and never auto-retries a transient failure — a re-apply of a dump WITHOUT DROP
+// TABLE would double-insert. This validator does not (cannot) inspect the dump; the run-once contract
+// is the safety control, alongside the download-before-import order in actuate.ts (a failed download
+// aborts before the DB is touched).
+
+export interface DbImportParams {
+  /** The site's docroot on the cell — selects the site whose DB is replaced + the working directory. */
+  docroot: string;
+  /** The object key of the dump to import, e.g. "db-exports/<slug>-<timestamp>.sql". */
+  objectKey: string;
+}
+
+export function validateDbImportParams(raw: unknown): ParamsVerdict<DbImportParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { docroot, objectKey } = raw;
+
+  if (typeof docroot !== "string" || !WP_CLI_DOCROOT_RE.test(docroot)) {
+    return {
+      ok: false,
+      reason:
+        "docroot must be an absolute cell docroot (/var/www/<slug> or /sites/<slug>/public) with a lowercase slug, no '..', no trailing slash, no extra path segment",
+    };
+  }
+  // Same object-key grammar as db-export (a db-import normally re-loads a db-export dump): the "."
+  // check keeps the "no traversal-looking key" rule literal even though no "/" can follow the prefix.
+  if (typeof objectKey !== "string" || !DB_EXPORT_OBJECT_KEY_RE.test(objectKey) || objectKey.includes("..")) {
+    return {
+      ok: false,
+      reason:
+        "objectKey must be db-exports/<name>.sql with a lowercase <name> of [a-z0-9._-] (1-121 chars), no '..', no leading slash, no extra path segment",
+    };
+  }
+
+  return { ok: true, params: { docroot, objectKey } };
+}
+
 // ── shared ─────────────────────────────────────────────────────────────────────────
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

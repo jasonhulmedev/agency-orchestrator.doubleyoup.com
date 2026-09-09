@@ -274,16 +274,8 @@ export async function presignS3Url(options: {
   return { url, canonicalRequest, stringToSign };
 }
 
-/**
- * Presign a PUT of ONE object so a third party can upload it without the credential.
- *
- * URL style follows the validate write-probe (validators.ts::validateS3):
- *   • `endpoint` set (Cloudflare R2, MinIO, Wasabi) — path-style `<endpoint>/<bucket>/<key>`;
- *   • no `endpoint` (real AWS S3) — virtual-hosted `https://<bucket>.s3.<region>.amazonaws.com/<key>`.
- * The bucket and each `/`-separated key segment are AWS-URI-encoded exactly once here; the
- * path then goes to presignS3Url verbatim (see its encoding contract).
- */
-export async function presignS3Put(options: {
+/** Options for the per-object presigners (presignS3Put / presignS3Get) — one object, one method. */
+export interface PresignS3ObjectOptions {
   endpoint?: string;
   bucket: string;
   region: string;
@@ -292,27 +284,57 @@ export async function presignS3Put(options: {
   key: string;
   expiresSeconds: number;
   nowMs?: number;
-}): Promise<PresignedUrl> {
-  const encodedKey = options.key.split("/").map(awsUriEncodeComponent).join("/");
+}
 
-  let objectUrl: string;
+/**
+ * Build the S3 wire URL for ONE object, following the validate write-probe (validators.ts::validateS3):
+ *   • `endpoint` set (Cloudflare R2, MinIO, Wasabi) — path-style `<endpoint>/<bucket>/<key>`;
+ *   • no `endpoint` (real AWS S3) — virtual-hosted `https://<bucket>.s3.<region>.amazonaws.com/<key>`.
+ * The bucket and each `/`-separated key segment are AWS-URI-encoded exactly once here; the path
+ * then goes to presignS3Url verbatim (see its encoding contract). Shared by the PUT and GET
+ * presigners so an upload and a download address the same object identically.
+ */
+function s3ObjectUrl(options: PresignS3ObjectOptions): string {
+  const encodedKey = options.key.split("/").map(awsUriEncodeComponent).join("/");
   if (options.endpoint) {
     const endpoint = new URL(options.endpoint);
     // Keep any path prefix the endpoint carries (normally none — R2 endpoints are bare hosts),
     // minus a trailing slash so the join never produces "//".
     const basePath = endpoint.pathname.replace(/\/+$/, "");
-    objectUrl = `${endpoint.protocol}//${endpoint.host}${basePath}/${awsUriEncodeComponent(options.bucket)}/${encodedKey}`;
-  } else {
-    objectUrl = `https://${options.bucket}.s3.${options.region}.amazonaws.com/${encodedKey}`;
+    return `${endpoint.protocol}//${endpoint.host}${basePath}/${awsUriEncodeComponent(options.bucket)}/${encodedKey}`;
   }
+  return `https://${options.bucket}.s3.${options.region}.amazonaws.com/${encodedKey}`;
+}
 
+/** Presign one object for `method`, valid for `expiresSeconds`. The shared core of the two exports. */
+function presignS3Object(method: "GET" | "PUT", options: PresignS3ObjectOptions): Promise<PresignedUrl> {
   return presignS3Url({
-    method: "PUT",
-    url: objectUrl,
+    method,
+    url: s3ObjectUrl(options),
     region: options.region,
     accessKeyId: options.accessKeyId,
     secretAccessKey: options.secretAccessKey,
     expiresSeconds: options.expiresSeconds,
     nowMs: options.nowMs,
   });
+}
+
+/**
+ * Presign a PUT of ONE object so a third party can UPLOAD it without the credential — the
+ * agency's cell uses this in the Direction-B `db-export` op to `curl --upload-file` a DB dump
+ * straight to the agency's object store. The secret key never leaves the Worker; the URL carries
+ * only a derived signature, the access-key ID and the expiry, and grants exactly one PUT of one key.
+ */
+export function presignS3Put(options: PresignS3ObjectOptions): Promise<PresignedUrl> {
+  return presignS3Object("PUT", options);
+}
+
+/**
+ * Presign a GET of ONE object so a third party can DOWNLOAD it without the credential — the
+ * agency's cell uses this in the Direction-B `db-import` op to `curl` a DB dump down from the
+ * agency's object store before `wp db import`. Same guarantees as presignS3Put in reverse: the
+ * secret key never leaves the Worker, and the URL grants exactly one GET of one key until it expires.
+ */
+export function presignS3Get(options: PresignS3ObjectOptions): Promise<PresignedUrl> {
+  return presignS3Object("GET", options);
 }

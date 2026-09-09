@@ -17,7 +17,7 @@
 // Worker-native (Web Crypto only), like the rest of the Worker's tests.
 
 import { describe, it, expect } from "vitest";
-import { presignS3Put, presignS3Url } from "../src/sigv4.js";
+import { presignS3Put, presignS3Get, presignS3Url } from "../src/sigv4.js";
 
 // ── Pin 1: the AWS-published example ──────────────────────────────────────────────────
 const AWS_EXAMPLE = {
@@ -186,5 +186,52 @@ describe("presignS3Put — the db-export PUT pin (R2 path-style, region auto)", 
     const presigned = await presignS3Put({ ...DB_EXPORT_PUT, endpoint: "https://acct123.r2.cloudflarestorage.com/" });
     expect(new URL(presigned.url).pathname).toBe("/agency-backups/db-exports/geelongns-2026-09-07t01-02-03z.sql");
     expect(presigned.url).toBe((await presignS3Put(DB_EXPORT_PUT)).url);
+  });
+});
+
+describe("presignS3Get — the db-import GET pin (same object as the PUT, method GET)", () => {
+  // db-import reads back exactly the object db-export wrote, so presignS3Get MUST address it
+  // identically to presignS3Put — same path, same X-Amz query (the method is NOT in the query) —
+  // and differ ONLY in the canonical request's method line, which flows through to a different
+  // signature. The GET signing scheme itself is already pinned against the AWS-published GET
+  // example above (both go through presignS3Url), so here we pin the shared addressing + the
+  // method sensitivity rather than a second magic signature.
+  it("pins the canonical request: GET, the SAME single-encoded path + query as the PUT, host only, UNSIGNED-PAYLOAD", async () => {
+    const presigned = await presignS3Get(DB_EXPORT_PUT);
+    expect(presigned.canonicalRequest).toBe(
+      "GET\n" +
+        "/agency-backups/db-exports/geelongns-2026-09-07t01-02-03z.sql\n" +
+        `${DB_EXPORT_PUT_CANONICAL_QUERY}\n` +
+        "host:acct123.r2.cloudflarestorage.com\n" +
+        "\n" +
+        "host\n" +
+        "UNSIGNED-PAYLOAD",
+    );
+  });
+
+  it("addresses the SAME object as presignS3Put but signs a DIFFERENT signature (method-sensitive)", async () => {
+    const get = await presignS3Get(DB_EXPORT_PUT);
+    const put = await presignS3Put(DB_EXPORT_PUT);
+    const getUrl = new URL(get.url);
+    const putUrl = new URL(put.url);
+    // Same object + same signed query set ...
+    expect(getUrl.origin).toBe(putUrl.origin);
+    expect(getUrl.pathname).toBe(putUrl.pathname);
+    expect(getUrl.searchParams.get("X-Amz-Credential")).toBe(putUrl.searchParams.get("X-Amz-Credential"));
+    expect(getUrl.searchParams.get("X-Amz-SignedHeaders")).toBe("host");
+    // ... but the method line makes the signature differ, and the secret never appears.
+    const signatureOf = (u: URL) => u.searchParams.get("X-Amz-Signature");
+    expect(signatureOf(getUrl)).toMatch(/^[0-9a-f]{64}$/);
+    expect(signatureOf(getUrl)).not.toBe(signatureOf(putUrl));
+    expect(get.url).not.toContain(DB_EXPORT_PUT.secretAccessKey);
+  });
+
+  it("targets real AWS S3 virtual-hosted-style when no endpoint is configured", async () => {
+    const { endpoint: _dropped, ...withoutEndpoint } = DB_EXPORT_PUT;
+    const presigned = await presignS3Get({ ...withoutEndpoint, region: "us-east-1" });
+    expect(
+      presigned.url.startsWith("https://agency-backups.s3.us-east-1.amazonaws.com/db-exports/geelongns-2026-09-07t01-02-03z.sql?"),
+    ).toBe(true);
+    expect(presigned.canonicalRequest.split("\n")[0]).toBe("GET");
   });
 });
