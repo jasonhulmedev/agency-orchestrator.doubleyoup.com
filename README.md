@@ -138,6 +138,7 @@ npm run typecheck                # tsc --noEmit
 - Worker-native only: **`fetch` + Web Crypto** (`crypto.subtle`). No AWS/GCP
   SDKs. The SigV4 signer (S3) and the RS256 JWT-bearer mint (GCP) are
   hand-rolled against Web Crypto.
-- Inbound requests are **not yet signature-verified**: in Phase 1 the agency
-  triggers `/validate` and `/complete` themselves. The Direction-B signed
-  handshake (our app → this Worker) is Phase 2.
+- The Direction-B signed handshake (our app → this Worker) is **live**: `POST
+  /actuate` verifies an ed25519 signature + a single-use nonce before running any
+  allowlisted op (provision-r2, dns-record-upsert, cache-purge, wp-cli,
+  db-export, db-import). `/validate` and `/complete` stay agency-triggered.
