@@ -427,6 +427,21 @@ export async function validateAnthropic(env: Env): Promise<ValidationResult> {
     return { ok: false, detail: "Anthropic not configured — set the ANTHROPIC_API_KEY secret." };
   }
 
+  // A Claude Code OAuth / setup-token ("sk-ant-oat…", from `claude setup-token`) is NOT a standard
+  // API key: it authenticates via the OAuth Bearer flow, Anthropic rejects it for third-party API
+  // use (disabled 2026-02-20), and the x-api-key probe below cannot verify it. Per an explicit
+  // product decision (Jason) we ACCEPT it on FORMAT ONLY — green so onboarding is not blocked —
+  // WITHOUT verifying it works. This is deliberately not a working-credential check; whether such a
+  // token is usable is left to be handled at runtime. TODO: revisit if the platform gains an
+  // OAuth-aware Anthropic runtime path (or Anthropic re-enables third-party OAuth).
+  if (env.ANTHROPIC_API_KEY.startsWith("sk-ant-oat")) {
+    return {
+      ok: true,
+      detail:
+        "Anthropic Claude setup-token accepted on FORMAT ONLY — NOT verified. OAuth/setup-tokens are not usable for third-party API calls; usability is handled at runtime.",
+    };
+  }
+
   try {
     const response = await fetch("https://api.anthropic.com/v1/models?limit=1", {
       headers: {

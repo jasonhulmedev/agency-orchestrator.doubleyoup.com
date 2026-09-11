@@ -269,6 +269,17 @@ describe("validateAnthropic / validateOpenRouter", () => {
     expect(result.detail).toMatch(/ANTHROPIC_API_KEY/);
   });
 
+  it("Anthropic setup-token (sk-ant-oat) is accepted on FORMAT ONLY without hitting the network", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateAnthropic({ ...baseEnv, ANTHROPIC_API_KEY: "sk-ant-oat01-EXAMPLE" });
+    expect(result.ok).toBe(true);
+    // Deliberately format-only: the detail must say it was NOT verified (no false "authenticated").
+    expect(result.detail).toMatch(/FORMAT ONLY/);
+    expect(result.detail).toMatch(/NOT verified/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("OpenRouter ok on 200 with a label", async () => {
     vi.stubGlobal(
       "fetch",
