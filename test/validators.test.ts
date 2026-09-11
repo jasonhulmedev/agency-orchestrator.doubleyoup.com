@@ -11,6 +11,9 @@ import {
   validateR2Provision,
   validateCfDns,
   validateAll,
+  mintGoogleAccessToken,
+  GOOGLE_SCOPE_CLOUD_PLATFORM,
+  GOOGLE_SCOPE_CLOUD_PLATFORM_READ_ONLY,
 } from "../src/validators.js";
 
 // Minimal Env with only the Direction-A fields; each test spreads in the
@@ -320,7 +323,7 @@ describe("validateAI aggregate", () => {
     expect(result.detail).toContain("Anthropic: ok");
   });
 
-  it("is not-ok when one configured provider fails, and names both", async () => {
+  it("is OK when one configured provider fails but another passes (any-of), and names both", async () => {
     vi.stubGlobal(
       "fetch",
       routedFetch([
@@ -329,8 +332,23 @@ describe("validateAI aggregate", () => {
       ]),
     );
     const result = await validateAI({ ...baseEnv, ANTHROPIC_API_KEY: "sk-ant-x", OPENROUTER_API_KEY: "bad" });
-    expect(result.ok).toBe(false);
+    // One working provider is enough; the broken one is still surfaced in the detail.
+    expect(result.ok).toBe(true);
     expect(result.detail).toContain("Anthropic: ok");
+    expect(result.detail).toMatch(/OpenRouter: .*401/);
+  });
+
+  it("is not-ok only when EVERY configured provider fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      routedFetch([
+        { match: (u) => u.startsWith("https://api.anthropic.com"), respond: () => new Response("", { status: 401 }) },
+        { match: (u) => u.startsWith("https://openrouter.ai"), respond: () => new Response("", { status: 401 }) },
+      ]),
+    );
+    const result = await validateAI({ ...baseEnv, ANTHROPIC_API_KEY: "bad", OPENROUTER_API_KEY: "bad" });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain("Anthropic:");
     expect(result.detail).toContain("OpenRouter:");
   });
 
@@ -573,5 +591,66 @@ describe("validateGCP", () => {
     const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
     expect(result.ok).toBe(false);
     expect(result.detail).toMatch(/could not mint an access token/);
+  });
+
+  it("still requests the READ-ONLY scope (least-privilege probe — unchanged by the scope option)", async () => {
+    const key = await makeServiceAccountKey();
+    const fetchMock = routedFetch([
+      { match: (u) => u.includes("oauth2.googleapis.com/token"), respond: () => jsonResponse({ access_token: "ya29.test" }) },
+      { match: (u) => u.includes("cloudresourcemanager.googleapis.com"), respond: () => jsonResponse({ permissions: ["resourcemanager.projects.get"] }) },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+    expect(result.ok).toBe(true);
+    const [, tokenInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const claims = jwtClaimsOf(new URLSearchParams(String(tokenInit.body)).get("assertion") ?? "");
+    expect(claims.scope).toBe(GOOGLE_SCOPE_CLOUD_PLATFORM_READ_ONLY);
+    expect(claims.scope).toBe("https://www.googleapis.com/auth/cloud-platform.read-only");
+  });
+});
+
+/** Decode the claims segment of a JWT assertion (base64url, no padding). */
+function jwtClaimsOf(assertion: string): Record<string, unknown> {
+  const claimsSegment = assertion.split(".")[1];
+  const padded = claimsSegment
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    .padEnd(Math.ceil(claimsSegment.length / 4) * 4, "=");
+  return JSON.parse(atob(padded)) as Record<string, unknown>;
+}
+
+// The one place the Worker mints Google tokens. The scope is the knob that separates the read-only
+// /validate probe from the gcp-instance-create WRITE — pin both behaviours.
+describe("mintGoogleAccessToken", () => {
+  async function saKeyFields(): Promise<{ clientEmail: string; privateKeyPem: string; tokenUri: string }> {
+    const parsed = JSON.parse(await makeServiceAccountKey()) as { client_email: string; private_key: string; token_uri: string };
+    return { clientEmail: parsed.client_email, privateKeyPem: parsed.private_key, tokenUri: parsed.token_uri };
+  }
+
+  it("defaults to the READ-ONLY scope and returns the access token", async () => {
+    const fetchMock = routedFetch([
+      { match: (u) => u === "https://oauth2.googleapis.com/token", respond: () => jsonResponse({ access_token: "ya29.default" }) },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const token = await mintGoogleAccessToken(await saKeyFields());
+    expect(token).toBe("ya29.default");
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const claims = jwtClaimsOf(new URLSearchParams(String(init.body)).get("assertion") ?? "");
+    expect(claims.scope).toBe(GOOGLE_SCOPE_CLOUD_PLATFORM_READ_ONLY);
+  });
+
+  it("honours an explicit scope (the FULL cloud-platform scope the gcp-instance-create actuator asks for)", async () => {
+    const fetchMock = routedFetch([
+      { match: (u) => u === "https://oauth2.googleapis.com/token", respond: () => jsonResponse({ access_token: "ya29.full" }) },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const token = await mintGoogleAccessToken({ ...(await saKeyFields()), scope: GOOGLE_SCOPE_CLOUD_PLATFORM });
+    expect(token).toBe("ya29.full");
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const claims = jwtClaimsOf(new URLSearchParams(String(init.body)).get("assertion") ?? "");
+    expect(claims.scope).toBe("https://www.googleapis.com/auth/cloud-platform");
   });
 });

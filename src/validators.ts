@@ -503,10 +503,13 @@ export async function validateOpenAI(env: Env): Promise<ValidationResult> {
   }
 }
 
-// Aggregate AI result surfaced at /validate. All three providers are optional;
-// the aggregate is green only when at least one AI key is configured and EVERY
-// configured provider validates. A provider that isn't configured is neither
-// counted nor held against the agency.
+// Aggregate AI result surfaced at /validate. All three providers are optional and
+// the platform only needs ONE working AI backend, so the aggregate is green when at
+// least one CONFIGURED provider validates (any-of, not all-of). A configured-but-broken
+// key does NOT block onboarding — it is still listed in the detail so the agency can fix
+// or remove it, but as long as one provider works the check passes. A provider that isn't
+// configured is neither counted nor held against the agency. Only red when every
+// configured provider fails (or none is configured).
 export async function validateAI(env: Env): Promise<ValidationResult> {
   const providers: Array<{ name: string; configured: boolean; result: ValidationResult }> = [
     { name: "Anthropic", configured: !!env.ANTHROPIC_API_KEY, result: await validateAnthropic(env) },
@@ -518,15 +521,17 @@ export async function validateAI(env: Env): Promise<ValidationResult> {
   if (configured.length === 0) {
     return {
       ok: false,
-      detail: "No AI keys configured — set ANTHROPIC_API_KEY, OPENROUTER_API_KEY and/or OPENAI_API_KEY.",
+      detail: "No AI keys configured — set ANTHROPIC_API_KEY, OPENROUTER_API_KEY and/or OPENAI_API_KEY (any one is enough).",
     };
   }
 
-  const allOk = configured.every((provider) => provider.result.ok);
+  // any-of: one working provider is enough. The detail still names every configured
+  // provider's status so a broken key stays visible even when the aggregate is green.
+  const anyOk = configured.some((provider) => provider.result.ok);
   const detail = configured
     .map((provider) => `${provider.name}: ${provider.result.ok ? "ok" : provider.result.detail}`)
     .join(" | ");
-  return { ok: allOk, detail };
+  return { ok: anyOk, detail };
 }
 
 // ── Google Cloud ──────────────────────────────────────────────────────────────
