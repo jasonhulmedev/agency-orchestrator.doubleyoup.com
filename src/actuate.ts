@@ -2,10 +2,12 @@
 // OWN credentials — R2_PROVISION_API_TOKEN to create an R2 bucket, CF_DNS_API_TOKEN to
 // upsert a DNS record / purge cache in one of the agency's zones, CELL_AGENT_TOKEN to run
 // a wp-cli command on the agency's own cell via its on-VM cell-agent (the first "heavy"
-// data-plane op), and — for `db-export` — the agency's S3_* object-store credential to
-// PRESIGN a URL the cell uploads a DB dump to. There is deliberately NO platform
-// credential anywhere in this Worker to fall back to: if the agency's token is missing or
-// unauthorized, actuation fails cleanly rather than reaching for ours.
+// data-plane op), the agency's S3_* object-store credential to PRESIGN a URL the cell
+// uploads a DB dump to (`db-export`) or downloads one from (`db-import`), and — for
+// `gcp-instance-create` — the agency's GCP_SERVICE_ACCOUNT_KEY to mint a Google access
+// token and create a Compute Engine VM in the agency's own project. There is deliberately
+// NO platform credential anywhere in this Worker to fall back to: if the agency's token is
+// missing or unauthorized, actuation fails cleanly rather than reaching for ours.
 //
 // Every actuator here runs ONLY after dispatch-verify.ts::verifyDispatch returned ok:true,
 // the nonce was consumed, and the op's params validated (index.ts::handleActuate via
@@ -18,8 +20,16 @@
 // ever string-interpolated into a URL.
 
 import type { Env } from "./env.js";
-import type { DnsRecordUpsertParams, CachePurgeParams, WpCliParams, DbExportParams, DbImportParams } from "./dispatch-params.js";
+import type {
+  DnsRecordUpsertParams,
+  CachePurgeParams,
+  WpCliParams,
+  DbExportParams,
+  DbImportParams,
+  GcpInstanceCreateParams,
+} from "./dispatch-params.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
+import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken } from "./validators.js";
 import { errorMessage, stripTrailingSlash } from "./util.js";
 
 const CF_API = "https://api.cloudflare.com/client/v4";
@@ -52,13 +62,21 @@ export type DbImportResult =
   | { ok: true; op: "db-import"; objectKey: string; exitCode: 0 }
   | { ok: false; op: "db-import"; objectKey: string; detail: string; exitCode?: number };
 
+// instances.insert is ASYNC: a 2xx returns a long-running Operation, not the VM. Success here
+// means "Google ACCEPTED the create" — `operationName` + `status` (PENDING/RUNNING/DONE) are
+// what a caller polls. The minted access token is never part of either variant.
+export type GcpInstanceCreateResult =
+  | { ok: true; op: "gcp-instance-create"; instanceName: string; operationName: string; status: string }
+  | { ok: false; op: "gcp-instance-create"; instanceName: string; detail: string };
+
 export type ActuateResult =
   | ProvisionR2Result
   | DnsRecordUpsertResult
   | CachePurgeResult
   | WpCliResult
   | DbExportResult
-  | DbImportResult;
+  | DbImportResult
+  | GcpInstanceCreateResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -970,4 +988,221 @@ export async function actuateDbImport(params: DbImportParams, env: Env): Promise
   }
 
   return { ok: true, op: "db-import", objectKey, exitCode: 0 };
+}
+
+// ── gcp-instance-create ──────────────────────────────────────────────────────────────────
+// The first GCP WRITE through Direction-B: create ONE Compute Engine VM in the AGENCY's own
+// project, authenticated with the agency's own GCP_SERVICE_ACCOUNT_KEY (the same secret /validate
+// probes read-only). Two steps:
+//   1. Mint a Google access token from the key (validators.ts::mintGoogleAccessToken — the RS256
+//      JWT-bearer grant, no SDK) with the FULL cloud-platform scope. validateGCP mints READ-ONLY;
+//      this op cannot, because instances.insert is a write. The scope escalation is inherent to the
+//      op and is the ONLY place the Worker asks for it. The token is per-call, lives in a local, is
+//      sent only as an Authorization header to Google, and is never logged or returned.
+//   2. POST projects/{project}/zones/{zone}/instances with a MINIMAL, PRIVATE body: one boot disk
+//      (Debian 12, auto-delete) and one interface on the project's default VPC with NO accessConfigs
+//      => NO external IP. No `serviceAccounts` either, so the VM carries no identity of its own
+//      (and the create needs no iam.serviceAccounts.actAs). This is a proof VM, not a host.
+//
+// INJECTION SURFACE: `project` + `zone` are URL path segments, and all four params land in the
+// JSON body. They pass the strict grammars in dispatch-params.ts first (no "/", ".", "?", "#",
+// whitespace), then go through encodeURIComponent + JSON.stringify here — belt and braces.
+//
+// ASYNC: a 2xx is a long-running Operation ({name, status, ...}), not the VM. We report ACCEPTED
+// (ok:true + the operation) and leave polling to the caller. A non-2xx (403 missing permission,
+// 404 no such project/zone/network, 409 name taken) is a TERMINAL ok:false carrying Google's own
+// message — the orchestrator classifies a 200 ok:false as actuated-failure and never retries it.
+//
+// NON-IDEMPOTENT (F1): a second insert of the same name is a 409, and a lost response may already
+// have created the VM. The orchestrator registers this op `false` in AGENCY_OP_IDEMPOTENT, so
+// dispatchWithRetry runs it exactly once and never auto-retries a transient failure (like db-import).
+
+const GCP_COMPUTE_API = "https://compute.googleapis.com/compute/v1";
+// The boot image every proof VM is created from: Debian 12 from Google's public debian-cloud
+// project, addressed by image FAMILY so it always resolves to the current patched image.
+const GCP_INSTANCE_BOOT_IMAGE = "projects/debian-cloud/global/images/family/debian-12";
+const GOOGLE_DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token";
+
+/**
+ * What instances.insert answers with. A 2xx is an Operation (`name`, `status`, and — only once
+ * DONE with a failure — `error.errors`); a non-2xx is Google's standard error envelope
+ * (`error.message`). One shape covers both so a single parse serves both paths.
+ */
+interface ComputeInsertResponse {
+  name?: string;
+  status?: string;
+  error?: {
+    message?: string;
+    errors?: Array<{ code?: string; message?: string }>;
+  };
+}
+
+function gcpInstanceCreateFailure(instanceName: string, detail: string): GcpInstanceCreateResult {
+  return { ok: false, op: "gcp-instance-create", instanceName, detail };
+}
+
+/** Google's top-level error message from a response body, if any (for detail strings). */
+function googleErrorMessage(body: ComputeInsertResponse | null): string {
+  const message = body?.error?.message;
+  return message ? `: ${message}` : "";
+}
+
+/**
+ * Create the VM described by `params` in the agency's own project with the agency's own
+ * GCP_SERVICE_ACCOUNT_KEY. Returns a structured result; every failure (missing/malformed key, a
+ * token-mint failure, an unreachable API, a non-2xx from Google) is ok:false + detail, never a
+ * thrown 500. NEVER uses a platform credential (there is none here), and NEVER returns or logs the
+ * minted access token.
+ */
+export async function actuateGcpInstanceCreate(
+  params: GcpInstanceCreateParams,
+  env: Env,
+): Promise<GcpInstanceCreateResult> {
+  const instanceName = params.name;
+
+  if (!env.GCP_SERVICE_ACCOUNT_KEY) {
+    return gcpInstanceCreateFailure(instanceName, "GCP_SERVICE_ACCOUNT_KEY is not configured on this Worker.");
+  }
+  // Parse the key the same way validateGCP does. JSON.parse needs the try/catch (no non-throwing
+  // parse); a non-object result (e.g. the literal `null`) is treated as malformed too.
+  let key: ServiceAccountKey | null;
+  try {
+    key = JSON.parse(env.GCP_SERVICE_ACCOUNT_KEY) as ServiceAccountKey | null;
+  } catch {
+    key = null;
+  }
+  if (!key || typeof key !== "object") {
+    return gcpInstanceCreateFailure(
+      instanceName,
+      "GCP_SERVICE_ACCOUNT_KEY is not valid JSON — it must be the entire downloaded service-account key file.",
+    );
+  }
+  const clientEmail = key.client_email;
+  const privateKeyPem = key.private_key;
+  if (!clientEmail || !privateKeyPem) {
+    return gcpInstanceCreateFailure(
+      instanceName,
+      "GCP_SERVICE_ACCOUNT_KEY is missing client_email or private_key — use a service-account key, not an OAuth client ID.",
+    );
+  }
+  // PIN the target to the key's OWN project (review defense-in-depth). Cross-tenant is already
+  // impossible — the SA key IS the tenant boundary, so a job can never reach another agency's
+  // project (403) — but this makes the code ENFORCE the "in the agency's own project" guarantee the
+  // op claims, so a signed job cannot create a VM in some other project the agency's SA happens to
+  // hold IAM in. Reject BEFORE minting any token or making any call.
+  if (!key.project_id || params.project !== key.project_id) {
+    return gcpInstanceCreateFailure(
+      instanceName,
+      `project "${params.project}" does not match the service-account key's own project` +
+        `${key.project_id ? ` ("${key.project_id}")` : ""} — a VM is only created in the agency's own project.`,
+    );
+  }
+  const tokenUri = key.token_uri || GOOGLE_DEFAULT_TOKEN_URI;
+
+  // FULL cloud-platform scope — the write scope this op needs (see the section note). The token
+  // stays in this local and goes only into the Authorization header below.
+  let accessToken: string;
+  try {
+    accessToken = await mintGoogleAccessToken({
+      clientEmail,
+      privateKeyPem,
+      tokenUri,
+      scope: GOOGLE_SCOPE_CLOUD_PLATFORM,
+    });
+  } catch (err) {
+    return gcpInstanceCreateFailure(
+      instanceName,
+      `could not mint a Google access token from GCP_SERVICE_ACCOUNT_KEY: ${errorMessage(err)}`,
+    );
+  }
+
+  // The two path segments are grammar-checked upstream AND URL-encoded here; the body is built
+  // with JSON.stringify from the four validated fields only.
+  const url =
+    `${GCP_COMPUTE_API}/projects/${encodeURIComponent(params.project)}` +
+    `/zones/${encodeURIComponent(params.zone)}/instances`;
+  const instanceBody = JSON.stringify({
+    name: instanceName,
+    machineType: `zones/${params.zone}/machineTypes/${params.machineType}`,
+    disks: [
+      {
+        boot: true,
+        autoDelete: true,
+        initializeParams: { sourceImage: GCP_INSTANCE_BOOT_IMAGE },
+      },
+    ],
+    // ONE interface on the default VPC and deliberately NO accessConfigs => no external IP.
+    networkInterfaces: [{ network: "global/networks/default" }],
+  });
+
+  // Default redirect handling, NOT redirect:"error" — workerd throws on that value at runtime
+  // (the gotcha the cell-agent relay above documents). Google's API does not redirect.
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: instanceBody,
+    });
+  } catch (err) {
+    return gcpInstanceCreateFailure(
+      instanceName,
+      `could not reach Google Compute Engine to create the instance: ${errorMessage(err)}`,
+    );
+  }
+
+  const body = (await response.json().catch(() => null)) as ComputeInsertResponse | null;
+
+  if (response.ok) {
+    // A 2xx must carry an Operation. Its ABSENCE means we cannot confirm Google accepted the
+    // create, so fail closed rather than report a success we cannot point at.
+    const operationName = body?.name;
+    if (!operationName) {
+      return gcpInstanceCreateFailure(
+        instanceName,
+        `Compute Engine returned HTTP ${response.status} but no operation — cannot confirm the instance create was accepted.`,
+      );
+    }
+    // An insert normally returns PENDING/RUNNING; if Google ever answers with an already-DONE
+    // operation that carries errors, that is a failed create, not a success.
+    const operationErrors = body?.error?.errors ?? [];
+    if (operationErrors.length > 0) {
+      const messages = operationErrors.map((entry) => entry.message ?? entry.code ?? "unknown error").join("; ");
+      return gcpInstanceCreateFailure(instanceName, `instance create operation ${operationName} failed: ${messages}.`);
+    }
+    return {
+      ok: true,
+      op: "gcp-instance-create",
+      instanceName,
+      operationName,
+      status: body?.status ?? "UNKNOWN",
+    };
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    return gcpInstanceCreateFailure(
+      instanceName,
+      `Google Cloud denied the instance create (HTTP ${response.status})${googleErrorMessage(body)} — the service account ` +
+        `needs compute.instances.create (e.g. roles/compute.instanceAdmin.v1) on project "${params.project}".`,
+    );
+  }
+  if (response.status === 409) {
+    // Unlike provision-r2's "already exists", this is a FAILURE: the op is a create of a NEW named
+    // VM, and a name collision means either a stale VM to clean up or a caller bug — never a
+    // converged success to report as ok.
+    return gcpInstanceCreateFailure(
+      instanceName,
+      `an instance named "${instanceName}" already exists in ${params.project}/${params.zone}${googleErrorMessage(body)} — ` +
+        "instance create is not idempotent; pick a new name or delete the existing VM first.",
+    );
+  }
+
+  return gcpInstanceCreateFailure(
+    instanceName,
+    `instance create failed with HTTP ${response.status}${googleErrorMessage(body)}.`,
+  );
 }

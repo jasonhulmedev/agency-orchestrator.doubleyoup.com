@@ -470,6 +470,81 @@ export function validateDbImportParams(raw: unknown): ParamsVerdict<DbImportPara
   return { ok: true, params: { docroot, objectKey } };
 }
 
+// ── gcp-instance-create ──────────────────────────────────────────────────────────────
+// Create ONE Compute Engine VM in the AGENCY's own GCP project — the first GCP WRITE through
+// Direction-B (actuate.ts::actuateGcpInstanceCreate, with the agency's own GCP_SERVICE_ACCOUNT_KEY).
+// Four params, all strings, all REQUIRED, each pinned to the exact GCP resource-name grammar:
+//   1. `project`     — the project id (6-30 chars: lowercase-letter start, [a-z0-9-], alphanumeric end).
+//   2. `zone`        — a Compute zone, e.g. australia-southeast1-a (<region>-<area><n>-<letter>).
+//   3. `name`        — the instance name (RFC 1035: 1-63 chars, lowercase-letter start, [-a-z0-9],
+//                      alphanumeric end).
+//   4. `machineType` — a machine-type name, e.g. e2-small / n2-standard-4 (<family>-<shape>[-<n>]).
+// These four values are the ONLY job-derived data that reaches Google: `project` + `zone` become
+// URL path segments of the instances.insert call, and all four land in its JSON body. The grammars
+// admit no "/", "?", "#", ".", whitespace or any other URL/JSON metacharacter, so a signed value
+// can never re-path the API call (e.g. a zone of "a/../..") or smuggle a second field — this
+// validation IS the injection guard, alongside encodeURIComponent + JSON.stringify in the actuator.
+//
+// NON-IDEMPOTENT: creating the same instance name twice is a 409 from GCP, and a lost response may
+// already have created the VM. The orchestrator registers it `false` in AGENCY_OP_IDEMPOTENT, so
+// the F1 dispatcher runs it exactly once and never auto-retries (like db-import).
+
+export interface GcpInstanceCreateParams {
+  /** The agency's GCP project id the VM is created in. */
+  project: string;
+  /** The Compute Engine zone, e.g. "australia-southeast1-a". */
+  zone: string;
+  /** The instance name — unique within project + zone. */
+  name: string;
+  /** The machine-type name, e.g. "e2-small". */
+  machineType: string;
+}
+
+const GCP_PROJECT_ID_RE = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
+const GCP_ZONE_RE = /^[a-z]+-[a-z0-9]+-[a-z]$/;
+const GCP_INSTANCE_NAME_RE = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
+const GCP_MACHINE_TYPE_RE = /^[a-z0-9]+-[a-z0-9-]+$/;
+// The zone + machine-type grammars are open-ended on length (a real value is ~10-25 chars); cap
+// both so a junk mega-string fails here rather than at Google. Project + name are length-bound
+// by their own grammars.
+const GCP_RESOURCE_NAME_MAX_LENGTH = 63;
+
+export function validateGcpInstanceCreateParams(raw: unknown): ParamsVerdict<GcpInstanceCreateParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, zone, name, machineType } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return {
+      ok: false,
+      reason:
+        "project must be a GCP project id (6-30 chars: lowercase letter first, then lowercase letters, digits, hyphens; alphanumeric last)",
+    };
+  }
+  if (typeof zone !== "string" || zone.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a Compute Engine zone name (e.g. australia-southeast1-a)" };
+  }
+  if (typeof name !== "string" || !GCP_INSTANCE_NAME_RE.test(name)) {
+    return {
+      ok: false,
+      reason:
+        "name must be a Compute Engine instance name (1-63 chars: lowercase letter first, then lowercase letters, digits, hyphens; alphanumeric last)",
+    };
+  }
+  if (
+    typeof machineType !== "string" ||
+    machineType.length > GCP_RESOURCE_NAME_MAX_LENGTH ||
+    !GCP_MACHINE_TYPE_RE.test(machineType)
+  ) {
+    return { ok: false, reason: "machineType must be a Compute Engine machine-type name (e.g. e2-small)" };
+  }
+
+  // Return a FRESH object holding only the four known keys — never the caller's object — so an
+  // extra key can never ride along into the instance body the actuator builds.
+  return { ok: true, params: { project, zone, name, machineType } };
+}
+
 // ── shared ─────────────────────────────────────────────────────────────────────────
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

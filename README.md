@@ -141,4 +141,5 @@ npm run typecheck                # tsc --noEmit
 - The Direction-B signed handshake (our app → this Worker) is **live**: `POST
   /actuate` verifies an ed25519 signature + a single-use nonce before running any
   allowlisted op (provision-r2, dns-record-upsert, cache-purge, wp-cli,
-  db-export, db-import). `/validate` and `/complete` stay agency-triggered.
+  db-export, db-import, gcp-instance-create). `/validate` and `/complete` stay
+  agency-triggered.

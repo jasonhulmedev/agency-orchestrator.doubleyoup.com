@@ -15,7 +15,9 @@
 // idempotent: the orchestrator fixes the object key before retrying, so a re-run overwrites the
 // same object (see actuate.ts::actuateDbExport). `db-import` is NON-idempotent — it replaces the
 // site's DB — so the orchestrator runs it exactly once under F1 and never auto-retries (see
-// actuate.ts::actuateDbImport).
+// actuate.ts::actuateDbImport). `gcp-instance-create` is likewise NON-idempotent — a second create
+// of the same name is a 409 and a lost response may already have created the VM — so it too runs
+// exactly once under F1 (see actuate.ts::actuateGcpInstanceCreate).
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -27,12 +29,14 @@ import {
   type WpCliParams,
   type DbExportParams,
   type DbImportParams,
+  type GcpInstanceCreateParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
   validateWpCliParams,
   validateDbExportParams,
   validateDbImportParams,
+  validateGcpInstanceCreateParams,
 } from "./dispatch-params.js";
 import {
   type ActuateResult,
@@ -42,6 +46,7 @@ import {
   actuateWpCli,
   actuateDbExport,
   actuateDbImport,
+  actuateGcpInstanceCreate,
 } from "./actuate.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
@@ -92,6 +97,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "db-import": defineOp<DbImportParams>({
     validateParams: validateDbImportParams,
     actuate: (params, env) => actuateDbImport(params, env),
+  }),
+  "gcp-instance-create": defineOp<GcpInstanceCreateParams>({
+    validateParams: validateGcpInstanceCreateParams,
+    actuate: (params, env) => actuateGcpInstanceCreate(params, env),
   }),
 };
 

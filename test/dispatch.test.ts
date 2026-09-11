@@ -31,9 +31,11 @@ import {
   validateWpCliParams,
   validateDbExportParams,
   validateDbImportParams,
+  validateGcpInstanceCreateParams,
 } from "../src/dispatch-params.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
 import { buildDbExportScript, buildDbImportScript } from "../src/actuate.js";
+import { GOOGLE_SCOPE_CLOUD_PLATFORM } from "../src/validators.js";
 
 // ── Web-Crypto helpers (no Node APIs) ───────────────────────────────────────────────
 function bytesToBase64(bytes: Uint8Array): string {
@@ -160,6 +162,53 @@ function dbImportJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
     nonce: "dd88dd88dd88dd88dd88dd88dd88dd88",
     ...overrides,
   });
+}
+
+// A gcp-instance-create job — a throwaway proof VM in the agency's own project (Sydney zone).
+const GCP_INSTANCE_PARAMS = {
+  project: "dy-agency-proof",
+  zone: "australia-southeast1-a",
+  name: "dy-dirb-proof-vm",
+  machineType: "e2-small",
+};
+function gcpInstanceCreateJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-instance-create",
+    params: JSON.stringify(GCP_INSTANCE_PARAMS),
+    nonce: "ee99ee99ee99ee99ee99ee99ee99ee99",
+    ...overrides,
+  });
+}
+
+// Build a REAL service-account key JSON with a freshly generated RSA key, so the actuator's RS256
+// JWT-bearer mint runs for real (only the token + Compute HTTP calls are mocked). Mirrors the
+// helper in validators.test.ts; kept local so this file stays self-contained.
+async function makeServiceAccountKey(projectId: string): Promise<string> {
+  const keyPair = (await crypto.subtle.generateKey(
+    { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+    true,
+    ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const pkcs8 = new Uint8Array((await crypto.subtle.exportKey("pkcs8", keyPair.privateKey)) as ArrayBuffer);
+  const base64 = bytesToBase64(pkcs8);
+  const pem = `-----BEGIN PRIVATE KEY-----\n${base64.match(/.{1,64}/g)!.join("\n")}\n-----END PRIVATE KEY-----\n`;
+  return JSON.stringify({
+    type: "service_account",
+    project_id: projectId,
+    private_key: pem,
+    client_email: `sa@${projectId}.iam.gserviceaccount.com`,
+    token_uri: "https://oauth2.googleapis.com/token",
+  });
+}
+
+/** Decode the claims segment of a JWT assertion (base64url, no padding) so a test can read `scope`. */
+function jwtClaimsOf(assertion: string): Record<string, unknown> {
+  const claimsSegment = assertion.split(".")[1];
+  const padded = claimsSegment
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    .padEnd(Math.ceil(claimsSegment.length / 4) * 4, "=");
+  return JSON.parse(atob(padded)) as Record<string, unknown>;
 }
 
 // The ONE canonical byte-string both sides must agree on. This exact literal is also
@@ -435,6 +484,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "db-export",
       "db-import",
       "dns-record-upsert",
+      "gcp-instance-create",
       "provision-r2",
       "wp-cli",
     ]);
@@ -673,13 +723,101 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(keyVerdict.ok).toBe(false);
     if (!keyVerdict.ok) expect(keyVerdict.reason).toMatch(/^objectKey must be db-exports\//);
   });
+
+  // ── gcp-instance-create (twin of the app's rules) ─────────────────────────────────
+  // The four fields are the ONLY job-derived data that reaches Google (two as URL path segments,
+  // all four in the JSON body), so these grammars ARE the injection guard.
+
+  it("gcp-instance-create: accepts valid params and returns ONLY the four known keys", () => {
+    expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, extra: "x" })).toEqual({
+      ok: true,
+      params: GCP_INSTANCE_PARAMS,
+    });
+    // Other real zones / machine types.
+    expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, zone: "us-central1-f" }).ok).toBe(true);
+    expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, zone: "europe-west4-b" }).ok).toBe(true);
+    expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, machineType: "n2-standard-4" }).ok).toBe(true);
+    expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, machineType: "e2-custom-2-4096" }).ok).toBe(true);
+    // Grammar edges: a 6-char + a 30-char project, a 1-char + a 63-char name.
+    expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, project: "abcde1" }).ok).toBe(true);
+    expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, project: `a${"b".repeat(28)}1` }).ok).toBe(true);
+    expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, name: "a" }).ok).toBe(true);
+    expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, name: `a${"b".repeat(61)}1` }).ok).toBe(true);
+  });
+
+  it("gcp-instance-create: rejects bad input field by field (URL/JSON metacharacters, case, length, shape)", () => {
+    const bad = (overrides: Record<string, unknown>) => validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, ...overrides });
+
+    expect(validateGcpInstanceCreateParams(null).ok).toBe(false);
+    expect(validateGcpInstanceCreateParams("string").ok).toBe(false);
+    expect(validateGcpInstanceCreateParams([]).ok).toBe(false);
+    // project
+    expect(bad({ project: undefined }).ok).toBe(false); // missing
+    expect(bad({ project: 42 }).ok).toBe(false); // non-string
+    expect(bad({ project: "" }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false); // uppercase
+    expect(bad({ project: "abcde" }).ok).toBe(false); // too short (5)
+    expect(bad({ project: `a${"b".repeat(29)}1` }).ok).toBe(false); // too long (31)
+    expect(bad({ project: "1dy-agency" }).ok).toBe(false); // digit first
+    expect(bad({ project: "dy-agency-" }).ok).toBe(false); // hyphen last
+    expect(bad({ project: "dy-agency/x" }).ok).toBe(false); // path separator
+    expect(bad({ project: "dy-agency.x" }).ok).toBe(false); // dot
+    expect(bad({ project: "dy-agency%2f" }).ok).toBe(false); // percent-encoding
+    expect(bad({ project: "../dy-agency" }).ok).toBe(false); // traversal
+    // zone
+    expect(bad({ zone: undefined }).ok).toBe(false); // missing
+    expect(bad({ zone: "Australia-Southeast1-a" }).ok).toBe(false); // uppercase
+    expect(bad({ zone: "australia-southeast1" }).ok).toBe(false); // a region, not a zone
+    expect(bad({ zone: "australia-southeast1-ab" }).ok).toBe(false); // two-letter suffix
+    expect(bad({ zone: "australia-southeast1-a/../.." }).ok).toBe(false); // traversal
+    expect(bad({ zone: "australia southeast1-a" }).ok).toBe(false); // space
+    expect(bad({ zone: "australia-southeast1-a?x=1" }).ok).toBe(false); // URL metachar
+    expect(bad({ zone: `${"a".repeat(60)}-b1-c` }).ok).toBe(false); // over the length cap
+    // name
+    expect(bad({ name: undefined }).ok).toBe(false); // missing
+    expect(bad({ name: "" }).ok).toBe(false);
+    expect(bad({ name: "Bad-Name" }).ok).toBe(false); // uppercase
+    expect(bad({ name: "1vm" }).ok).toBe(false); // digit first
+    expect(bad({ name: "-lead" }).ok).toBe(false); // hyphen first
+    expect(bad({ name: "trail-" }).ok).toBe(false); // hyphen last
+    expect(bad({ name: `a${"b".repeat(63)}` }).ok).toBe(false); // 64 chars
+    expect(bad({ name: "a.b" }).ok).toBe(false); // dot
+    expect(bad({ name: "a/b" }).ok).toBe(false); // path separator
+    expect(bad({ name: "a b" }).ok).toBe(false); // space
+    // machineType
+    expect(bad({ machineType: undefined }).ok).toBe(false); // missing
+    expect(bad({ machineType: "e2small" }).ok).toBe(false); // no hyphen
+    expect(bad({ machineType: "E2-small" }).ok).toBe(false); // uppercase
+    expect(bad({ machineType: "e2-small/x" }).ok).toBe(false); // path separator
+    expect(bad({ machineType: "e2-small?x" }).ok).toBe(false); // URL metachar
+    expect(bad({ machineType: "e2-small x" }).ok).toBe(false); // space
+    expect(bad({ machineType: `e2-${"a".repeat(64)}` }).ok).toBe(false); // over the length cap
+  });
+
+  it("gcp-instance-create: a verdict names the offending field", () => {
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ zone: "nope" }, /^zone must be/],
+      [{ name: "Bad" }, /^name must be/],
+      [{ machineType: "nope" }, /^machineType must be/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, ...overrides });
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
 });
 
 describe("POST /actuate route", () => {
   let publicKeyPem: string;
   let privateKey: CryptoKey;
+  // The agency's GCP service-account key (a real RSA key so the JWT mint runs), used ONLY by
+  // the gcp-instance-create tests via envWith({ GCP_SERVICE_ACCOUNT_KEY }).
+  let serviceAccountKey: string;
   beforeAll(async () => {
     ({ publicKeyPem, privateKey } = await makeKeypair());
+    serviceAccountKey = await makeServiceAccountKey(GCP_INSTANCE_PARAMS.project);
   });
 
   // A stand-in NONCE_STORE binding for these Node tests. They exercise the ACTUATE path
@@ -1853,6 +1991,319 @@ describe("POST /actuate route", () => {
     expect(response.status).toBe(400);
     const body = (await response.json()) as { reason: string };
     expect(body.reason).toMatch(/objectKey must be db-exports\//);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── gcp-instance-create through the registry ────────────────────────────────────────
+  // The first GCP WRITE: the Worker mints a Google access token from the agency's OWN
+  // GCP_SERVICE_ACCOUNT_KEY (FULL cloud-platform scope — the write scope this op needs) and POSTs
+  // instances.insert. Load-bearing assertions: the JWT asks for the FULL scope (not read-only), the
+  // token goes ONLY into the Compute call's Authorization header and never into the result, the
+  // URL path is built from the two grammar-checked segments, the body is the MINIMAL private shape
+  // (no accessConfigs => no external IP, no serviceAccounts), a 2xx Operation is ACCEPTED, and every
+  // non-2xx (403 / 409 / 404) is a TERMINAL ok:false — a 409 is NOT an idempotent success here.
+
+  const GCP_ACCESS_TOKEN = "ya29.agency-token-never-echoed";
+  const GCP_INSERT_URL =
+    "https://compute.googleapis.com/compute/v1/projects/dy-agency-proof/zones/australia-southeast1-a/instances";
+
+  /** Route the two Google calls: the token endpoint (always succeeds) and instances.insert (programmable). */
+  function mockGcpApi(insertReply: { body: unknown; status?: number }) {
+    const calls: Array<{ method: string; url: string; auth: string | null; body?: unknown; form?: URLSearchParams }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = urlOf(input);
+      const method = init?.method ?? "GET";
+      const auth = new Headers(init?.headers).get("authorization");
+      if (url === "https://oauth2.googleapis.com/token") {
+        calls.push({ method, url, auth, form: new URLSearchParams(String(init?.body)) });
+        return jsonResponse({ access_token: GCP_ACCESS_TOKEN, expires_in: 3600, token_type: "Bearer" });
+      }
+      if (url.startsWith("https://compute.googleapis.com/")) {
+        calls.push({ method, url, auth, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+        return jsonResponse(insertReply.body, insertReply.status ?? 200);
+      }
+      throw new Error(`unexpected fetch ${method} ${url}`);
+    });
+    return calls;
+  }
+
+  it("gcp-instance-create: mints a FULL-scope token from the agency's SA key and POSTs a minimal PRIVATE instance", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApi({ body: { name: "operation-1234", status: "PENDING", operationType: "insert" } });
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
+    );
+    expect(response.status).toBe(200);
+    const resultBody = await response.json();
+    // ACCEPTED: the async Operation is reported, not the VM.
+    expect(resultBody).toEqual({
+      ok: true,
+      op: "gcp-instance-create",
+      instanceName: "dy-dirb-proof-vm",
+      operationName: "operation-1234",
+      status: "PENDING",
+    });
+    // The minted token is NEVER echoed in the result.
+    expect(JSON.stringify(resultBody)).not.toContain(GCP_ACCESS_TOKEN);
+
+    expect(calls).toHaveLength(2);
+    const [tokenCall, insertCall] = calls;
+
+    // 1) The JWT-bearer grant, signed by the agency's SA key, asks for the FULL cloud-platform
+    //    scope — the write scope this op needs (validateGCP's probe stays read-only, tested in
+    //    validators.test.ts).
+    expect(tokenCall.method).toBe("POST");
+    expect(tokenCall.form?.get("grant_type")).toBe("urn:ietf:params:oauth:grant-type:jwt-bearer");
+    const claims = jwtClaimsOf(tokenCall.form?.get("assertion") ?? "");
+    expect(claims.scope).toBe(GOOGLE_SCOPE_CLOUD_PLATFORM);
+    expect(claims.scope).toBe("https://www.googleapis.com/auth/cloud-platform");
+    expect(claims.iss).toBe("sa@dy-agency-proof.iam.gserviceaccount.com");
+    expect(claims.aud).toBe("https://oauth2.googleapis.com/token");
+
+    // 2) instances.insert at the grammar-checked path, bearing the minted token ONLY (never a
+    //    Cloudflare / cell credential), with the minimal private body.
+    expect(insertCall.url).toBe(GCP_INSERT_URL);
+    expect(insertCall.method).toBe("POST");
+    expect(insertCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+    expect(insertCall.auth).not.toContain("cf-token-xyz");
+    expect(insertCall.auth).not.toContain("cf-dns-token-abc");
+    expect(insertCall.auth).not.toContain("cell-token-123");
+    expect(insertCall.body).toEqual({
+      name: "dy-dirb-proof-vm",
+      machineType: "zones/australia-southeast1-a/machineTypes/e2-small",
+      disks: [
+        {
+          boot: true,
+          autoDelete: true,
+          initializeParams: { sourceImage: "projects/debian-cloud/global/images/family/debian-12" },
+        },
+      ],
+      networkInterfaces: [{ network: "global/networks/default" }],
+    });
+    // Explicitly: NO external IP (no accessConfigs) and NO attached service account.
+    const insertBody = insertCall.body as { networkInterfaces: Array<Record<string, unknown>>; serviceAccounts?: unknown };
+    expect(insertBody.networkInterfaces[0]).not.toHaveProperty("accessConfigs");
+    expect(insertBody).not.toHaveProperty("serviceAccounts");
+    // The SA private key never leaves the Worker.
+    expect(JSON.stringify(insertCall.body)).not.toContain("PRIVATE KEY");
+  });
+
+  it("gcp-instance-create: REJECTS a project that is not the SA key's own project — no token minted, no GCP call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob(); // targets project "dy-agency-proof"
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApi({ body: { name: "operation-should-not-happen", status: "PENDING" } });
+    // A VALID key, but for a DIFFERENT project the agency's SA might also hold IAM in.
+    const otherProjectKey = await makeServiceAccountKey("some-other-project");
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: otherProjectKey }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-instance-create");
+    expect(body.detail).toMatch(/own project/);
+    // The pin fires BEFORE minting a token or calling Compute — zero GCP fetches.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("gcp-instance-create: a 403 (missing compute permission) is a TERMINAL ok:false carrying Google's message, token not echoed", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApi({
+      status: 403,
+      body: {
+        error: {
+          code: 403,
+          message: "Required 'compute.instances.create' permission for 'projects/dy-agency-proof/zones/australia-southeast1-a/instances/dy-dirb-proof-vm'",
+          status: "PERMISSION_DENIED",
+        },
+      },
+    });
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; op: string; instanceName: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-instance-create");
+    expect(body.instanceName).toBe("dy-dirb-proof-vm");
+    expect(body.detail).toMatch(/denied the instance create \(HTTP 403\)/);
+    expect(body.detail).toContain("Required 'compute.instances.create' permission");
+    expect(body.detail).toMatch(/roles\/compute\.instanceAdmin\.v1/);
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+  });
+
+  it("gcp-instance-create: a 409 (name already exists) is ok:false — NOT an idempotent success like provision-r2", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApi({
+      status: 409,
+      body: { error: { code: 409, message: "The resource 'projects/dy-agency-proof/zones/australia-southeast1-a/instances/dy-dirb-proof-vm' already exists", status: "ALREADY_EXISTS" } },
+    });
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/already exists in dy-agency-proof\/australia-southeast1-a/);
+    expect(body.detail).toMatch(/not idempotent/);
+  });
+
+  it("gcp-instance-create: any other non-2xx (e.g. 404 no default network) is ok:false with Google's message", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApi({
+      status: 404,
+      body: { error: { code: 404, message: "The resource 'projects/dy-agency-proof/global/networks/default' was not found", status: "NOT_FOUND" } },
+    });
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
+    );
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/instance create failed with HTTP 404: The resource .*networks\/default' was not found/);
+  });
+
+  it("gcp-instance-create: a 2xx WITHOUT an operation is fail-closed ok:false (cannot confirm acceptance)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApi({ body: {} });
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
+    );
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/HTTP 200 but no operation/);
+  });
+
+  it("gcp-instance-create: an already-DONE operation carrying errors is a failed create, not a success", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApi({
+      body: { name: "operation-err", status: "DONE", error: { errors: [{ code: "QUOTA_EXCEEDED", message: "Quota 'CPUS' exceeded." }] } },
+    });
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
+    );
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/operation operation-err failed: Quota 'CPUS' exceeded/);
+  });
+
+  it("gcp-instance-create: a token-mint failure is ok:false and Compute is NEVER called", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      calls.push(urlOf(input));
+      return jsonResponse({ error: "invalid_grant", error_description: "Invalid JWT Signature." }, 400);
+    });
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/could not mint a Google access token/);
+    expect(body.detail).toContain("invalid_grant");
+    // Only the token endpoint was contacted — no write was attempted without a token.
+    expect(calls).toEqual(["https://oauth2.googleapis.com/token"]);
+  });
+
+  it("gcp-instance-create: reports a clean failure and touches NO API when GCP_SERVICE_ACCOUNT_KEY is missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    // Every OTHER agency credential is present — none may be used as a substitute.
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/GCP_SERVICE_ACCOUNT_KEY is not configured/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("gcp-instance-create: a malformed or incomplete SA key is ok:false with NO API call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    for (const badKey of ["{not json", "null", '"a string"']) {
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: badKey }));
+      const body = (await response.json()) as { ok: boolean; detail: string };
+      expect(body.ok).toBe(false);
+      expect(body.detail).toMatch(/not valid JSON/);
+    }
+    // Valid JSON but not a service-account key (an OAuth client id has no private_key).
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: JSON.stringify({ client_email: "sa@x.iam.gserviceaccount.com" }) }),
+    );
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/missing client_email or private_key/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("gcp-instance-create: a signed job with a path-traversal zone is 400 with NO Google call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob({
+      params: JSON.stringify({ ...GCP_INSTANCE_PARAMS, zone: "australia-southeast1-a/../../projects/victim/zones/us-central1-a" }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
+    );
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { reason: string };
+    expect(body.reason).toMatch(/^zone must be/);
+    // No token was minted and no write was attempted.
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("gcp-instance-create: a valid op given db-import's params is 400 with NO Google call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob({ params: JSON.stringify(DB_IMPORT_PARAMS) });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
+    );
+    expect(response.status).toBe(400);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
