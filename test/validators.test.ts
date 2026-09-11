@@ -511,11 +511,11 @@ describe("validateGCP", () => {
     expect(result.detail).toMatch(/not valid JSON/);
   });
 
-  it("mints a token via the JWT-bearer grant and is ok when the project authorizes", async () => {
+  it("mints a token, then is ok when testIamPermissions holds every required permission", async () => {
     const key = await makeServiceAccountKey();
     const fetchMock = routedFetch([
       { match: (u) => u === "https://oauth2.googleapis.com/token", respond: () => jsonResponse({ access_token: "ya29.test", expires_in: 3600 }) },
-      { match: (u) => u.includes("cloudresourcemanager.googleapis.com/v1/projects/demo-project"), respond: () => jsonResponse({ projectId: "demo-project" }) },
+      { match: (u) => u.includes("cloudresourcemanager.googleapis.com/v1/projects/demo-project:testIamPermissions"), respond: () => jsonResponse({ permissions: ["resourcemanager.projects.get"] }) },
     ]);
     vi.stubGlobal("fetch", fetchMock);
 
@@ -523,15 +523,33 @@ describe("validateGCP", () => {
     expect(result.ok).toBe(true);
     expect(result.detail).toContain("demo-project");
 
-    // The token request is a JWT-bearer assertion; the project call carries the bearer.
+    // The token request is a JWT-bearer assertion; the permission check is a POST that carries the
+    // bearer and asks for the required permissions.
     const [, tokenInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     expect(String(tokenInit.body)).toContain("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer");
     expect(String(tokenInit.body)).toContain("assertion=");
     const [, projectInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
     expect(new Headers(projectInit.headers).get("authorization")).toBe("Bearer ya29.test");
+    expect(projectInit.method).toBe("POST");
+    expect(String(projectInit.body)).toContain("resourcemanager.projects.get");
   });
 
-  it("reports a 403 project denial after the token mints", async () => {
+  it("reports missing permissions when testIamPermissions returns a smaller set", async () => {
+    const key = await makeServiceAccountKey();
+    vi.stubGlobal(
+      "fetch",
+      routedFetch([
+        { match: (u) => u.includes("oauth2.googleapis.com/token"), respond: () => jsonResponse({ access_token: "ya29.test" }) },
+        { match: (u) => u.includes("cloudresourcemanager.googleapis.com"), respond: () => jsonResponse({ permissions: [] }) },
+      ]),
+    );
+    const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/missing/);
+    expect(result.detail).toMatch(/resourcemanager\.projects\.get/);
+  });
+
+  it("reports a 403 (API disabled / no project access) after the token mints", async () => {
     const key = await makeServiceAccountKey();
     vi.stubGlobal(
       "fetch",
@@ -543,7 +561,7 @@ describe("validateGCP", () => {
     const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
     expect(result.ok).toBe(false);
     expect(result.detail).toMatch(/403/);
-    expect(result.detail).toMatch(/Viewer/);
+    expect(result.detail).toMatch(/Cloud Resource Manager API/);
   });
 
   it("reports a token-mint failure clearly", async () => {

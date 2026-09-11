@@ -557,7 +557,9 @@ function pemToDer(pem: string): Uint8Array {
   return Uint8Array.from(atob(base64Body), (char) => char.charCodeAt(0));
 }
 
-interface ServiceAccountKey {
+// The shape of the downloaded service-account key JSON (GCP_SERVICE_ACCOUNT_KEY). Shared with
+// the Direction-B gcp-instance-create actuator (actuate.ts), which parses the same secret.
+export interface ServiceAccountKey {
   client_email?: string;
   private_key?: string;
   project_id?: string;
@@ -568,23 +570,37 @@ interface GoogleTokenResponse {
   access_token?: string;
 }
 
+// The two OAuth2 scopes this Worker ever mints a Google access token for. A scope bounds what
+// the TOKEN may do (the service account's IAM roles still bound what the agency has granted):
+//   - READ_ONLY is the DEFAULT and is all validateGCP's testIamPermissions probe needs —
+//     least-privilege for a probe that must never be able to change anything.
+//   - CLOUD_PLATFORM (full) is requested ONLY by the Direction-B `gcp-instance-create` actuator
+//     (actuate.ts), because creating a Compute Engine resource is a write the read-only scope
+//     cannot authorize. That escalation is inherent to the op and deliberate; nothing else
+//     asks for it, and validateGCP stays on the read-only default.
+export const GOOGLE_SCOPE_CLOUD_PLATFORM_READ_ONLY = "https://www.googleapis.com/auth/cloud-platform.read-only";
+export const GOOGLE_SCOPE_CLOUD_PLATFORM = "https://www.googleapis.com/auth/cloud-platform";
+
 // Mint a Google OAuth2 access token via the JWT-bearer grant (RFC 7523 /
 // Google's "server-to-server" flow): build a JWT signed with the service
 // account's RS256 private key, POST it as the assertion, receive a bearer token.
 // This avoids any Google SDK — pure Web Crypto + fetch. Throws on failure.
-async function mintGoogleAccessToken(options: {
+// The returned token is a bearer credential: callers place it in an Authorization
+// header and MUST NOT log it or echo it in any result/detail.
+export async function mintGoogleAccessToken(options: {
   clientEmail: string;
   privateKeyPem: string;
   tokenUri: string;
+  /** OAuth2 scope to request. Defaults to READ-ONLY so a probe stays least-privilege. */
+  scope?: string;
 }): Promise<string> {
   const nowSeconds = Math.floor(Date.now() / 1000);
+  const scope = options.scope ?? GOOGLE_SCOPE_CLOUD_PLATFORM_READ_ONLY;
 
   const header = { alg: "RS256", typ: "JWT" };
   const claims = {
     iss: options.clientEmail,
-    // Least-privilege: read-only cloud-platform scope is enough for a
-    // projects.get authorization probe.
-    scope: "https://www.googleapis.com/auth/cloud-platform.read-only",
+    scope,
     aud: options.tokenUri,
     iat: nowSeconds,
     exp: nowSeconds + 3600,
@@ -632,8 +648,16 @@ async function mintGoogleAccessToken(options: {
   return data.access_token;
 }
 
-// Parse the SA-key JSON, mint an access token, then authorize a cheap
-// projects.get. ok when the token mints AND the project call authorizes.
+// The permissions doubleyoup's GCP integration REQUIRES. TODAY the only GCP use is a read-only
+// project probe — every provisioning op runs through Cloudflare + the cell-agent (planning/36).
+// When GCP compute provisioning into the agency's own project is wired (planning/34/38), ADD the
+// permissions the provisioning code actually calls here (e.g. "compute.instances.create") and
+// validateGCP reports any the service account is missing. This is the single source of truth for
+// the required set — keep it matched to what the code actually does with the key (do NOT over-ask).
+const REQUIRED_GCP_PERMISSIONS = ["resourcemanager.projects.get"];
+
+// Parse the SA-key JSON, mint an access token, then check the service account holds every
+// REQUIRED_GCP_PERMISSIONS via testIamPermissions. ok when the token mints AND none are missing.
 export async function validateGCP(env: Env): Promise<ValidationResult> {
   if (!env.GCP_SERVICE_ACCOUNT_KEY) {
     return {
@@ -675,21 +699,42 @@ export async function validateGCP(env: Env): Promise<ValidationResult> {
   }
 
   try {
+    // testIamPermissions returns the SUBSET of the passed permissions the caller actually holds —
+    // role-agnostic (it does not matter whether Viewer, Editor or a custom role grants them). We diff
+    // the result against REQUIRED_GCP_PERMISSIONS and report exactly what is missing. The call itself
+    // needs no permission, but the project must exist and the Cloud Resource Manager API must be on.
     const response = await fetch(
-      `https://cloudresourcemanager.googleapis.com/v1/projects/${encodeURIComponent(projectId)}`,
-      { headers: { authorization: `Bearer ${accessToken}`, accept: "application/json" } },
+      `https://cloudresourcemanager.googleapis.com/v1/projects/${encodeURIComponent(projectId)}:testIamPermissions`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify({ permissions: REQUIRED_GCP_PERMISSIONS }),
+      },
     );
 
     if (response.status === 200) {
+      const heldBody = (await response.json().catch(() => null)) as { permissions?: string[] } | null;
+      const held = new Set(heldBody?.permissions ?? []);
+      const missing = REQUIRED_GCP_PERMISSIONS.filter((permission) => !held.has(permission));
+      if (missing.length === 0) {
+        return {
+          ok: true,
+          detail: `Google Cloud authenticated as ${clientEmail}; project "${projectId}" accessible with all ${REQUIRED_GCP_PERMISSIONS.length} required permission(s).`,
+        };
+      }
       return {
-        ok: true,
-        detail: `Google Cloud authenticated as ${clientEmail}; project "${projectId}" is accessible.`,
+        ok: false,
+        detail: `Google Cloud authenticated as ${clientEmail}, but the service account is missing ${missing.length} required permission(s): ${missing.join(", ")}. Grant a role that includes them (the Viewer role covers today's read-only needs).`,
       };
     }
     if (response.status === 403) {
       return {
         ok: false,
-        detail: `Google Cloud token minted but project "${projectId}" access was denied (403) — grant the service account at least the Viewer role and enable the Cloud Resource Manager API.`,
+        detail: `Google Cloud project "${projectId}" permission check was denied (403) — enable the Cloud Resource Manager API on the project, and check the service account can see the project.`,
       };
     }
     if (response.status === 404) {
