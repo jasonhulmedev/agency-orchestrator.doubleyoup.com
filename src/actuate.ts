@@ -1117,20 +1117,41 @@ export async function actuateGcpInstanceCreate(
   }
 
   // The two path segments are grammar-checked upstream AND URL-encoded here; the body is built
-  // with JSON.stringify from the four validated fields only.
+  // with JSON.stringify from the validated fields only (the four required, plus the optional data
+  // disk).
   const url =
     `${GCP_COMPUTE_API}/projects/${encodeURIComponent(params.project)}` +
     `/zones/${encodeURIComponent(params.zone)}/instances`;
+
+  // The boot disk: Debian 12, deleted with the VM. Always present.
+  const disks: Array<Record<string, unknown>> = [
+    {
+      boot: true,
+      autoDelete: true,
+      initializeParams: { sourceImage: GCP_INSTANCE_BOOT_IMAGE },
+    },
+  ];
+  // OPTIONAL second, non-boot data disk (the file node's storage). autoDelete is FALSE on purpose:
+  // a data disk holds site files and MUST survive the VM being deleted — its lifecycle belongs to a
+  // future cell-teardown, not to this create op, so this op never tears it down with the VM.
+  // pd-balanced matches the reference file node (planning/34). `zone` is the same grammar-checked
+  // value used in the machineType path above (no metacharacter can pass the validator), reused the
+  // same way; diskSizeGb is the validated integer. When dataDiskGb is absent the body is unchanged.
+  if (params.dataDiskGb !== undefined) {
+    disks.push({
+      boot: false,
+      autoDelete: false,
+      initializeParams: {
+        diskType: `zones/${params.zone}/diskTypes/pd-balanced`,
+        diskSizeGb: params.dataDiskGb,
+      },
+    });
+  }
+
   const instanceBody = JSON.stringify({
     name: instanceName,
     machineType: `zones/${params.zone}/machineTypes/${params.machineType}`,
-    disks: [
-      {
-        boot: true,
-        autoDelete: true,
-        initializeParams: { sourceImage: GCP_INSTANCE_BOOT_IMAGE },
-      },
-    ],
+    disks,
     // ONE interface on the default VPC and deliberately NO accessConfigs => no external IP.
     networkInterfaces: [{ network: "global/networks/default" }],
   });

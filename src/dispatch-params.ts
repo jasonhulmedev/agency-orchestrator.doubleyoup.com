@@ -473,17 +473,23 @@ export function validateDbImportParams(raw: unknown): ParamsVerdict<DbImportPara
 // ── gcp-instance-create ──────────────────────────────────────────────────────────────
 // Create ONE Compute Engine VM in the AGENCY's own GCP project — the first GCP WRITE through
 // Direction-B (actuate.ts::actuateGcpInstanceCreate, with the agency's own GCP_SERVICE_ACCOUNT_KEY).
-// Four params, all strings, all REQUIRED, each pinned to the exact GCP resource-name grammar:
+// Four REQUIRED string params (each pinned to the exact GCP resource-name grammar) plus one
+// OPTIONAL numeric param:
 //   1. `project`     — the project id (6-30 chars: lowercase-letter start, [a-z0-9-], alphanumeric end).
 //   2. `zone`        — a Compute zone, e.g. australia-southeast1-a (<region>-<area><n>-<letter>).
 //   3. `name`        — the instance name (RFC 1035: 1-63 chars, lowercase-letter start, [-a-z0-9],
 //                      alphanumeric end).
 //   4. `machineType` — a machine-type name, e.g. e2-small / n2-standard-4 (<family>-<shape>[-<n>]).
-// These four values are the ONLY job-derived data that reaches Google: `project` + `zone` become
+//   5. `dataDiskGb`  — OPTIONAL: when present, a SECOND non-boot persistent data disk of this many GB
+//                      (the file node's storage) is attached; absent => a single-boot-disk VM,
+//                      byte-identical to the four-field form. An integer in [10, 65536].
+// The four string values are the ONLY job-derived STRINGS that reach Google: `project` + `zone` become
 // URL path segments of the instances.insert call, and all four land in its JSON body. The grammars
 // admit no "/", "?", "#", ".", whitespace or any other URL/JSON metacharacter, so a signed value
 // can never re-path the API call (e.g. a zone of "a/../..") or smuggle a second field — this
 // validation IS the injection guard, alongside encodeURIComponent + JSON.stringify in the actuator.
+// `dataDiskGb` (when present) reaches Google only as the body's numeric `diskSizeGb`; bounding it to
+// a whole number in [10, 65536] keeps it a plain integer that can carry no metacharacter.
 //
 // NON-IDEMPOTENT: creating the same instance name twice is a 409 from GCP, and a lost response may
 // already have created the VM. The orchestrator registers it `false` in AGENCY_OP_IDEMPOTENT, so
@@ -498,6 +504,12 @@ export interface GcpInstanceCreateParams {
   name: string;
   /** The machine-type name, e.g. "e2-small". */
   machineType: string;
+  /**
+   * OPTIONAL size in GB of a second, non-boot persistent data disk (the file node's storage).
+   * When present, the actuator attaches it alongside the boot disk; when absent, the VM has a boot
+   * disk only and the instance body is unchanged.
+   */
+  dataDiskGb?: number;
 }
 
 const GCP_PROJECT_ID_RE = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
@@ -508,12 +520,16 @@ const GCP_MACHINE_TYPE_RE = /^[a-z0-9]+-[a-z0-9-]+$/;
 // both so a junk mega-string fails here rather than at Google. Project + name are length-bound
 // by their own grammars.
 const GCP_RESOURCE_NAME_MAX_LENGTH = 63;
+// A data disk is a whole number of GB. 10 GB is Google's floor for a pd-balanced disk and 65536 GB
+// (64 TB) is its per-disk ceiling; reject anything outside that range here rather than at Google.
+const GCP_DATA_DISK_MIN_GB = 10;
+const GCP_DATA_DISK_MAX_GB = 65_536;
 
 export function validateGcpInstanceCreateParams(raw: unknown): ParamsVerdict<GcpInstanceCreateParams> {
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
   }
-  const { project, zone, name, machineType } = raw;
+  const { project, zone, name, machineType, dataDiskGb } = raw;
 
   if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
     return {
@@ -539,10 +555,30 @@ export function validateGcpInstanceCreateParams(raw: unknown): ParamsVerdict<Gcp
   ) {
     return { ok: false, reason: "machineType must be a Compute Engine machine-type name (e.g. e2-small)" };
   }
+  // dataDiskGb is OPTIONAL: absent/undefined => a single-boot-disk VM (unchanged). When present it
+  // must be a whole number of GB within GCP's persistent-disk size range.
+  if (
+    dataDiskGb !== undefined &&
+    (typeof dataDiskGb !== "number" ||
+      !Number.isInteger(dataDiskGb) ||
+      dataDiskGb < GCP_DATA_DISK_MIN_GB ||
+      dataDiskGb > GCP_DATA_DISK_MAX_GB)
+  ) {
+    return {
+      ok: false,
+      reason: `dataDiskGb, when present, must be an integer number of GB in [${GCP_DATA_DISK_MIN_GB}, ${GCP_DATA_DISK_MAX_GB}]`,
+    };
+  }
 
-  // Return a FRESH object holding only the four known keys — never the caller's object — so an
-  // extra key can never ride along into the instance body the actuator builds.
-  return { ok: true, params: { project, zone, name, machineType } };
+  // Return a FRESH object holding only the known keys — never the caller's object — so an extra key
+  // can never ride along into the instance body the actuator builds. dataDiskGb is added ONLY when
+  // present, so an absent value keeps the signed params (and the body the actuator builds) identical
+  // to the four-field form.
+  const params: GcpInstanceCreateParams = { project, zone, name, machineType };
+  if (dataDiskGb !== undefined) {
+    params.dataDiskGb = dataDiskGb;
+  }
+  return { ok: true, params };
 }
 
 // ── shared ─────────────────────────────────────────────────────────────────────────

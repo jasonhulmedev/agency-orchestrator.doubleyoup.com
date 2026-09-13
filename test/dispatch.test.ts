@@ -807,6 +807,40 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       if (!verdict.ok) expect(verdict.reason).toMatch(expected);
     }
   });
+
+  it("gcp-instance-create: accepts an OPTIONAL dataDiskGb at the range edges and carries it as a fifth key", () => {
+    // Absent => still ONLY the four keys (backward-compatible; the acceptance test above proves this too).
+    expect(validateGcpInstanceCreateParams(GCP_INSTANCE_PARAMS)).toEqual({ ok: true, params: GCP_INSTANCE_PARAMS });
+    // Present at the floor (10), the ceiling (65536), and a mid value => the fifth key rides through.
+    for (const size of [10, 200, 65536]) {
+      expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, dataDiskGb: size })).toEqual({
+        ok: true,
+        params: { ...GCP_INSTANCE_PARAMS, dataDiskGb: size },
+      });
+    }
+    // An explicit `undefined` is the same as absent — accepted, and the key is NOT added.
+    expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, dataDiskGb: undefined })).toEqual({
+      ok: true,
+      params: GCP_INSTANCE_PARAMS,
+    });
+  });
+
+  it("gcp-instance-create: rejects an out-of-range or non-integer dataDiskGb, and names the field", () => {
+    const bad = (dataDiskGb: unknown) => validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, dataDiskGb });
+    expect(bad(9).ok).toBe(false); // below the floor
+    expect(bad(65537).ok).toBe(false); // above the ceiling
+    expect(bad(0).ok).toBe(false);
+    expect(bad(-10).ok).toBe(false);
+    expect(bad(10.5).ok).toBe(false); // not an integer
+    expect(bad(Number.NaN).ok).toBe(false);
+    expect(bad(Number.POSITIVE_INFINITY).ok).toBe(false);
+    expect(bad("20").ok).toBe(false); // a string, not a number
+    expect(bad(null).ok).toBe(false); // null is not "absent"
+    expect(bad({}).ok).toBe(false);
+    const verdict = bad(9);
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.reason).toMatch(/^dataDiskGb/);
+  });
 });
 
 describe("POST /actuate route", () => {
@@ -2304,6 +2338,66 @@ describe("POST /actuate route", () => {
       envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
     );
     expect(response.status).toBe(400);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("gcp-instance-create: with dataDiskGb attaches a SECOND non-boot pd-balanced data disk (autoDelete:false)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob({ params: JSON.stringify({ ...GCP_INSTANCE_PARAMS, dataDiskGb: 200 }) });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApi({ body: { name: "operation-1234", status: "PENDING", operationType: "insert" } });
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
+    );
+    expect(response.status).toBe(200);
+    const resultBody = (await response.json()) as { ok: boolean };
+    expect(resultBody.ok).toBe(true);
+
+    const [, insertCall] = calls;
+    // The boot disk is UNCHANGED and a second data disk is appended: boot:false, autoDelete:FALSE
+    // (survives VM deletion), pd-balanced, sized to the validated dataDiskGb. The zone in the diskType
+    // path is the same grammar-checked value as the machineType path.
+    expect(insertCall.body).toEqual({
+      name: "dy-dirb-proof-vm",
+      machineType: "zones/australia-southeast1-a/machineTypes/e2-small",
+      disks: [
+        {
+          boot: true,
+          autoDelete: true,
+          initializeParams: { sourceImage: "projects/debian-cloud/global/images/family/debian-12" },
+        },
+        {
+          boot: false,
+          autoDelete: false,
+          initializeParams: {
+            diskType: "zones/australia-southeast1-a/diskTypes/pd-balanced",
+            diskSizeGb: 200,
+          },
+        },
+      ],
+      networkInterfaces: [{ network: "global/networks/default" }],
+    });
+    const insertBody = insertCall.body as { disks: Array<Record<string, unknown>> };
+    expect(insertBody.disks).toHaveLength(2);
+    expect(insertBody.disks[1].boot).toBe(false);
+    expect(insertBody.disks[1].autoDelete).toBe(false);
+  });
+
+  it("gcp-instance-create: an out-of-range dataDiskGb is 400 with NO Google call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob({ params: JSON.stringify({ ...GCP_INSTANCE_PARAMS, dataDiskGb: 5 }) });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
+    );
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { reason: string };
+    expect(body.reason).toMatch(/^dataDiskGb/);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
