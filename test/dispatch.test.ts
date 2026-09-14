@@ -35,6 +35,7 @@ import {
   validateGcpNetworkCreateParams,
   validateGcpFirewallCreateParams,
   validateGcpAddressCreateParams,
+  validateGcpRouterNatCreateParams,
   GCP_FIREWALL_PROTOCOLS,
 } from "../src/dispatch-params.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
@@ -231,6 +232,23 @@ function gcpAddressCreateJob(overrides: Partial<DispatchJob> = {}): DispatchJob 
     op: "gcp-address-create",
     params: JSON.stringify(GCP_ADDRESS_PARAMS),
     nonce: "33cc33cc33cc33cc33cc33cc33cc33cc",
+    ...overrides,
+  });
+}
+
+// A gcp-router-nat-create job — the cell's Cloud Router + inline NAT (egress for the private VMs).
+const GCP_ROUTER_NAT_PARAMS = {
+  project: "dy-agency-proof",
+  region: "australia-southeast1",
+  networkName: "dy-cell-australia-southeast1",
+  routerName: "dy-cell-australia-southeast1-router",
+  natName: "dy-cell-australia-southeast1-nat",
+};
+function gcpRouterNatCreateJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-router-nat-create",
+    params: JSON.stringify(GCP_ROUTER_NAT_PARAMS),
+    nonce: "44dd44dd44dd44dd44dd44dd44dd44dd",
     ...overrides,
   });
 }
@@ -543,6 +561,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-firewall-create",
       "gcp-instance-create",
       "gcp-network-create",
+      "gcp-router-nat-create",
       "provision-r2",
       "wp-cli",
     ]);
@@ -1268,6 +1287,52 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       [{ project: "Bad" }, /^project must be/],
       [{ region: "nope" }, /^region must be/],
       [{ addressName: "Bad" }, /^addressName must be/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  // ── gcp-router-nat-create (twin of the app's rules) ───────────────────────────────
+
+  it("gcp-router-nat-create: accepts valid params and returns ONLY the five known keys", () => {
+    expect(validateGcpRouterNatCreateParams({ ...GCP_ROUTER_NAT_PARAMS, extra: "x" })).toEqual({ ok: true, params: GCP_ROUTER_NAT_PARAMS });
+    expect(validateGcpRouterNatCreateParams({ ...GCP_ROUTER_NAT_PARAMS, region: "us-central1" }).ok).toBe(true);
+    expect(validateGcpRouterNatCreateParams({ ...GCP_ROUTER_NAT_PARAMS, routerName: "r" }).ok).toBe(true);
+    expect(validateGcpRouterNatCreateParams({ ...GCP_ROUTER_NAT_PARAMS, natName: `a${"b".repeat(61)}1` }).ok).toBe(true);
+  });
+
+  it("gcp-router-nat-create: rejects bad input field by field, and names the field", () => {
+    const bad = (overrides: Record<string, unknown>) => validateGcpRouterNatCreateParams({ ...GCP_ROUTER_NAT_PARAMS, ...overrides });
+
+    expect(validateGcpRouterNatCreateParams(null).ok).toBe(false);
+    expect(validateGcpRouterNatCreateParams("string").ok).toBe(false);
+    expect(validateGcpRouterNatCreateParams([]).ok).toBe(false);
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false);
+    expect(bad({ region: undefined }).ok).toBe(false);
+    expect(bad({ region: "australia-southeast1-a" }).ok).toBe(false); // a zone
+    expect(bad({ region: "australia-southeast1/../.." }).ok).toBe(false); // traversal
+    expect(bad({ networkName: undefined }).ok).toBe(false);
+    expect(bad({ networkName: "global/networks/dy-cell" }).ok).toBe(false); // a URL, not a name
+    expect(bad({ routerName: undefined }).ok).toBe(false);
+    expect(bad({ routerName: "" }).ok).toBe(false);
+    expect(bad({ routerName: "Bad-Name" }).ok).toBe(false);
+    expect(bad({ routerName: "1router" }).ok).toBe(false);
+    expect(bad({ routerName: "a/b" }).ok).toBe(false);
+    expect(bad({ routerName: `a${"b".repeat(63)}` }).ok).toBe(false);
+    expect(bad({ natName: undefined }).ok).toBe(false);
+    expect(bad({ natName: "nat_1" }).ok).toBe(false);
+    expect(bad({ natName: "nat-" }).ok).toBe(false);
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ region: "nope" }, /^region must be/],
+      [{ networkName: "Bad" }, /^networkName must be/],
+      [{ routerName: "Bad" }, /^routerName must be/],
+      [{ natName: "Bad" }, /^natName must be/],
     ];
     for (const [overrides, expected] of cases) {
       const verdict = bad(overrides);
@@ -3537,12 +3602,163 @@ describe("POST /actuate route", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("the three cell-infra ops given another op's params are 400 with NO Google call", async () => {
+  // ── gcp-router-nat-create through the registry ───────────────────────────────────────
+  // routers.insert (ONE router with the NAT inline) -> WAIT for its regional operation. The NAT is the
+  // private VMs' only egress, so "created" must mean it EXISTS (the same wait contract as the network).
+
+  it("gcp-router-nat-create: POSTs ONE regional router carrying the inline NAT (AUTO_ONLY, all subnets), WAITS for it — agency SA only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRouterNatCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-router", status: "RUNNING", operationType: "insert" } }, // routers.insert
+      { body: { name: "operation-router", status: "DONE" } }, // regionOperations.wait
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const resultBody = await response.json();
+    expect(resultBody).toEqual({
+      ok: true,
+      op: "gcp-router-nat-create",
+      routerName: "dy-cell-australia-southeast1-router",
+      natName: "dy-cell-australia-southeast1-nat",
+      status: "created",
+    });
+    expect(JSON.stringify(resultBody)).not.toContain(GCP_ACCESS_TOKEN);
+
+    const [tokenCall] = calls;
+    expect(jwtClaimsOf(tokenCall.form?.get("assertion") ?? "").scope).toBe(GOOGLE_SCOPE_CLOUD_PLATFORM);
+    const [insertCall, waitCall] = computeCalls(calls);
+    expect(insertCall.method).toBe("POST");
+    expect(insertCall.url).toBe(`${GCP_REGION_URL}/routers`);
+    expect(insertCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+    expect(insertCall.body).toEqual({
+      name: "dy-cell-australia-southeast1-router",
+      network: "global/networks/dy-cell-australia-southeast1",
+      nats: [
+        {
+          name: "dy-cell-australia-southeast1-nat",
+          sourceSubnetworkIpRangesToNat: "ALL_SUBNETWORKS_ALL_IP_RANGES",
+          natIpAllocateOption: "AUTO_ONLY",
+        },
+      ],
+    });
+    expect(waitCall.method).toBe("POST");
+    expect(waitCall.url).toBe(`${GCP_REGION_URL}/operations/operation-router/wait`);
+    expect(waitCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+    expect(JSON.stringify(calls.map((call) => call.body))).not.toContain("PRIVATE KEY");
+  });
+
+  it("gcp-router-nat-create: a 409 (router already exists) is ok:true already-existed with NO wait call — idempotent by name", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRouterNatCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([alreadyExists409("projects/dy-agency-proof/regions/australia-southeast1/routers/dy-cell-australia-southeast1-router")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-router-nat-create",
+      routerName: "dy-cell-australia-southeast1-router",
+      natName: "dy-cell-australia-southeast1-nat",
+      status: "already-existed",
+    });
+    expect(computeCalls(calls).map((call) => call.url)).toEqual([`${GCP_REGION_URL}/routers`]);
+  });
+
+  it("gcp-router-nat-create: a router operation that finishes with errors is ok:false carrying Google's message", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRouterNatCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-router", status: "RUNNING" } },
+      { body: { name: "operation-router", status: "DONE", error: { errors: [{ code: "QUOTA_EXCEEDED", message: "Quota 'ROUTERS' exceeded." }] } } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; routerName: string; natName: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-router-nat-create");
+    expect(body.routerName).toBe("dy-cell-australia-southeast1-router");
+    expect(body.natName).toBe("dy-cell-australia-southeast1-nat");
+    expect(body.detail).toMatch(/router "dy-cell-australia-southeast1-router" create operation failed: Quota 'ROUTERS' exceeded/);
+    expect(computeCalls(calls)).toHaveLength(2);
+  });
+
+  it("gcp-router-nat-create: a 403 on the insert is a TERMINAL ok:false naming the permission, token not echoed, NO wait", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRouterNatCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([denied403("compute.routers.create")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-router-nat-create");
+    expect(body.detail).toMatch(/denied the router "dy-cell-australia-southeast1-router" create \(HTTP 403\)/);
+    expect(body.detail).toContain("Required 'compute.routers.create' permission");
+    expect(body.detail).toMatch(/roles\/compute\.networkAdmin/);
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+    expect(computeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-router-nat-create: REJECTS a project that is not the SA key's own project — no token minted, ZERO GCP calls", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRouterNatCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([{ body: { name: "operation-should-not-happen", status: "RUNNING" } }]);
+    const otherProjectKey = await makeServiceAccountKey("some-other-project");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: otherProjectKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-router-nat-create");
+    expect(body.detail).toMatch(/does not match the service-account key's own project \("some-other-project"\)/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("gcp-router-nat-create: a zone in place of the region (or a URL as networkName) is 400 with NO Google call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    for (const [overrides, expected] of [
+      [{ region: "australia-southeast1-a" }, /^region must be/],
+      [{ networkName: "global/networks/dy-cell-australia-southeast1" }, /^networkName must be/],
+    ] as Array<[Record<string, unknown>, RegExp]>) {
+      const job = gcpRouterNatCreateJob({ params: JSON.stringify({ ...GCP_ROUTER_NAT_PARAMS, ...overrides }) });
+      const signature = await signAsApp(job, privateKey);
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { reason: string };
+      expect(body.reason).toMatch(expected);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("gcp-router-nat-create: reports a clean failure and touches NO API when GCP_SERVICE_ACCOUNT_KEY is missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRouterNatCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/GCP_SERVICE_ACCOUNT_KEY is not configured/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("the four cell-infra ops given another op's params are 400 with NO Google call", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const jobs = [
       gcpNetworkCreateJob({ params: JSON.stringify(GCP_INSTANCE_PARAMS) }),
       gcpFirewallCreateJob({ params: JSON.stringify(GCP_NETWORK_PARAMS) }),
       gcpAddressCreateJob({ params: JSON.stringify(GCP_FIREWALL_PARAMS) }),
+      gcpRouterNatCreateJob({ params: JSON.stringify(GCP_ADDRESS_PARAMS) }),
     ];
     for (const job of jobs) {
       const signature = await signAsApp(job, privateKey);

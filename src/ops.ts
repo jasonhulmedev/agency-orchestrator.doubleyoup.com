@@ -18,8 +18,9 @@
 // actuate.ts::actuateDbImport). `gcp-instance-create` is likewise NON-idempotent — a second create
 // of the same name is a 409 and a lost response may already have created the VM — so it too runs
 // exactly once under F1 (see actuate.ts::actuateGcpInstanceCreate). The cell-infra ops
-// `gcp-network-create` / `gcp-firewall-create` / `gcp-address-create` ARE idempotent — each treats
-// Google's 409 alreadyExists as success so a half-built cell resumes on re-run (planning/34).
+// `gcp-network-create` / `gcp-firewall-create` / `gcp-address-create` / `gcp-router-nat-create` ARE
+// idempotent — each treats Google's 409 alreadyExists as success so a half-built cell resumes on
+// re-run (planning/34).
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -35,6 +36,7 @@ import {
   type GcpNetworkCreateParams,
   type GcpFirewallCreateParams,
   type GcpAddressCreateParams,
+  type GcpRouterNatCreateParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
@@ -45,6 +47,7 @@ import {
   validateGcpNetworkCreateParams,
   validateGcpFirewallCreateParams,
   validateGcpAddressCreateParams,
+  validateGcpRouterNatCreateParams,
 } from "./dispatch-params.js";
 import {
   type ActuateResult,
@@ -58,6 +61,7 @@ import {
   actuateGcpNetworkCreate,
   actuateGcpFirewallCreate,
   actuateGcpAddressCreate,
+  actuateGcpRouterNatCreate,
 } from "./actuate.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
@@ -124,6 +128,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "gcp-address-create": defineOp<GcpAddressCreateParams>({
     validateParams: validateGcpAddressCreateParams,
     actuate: (params, env) => actuateGcpAddressCreate(params, env),
+  }),
+  "gcp-router-nat-create": defineOp<GcpRouterNatCreateParams>({
+    validateParams: validateGcpRouterNatCreateParams,
+    actuate: (params, env) => actuateGcpRouterNatCreate(params, env),
   }),
 };
 

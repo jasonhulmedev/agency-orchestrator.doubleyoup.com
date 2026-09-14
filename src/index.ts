@@ -24,8 +24,9 @@
 //                     with wp db import), and the gcp-* ops — gcp-instance-create (one
 //                     Compute Engine VM), gcp-network-create (a VPC + subnet),
 //                     gcp-firewall-create (one ingress rule), gcp-address-create (a
-//                     static external IP) — each in the agency's own GCP project with
-//                     its own service-account key. Verified before any side effect.
+//                     static external IP), gcp-router-nat-create (a Cloud Router + NAT
+//                     for private-VM egress) — each in the agency's own GCP project
+//                     with its own service-account key. Verified before any side effect.
 //
 // NOTE on inbound auth: /validate and /complete are Phase-1 endpoints the agency
 // triggers themselves, so they are intentionally open. /actuate is the Direction-B

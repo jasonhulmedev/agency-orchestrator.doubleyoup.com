@@ -40,7 +40,8 @@ export interface Env {
   // Google Cloud service-account key — the entire downloaded JSON as one string.
   // Probed read-only by /validate (validators.ts::validateGCP), and used by the
   // Direction-B `gcp-*` actuators (src/actuate.ts: gcp-instance-create,
-  // gcp-network-create, gcp-firewall-create, gcp-address-create) to mint a FULL
+  // gcp-network-create, gcp-firewall-create, gcp-address-create,
+  // gcp-router-nat-create) to mint a FULL
   // cloud-platform-scoped token and create Compute Engine resources in the
   // agency's own project (every op is pinned to the key's own project_id). The
   // key never leaves this Worker; only the short-lived token it mints reaches

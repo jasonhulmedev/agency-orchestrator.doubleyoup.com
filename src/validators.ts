@@ -596,7 +596,8 @@ interface GoogleTokenResponse {
 //     least-privilege for a probe that must never be able to change anything.
 //   - CLOUD_PLATFORM (full) is requested ONLY by the Direction-B `gcp-*` write actuators
 //     (actuate.ts::mintPinnedGcpAccessToken — the one place that asks for it, on behalf of
-//     gcp-instance-create / gcp-network-create / gcp-firewall-create / gcp-address-create),
+//     gcp-instance-create / gcp-network-create / gcp-firewall-create / gcp-address-create /
+//     gcp-router-nat-create),
 //     because creating a Compute Engine resource is a write the read-only scope cannot
 //     authorize. That escalation is inherent to those ops and deliberate; nothing else asks
 //     for it, and validateGCP stays on the read-only default.

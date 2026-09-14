@@ -48,6 +48,7 @@ export const DISPATCH_OPS = [
   "gcp-network-create",
   "gcp-firewall-create",
   "gcp-address-create",
+  "gcp-router-nat-create",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 

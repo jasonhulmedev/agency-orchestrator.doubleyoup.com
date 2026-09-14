@@ -472,7 +472,8 @@ export function validateDbImportParams(raw: unknown): ParamsVerdict<DbImportPara
 
 // ── GCP shared grammars ──────────────────────────────────────────────────────────────
 // Grammars shared by the GCP ops below: gcp-instance-create's OPTIONAL networking fields and the
-// gcp-network-create / gcp-firewall-create / gcp-address-create resource ops (planning/34 phase 2).
+// gcp-network-create / gcp-firewall-create / gcp-address-create / gcp-router-nat-create resource ops
+// (planning/34 phases 2-3).
 // Every GCP value a job carries becomes either a URL path segment or a JSON body field of a
 // Compute Engine call, so each grammar is anchored, lowercase, and admits no "/", "?", "#",
 // whitespace or other URL/JSON metacharacter — the grammar IS the injection guard, alongside
@@ -953,6 +954,62 @@ export function validateGcpAddressCreateParams(raw: unknown): ParamsVerdict<GcpA
   }
 
   return { ok: true, params: { project, region, addressName } };
+}
+
+// ── gcp-router-nat-create ────────────────────────────────────────────────────────────
+// Create ONE regional Cloud Router carrying ONE inline Cloud NAT on a cell's VPC in the AGENCY's own
+// project (planning/34 phase 3). WHY: every cell VM except the gateway has NO external IP, so without
+// a NAT the private web/file/data nodes have no egress at all — no apt, no cell-agent bundle fetch,
+// no cloudflared. The NAT uses Google-managed IPs (AUTO_ONLY), so no address reservation is needed,
+// and covers every subnet of the network (ALL_SUBNETWORKS_ALL_IP_RANGES) — the cell has exactly one.
+// Five REQUIRED strings, each pinned to a strict grammar:
+//   1. `project`     — the project id (pinned to the SA key's own project by the actuator).
+//   2. `region`      — a Compute region (a URL path segment; a router is regional).
+//   3. `networkName` — the VPC the router attaches to (becomes "global/networks/<name>").
+//   4. `routerName`  — the router's resource name.
+//   5. `natName`     — the NAT config's name inside the router.
+//
+// IDEMPOTENT: the insert treats Google's 409 alreadyExists as success (a re-run resumes). Registered
+// `true` in AGENCY_OP_IDEMPOTENT. Idempotence is by ROUTER NAME — a re-run against a same-named router
+// created elsewhere with a different (or no) NAT is a no-op, not an update.
+
+export interface GcpRouterNatCreateParams {
+  /** The agency's GCP project id the router is created in. */
+  project: string;
+  /** The Compute Engine region of the router, e.g. "australia-southeast1". */
+  region: string;
+  /** The VPC network the router attaches to. */
+  networkName: string;
+  /** The Cloud Router's resource name. */
+  routerName: string;
+  /** The inline Cloud NAT config's name. */
+  natName: string;
+}
+
+export function validateGcpRouterNatCreateParams(raw: unknown): ParamsVerdict<GcpRouterNatCreateParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region, networkName, routerName, natName } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast1)" };
+  }
+  if (typeof networkName !== "string" || !GCP_RESOURCE_NAME_RE.test(networkName)) {
+    return { ok: false, reason: `networkName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+  if (typeof routerName !== "string" || !GCP_RESOURCE_NAME_RE.test(routerName)) {
+    return { ok: false, reason: `routerName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+  if (typeof natName !== "string" || !GCP_RESOURCE_NAME_RE.test(natName)) {
+    return { ok: false, reason: `natName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, region, networkName, routerName, natName } };
 }
 
 // ── shared ─────────────────────────────────────────────────────────────────────────

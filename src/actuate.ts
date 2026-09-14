@@ -5,8 +5,8 @@
 // data-plane op), the agency's S3_* object-store credential to PRESIGN a URL the cell
 // uploads a DB dump to (`db-export`) or downloads one from (`db-import`), and — for the
 // `gcp-*` ops — the agency's GCP_SERVICE_ACCOUNT_KEY to mint a Google access token and
-// create Compute Engine resources (a VM, a VPC + subnet, a firewall rule, a static address)
-// in the agency's own project. There is deliberately NO platform credential anywhere in
+// create Compute Engine resources (a VM, a VPC + subnet, a firewall rule, a static address,
+// a Cloud Router + NAT) in the agency's own project. There is deliberately NO platform credential anywhere in
 // this Worker to fall back to: if the agency's token is missing or unauthorized, actuation
 // fails cleanly rather than reaching for ours.
 //
@@ -31,6 +31,7 @@ import type {
   GcpNetworkCreateParams,
   GcpFirewallCreateParams,
   GcpAddressCreateParams,
+  GcpRouterNatCreateParams,
 } from "./dispatch-params.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken } from "./validators.js";
@@ -107,6 +108,13 @@ export type GcpAddressCreateResult =
   | { ok: true; op: "gcp-address-create"; addressName: string; address: string | null; status: GcpResourceStatus }
   | { ok: false; op: "gcp-address-create"; addressName: string; detail: string };
 
+// One insert, one status: the router and its inline NAT are created together. "created" means the
+// Worker WAITED for the insert Operation to reach DONE (see actuateGcpRouterNatCreate), so the NAT
+// is in place on return — the private VMs created next boot with egress.
+export type GcpRouterNatCreateResult =
+  | { ok: true; op: "gcp-router-nat-create"; routerName: string; natName: string; status: GcpResourceStatus }
+  | { ok: false; op: "gcp-router-nat-create"; routerName: string; natName: string; detail: string };
+
 export type ActuateResult =
   | ProvisionR2Result
   | DnsRecordUpsertResult
@@ -117,7 +125,8 @@ export type ActuateResult =
   | GcpInstanceCreateResult
   | GcpNetworkCreateResult
   | GcpFirewallCreateResult
-  | GcpAddressCreateResult;
+  | GcpAddressCreateResult
+  | GcpRouterNatCreateResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -1737,4 +1746,78 @@ export async function actuateGcpAddressCreate(
     return failure(read.detail);
   }
   return { ok: true, op: "gcp-address-create", addressName, address: read.address, status: outcome.kind };
+}
+
+// ── gcp-router-nat-create ────────────────────────────────────────────────────────────────
+// ONE regional Cloud Router carrying ONE inline Cloud NAT on the cell's VPC, in the agency's own
+// project (planning/34 phase 3). WHY: the web/file/data nodes have NO external IP, so this NAT is
+// their only route out — apt, the cell-agent bundle fetch and cloudflared all need it. Idempotent
+// by router name: a 409 is success. AUTO_ONLY lets Google allocate the NAT IPs (no reservation);
+// ALL_SUBNETWORKS_ALL_IP_RANGES covers the cell's one subnet.
+//
+// routers.insert is async. Unlike a firewall rule (nothing waits on it), the VMs created right after
+// this op need the NAT AT BOOT, so when THIS run created the router the Worker WAITS for the insert
+// Operation to reach DONE before returning — "created" means the NAT exists, not merely that Google
+// accepted it (the same contract as gcp-network-create). When the router already existed there is
+// nothing to wait on.
+
+export async function actuateGcpRouterNatCreate(
+  params: GcpRouterNatCreateParams,
+  env: Env,
+): Promise<GcpRouterNatCreateResult> {
+  const { project, region, networkName, routerName, natName } = params;
+  const failure = (detail: string): GcpRouterNatCreateResult => ({
+    ok: false,
+    op: "gcp-router-nat-create",
+    routerName,
+    natName,
+    detail,
+  });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const accessToken = token.accessToken;
+  // Path segments are grammar-checked upstream AND URL-encoded here.
+  const regionPath =
+    `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}` +
+    `/regions/${encodeURIComponent(region)}`;
+  const what = `router "${routerName}"`;
+
+  const outcome = await insertComputeResource({
+    url: `${regionPath}/routers`,
+    accessToken,
+    // Project-relative network reference, like the subnet body's — never a caller-supplied URL. The
+    // NAT rides INLINE on the router so one insert creates both.
+    body: {
+      name: routerName,
+      network: `global/networks/${networkName}`,
+      nats: [
+        {
+          name: natName,
+          sourceSubnetworkIpRangesToNat: "ALL_SUBNETWORKS_ALL_IP_RANGES",
+          natIpAllocateOption: "AUTO_ONLY",
+        },
+      ],
+    },
+    what,
+    project,
+    permissionHint: "compute.routers.create (e.g. roles/compute.networkAdmin)",
+  });
+  if (outcome.kind === "failed") {
+    return failure(outcome.detail);
+  }
+  if (outcome.kind === "created") {
+    const waited = await waitForComputeOperation({
+      waitUrl: `${regionPath}/operations/${encodeURIComponent(outcome.operationName)}/wait`,
+      accessToken,
+      what,
+    });
+    if (!waited.ok) {
+      return failure(waited.detail);
+    }
+  }
+
+  return { ok: true, op: "gcp-router-nat-create", routerName, natName, status: outcome.kind };
 }
