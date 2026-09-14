@@ -2678,10 +2678,31 @@ describe("POST /actuate route", () => {
       envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
     );
     expect(response.status).toBe(200);
-    const body = (await response.json()) as { ok: boolean; detail: string };
+    const body = (await response.json()) as { ok: boolean; detail: string; alreadyExisted?: boolean };
     expect(body.ok).toBe(false);
     expect(body.detail).toMatch(/already exists in dy-agency-proof\/australia-southeast1-a/);
     expect(body.detail).toMatch(/not idempotent/);
+    // The DISCRIMINABLE already-existed signal a cell-level resume keys on (planning/34): a field,
+    // so the orchestrator never has to match the detail string.
+    expect(body.alreadyExisted).toBe(true);
+  });
+
+  it("gcp-instance-create: only a 409 carries alreadyExisted — a 403 denial does not", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApi({
+      status: 403,
+      body: { error: { code: 403, message: "Required 'compute.instances.create' permission", status: "PERMISSION_DENIED" } },
+    });
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }),
+    );
+    const body = (await response.json()) as { ok: boolean; alreadyExisted?: boolean };
+    expect(body.ok).toBe(false);
+    expect("alreadyExisted" in body).toBe(false);
   });
 
   it("gcp-instance-create: any other non-2xx (e.g. 404 no default network) is ok:false with Google's message", async () => {

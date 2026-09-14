@@ -69,9 +69,15 @@ export type DbImportResult =
 // instances.insert is ASYNC: a 2xx returns a long-running Operation, not the VM. Success here
 // means "Google ACCEPTED the create" — `operationName` + `status` (PENDING/RUNNING/DONE) are
 // what a caller polls. The minted access token is never part of either variant.
+//
+// `alreadyExisted` (ok:false ONLY) is set to true when Google answered the insert with 409 — the
+// named VM already exists. The op itself stays NON-idempotent (a 409 is still reported ok:false,
+// see actuateGcpInstanceCreate), but a CELL-level caller resuming a half-built cell (planning/34
+// "resume on re-run") needs a discriminable "the node is already there" signal it can treat as
+// skip-and-continue, rather than matching on the detail string. Absent on every other failure.
 export type GcpInstanceCreateResult =
   | { ok: true; op: "gcp-instance-create"; instanceName: string; operationName: string; status: string }
-  | { ok: false; op: "gcp-instance-create"; instanceName: string; detail: string };
+  | { ok: false; op: "gcp-instance-create"; instanceName: string; detail: string; alreadyExisted?: true };
 
 // The IDEMPOTENT cell-infra ops report, per resource, whether THIS run created it or found it
 // already there (Google's 409 alreadyExists) — the same vocabulary as provision-r2's status.
@@ -1328,12 +1334,17 @@ export async function actuateGcpInstanceCreate(
   if (response.status === 409) {
     // Unlike provision-r2's "already exists", this is a FAILURE: the op is a create of a NEW named
     // VM, and a name collision means either a stale VM to clean up or a caller bug — never a
-    // converged success to report as ok.
-    return gcpInstanceCreateFailure(
+    // converged success to report as ok. `alreadyExisted:true` is the discriminable signal a
+    // cell-level resume uses to skip an already-provisioned node (see GcpInstanceCreateResult).
+    return {
+      ok: false,
+      op: "gcp-instance-create",
       instanceName,
-      `an instance named "${instanceName}" already exists in ${params.project}/${params.zone}${googleErrorMessage(body)} — ` +
+      detail:
+        `an instance named "${instanceName}" already exists in ${params.project}/${params.zone}${googleErrorMessage(body)} — ` +
         "instance create is not idempotent; pick a new name or delete the existing VM first.",
-    );
+      alreadyExisted: true,
+    };
   }
 
   return gcpInstanceCreateFailure(
