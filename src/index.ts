@@ -21,9 +21,11 @@
 //                     db-export (the cell exports its WP DB and uploads it to the
 //                     agency's object store via a presigned URL), db-import (the cell
 //                     downloads a dump from that store via a presigned URL and loads it
-//                     with wp db import), and gcp-instance-create (create one private
-//                     Compute Engine VM in the agency's own GCP project with its own
-//                     service-account key). Verified before any side effect.
+//                     with wp db import), and the gcp-* ops — gcp-instance-create (one
+//                     Compute Engine VM), gcp-network-create (a VPC + subnet),
+//                     gcp-firewall-create (one ingress rule), gcp-address-create (a
+//                     static external IP) — each in the agency's own GCP project with
+//                     its own service-account key. Verified before any side effect.
 //
 // NOTE on inbound auth: /validate and /complete are Phase-1 endpoints the agency
 // triggers themselves, so they are intentionally open. /actuate is the Direction-B

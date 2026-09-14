@@ -470,26 +470,94 @@ export function validateDbImportParams(raw: unknown): ParamsVerdict<DbImportPara
   return { ok: true, params: { docroot, objectKey } };
 }
 
+// ── GCP shared grammars ──────────────────────────────────────────────────────────────
+// Grammars shared by the GCP ops below: gcp-instance-create's OPTIONAL networking fields and the
+// gcp-network-create / gcp-firewall-create / gcp-address-create resource ops (planning/34 phase 2).
+// Every GCP value a job carries becomes either a URL path segment or a JSON body field of a
+// Compute Engine call, so each grammar is anchored, lowercase, and admits no "/", "?", "#",
+// whitespace or other URL/JSON metacharacter — the grammar IS the injection guard, alongside
+// encodeURIComponent + JSON.stringify in the actuator (see the gcp-instance-create note below).
+
+// A Compute Engine resource name (RFC 1035): 1-63 chars, lowercase-letter start, [-a-z0-9],
+// alphanumeric end. Used for network / subnetwork / firewall-rule / address names and for
+// instance network tags. The same grammar as GCP_INSTANCE_NAME_RE below.
+const GCP_RESOURCE_NAME_RE = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
+const GCP_RESOURCE_NAME_RULE =
+  "must be a Compute Engine resource name (1-63 chars: lowercase letter first, then lowercase letters, digits, hyphens; alphanumeric last)";
+const GCP_PROJECT_ID_RULE =
+  "project must be a GCP project id (6-30 chars: lowercase letter first, then lowercase letters, digits, hyphens; alphanumeric last)";
+// A Compute REGION, e.g. australia-southeast1 (<geo>-<area><n>). A zone ("...-a") does not match.
+const GCP_REGION_RE = /^[a-z]+-[a-z0-9]+$/;
+// One dotted-quad octet, 0-255, no leading zero.
+const IPV4_OCTET = "(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
+// A plain IPv4 address — the reserved external IP an instance attaches.
+const IPV4_ADDRESS_RE = new RegExp(`^${IPV4_OCTET}(?:\\.${IPV4_OCTET}){3}$`);
+// Any IPv4 CIDR block, prefix /0-/32 — a firewall SOURCE range, where 0.0.0.0/0 is legitimate.
+const IPV4_CIDR_RE = new RegExp(`^${IPV4_OCTET}(?:\\.${IPV4_OCTET}){3}\\/(?:3[0-2]|[12]?[0-9])$`);
+// A subnet's primary range: a PRIVATE (RFC 1918) IPv4 block no smaller than GCP's /29 floor —
+// 10/8 at /8-/29, 172.16/12 at /12-/29, or 192.168/16 at /16-/29. A public block or a /30+ is
+// rejected here rather than at Google.
+const GCP_SUBNET_CIDR_RE = new RegExp(
+  `^(?:10(?:\\.${IPV4_OCTET}){3}\\/(?:[89]|1[0-9]|2[0-9])` +
+    `|172\\.(?:1[6-9]|2[0-9]|3[01])(?:\\.${IPV4_OCTET}){2}\\/(?:1[2-9]|2[0-9])` +
+    `|192\\.168(?:\\.${IPV4_OCTET}){2}\\/(?:1[6-9]|2[0-9]))$`,
+);
+// Google allows at most 64 network tags per instance.
+const GCP_INSTANCE_TAGS_MAX = 64;
+// Google caps a metadata VALUE at 256 KB; the startup script is one metadata value. Measured in
+// JS string length (UTF-16 units) — for an ASCII shell script that equals its byte length.
+const GCP_STARTUP_SCRIPT_MAX_LENGTH = 256 * 1024;
+
+/**
+ * Validate a list of Compute Engine resource names (tags / target tags): a non-empty array of
+ * 1..`max` strings, each matching GCP_RESOURCE_NAME_RE. Returns a FRESH array of the validated
+ * entries — never the caller's array — or null when anything about the list is wrong.
+ */
+function cleanGcpResourceNameList(value: unknown, max: number): string[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > max) {
+    return null;
+  }
+  const clean: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string" || !GCP_RESOURCE_NAME_RE.test(entry)) {
+      return null;
+    }
+    clean.push(entry);
+  }
+  return clean;
+}
+
 // ── gcp-instance-create ──────────────────────────────────────────────────────────────
 // Create ONE Compute Engine VM in the AGENCY's own GCP project — the first GCP WRITE through
 // Direction-B (actuate.ts::actuateGcpInstanceCreate, with the agency's own GCP_SERVICE_ACCOUNT_KEY).
-// Four REQUIRED string params (each pinned to the exact GCP resource-name grammar) plus one
-// OPTIONAL numeric param:
+// Four REQUIRED string params (each pinned to the exact GCP resource-name grammar) plus OPTIONAL
+// params, every one of which leaves the body byte-identical to the four-field form when absent:
 //   1. `project`     — the project id (6-30 chars: lowercase-letter start, [a-z0-9-], alphanumeric end).
 //   2. `zone`        — a Compute zone, e.g. australia-southeast1-a (<region>-<area><n>-<letter>).
 //   3. `name`        — the instance name (RFC 1035: 1-63 chars, lowercase-letter start, [-a-z0-9],
 //                      alphanumeric end).
 //   4. `machineType` — a machine-type name, e.g. e2-small / n2-standard-4 (<family>-<shape>[-<n>]).
 //   5. `dataDiskGb`  — OPTIONAL: when present, a SECOND non-boot persistent data disk of this many GB
-//                      (the file node's storage) is attached; absent => a single-boot-disk VM,
-//                      byte-identical to the four-field form. An integer in [10, 65536].
-// The four string values are the ONLY job-derived STRINGS that reach Google: `project` + `zone` become
-// URL path segments of the instances.insert call, and all four land in its JSON body. The grammars
+//                      (the file node's storage) is attached; absent => a single-boot-disk VM.
+//                      An integer in [10, 65536].
+//   6. `network`     — OPTIONAL: the NAME of a VPC network in `project` to attach instead of "default".
+//   7. `subnetwork`  — OPTIONAL: the NAME of a subnetwork in `project`, in the zone's region.
+//   8. `tags`        — OPTIONAL: 1-64 network tags (firewall targets), each a resource name.
+//   9. `externalIp`  — OPTIONAL: a reserved IPv4 address to attach as the VM's external IP (a
+//                      ONE_TO_ONE_NAT access config). Absent => NO external IP (the private default).
+//  10. `startupScript` — OPTIONAL: the `startup-script` metadata value (planning/34 phase 3 bootstrap).
+// The string values are the ONLY job-derived STRINGS that reach Google: `project` + `zone` become
+// URL path segments of the instances.insert call, and the rest land in its JSON body. The grammars
 // admit no "/", "?", "#", ".", whitespace or any other URL/JSON metacharacter, so a signed value
 // can never re-path the API call (e.g. a zone of "a/../..") or smuggle a second field — this
 // validation IS the injection guard, alongside encodeURIComponent + JSON.stringify in the actuator.
+// `network` / `subnetwork` are deliberately BARE NAMES, not URLs: the actuator expands them into
+// project-relative paths, so a signed job can never point the interface at another project's VPC.
 // `dataDiskGb` (when present) reaches Google only as the body's numeric `diskSizeGb`; bounding it to
 // a whole number in [10, 65536] keeps it a plain integer that can carry no metacharacter.
+// `startupScript` is the ONE opaque value: a shell script legitimately contains any character, and
+// it reaches Google only as a JSON.stringify'd metadata value (never a URL segment), so it is
+// length-capped (Google's 256 KB metadata-value limit) rather than charset-restricted.
 //
 // NON-IDEMPOTENT: creating the same instance name twice is a 409 from GCP, and a lost response may
 // already have created the VM. The orchestrator registers it `false` in AGENCY_OP_IDEMPOTENT, so
@@ -510,6 +578,16 @@ export interface GcpInstanceCreateParams {
    * disk only and the instance body is unchanged.
    */
   dataDiskGb?: number;
+  /** OPTIONAL name of the VPC network (in `project`) to attach to; absent => the "default" network. */
+  network?: string;
+  /** OPTIONAL name of the subnetwork (in `project`, in the zone's region) to attach to. */
+  subnetwork?: string;
+  /** OPTIONAL network tags (1-64 resource names) — the firewall-rule targets this VM matches. */
+  tags?: string[];
+  /** OPTIONAL reserved external IPv4 address to attach; absent => no external IP (private VM). */
+  externalIp?: string;
+  /** OPTIONAL startup-script metadata value (opaque shell script, at most 256 KB). */
+  startupScript?: string;
 }
 
 const GCP_PROJECT_ID_RE = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
@@ -529,7 +607,7 @@ export function validateGcpInstanceCreateParams(raw: unknown): ParamsVerdict<Gcp
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
   }
-  const { project, zone, name, machineType, dataDiskGb } = raw;
+  const { project, zone, name, machineType, dataDiskGb, network, subnetwork, tags, externalIp, startupScript } = raw;
 
   if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
     return {
@@ -569,16 +647,312 @@ export function validateGcpInstanceCreateParams(raw: unknown): ParamsVerdict<Gcp
       reason: `dataDiskGb, when present, must be an integer number of GB in [${GCP_DATA_DISK_MIN_GB}, ${GCP_DATA_DISK_MAX_GB}]`,
     };
   }
+  // The OPTIONAL networking fields. Each is checked only when present (absent/undefined => the
+  // default-network, private, untagged, no-metadata VM — unchanged). `network` / `subnetwork` are
+  // bare resource NAMES (never URLs — see the section note).
+  if (network !== undefined && (typeof network !== "string" || !GCP_RESOURCE_NAME_RE.test(network))) {
+    return { ok: false, reason: `network, when present, ${GCP_RESOURCE_NAME_RULE}` };
+  }
+  if (subnetwork !== undefined && (typeof subnetwork !== "string" || !GCP_RESOURCE_NAME_RE.test(subnetwork))) {
+    return { ok: false, reason: `subnetwork, when present, ${GCP_RESOURCE_NAME_RULE}` };
+  }
+  let cleanTags: string[] | undefined;
+  if (tags !== undefined) {
+    const validatedTags = cleanGcpResourceNameList(tags, GCP_INSTANCE_TAGS_MAX);
+    if (validatedTags === null) {
+      return {
+        ok: false,
+        reason: `tags, when present, must be an array of 1-${GCP_INSTANCE_TAGS_MAX} network tags, each a Compute Engine resource name`,
+      };
+    }
+    cleanTags = validatedTags;
+  }
+  if (externalIp !== undefined && (typeof externalIp !== "string" || !IPV4_ADDRESS_RE.test(externalIp))) {
+    return { ok: false, reason: "externalIp, when present, must be an IPv4 address (e.g. 35.244.66.16)" };
+  }
+  // startupScript is opaque (any character is legitimate in a shell script) but bounded: non-empty
+  // and within Google's metadata-value limit.
+  if (
+    startupScript !== undefined &&
+    (typeof startupScript !== "string" || startupScript.length === 0 || startupScript.length > GCP_STARTUP_SCRIPT_MAX_LENGTH)
+  ) {
+    return {
+      ok: false,
+      reason: `startupScript, when present, must be a non-empty string of at most ${GCP_STARTUP_SCRIPT_MAX_LENGTH} characters`,
+    };
+  }
 
   // Return a FRESH object holding only the known keys — never the caller's object — so an extra key
-  // can never ride along into the instance body the actuator builds. dataDiskGb is added ONLY when
-  // present, so an absent value keeps the signed params (and the body the actuator builds) identical
-  // to the four-field form.
+  // can never ride along into the instance body the actuator builds. Every optional field is added
+  // ONLY when present, so an absent value keeps the signed params (and the body the actuator builds)
+  // identical to the four-field form.
   const params: GcpInstanceCreateParams = { project, zone, name, machineType };
   if (dataDiskGb !== undefined) {
     params.dataDiskGb = dataDiskGb;
   }
+  if (network !== undefined) {
+    params.network = network;
+  }
+  if (subnetwork !== undefined) {
+    params.subnetwork = subnetwork;
+  }
+  if (cleanTags !== undefined) {
+    params.tags = cleanTags;
+  }
+  if (externalIp !== undefined) {
+    params.externalIp = externalIp;
+  }
+  if (startupScript !== undefined) {
+    params.startupScript = startupScript;
+  }
   return { ok: true, params };
+}
+
+// ── gcp-network-create ───────────────────────────────────────────────────────────────
+// Create a cell's dedicated VPC in the AGENCY's own project: a CUSTOM-mode network plus ONE regional
+// subnet (planning/34 phase 2 — the web/file/data/gateway VMs all land on this subnet). Five REQUIRED
+// strings, each pinned to a strict grammar:
+//   1. `project`     — the project id (the actuator pins it to the SA key's own project).
+//   2. `region`      — a Compute region, e.g. australia-southeast1 (a URL path segment).
+//   3. `networkName` — the VPC's resource name, e.g. dy-cell-australia-southeast1.
+//   4. `subnetName`  — the subnet's resource name.
+//   5. `ipCidr`      — the subnet's primary range: a PRIVATE (RFC 1918) IPv4 block, /8-/29, e.g.
+//                      10.20.0.0/24. Not user-configurable in the cell flow (fixed per cell).
+//
+// IDEMPOTENT: both inserts treat Google's 409 alreadyExists as success, so a re-run of a half-built
+// cell resumes (planning/34 "partial-failure = resume on re-run"). The orchestrator registers it
+// `true` in AGENCY_OP_IDEMPOTENT, so the F1 dispatcher may auto-retry a transient failure.
+
+export interface GcpNetworkCreateParams {
+  /** The agency's GCP project id the network is created in. */
+  project: string;
+  /** The Compute Engine region of the subnet, e.g. "australia-southeast1". */
+  region: string;
+  /** The custom-mode VPC network's name. */
+  networkName: string;
+  /** The regional subnetwork's name. */
+  subnetName: string;
+  /** The subnet's primary IPv4 range — a private RFC 1918 block between /8 and /29. */
+  ipCidr: string;
+}
+
+export function validateGcpNetworkCreateParams(raw: unknown): ParamsVerdict<GcpNetworkCreateParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region, networkName, subnetName, ipCidr } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast1)" };
+  }
+  if (typeof networkName !== "string" || !GCP_RESOURCE_NAME_RE.test(networkName)) {
+    return { ok: false, reason: `networkName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+  if (typeof subnetName !== "string" || !GCP_RESOURCE_NAME_RE.test(subnetName)) {
+    return { ok: false, reason: `subnetName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+  if (typeof ipCidr !== "string" || !GCP_SUBNET_CIDR_RE.test(ipCidr)) {
+    return {
+      ok: false,
+      reason: "ipCidr must be a private (RFC 1918) IPv4 CIDR block between /8 and /29 (e.g. 10.20.0.0/24)",
+    };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, region, networkName, subnetName, ipCidr } };
+}
+
+// ── gcp-firewall-create ──────────────────────────────────────────────────────────────
+// Create ONE INGRESS firewall rule on a cell's VPC in the AGENCY's own project (planning/34 phase 2:
+// one rule for public tcp:22 to the `dy-gateway` tag, one allow-all rule inside the subnet). Six
+// REQUIRED params:
+//   1. `project`      — the project id (pinned to the SA key's own project by the actuator).
+//   2. `networkName`  — the VPC the rule attaches to (a resource name; becomes "global/networks/<name>").
+//   3. `ruleName`     — the rule's resource name.
+//   4. `allowed`      — 1-32 entries of { protocol, ports? }: `protocol` from the small allowlist
+//                       (tcp / udp / icmp / all); `ports` (tcp/udp ONLY, 1-256 entries) are single
+//                       ports or low-high ranges within 0-65535. icmp / all carry no ports.
+//   5. `sourceRanges` — 1-256 IPv4 CIDR blocks the rule admits traffic FROM (0.0.0.0/0 is legitimate:
+//                       the gateway's public sshd, hardened + fail2ban'd, per the live SFTP gateway).
+//   6. `targetTags`   — 1-256 network tags the rule applies TO. Required non-empty on purpose: a rule
+//                       always names its target scope (an untagged rule would apply to every VM in
+//                       the network — a tcp:22-from-anywhere rule must never do that by accident).
+// Every list is rebuilt as a FRESH array of validated entries, and every `allowed` entry as a fresh
+// object of only its known keys.
+//
+// IDEMPOTENT: the insert treats Google's 409 alreadyExists as success (a re-run resumes). Registered
+// `true` in AGENCY_OP_IDEMPOTENT. Note that idempotence is by NAME — a re-run with a different body
+// under the same ruleName is a no-op, not an update.
+
+export const GCP_FIREWALL_PROTOCOLS = ["tcp", "udp", "icmp", "all"] as const;
+export type GcpFirewallProtocol = (typeof GCP_FIREWALL_PROTOCOLS)[number];
+
+export interface GcpFirewallAllowed {
+  protocol: GcpFirewallProtocol;
+  /** tcp/udp only: single ports ("22") or ranges ("8000-8080"), each within 0-65535. */
+  ports?: string[];
+}
+
+export interface GcpFirewallCreateParams {
+  /** The agency's GCP project id the rule is created in. */
+  project: string;
+  /** The VPC network the rule attaches to. */
+  networkName: string;
+  /** The firewall rule's name — unique within the project. */
+  ruleName: string;
+  /** What the rule allows — at least one protocol entry. */
+  allowed: GcpFirewallAllowed[];
+  /** IPv4 CIDR source ranges the rule admits. */
+  sourceRanges: string[];
+  /** The network tags of the instances the rule applies to. */
+  targetTags: string[];
+}
+
+// A port or a low-high range: 1-5 digits each, no leading zero. The numeric bound (<= 65535 and
+// low <= high) is checked separately in isValidGcpFirewallPort.
+const GCP_FIREWALL_PORT_RE = /^(0|[1-9][0-9]{0,4})(?:-(0|[1-9][0-9]{0,4}))?$/;
+const GCP_FIREWALL_PORT_MAX = 65_535;
+// Google allows up to 256 source ranges / target tags / ports per rule; the number of `allowed`
+// entries has no meaningful reason to exceed a handful (one per protocol + port set).
+const GCP_FIREWALL_LIST_MAX = 256;
+const GCP_FIREWALL_ALLOWED_MAX = 32;
+
+/** True when `value` is a port ("22") or a low-high range ("8000-8080") within 0-65535. */
+function isValidGcpFirewallPort(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const match = GCP_FIREWALL_PORT_RE.exec(value);
+  if (!match) return false;
+  const low = Number(match[1]);
+  if (low > GCP_FIREWALL_PORT_MAX) return false;
+  if (match[2] === undefined) return true;
+  const high = Number(match[2]);
+  return high <= GCP_FIREWALL_PORT_MAX && low <= high;
+}
+
+/**
+ * Validate ONE `allowed` entry into a fresh { protocol, ports? } object, or return the reason it is
+ * invalid. `ports` may be present only for tcp/udp (Google rejects ports on icmp/all).
+ */
+function cleanGcpFirewallAllowed(entry: unknown): { ok: true; allowed: GcpFirewallAllowed } | { ok: false; reason: string } {
+  if (!isPlainObject(entry)) {
+    return { ok: false, reason: "each allowed entry must be an object { protocol, ports? }" };
+  }
+  const { protocol, ports } = entry;
+  if (typeof protocol !== "string" || !(GCP_FIREWALL_PROTOCOLS as readonly string[]).includes(protocol)) {
+    return { ok: false, reason: `each allowed entry's protocol must be one of ${GCP_FIREWALL_PROTOCOLS.join(", ")}` };
+  }
+  const typedProtocol = protocol as GcpFirewallProtocol;
+  if (ports === undefined) {
+    return { ok: true, allowed: { protocol: typedProtocol } };
+  }
+  if (typedProtocol !== "tcp" && typedProtocol !== "udp") {
+    return { ok: false, reason: `allowed ports apply to tcp/udp only (protocol "${typedProtocol}" must not carry ports)` };
+  }
+  if (!Array.isArray(ports) || ports.length < 1 || ports.length > GCP_FIREWALL_LIST_MAX) {
+    return { ok: false, reason: `allowed ports, when present, must be an array of 1-${GCP_FIREWALL_LIST_MAX} port strings` };
+  }
+  const cleanPorts: string[] = [];
+  for (const port of ports) {
+    if (!isValidGcpFirewallPort(port)) {
+      return { ok: false, reason: 'each allowed port must be a port ("22") or a low-high range ("8000-8080") within 0-65535' };
+    }
+    cleanPorts.push(port as string);
+  }
+  return { ok: true, allowed: { protocol: typedProtocol, ports: cleanPorts } };
+}
+
+export function validateGcpFirewallCreateParams(raw: unknown): ParamsVerdict<GcpFirewallCreateParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, networkName, ruleName, allowed, sourceRanges, targetTags } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof networkName !== "string" || !GCP_RESOURCE_NAME_RE.test(networkName)) {
+    return { ok: false, reason: `networkName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+  if (typeof ruleName !== "string" || !GCP_RESOURCE_NAME_RE.test(ruleName)) {
+    return { ok: false, reason: `ruleName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  if (!Array.isArray(allowed) || allowed.length < 1 || allowed.length > GCP_FIREWALL_ALLOWED_MAX) {
+    return { ok: false, reason: `allowed must be an array of 1-${GCP_FIREWALL_ALLOWED_MAX} { protocol, ports? } entries` };
+  }
+  const cleanAllowed: GcpFirewallAllowed[] = [];
+  for (const entry of allowed) {
+    const verdict = cleanGcpFirewallAllowed(entry);
+    if (!verdict.ok) {
+      return { ok: false, reason: verdict.reason };
+    }
+    cleanAllowed.push(verdict.allowed);
+  }
+
+  if (!Array.isArray(sourceRanges) || sourceRanges.length < 1 || sourceRanges.length > GCP_FIREWALL_LIST_MAX) {
+    return { ok: false, reason: `sourceRanges must be an array of 1-${GCP_FIREWALL_LIST_MAX} IPv4 CIDR blocks` };
+  }
+  const cleanSourceRanges: string[] = [];
+  for (const range of sourceRanges) {
+    if (typeof range !== "string" || !IPV4_CIDR_RE.test(range)) {
+      return { ok: false, reason: "each sourceRanges entry must be an IPv4 CIDR block (e.g. 0.0.0.0/0 or 10.20.0.0/24)" };
+    }
+    cleanSourceRanges.push(range);
+  }
+
+  const cleanTargetTags = cleanGcpResourceNameList(targetTags, GCP_FIREWALL_LIST_MAX);
+  if (cleanTargetTags === null) {
+    return {
+      ok: false,
+      reason: `targetTags must be an array of 1-${GCP_FIREWALL_LIST_MAX} network tags, each a Compute Engine resource name`,
+    };
+  }
+
+  return {
+    ok: true,
+    params: { project, networkName, ruleName, allowed: cleanAllowed, sourceRanges: cleanSourceRanges, targetTags: cleanTargetTags },
+  };
+}
+
+// ── gcp-address-create ───────────────────────────────────────────────────────────────
+// Reserve ONE regional static EXTERNAL IPv4 address in the AGENCY's own project — the cell gateway's
+// public SFTP endpoint (planning/34 phase 2; the only node with an external IP). Three REQUIRED
+// strings, each pinned to a strict grammar: `project` (pinned to the SA key's own project by the
+// actuator), `region` (a URL path segment) and `addressName` (a resource name). The actuator reads
+// the reserved IP back and returns it (or null while Google is still assigning it).
+//
+// IDEMPOTENT: the insert treats Google's 409 alreadyExists as success and the read-back then returns
+// the existing reservation's IP, so a re-run resumes. Registered `true` in AGENCY_OP_IDEMPOTENT.
+
+export interface GcpAddressCreateParams {
+  /** The agency's GCP project id the address is reserved in. */
+  project: string;
+  /** The Compute Engine region, e.g. "australia-southeast1". */
+  region: string;
+  /** The reserved address's resource name. */
+  addressName: string;
+}
+
+export function validateGcpAddressCreateParams(raw: unknown): ParamsVerdict<GcpAddressCreateParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region, addressName } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast1)" };
+  }
+  if (typeof addressName !== "string" || !GCP_RESOURCE_NAME_RE.test(addressName)) {
+    return { ok: false, reason: `addressName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  return { ok: true, params: { project, region, addressName } };
 }
 
 // ── shared ─────────────────────────────────────────────────────────────────────────

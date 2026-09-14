@@ -45,6 +45,9 @@ export const DISPATCH_OPS = [
   "db-export",
   "db-import",
   "gcp-instance-create",
+  "gcp-network-create",
+  "gcp-firewall-create",
+  "gcp-address-create",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 

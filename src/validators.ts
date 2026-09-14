@@ -594,10 +594,12 @@ interface GoogleTokenResponse {
 // the TOKEN may do (the service account's IAM roles still bound what the agency has granted):
 //   - READ_ONLY is the DEFAULT and is all validateGCP's testIamPermissions probe needs —
 //     least-privilege for a probe that must never be able to change anything.
-//   - CLOUD_PLATFORM (full) is requested ONLY by the Direction-B `gcp-instance-create` actuator
-//     (actuate.ts), because creating a Compute Engine resource is a write the read-only scope
-//     cannot authorize. That escalation is inherent to the op and deliberate; nothing else
-//     asks for it, and validateGCP stays on the read-only default.
+//   - CLOUD_PLATFORM (full) is requested ONLY by the Direction-B `gcp-*` write actuators
+//     (actuate.ts::mintPinnedGcpAccessToken — the one place that asks for it, on behalf of
+//     gcp-instance-create / gcp-network-create / gcp-firewall-create / gcp-address-create),
+//     because creating a Compute Engine resource is a write the read-only scope cannot
+//     authorize. That escalation is inherent to those ops and deliberate; nothing else asks
+//     for it, and validateGCP stays on the read-only default.
 export const GOOGLE_SCOPE_CLOUD_PLATFORM_READ_ONLY = "https://www.googleapis.com/auth/cloud-platform.read-only";
 export const GOOGLE_SCOPE_CLOUD_PLATFORM = "https://www.googleapis.com/auth/cloud-platform";
 

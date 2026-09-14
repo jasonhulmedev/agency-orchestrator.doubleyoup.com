@@ -3,11 +3,12 @@
 // upsert a DNS record / purge cache in one of the agency's zones, CELL_AGENT_TOKEN to run
 // a wp-cli command on the agency's own cell via its on-VM cell-agent (the first "heavy"
 // data-plane op), the agency's S3_* object-store credential to PRESIGN a URL the cell
-// uploads a DB dump to (`db-export`) or downloads one from (`db-import`), and — for
-// `gcp-instance-create` — the agency's GCP_SERVICE_ACCOUNT_KEY to mint a Google access
-// token and create a Compute Engine VM in the agency's own project. There is deliberately
-// NO platform credential anywhere in this Worker to fall back to: if the agency's token is
-// missing or unauthorized, actuation fails cleanly rather than reaching for ours.
+// uploads a DB dump to (`db-export`) or downloads one from (`db-import`), and — for the
+// `gcp-*` ops — the agency's GCP_SERVICE_ACCOUNT_KEY to mint a Google access token and
+// create Compute Engine resources (a VM, a VPC + subnet, a firewall rule, a static address)
+// in the agency's own project. There is deliberately NO platform credential anywhere in
+// this Worker to fall back to: if the agency's token is missing or unauthorized, actuation
+// fails cleanly rather than reaching for ours.
 //
 // Every actuator here runs ONLY after dispatch-verify.ts::verifyDispatch returned ok:true,
 // the nonce was consumed, and the op's params validated (index.ts::handleActuate via
@@ -27,6 +28,9 @@ import type {
   DbExportParams,
   DbImportParams,
   GcpInstanceCreateParams,
+  GcpNetworkCreateParams,
+  GcpFirewallCreateParams,
+  GcpAddressCreateParams,
 } from "./dispatch-params.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken } from "./validators.js";
@@ -69,6 +73,34 @@ export type GcpInstanceCreateResult =
   | { ok: true; op: "gcp-instance-create"; instanceName: string; operationName: string; status: string }
   | { ok: false; op: "gcp-instance-create"; instanceName: string; detail: string };
 
+// The IDEMPOTENT cell-infra ops report, per resource, whether THIS run created it or found it
+// already there (Google's 409 alreadyExists) — the same vocabulary as provision-r2's status.
+export type GcpResourceStatus = "created" | "already-existed";
+
+// Two resources, two statuses: "created" for the network/subnet means the Worker WAITED for its
+// insert Operation to reach DONE (see actuateGcpNetworkCreate), so the resource exists on return.
+export type GcpNetworkCreateResult =
+  | {
+      ok: true;
+      op: "gcp-network-create";
+      networkName: string;
+      networkStatus: GcpResourceStatus;
+      subnetName: string;
+      subnetStatus: GcpResourceStatus;
+    }
+  | { ok: false; op: "gcp-network-create"; networkName: string; subnetName: string; detail: string };
+
+// firewalls.insert is async: "created" means Google ACCEPTED the insert.
+export type GcpFirewallCreateResult =
+  | { ok: true; op: "gcp-firewall-create"; ruleName: string; status: GcpResourceStatus }
+  | { ok: false; op: "gcp-firewall-create"; ruleName: string; detail: string };
+
+// `address` is the reserved IP read back after the insert, or null while Google is still
+// assigning it (the caller re-reads); never a credential.
+export type GcpAddressCreateResult =
+  | { ok: true; op: "gcp-address-create"; addressName: string; address: string | null; status: GcpResourceStatus }
+  | { ok: false; op: "gcp-address-create"; addressName: string; detail: string };
+
 export type ActuateResult =
   | ProvisionR2Result
   | DnsRecordUpsertResult
@@ -76,7 +108,10 @@ export type ActuateResult =
   | WpCliResult
   | DbExportResult
   | DbImportResult
-  | GcpInstanceCreateResult;
+  | GcpInstanceCreateResult
+  | GcpNetworkCreateResult
+  | GcpFirewallCreateResult
+  | GcpAddressCreateResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -999,14 +1034,22 @@ export async function actuateDbImport(params: DbImportParams, env: Env): Promise
 //      this op cannot, because instances.insert is a write. The scope escalation is inherent to the
 //      op and is the ONLY place the Worker asks for it. The token is per-call, lives in a local, is
 //      sent only as an Authorization header to Google, and is never logged or returned.
-//   2. POST projects/{project}/zones/{zone}/instances with a MINIMAL, PRIVATE body: one boot disk
-//      (Debian 12, auto-delete) and one interface on the project's default VPC with NO accessConfigs
-//      => NO external IP. No `serviceAccounts` either, so the VM carries no identity of its own
-//      (and the create needs no iam.serviceAccounts.actAs). This is a proof VM, not a host.
+//   2. POST projects/{project}/zones/{zone}/instances with a MINIMAL, PRIVATE body by default: one
+//      boot disk (Debian 12, auto-delete) and one interface on the project's default VPC with NO
+//      accessConfigs => NO external IP. No `serviceAccounts` either, so the VM carries no identity
+//      of its own (and the create needs no iam.serviceAccounts.actAs). The OPTIONAL params
+//      (planning/34 phase 2 — a cell node) each add exactly one thing: `dataDiskGb` a second data
+//      disk, `network`/`subnetwork` the cell's own VPC/subnet in place of "default", `tags` the
+//      firewall target tags, `externalIp` a ONE_TO_ONE_NAT access config carrying a reserved
+//      address, `startupScript` the `startup-script` metadata value. ABSENT => the body is
+//      byte-identical to the four-field proof VM.
 //
-// INJECTION SURFACE: `project` + `zone` are URL path segments, and all four params land in the
-// JSON body. They pass the strict grammars in dispatch-params.ts first (no "/", ".", "?", "#",
+// INJECTION SURFACE: `project` + `zone` are URL path segments, and the params land in the JSON
+// body. They pass the strict grammars in dispatch-params.ts first (no "/", ".", "?", "#",
 // whitespace), then go through encodeURIComponent + JSON.stringify here — belt and braces.
+// `network`/`subnetwork` arrive as bare names and are expanded into PROJECT-RELATIVE paths here,
+// so the interface can only ever point into the pinned project. `startupScript` is the one opaque
+// value; it is placed ONLY as a JSON.stringify'd metadata value, never in a URL.
 //
 // ASYNC: a 2xx is a long-running Operation ({name, status, ...}), not the VM. We report ACCEPTED
 // (ok:true + the operation) and leave polling to the caller. A non-2xx (403 missing permission,
@@ -1033,7 +1076,7 @@ interface ComputeInsertResponse {
   status?: string;
   error?: {
     message?: string;
-    errors?: Array<{ code?: string; message?: string }>;
+    errors?: Array<{ code?: string; message?: string; reason?: string }>;
   };
 }
 
@@ -1045,6 +1088,93 @@ function gcpInstanceCreateFailure(instanceName: string, detail: string): GcpInst
 function googleErrorMessage(body: ComputeInsertResponse | null): string {
   const message = body?.error?.message;
   return message ? `: ${message}` : "";
+}
+
+/** The request headers for a Compute Engine call: the minted bearer token + JSON in/out. */
+function gcpHeaders(accessToken: string): Record<string, string> {
+  return {
+    authorization: `Bearer ${accessToken}`,
+    "content-type": "application/json",
+    accept: "application/json",
+  };
+}
+
+/** The region a grammar-checked zone belongs to: "australia-southeast1-a" -> "australia-southeast1". */
+function regionOfZone(zone: string): string {
+  return zone.slice(0, zone.lastIndexOf("-"));
+}
+
+/** The outcome of resolving the agency's GCP write token for an op pinned to `project`. */
+type GcpTokenOutcome = { ok: true; accessToken: string } | { ok: false; detail: string };
+
+/**
+ * Resolve the agency's OWN GCP write credential for an op targeting `project` — the ONE
+ * implementation every gcp-* op uses, so the agency-boundary guarantee cannot drift between ops:
+ *   1. read + parse GCP_SERVICE_ACCOUNT_KEY (the agency's secret — there is no platform fallback);
+ *   2. PIN `project` to the key's OWN project_id, rejecting BEFORE any token is minted or any call
+ *      is made (review defense-in-depth). Cross-tenant is already impossible — the SA key IS the
+ *      tenant boundary, so a job can never reach another agency's project (403) — but this makes
+ *      the code ENFORCE the "in the agency's own project" guarantee the ops claim: a signed job
+ *      cannot create a resource in some other project the agency's SA happens to hold IAM in;
+ *   3. mint a FULL cloud-platform-scoped access token (validators.ts::mintGoogleAccessToken — the
+ *      RS256 JWT-bearer grant). validateGCP mints READ-ONLY; a write op cannot. This is the ONLY
+ *      place the Worker asks for the write scope.
+ * Every failure is ok:false + detail. The ONLY fetch made here is the token mint itself, and only
+ * after the pin passes. The token goes back to the caller alone, who places it in an Authorization
+ * header and never logs or echoes it.
+ */
+async function mintPinnedGcpAccessToken(env: Env, project: string): Promise<GcpTokenOutcome> {
+  if (!env.GCP_SERVICE_ACCOUNT_KEY) {
+    return { ok: false, detail: "GCP_SERVICE_ACCOUNT_KEY is not configured on this Worker." };
+  }
+  // Parse the key the same way validateGCP does. JSON.parse needs the try/catch (no non-throwing
+  // parse); a non-object result (e.g. the literal `null`) is treated as malformed too.
+  let key: ServiceAccountKey | null;
+  try {
+    key = JSON.parse(env.GCP_SERVICE_ACCOUNT_KEY) as ServiceAccountKey | null;
+  } catch {
+    key = null;
+  }
+  if (!key || typeof key !== "object") {
+    return {
+      ok: false,
+      detail: "GCP_SERVICE_ACCOUNT_KEY is not valid JSON — it must be the entire downloaded service-account key file.",
+    };
+  }
+  const clientEmail = key.client_email;
+  const privateKeyPem = key.private_key;
+  if (!clientEmail || !privateKeyPem) {
+    return {
+      ok: false,
+      detail:
+        "GCP_SERVICE_ACCOUNT_KEY is missing client_email or private_key — use a service-account key, not an OAuth client ID.",
+    };
+  }
+  if (!key.project_id || project !== key.project_id) {
+    return {
+      ok: false,
+      detail:
+        `project "${project}" does not match the service-account key's own project` +
+        `${key.project_id ? ` ("${key.project_id}")` : ""} — a resource is only created in the agency's own project.`,
+    };
+  }
+  const tokenUri = key.token_uri || GOOGLE_DEFAULT_TOKEN_URI;
+
+  let accessToken: string;
+  try {
+    accessToken = await mintGoogleAccessToken({
+      clientEmail,
+      privateKeyPem,
+      tokenUri,
+      scope: GOOGLE_SCOPE_CLOUD_PLATFORM,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      detail: `could not mint a Google access token from GCP_SERVICE_ACCOUNT_KEY: ${errorMessage(err)}`,
+    };
+  }
+  return { ok: true, accessToken };
 }
 
 /**
@@ -1060,65 +1190,19 @@ export async function actuateGcpInstanceCreate(
 ): Promise<GcpInstanceCreateResult> {
   const instanceName = params.name;
 
-  if (!env.GCP_SERVICE_ACCOUNT_KEY) {
-    return gcpInstanceCreateFailure(instanceName, "GCP_SERVICE_ACCOUNT_KEY is not configured on this Worker.");
+  // Parse the agency's key, PIN the target project to the key's own project (rejecting before any
+  // token or call), and mint the FULL-scope write token — the shared implementation every gcp-* op
+  // uses (mintPinnedGcpAccessToken). The token stays in this local and goes only into the
+  // Authorization header below.
+  const token = await mintPinnedGcpAccessToken(env, params.project);
+  if (!token.ok) {
+    return gcpInstanceCreateFailure(instanceName, token.detail);
   }
-  // Parse the key the same way validateGCP does. JSON.parse needs the try/catch (no non-throwing
-  // parse); a non-object result (e.g. the literal `null`) is treated as malformed too.
-  let key: ServiceAccountKey | null;
-  try {
-    key = JSON.parse(env.GCP_SERVICE_ACCOUNT_KEY) as ServiceAccountKey | null;
-  } catch {
-    key = null;
-  }
-  if (!key || typeof key !== "object") {
-    return gcpInstanceCreateFailure(
-      instanceName,
-      "GCP_SERVICE_ACCOUNT_KEY is not valid JSON — it must be the entire downloaded service-account key file.",
-    );
-  }
-  const clientEmail = key.client_email;
-  const privateKeyPem = key.private_key;
-  if (!clientEmail || !privateKeyPem) {
-    return gcpInstanceCreateFailure(
-      instanceName,
-      "GCP_SERVICE_ACCOUNT_KEY is missing client_email or private_key — use a service-account key, not an OAuth client ID.",
-    );
-  }
-  // PIN the target to the key's OWN project (review defense-in-depth). Cross-tenant is already
-  // impossible — the SA key IS the tenant boundary, so a job can never reach another agency's
-  // project (403) — but this makes the code ENFORCE the "in the agency's own project" guarantee the
-  // op claims, so a signed job cannot create a VM in some other project the agency's SA happens to
-  // hold IAM in. Reject BEFORE minting any token or making any call.
-  if (!key.project_id || params.project !== key.project_id) {
-    return gcpInstanceCreateFailure(
-      instanceName,
-      `project "${params.project}" does not match the service-account key's own project` +
-        `${key.project_id ? ` ("${key.project_id}")` : ""} — a VM is only created in the agency's own project.`,
-    );
-  }
-  const tokenUri = key.token_uri || GOOGLE_DEFAULT_TOKEN_URI;
-
-  // FULL cloud-platform scope — the write scope this op needs (see the section note). The token
-  // stays in this local and goes only into the Authorization header below.
-  let accessToken: string;
-  try {
-    accessToken = await mintGoogleAccessToken({
-      clientEmail,
-      privateKeyPem,
-      tokenUri,
-      scope: GOOGLE_SCOPE_CLOUD_PLATFORM,
-    });
-  } catch (err) {
-    return gcpInstanceCreateFailure(
-      instanceName,
-      `could not mint a Google access token from GCP_SERVICE_ACCOUNT_KEY: ${errorMessage(err)}`,
-    );
-  }
+  const accessToken = token.accessToken;
 
   // The two path segments are grammar-checked upstream AND URL-encoded here; the body is built
-  // with JSON.stringify from the validated fields only (the four required, plus the optional data
-  // disk).
+  // with JSON.stringify from the validated fields only (the four required, plus whichever optional
+  // fields are present).
   const url =
     `${GCP_COMPUTE_API}/projects/${encodeURIComponent(params.project)}` +
     `/zones/${encodeURIComponent(params.zone)}/instances`;
@@ -1148,13 +1232,43 @@ export async function actuateGcpInstanceCreate(
     });
   }
 
-  const instanceBody = JSON.stringify({
+  // The single network interface. DEFAULT (no networking param present): the project's "default"
+  // VPC and NO accessConfigs => no external IP — byte-identical to the pre-extension body.
+  // `network` / `subnetwork` are bare grammar-checked names expanded into PROJECT-RELATIVE paths
+  // here (never a caller-supplied URL, so the interface can only point into the pinned project);
+  // a subnet is regional and the VM's zone must lie in that region, so its region is derived from
+  // the zone. Google infers the network from the subnet when only `subnetwork` is given.
+  // `externalIp` attaches the caller's reserved address as a ONE_TO_ONE_NAT access config — the
+  // ONLY way this op ever gives a VM an external IP (an ephemeral one is never requested).
+  const networkInterface: Record<string, unknown> = {};
+  if (params.network === undefined && params.subnetwork === undefined) {
+    networkInterface.network = "global/networks/default";
+  }
+  if (params.network !== undefined) {
+    networkInterface.network = `global/networks/${params.network}`;
+  }
+  if (params.subnetwork !== undefined) {
+    networkInterface.subnetwork = `regions/${regionOfZone(params.zone)}/subnetworks/${params.subnetwork}`;
+  }
+  if (params.externalIp !== undefined) {
+    networkInterface.accessConfigs = [{ name: "External NAT", type: "ONE_TO_ONE_NAT", natIP: params.externalIp }];
+  }
+
+  const instance: Record<string, unknown> = {
     name: instanceName,
     machineType: `zones/${params.zone}/machineTypes/${params.machineType}`,
     disks,
-    // ONE interface on the default VPC and deliberately NO accessConfigs => no external IP.
-    networkInterfaces: [{ network: "global/networks/default" }],
-  });
+    networkInterfaces: [networkInterface],
+  };
+  // Network tags (firewall targets) and the startup script ride ONLY when present — absent means
+  // the keys are not in the body at all, not empty.
+  if (params.tags !== undefined) {
+    instance.tags = { items: [...params.tags] };
+  }
+  if (params.startupScript !== undefined) {
+    instance.metadata = { items: [{ key: "startup-script", value: params.startupScript }] };
+  }
+  const instanceBody = JSON.stringify(instance);
 
   // Default redirect handling, NOT redirect:"error" — workerd throws on that value at runtime
   // (the gotcha the cell-agent relay above documents). Google's API does not redirect.
@@ -1226,4 +1340,390 @@ export async function actuateGcpInstanceCreate(
     instanceName,
     `instance create failed with HTTP ${response.status}${googleErrorMessage(body)}.`,
   );
+}
+
+// ── GCP shared: idempotent insert + operation wait + read-back ─────────────────────────────
+// The cell-infra ops below (planning/34 phase 2) all create a NAMED Compute Engine resource and
+// are IDEMPOTENT by name: Google answers a second insert of an existing name with 409
+// alreadyExists, which these ops report as success ("already-existed") so a half-built cell
+// resumes on re-run. That is the deliberate opposite of gcp-instance-create's 409-is-failure —
+// a VM is stateful compute, a network/rule/address is declarative configuration.
+
+/** How a Compute Engine insert of an idempotent resource ended. */
+type ComputeInsertOutcome =
+  | { kind: "created"; operationName: string }
+  | { kind: "already-existed" }
+  | { kind: "failed"; detail: string };
+
+/** The `message`s of an Operation's error entries, joined for a detail string. */
+function operationErrorMessages(entries: Array<{ code?: string; message?: string }>): string {
+  return entries.map((entry) => entry.message ?? entry.code ?? "unknown error").join("; ");
+}
+
+/**
+ * True when a 409 body is Google's alreadyExists — the idempotent-success case. A 409 with NO error
+ * entries is taken as alreadyExists too (the only 409 an insert produces); a 409 whose entries name
+ * a DIFFERENT reason is not, and falls through to a failure carrying Google's message.
+ */
+function isAlreadyExists(body: ComputeInsertResponse | null): boolean {
+  const entries = body?.error?.errors ?? [];
+  if (entries.length === 0) {
+    return true;
+  }
+  return entries.some((entry) => entry.reason === "alreadyExists");
+}
+
+/**
+ * POST an insert to Compute Engine for an IDEMPOTENT resource. A 2xx Operation is "created"
+ * (ACCEPTED — the insert itself is async; the caller decides whether to wait on it), a 409
+ * alreadyExists is "already-existed", and everything else — unreachable, 401/403, a 2xx without an
+ * operation, an already-DONE operation carrying errors, any other non-2xx — is a terminal failure
+ * carrying Google's own message. `url` is built by the caller from grammar-checked,
+ * encodeURIComponent'd segments; `body` holds validated fields only and is JSON.stringify'd here.
+ * `what` names the resource for detail strings; `permissionHint` names what a 403 most likely lacks.
+ */
+async function insertComputeResource(input: {
+  url: string;
+  accessToken: string;
+  body: Record<string, unknown>;
+  what: string;
+  project: string;
+  permissionHint: string;
+}): Promise<ComputeInsertOutcome> {
+  const { url, accessToken, what, project, permissionHint } = input;
+
+  // Default redirect handling, NOT redirect:"error" — workerd throws on that value at runtime.
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: gcpHeaders(accessToken),
+      body: JSON.stringify(input.body),
+    });
+  } catch (err) {
+    return { kind: "failed", detail: `could not reach Google Compute Engine to create ${what}: ${errorMessage(err)}` };
+  }
+
+  const body = (await response.json().catch(() => null)) as ComputeInsertResponse | null;
+
+  if (response.ok) {
+    // A 2xx must carry an Operation; its ABSENCE means we cannot confirm Google accepted the create.
+    const operationName = body?.name;
+    if (!operationName) {
+      return {
+        kind: "failed",
+        detail: `Compute Engine returned HTTP ${response.status} but no operation — cannot confirm the ${what} create was accepted.`,
+      };
+    }
+    const operationErrors = body?.error?.errors ?? [];
+    if (operationErrors.length > 0) {
+      return {
+        kind: "failed",
+        detail: `${what} create operation ${operationName} failed: ${operationErrorMessages(operationErrors)}.`,
+      };
+    }
+    return { kind: "created", operationName };
+  }
+
+  if (response.status === 409 && isAlreadyExists(body)) {
+    return { kind: "already-existed" };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return {
+      kind: "failed",
+      detail:
+        `Google Cloud denied the ${what} create (HTTP ${response.status})${googleErrorMessage(body)} — the service account ` +
+        `needs ${permissionHint} on project "${project}".`,
+    };
+  }
+  return { kind: "failed", detail: `${what} create failed with HTTP ${response.status}${googleErrorMessage(body)}.` };
+}
+
+// globalOperations.wait / regionOperations.wait hold the request until the operation is DONE or
+// about two minutes pass, then return its current state. A network insert takes tens of seconds,
+// so one wait normally suffices; a small bounded count covers a slow region without an unbounded
+// loop.
+const GCP_OPERATION_WAIT_ATTEMPTS = 3;
+
+/**
+ * Block until the Compute operation at `waitUrl` (.../operations/{name}/wait) is DONE. ok:true only
+ * when it reached DONE with no errors; ok:false when it finished with errors, the wait call itself
+ * failed, or it was still not DONE after GCP_OPERATION_WAIT_ATTEMPTS waits.
+ */
+async function waitForComputeOperation(input: {
+  waitUrl: string;
+  accessToken: string;
+  what: string;
+}): Promise<{ ok: true } | { ok: false; detail: string }> {
+  const { waitUrl, accessToken, what } = input;
+
+  for (let attempt = 1; attempt <= GCP_OPERATION_WAIT_ATTEMPTS; attempt += 1) {
+    let response: Response;
+    try {
+      response = await fetch(waitUrl, { method: "POST", headers: gcpHeaders(accessToken) });
+    } catch (err) {
+      return {
+        ok: false,
+        detail: `could not reach Google Compute Engine while waiting for the ${what} create to finish: ${errorMessage(err)}`,
+      };
+    }
+    const body = (await response.json().catch(() => null)) as ComputeInsertResponse | null;
+    if (!response.ok) {
+      return {
+        ok: false,
+        detail: `waiting for the ${what} create to finish failed with HTTP ${response.status}${googleErrorMessage(body)}.`,
+      };
+    }
+    if (body?.status !== "DONE") {
+      continue;
+    }
+    const operationErrors = body?.error?.errors ?? [];
+    if (operationErrors.length > 0) {
+      return { ok: false, detail: `${what} create operation failed: ${operationErrorMessages(operationErrors)}.` };
+    }
+    return { ok: true };
+  }
+
+  return {
+    ok: false,
+    detail: `the ${what} create operation was still not DONE after ${GCP_OPERATION_WAIT_ATTEMPTS} waits — re-run to resume once it finishes.`,
+  };
+}
+
+// ── gcp-network-create ───────────────────────────────────────────────────────────────────
+// A cell's dedicated VPC in the agency's own project: a CUSTOM-mode network, then ONE regional
+// subnet on it (planning/34 phase 2). Both inserts are idempotent (409 alreadyExists = success).
+//
+// The subnet insert DEPENDS on the network insert having FINISHED: networks.insert is async, and a
+// subnetworks.insert issued while the network's Operation is still RUNNING fails with Google's
+// resourceNotReady. So when THIS run created the network, the Worker WAITS for that operation to
+// reach DONE before inserting the subnet — and likewise waits for the subnet's own operation, so
+// "created" on return means the resource EXISTS and the caller's instances.insert calls (which name
+// this subnet) cannot race it. When a resource already existed there is nothing to wait on (a
+// concurrent run still creating it makes the dependent insert fail cleanly; a re-run resumes).
+
+export async function actuateGcpNetworkCreate(
+  params: GcpNetworkCreateParams,
+  env: Env,
+): Promise<GcpNetworkCreateResult> {
+  const { project, region, networkName, subnetName } = params;
+  const failure = (detail: string): GcpNetworkCreateResult => ({
+    ok: false,
+    op: "gcp-network-create",
+    networkName,
+    subnetName,
+    detail,
+  });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const accessToken = token.accessToken;
+  // Path segments are grammar-checked upstream AND URL-encoded here.
+  const projectPath = `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}`;
+  const regionPath = `${projectPath}/regions/${encodeURIComponent(region)}`;
+
+  const networkOutcome = await insertComputeResource({
+    url: `${projectPath}/global/networks`,
+    accessToken,
+    // Custom mode: NO auto-created per-region subnets — the cell gets exactly the one subnet below.
+    body: { name: networkName, autoCreateSubnetworks: false },
+    what: `network "${networkName}"`,
+    project,
+    permissionHint: "compute.networks.create (e.g. roles/compute.networkAdmin)",
+  });
+  if (networkOutcome.kind === "failed") {
+    return failure(networkOutcome.detail);
+  }
+  if (networkOutcome.kind === "created") {
+    const waited = await waitForComputeOperation({
+      waitUrl: `${projectPath}/global/operations/${encodeURIComponent(networkOutcome.operationName)}/wait`,
+      accessToken,
+      what: `network "${networkName}"`,
+    });
+    if (!waited.ok) {
+      return failure(waited.detail);
+    }
+  }
+
+  const subnetOutcome = await insertComputeResource({
+    url: `${regionPath}/subnetworks`,
+    accessToken,
+    // Project-relative references, like the instance body's — never a caller-supplied URL.
+    body: {
+      name: subnetName,
+      network: `global/networks/${networkName}`,
+      ipCidrRange: params.ipCidr,
+      region: `regions/${region}`,
+    },
+    what: `subnetwork "${subnetName}"`,
+    project,
+    permissionHint: "compute.subnetworks.create (e.g. roles/compute.networkAdmin)",
+  });
+  if (subnetOutcome.kind === "failed") {
+    return failure(subnetOutcome.detail);
+  }
+  if (subnetOutcome.kind === "created") {
+    const waited = await waitForComputeOperation({
+      waitUrl: `${regionPath}/operations/${encodeURIComponent(subnetOutcome.operationName)}/wait`,
+      accessToken,
+      what: `subnetwork "${subnetName}"`,
+    });
+    if (!waited.ok) {
+      return failure(waited.detail);
+    }
+  }
+
+  return {
+    ok: true,
+    op: "gcp-network-create",
+    networkName,
+    networkStatus: networkOutcome.kind,
+    subnetName,
+    subnetStatus: subnetOutcome.kind,
+  };
+}
+
+// ── gcp-firewall-create ──────────────────────────────────────────────────────────────────
+// ONE INGRESS firewall rule on a cell's VPC in the agency's own project (planning/34 phase 2: public
+// tcp:22 to the `dy-gateway` tag; allow-all inside the subnet). Idempotent by NAME: a 409 is
+// success, and a re-run with a different body under the same name is a no-op, not an update. The
+// insert is async; "created" means Google ACCEPTED it (nothing in the cell bring-up depends on a
+// rule having finished propagating before the next step).
+
+export async function actuateGcpFirewallCreate(
+  params: GcpFirewallCreateParams,
+  env: Env,
+): Promise<GcpFirewallCreateResult> {
+  const { project, ruleName } = params;
+  const failure = (detail: string): GcpFirewallCreateResult => ({ ok: false, op: "gcp-firewall-create", ruleName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const projectPath = `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}`;
+
+  // Map the validated entries onto Google's shape: `protocol` -> `IPProtocol` ("all" is Google's
+  // own spelling for every protocol); `ports` rides only when present. Every list is rebuilt fresh.
+  const allowed = params.allowed.map((entry) => {
+    const rule: Record<string, unknown> = { IPProtocol: entry.protocol };
+    if (entry.ports !== undefined) {
+      rule.ports = [...entry.ports];
+    }
+    return rule;
+  });
+
+  const outcome = await insertComputeResource({
+    url: `${projectPath}/global/firewalls`,
+    accessToken: token.accessToken,
+    body: {
+      name: ruleName,
+      network: `global/networks/${params.networkName}`,
+      direction: "INGRESS",
+      allowed,
+      sourceRanges: [...params.sourceRanges],
+      targetTags: [...params.targetTags],
+    },
+    what: `firewall rule "${ruleName}"`,
+    project,
+    permissionHint: "compute.firewalls.create (e.g. roles/compute.securityAdmin)",
+  });
+  if (outcome.kind === "failed") {
+    return failure(outcome.detail);
+  }
+  return { ok: true, op: "gcp-firewall-create", ruleName, status: outcome.kind };
+}
+
+// ── gcp-address-create ───────────────────────────────────────────────────────────────────
+// Reserve ONE regional static EXTERNAL IPv4 address in the agency's own project — the cell
+// gateway's public SFTP endpoint (planning/34 phase 2). Idempotent: a 409 is success. After the
+// insert the reservation is READ BACK for its IP, which is returned (or null while Google is still
+// assigning it / before the new resource is visible — the caller re-reads). A read-back failure
+// other than not-yet-visible is reported as ok:false even though the reservation stands: the op is
+// idempotent, so a re-run hits 409 and reads again.
+
+/** What addresses.get answers with (the fields this op reads). */
+interface ComputeAddressResponse {
+  address?: string;
+  status?: string;
+  error?: ComputeInsertResponse["error"];
+}
+
+/**
+ * GET the reserved address for its IP. 404 = accepted but not yet visible => address null (ok);
+ * any other non-2xx or an unreachable API => ok:false; a 2xx without an `address` yet => null.
+ */
+async function readComputeAddress(input: {
+  url: string;
+  accessToken: string;
+  what: string;
+}): Promise<{ ok: true; address: string | null } | { ok: false; detail: string }> {
+  const { url, accessToken, what } = input;
+
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: gcpHeaders(accessToken) });
+  } catch (err) {
+    return {
+      ok: false,
+      detail: `${what} was reserved but reading it back failed — could not reach Google Compute Engine: ${errorMessage(err)}`,
+    };
+  }
+  const body = (await response.json().catch(() => null)) as ComputeAddressResponse | null;
+
+  if (response.status === 404) {
+    return { ok: true, address: null };
+  }
+  if (!response.ok) {
+    return {
+      ok: false,
+      detail: `${what} was reserved but reading it back failed with HTTP ${response.status}${googleErrorMessage(body)}.`,
+    };
+  }
+  const address = typeof body?.address === "string" && body.address.length > 0 ? body.address : null;
+  return { ok: true, address };
+}
+
+export async function actuateGcpAddressCreate(
+  params: GcpAddressCreateParams,
+  env: Env,
+): Promise<GcpAddressCreateResult> {
+  const { project, region, addressName } = params;
+  const failure = (detail: string): GcpAddressCreateResult => ({ ok: false, op: "gcp-address-create", addressName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const accessToken = token.accessToken;
+  const addressesPath =
+    `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}` +
+    `/regions/${encodeURIComponent(region)}/addresses`;
+  const what = `address "${addressName}"`;
+
+  const outcome = await insertComputeResource({
+    url: addressesPath,
+    accessToken,
+    // EXTERNAL is Google's default for a regional address; stated explicitly so this can never
+    // silently become an internal reservation.
+    body: { name: addressName, addressType: "EXTERNAL" },
+    what,
+    project,
+    permissionHint: "compute.addresses.create (e.g. roles/compute.networkAdmin)",
+  });
+  if (outcome.kind === "failed") {
+    return failure(outcome.detail);
+  }
+
+  const read = await readComputeAddress({
+    url: `${addressesPath}/${encodeURIComponent(addressName)}`,
+    accessToken,
+    what,
+  });
+  if (!read.ok) {
+    return failure(read.detail);
+  }
+  return { ok: true, op: "gcp-address-create", addressName, address: read.address, status: outcome.kind };
 }

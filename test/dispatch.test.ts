@@ -32,6 +32,10 @@ import {
   validateDbExportParams,
   validateDbImportParams,
   validateGcpInstanceCreateParams,
+  validateGcpNetworkCreateParams,
+  validateGcpFirewallCreateParams,
+  validateGcpAddressCreateParams,
+  GCP_FIREWALL_PROTOCOLS,
 } from "../src/dispatch-params.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
 import { buildDbExportScript, buildDbImportScript } from "../src/actuate.js";
@@ -176,6 +180,57 @@ function gcpInstanceCreateJob(overrides: Partial<DispatchJob> = {}): DispatchJob
     op: "gcp-instance-create",
     params: JSON.stringify(GCP_INSTANCE_PARAMS),
     nonce: "ee99ee99ee99ee99ee99ee99ee99ee99",
+    ...overrides,
+  });
+}
+
+// The cell-infra ops (planning/34 phase 2), all in the same agency project as the proof VM.
+// A gcp-network-create job — a cell's dedicated custom-mode VPC + its one regional subnet.
+const GCP_NETWORK_PARAMS = {
+  project: "dy-agency-proof",
+  region: "australia-southeast1",
+  networkName: "dy-cell-australia-southeast1",
+  subnetName: "dy-cell-australia-southeast1-subnet",
+  ipCidr: "10.20.0.0/24",
+};
+function gcpNetworkCreateJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-network-create",
+    params: JSON.stringify(GCP_NETWORK_PARAMS),
+    nonce: "11aa11aa11aa11aa11aa11aa11aa11aa",
+    ...overrides,
+  });
+}
+
+// A gcp-firewall-create job — the gateway's public tcp:22 rule (hardened sshd + fail2ban behind it).
+const GCP_FIREWALL_PARAMS = {
+  project: "dy-agency-proof",
+  networkName: "dy-cell-australia-southeast1",
+  ruleName: "dy-cell-allow-gateway-ssh",
+  allowed: [{ protocol: "tcp", ports: ["22"] }],
+  sourceRanges: ["0.0.0.0/0"],
+  targetTags: ["dy-gateway"],
+};
+function gcpFirewallCreateJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-firewall-create",
+    params: JSON.stringify(GCP_FIREWALL_PARAMS),
+    nonce: "22bb22bb22bb22bb22bb22bb22bb22bb",
+    ...overrides,
+  });
+}
+
+// A gcp-address-create job — the gateway's reserved static external IP.
+const GCP_ADDRESS_PARAMS = {
+  project: "dy-agency-proof",
+  region: "australia-southeast1",
+  addressName: "dy-cell-gateway-ip",
+};
+function gcpAddressCreateJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-address-create",
+    params: JSON.stringify(GCP_ADDRESS_PARAMS),
+    nonce: "33cc33cc33cc33cc33cc33cc33cc33cc",
     ...overrides,
   });
 }
@@ -484,7 +539,10 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "db-export",
       "db-import",
       "dns-record-upsert",
+      "gcp-address-create",
+      "gcp-firewall-create",
       "gcp-instance-create",
+      "gcp-network-create",
       "provision-r2",
       "wp-cli",
     ]);
@@ -840,6 +898,382 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     const verdict = bad(9);
     expect(verdict.ok).toBe(false);
     if (!verdict.ok) expect(verdict.reason).toMatch(/^dataDiskGb/);
+  });
+
+  // ── gcp-instance-create: the OPTIONAL networking fields (planning/34 phase 2) ────────
+  // network / subnetwork / tags / externalIp / startupScript. Each is checked only when present and
+  // rides in the fresh params object ONLY when present, so an absent field keeps the signed params
+  // (and the instance body) identical to the four-field form.
+
+  const GCP_INSTANCE_NETWORKING = {
+    network: "dy-cell-australia-southeast1",
+    subnetwork: "dy-cell-australia-southeast1-subnet",
+    tags: ["dy-gateway", "dy-cell-node"],
+    externalIp: "35.244.66.16",
+    startupScript: "#!/bin/sh\necho 'hello; $(whoami)' > \"/tmp/x y\"\n",
+  };
+
+  it("gcp-instance-create: accepts the OPTIONAL networking fields and carries each ONLY when present", () => {
+    const full = { ...GCP_INSTANCE_PARAMS, dataDiskGb: 200, ...GCP_INSTANCE_NETWORKING };
+    expect(validateGcpInstanceCreateParams({ ...full, extra: "x" })).toEqual({ ok: true, params: full });
+    // Each field alone rides as the ONLY extra key.
+    for (const [field, value] of Object.entries(GCP_INSTANCE_NETWORKING)) {
+      expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, [field]: value })).toEqual({
+        ok: true,
+        params: { ...GCP_INSTANCE_PARAMS, [field]: value },
+      });
+    }
+    // An explicit `undefined` is the same as absent — none of the keys is added.
+    expect(
+      validateGcpInstanceCreateParams({
+        ...GCP_INSTANCE_PARAMS,
+        network: undefined,
+        subnetwork: undefined,
+        tags: undefined,
+        externalIp: undefined,
+        startupScript: undefined,
+      }),
+    ).toEqual({ ok: true, params: GCP_INSTANCE_PARAMS });
+    // The edges: 64 tags (Google's cap), a 256 KB startup script, and the tags array is a FRESH copy.
+    const maxTags = Array.from({ length: 64 }, (_, i) => `tag-${i}`);
+    const tagsVerdict = validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, tags: maxTags });
+    expect(tagsVerdict.ok).toBe(true);
+    if (tagsVerdict.ok) {
+      expect(tagsVerdict.params.tags).toEqual(maxTags);
+      expect(tagsVerdict.params.tags).not.toBe(maxTags);
+    }
+    expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, startupScript: "x".repeat(256 * 1024) }).ok).toBe(true);
+    // A startup script is OPAQUE: shell metacharacters, quotes, newlines, unicode all pass.
+    expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, startupScript: "rm -rf / ; `id` $(x) \"q\" 'q' \\ é\n" }).ok).toBe(true);
+  });
+
+  it("gcp-instance-create: rejects a bad optional networking field (a URL or another project's network is NOT a name), and names it", () => {
+    const bad = (overrides: Record<string, unknown>) => validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, ...overrides });
+
+    // network / subnetwork — bare resource names ONLY: never a URL, a path, or another project.
+    for (const field of ["network", "subnetwork"]) {
+      expect(bad({ [field]: "" }).ok).toBe(false);
+      expect(bad({ [field]: 42 }).ok).toBe(false);
+      expect(bad({ [field]: null }).ok).toBe(false); // null is not "absent"
+      expect(bad({ [field]: "Bad-Net" }).ok).toBe(false); // uppercase
+      expect(bad({ [field]: "1net" }).ok).toBe(false); // digit first
+      expect(bad({ [field]: "net-" }).ok).toBe(false); // hyphen last
+      expect(bad({ [field]: "global/networks/default" }).ok).toBe(false); // a relative URL
+      expect(bad({ [field]: "projects/victim/global/networks/vpc" }).ok).toBe(false); // another project
+      expect(bad({ [field]: "https://www.googleapis.com/compute/v1/projects/victim/global/networks/vpc" }).ok).toBe(false);
+      expect(bad({ [field]: "../default" }).ok).toBe(false); // traversal
+      expect(bad({ [field]: "a.b" }).ok).toBe(false); // dot
+      expect(bad({ [field]: `a${"b".repeat(63)}` }).ok).toBe(false); // 64 chars
+      const verdict = bad({ [field]: "Bad" });
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(new RegExp(`^${field}, when present, must be a Compute Engine resource name`));
+    }
+    // tags — 1-64 resource names
+    expect(bad({ tags: [] }).ok).toBe(false); // present but empty
+    expect(bad({ tags: "dy-gateway" }).ok).toBe(false); // not an array
+    expect(bad({ tags: null }).ok).toBe(false);
+    expect(bad({ tags: ["Dy-Gateway"] }).ok).toBe(false); // uppercase
+    expect(bad({ tags: ["dy gateway"] }).ok).toBe(false); // space
+    expect(bad({ tags: ["dy/gateway"] }).ok).toBe(false); // path separator
+    expect(bad({ tags: [42] }).ok).toBe(false); // non-string entry
+    expect(bad({ tags: ["ok", ""] }).ok).toBe(false); // empty entry
+    expect(bad({ tags: Array.from({ length: 65 }, (_, i) => `tag-${i}`) }).ok).toBe(false); // over Google's cap
+    // externalIp — a plain IPv4 address, nothing else
+    expect(bad({ externalIp: "" }).ok).toBe(false);
+    expect(bad({ externalIp: 35 }).ok).toBe(false);
+    expect(bad({ externalIp: null }).ok).toBe(false);
+    expect(bad({ externalIp: "35.244.66" }).ok).toBe(false); // three octets
+    expect(bad({ externalIp: "35.244.66.256" }).ok).toBe(false); // octet > 255
+    expect(bad({ externalIp: "35.244.066.16" }).ok).toBe(false); // leading zero
+    expect(bad({ externalIp: "35.244.66.16/32" }).ok).toBe(false); // a CIDR, not an address
+    expect(bad({ externalIp: "2001:db8::1" }).ok).toBe(false); // IPv6
+    expect(bad({ externalIp: "dy-cell-gateway-ip" }).ok).toBe(false); // a NAME, not an address
+    expect(bad({ externalIp: " 35.244.66.16" }).ok).toBe(false); // whitespace
+    // startupScript — opaque but bounded: non-empty, at most 256 KB
+    expect(bad({ startupScript: "" }).ok).toBe(false);
+    expect(bad({ startupScript: 42 }).ok).toBe(false);
+    expect(bad({ startupScript: null }).ok).toBe(false);
+    expect(bad({ startupScript: "x".repeat(256 * 1024 + 1) }).ok).toBe(false);
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ tags: [] }, /^tags, when present/],
+      [{ externalIp: "nope" }, /^externalIp, when present/],
+      [{ startupScript: "" }, /^startupScript, when present/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  // ── gcp-network-create (twin of the app's rules) ──────────────────────────────────
+  // Every value is a URL path segment or a JSON body field of a Compute call, so these grammars ARE
+  // the injection guard (as for gcp-instance-create).
+
+  it("gcp-network-create: accepts valid params and returns ONLY the five known keys", () => {
+    expect(validateGcpNetworkCreateParams({ ...GCP_NETWORK_PARAMS, extra: "x" })).toEqual({ ok: true, params: GCP_NETWORK_PARAMS });
+    // Other real regions.
+    expect(validateGcpNetworkCreateParams({ ...GCP_NETWORK_PARAMS, region: "us-central1" }).ok).toBe(true);
+    expect(validateGcpNetworkCreateParams({ ...GCP_NETWORK_PARAMS, region: "europe-west4" }).ok).toBe(true);
+    // Every RFC 1918 block at its range edges (/8-/29, /12-/29, /16-/29).
+    for (const ipCidr of [
+      "10.0.0.0/8",
+      "10.20.0.0/24",
+      "10.255.255.248/29",
+      "172.16.0.0/12",
+      "172.31.0.0/16",
+      "172.20.1.0/29",
+      "192.168.0.0/16",
+      "192.168.1.0/24",
+      "192.168.1.8/29",
+    ]) {
+      expect(validateGcpNetworkCreateParams({ ...GCP_NETWORK_PARAMS, ipCidr }).ok).toBe(true);
+    }
+  });
+
+  it("gcp-network-create: rejects bad input field by field (a zone is not a region; a public or too-small block is not a subnet)", () => {
+    const bad = (overrides: Record<string, unknown>) => validateGcpNetworkCreateParams({ ...GCP_NETWORK_PARAMS, ...overrides });
+
+    expect(validateGcpNetworkCreateParams(null).ok).toBe(false);
+    expect(validateGcpNetworkCreateParams("string").ok).toBe(false);
+    expect(validateGcpNetworkCreateParams([]).ok).toBe(false);
+    // project
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false); // uppercase
+    expect(bad({ project: "dy-agency/x" }).ok).toBe(false); // path separator
+    expect(bad({ project: "../dy-agency" }).ok).toBe(false); // traversal
+    // region
+    expect(bad({ region: undefined }).ok).toBe(false);
+    expect(bad({ region: "australia-southeast1-a" }).ok).toBe(false); // a ZONE, not a region
+    expect(bad({ region: "Australia-Southeast1" }).ok).toBe(false); // uppercase
+    expect(bad({ region: "australia" }).ok).toBe(false); // no area
+    expect(bad({ region: "australia-southeast1/../.." }).ok).toBe(false); // traversal
+    expect(bad({ region: "australia southeast1" }).ok).toBe(false); // space
+    expect(bad({ region: "australia-southeast1?x=1" }).ok).toBe(false); // URL metachar
+    expect(bad({ region: `${"a".repeat(62)}-b1` }).ok).toBe(false); // over the length cap (65 chars)
+    // networkName / subnetName (resource-name grammar)
+    for (const field of ["networkName", "subnetName"]) {
+      expect(bad({ [field]: undefined }).ok).toBe(false);
+      expect(bad({ [field]: "" }).ok).toBe(false);
+      expect(bad({ [field]: "Bad-Name" }).ok).toBe(false); // uppercase
+      expect(bad({ [field]: "1net" }).ok).toBe(false); // digit first
+      expect(bad({ [field]: "net-" }).ok).toBe(false); // hyphen last
+      expect(bad({ [field]: "a/b" }).ok).toBe(false); // path separator
+      expect(bad({ [field]: "a.b" }).ok).toBe(false); // dot
+      expect(bad({ [field]: "a b" }).ok).toBe(false); // space
+      expect(bad({ [field]: `a${"b".repeat(63)}` }).ok).toBe(false); // 64 chars
+    }
+    // ipCidr — a PRIVATE block between /8 and /29
+    expect(bad({ ipCidr: undefined }).ok).toBe(false);
+    expect(bad({ ipCidr: 42 }).ok).toBe(false);
+    expect(bad({ ipCidr: "10.20.0.0" }).ok).toBe(false); // no prefix
+    expect(bad({ ipCidr: "10.20.0.0/30" }).ok).toBe(false); // smaller than GCP's /29 floor
+    expect(bad({ ipCidr: "10.20.0.0/32" }).ok).toBe(false);
+    expect(bad({ ipCidr: "10.20.0.0/7" }).ok).toBe(false); // wider than 10/8
+    expect(bad({ ipCidr: "10.256.0.0/24" }).ok).toBe(false); // octet > 255
+    expect(bad({ ipCidr: "10.020.0.0/24" }).ok).toBe(false); // leading zero
+    expect(bad({ ipCidr: "8.8.8.0/24" }).ok).toBe(false); // public
+    expect(bad({ ipCidr: "0.0.0.0/0" }).ok).toBe(false); // everything
+    expect(bad({ ipCidr: "172.15.0.0/16" }).ok).toBe(false); // just outside 172.16/12
+    expect(bad({ ipCidr: "172.32.0.0/16" }).ok).toBe(false);
+    expect(bad({ ipCidr: "172.16.0.0/11" }).ok).toBe(false); // wider than 172.16/12
+    expect(bad({ ipCidr: "192.168.0.0/15" }).ok).toBe(false); // wider than 192.168/16
+    expect(bad({ ipCidr: "192.169.0.0/16" }).ok).toBe(false);
+    expect(bad({ ipCidr: "10.20.0.0/24 " }).ok).toBe(false); // whitespace
+    expect(bad({ ipCidr: "10.20.0.0/24/x" }).ok).toBe(false); // path junk
+    expect(bad({ ipCidr: "fd00::/8" }).ok).toBe(false); // IPv6
+  });
+
+  it("gcp-network-create: a verdict names the offending field", () => {
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ region: "australia-southeast1-a" }, /^region must be/],
+      [{ networkName: "Bad" }, /^networkName must be/],
+      [{ subnetName: "Bad" }, /^subnetName must be/],
+      [{ ipCidr: "8.8.8.0/24" }, /^ipCidr must be a private/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = validateGcpNetworkCreateParams({ ...GCP_NETWORK_PARAMS, ...overrides });
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  // ── gcp-firewall-create (twin of the app's rules) ─────────────────────────────────
+
+  it("gcp-firewall-create exposes exactly the four protocols", () => {
+    expect([...GCP_FIREWALL_PROTOCOLS]).toEqual(["tcp", "udp", "icmp", "all"]);
+  });
+
+  it("gcp-firewall-create: accepts valid params, rebuilds every list fresh, and returns ONLY known keys", () => {
+    // An extra key at the top level AND inside an allowed entry is dropped.
+    expect(
+      validateGcpFirewallCreateParams({
+        ...GCP_FIREWALL_PARAMS,
+        extra: "x",
+        allowed: [{ protocol: "tcp", ports: ["22"], extra: "y" }],
+      }),
+    ).toEqual({ ok: true, params: GCP_FIREWALL_PARAMS });
+    // The internal allow-all rule: every protocol, no ports, the subnet as source, a node tag.
+    const internal = {
+      project: "dy-agency-proof",
+      networkName: "dy-cell-australia-southeast1",
+      ruleName: "dy-cell-allow-internal",
+      allowed: [{ protocol: "all" }],
+      sourceRanges: ["10.20.0.0/24"],
+      targetTags: ["dy-cell-node"],
+    };
+    expect(validateGcpFirewallCreateParams(internal)).toEqual({ ok: true, params: internal });
+    // Ports at the edges (0, 65535, a full range), udp, icmp without ports, several sources + tags.
+    const rich = {
+      ...GCP_FIREWALL_PARAMS,
+      allowed: [
+        { protocol: "tcp", ports: ["0", "22", "8000-8080", "65535", "0-65535"] },
+        { protocol: "udp", ports: ["53"] },
+        { protocol: "icmp" },
+      ],
+      sourceRanges: ["0.0.0.0/0", "10.20.0.0/24", "203.0.113.7/32"],
+      targetTags: ["dy-gateway", "dy-web"],
+    };
+    expect(validateGcpFirewallCreateParams(rich)).toEqual({ ok: true, params: rich });
+    // The returned lists are FRESH copies, never the caller's arrays/objects.
+    const verdict = validateGcpFirewallCreateParams(GCP_FIREWALL_PARAMS);
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) {
+      expect(verdict.params.allowed).not.toBe(GCP_FIREWALL_PARAMS.allowed);
+      expect(verdict.params.allowed[0]).not.toBe(GCP_FIREWALL_PARAMS.allowed[0]);
+      expect(verdict.params.allowed[0].ports).not.toBe(GCP_FIREWALL_PARAMS.allowed[0].ports);
+      expect(verdict.params.sourceRanges).not.toBe(GCP_FIREWALL_PARAMS.sourceRanges);
+      expect(verdict.params.targetTags).not.toBe(GCP_FIREWALL_PARAMS.targetTags);
+    }
+  });
+
+  it("gcp-firewall-create: rejects bad input field by field (protocol allowlist, ports on icmp/all, port grammar, CIDR grammar, EMPTY targetTags)", () => {
+    const bad = (overrides: Record<string, unknown>) => validateGcpFirewallCreateParams({ ...GCP_FIREWALL_PARAMS, ...overrides });
+
+    expect(validateGcpFirewallCreateParams(null).ok).toBe(false);
+    expect(validateGcpFirewallCreateParams([]).ok).toBe(false);
+    // project / networkName / ruleName
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Bad" }).ok).toBe(false);
+    expect(bad({ networkName: undefined }).ok).toBe(false);
+    expect(bad({ networkName: "Bad-Net" }).ok).toBe(false);
+    expect(bad({ networkName: "global/networks/default" }).ok).toBe(false); // a URL, not a name
+    expect(bad({ ruleName: undefined }).ok).toBe(false);
+    expect(bad({ ruleName: "rule.name" }).ok).toBe(false);
+    expect(bad({ ruleName: "rule/name" }).ok).toBe(false);
+    // allowed — list shape
+    expect(bad({ allowed: undefined }).ok).toBe(false);
+    expect(bad({ allowed: [] }).ok).toBe(false); // empty
+    expect(bad({ allowed: "tcp" }).ok).toBe(false); // not an array
+    expect(bad({ allowed: Array.from({ length: 33 }, () => ({ protocol: "tcp" })) }).ok).toBe(false); // oversized
+    expect(bad({ allowed: ["tcp"] }).ok).toBe(false); // entry not an object
+    expect(bad({ allowed: [null] }).ok).toBe(false);
+    expect(bad({ allowed: [["tcp"]] }).ok).toBe(false);
+    // allowed — protocol
+    expect(bad({ allowed: [{ ports: ["22"] }] }).ok).toBe(false); // missing
+    expect(bad({ allowed: [{ protocol: "TCP" }] }).ok).toBe(false); // case-sensitive
+    expect(bad({ allowed: [{ protocol: "sctp" }] }).ok).toBe(false); // outside the allowlist
+    expect(bad({ allowed: [{ protocol: "6" }] }).ok).toBe(false); // a protocol NUMBER
+    expect(bad({ allowed: [{ protocol: 6 }] }).ok).toBe(false);
+    // allowed — ports
+    expect(bad({ allowed: [{ protocol: "icmp", ports: ["22"] }] }).ok).toBe(false); // ports on icmp
+    expect(bad({ allowed: [{ protocol: "all", ports: ["22"] }] }).ok).toBe(false); // ports on all
+    expect(bad({ allowed: [{ protocol: "tcp", ports: [] }] }).ok).toBe(false); // present but empty
+    expect(bad({ allowed: [{ protocol: "tcp", ports: "22" }] }).ok).toBe(false); // not an array
+    expect(bad({ allowed: [{ protocol: "tcp", ports: [22] }] }).ok).toBe(false); // a number, not a string
+    expect(bad({ allowed: [{ protocol: "tcp", ports: ["65536"] }] }).ok).toBe(false); // over the port max
+    expect(bad({ allowed: [{ protocol: "tcp", ports: ["22-65536"] }] }).ok).toBe(false);
+    expect(bad({ allowed: [{ protocol: "tcp", ports: ["022"] }] }).ok).toBe(false); // leading zero
+    expect(bad({ allowed: [{ protocol: "tcp", ports: ["8080-8000"] }] }).ok).toBe(false); // inverted range
+    expect(bad({ allowed: [{ protocol: "tcp", ports: ["22-"] }] }).ok).toBe(false);
+    expect(bad({ allowed: [{ protocol: "tcp", ports: ["-22"] }] }).ok).toBe(false);
+    expect(bad({ allowed: [{ protocol: "tcp", ports: ["22,80"] }] }).ok).toBe(false);
+    expect(bad({ allowed: [{ protocol: "tcp", ports: ["ssh"] }] }).ok).toBe(false);
+    expect(bad({ allowed: [{ protocol: "tcp", ports: [" 22"] }] }).ok).toBe(false);
+    expect(bad({ allowed: [{ protocol: "tcp", ports: [""] }] }).ok).toBe(false);
+    expect(bad({ allowed: [{ protocol: "tcp", ports: Array.from({ length: 257 }, (_, i) => String(i)) }] }).ok).toBe(false); // oversized
+    // sourceRanges — IPv4 CIDR blocks
+    expect(bad({ sourceRanges: undefined }).ok).toBe(false);
+    expect(bad({ sourceRanges: [] }).ok).toBe(false);
+    expect(bad({ sourceRanges: "0.0.0.0/0" }).ok).toBe(false); // not an array
+    expect(bad({ sourceRanges: ["0.0.0.0"] }).ok).toBe(false); // no prefix
+    expect(bad({ sourceRanges: ["0.0.0.0/33"] }).ok).toBe(false);
+    expect(bad({ sourceRanges: ["256.0.0.0/8"] }).ok).toBe(false);
+    expect(bad({ sourceRanges: ["10.020.0.0/24"] }).ok).toBe(false); // leading zero
+    expect(bad({ sourceRanges: ["::/0"] }).ok).toBe(false); // IPv6
+    expect(bad({ sourceRanges: ["any"] }).ok).toBe(false);
+    expect(bad({ sourceRanges: [42] }).ok).toBe(false);
+    expect(bad({ sourceRanges: ["0.0.0.0/0", ""] }).ok).toBe(false);
+    expect(bad({ sourceRanges: Array.from({ length: 257 }, () => "0.0.0.0/0") }).ok).toBe(false);
+    // targetTags — REQUIRED non-empty: a rule always names its target scope
+    expect(bad({ targetTags: undefined }).ok).toBe(false);
+    expect(bad({ targetTags: [] }).ok).toBe(false);
+    expect(bad({ targetTags: "dy-gateway" }).ok).toBe(false);
+    expect(bad({ targetTags: ["Dy-Gateway"] }).ok).toBe(false);
+    expect(bad({ targetTags: ["dy gateway"] }).ok).toBe(false);
+    expect(bad({ targetTags: ["dy/gateway"] }).ok).toBe(false);
+    expect(bad({ targetTags: [42] }).ok).toBe(false);
+    expect(bad({ targetTags: Array.from({ length: 257 }, () => "t") }).ok).toBe(false);
+  });
+
+  it("gcp-firewall-create: a verdict names the offending field", () => {
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ networkName: "Bad" }, /^networkName must be/],
+      [{ ruleName: "Bad" }, /^ruleName must be/],
+      [{ allowed: [] }, /^allowed must be an array/],
+      [{ allowed: [{ protocol: "sctp" }] }, /protocol must be one of tcp, udp, icmp, all/],
+      [{ allowed: [{ protocol: "icmp", ports: ["22"] }] }, /ports apply to tcp\/udp only/],
+      [{ allowed: [{ protocol: "tcp", ports: ["x"] }] }, /^each allowed port must be/],
+      [{ sourceRanges: ["nope"] }, /^each sourceRanges entry must be an IPv4 CIDR/],
+      [{ targetTags: [] }, /^targetTags must be an array of 1-256/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = validateGcpFirewallCreateParams({ ...GCP_FIREWALL_PARAMS, ...overrides });
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  // ── gcp-address-create (twin of the app's rules) ──────────────────────────────────
+
+  it("gcp-address-create: accepts valid params and returns ONLY the three known keys", () => {
+    expect(validateGcpAddressCreateParams({ ...GCP_ADDRESS_PARAMS, extra: "x" })).toEqual({ ok: true, params: GCP_ADDRESS_PARAMS });
+    expect(validateGcpAddressCreateParams({ ...GCP_ADDRESS_PARAMS, region: "us-central1" }).ok).toBe(true);
+    expect(validateGcpAddressCreateParams({ ...GCP_ADDRESS_PARAMS, addressName: "a" }).ok).toBe(true);
+    expect(validateGcpAddressCreateParams({ ...GCP_ADDRESS_PARAMS, addressName: `a${"b".repeat(61)}1` }).ok).toBe(true);
+  });
+
+  it("gcp-address-create: rejects bad input field by field, and names the field", () => {
+    const bad = (overrides: Record<string, unknown>) => validateGcpAddressCreateParams({ ...GCP_ADDRESS_PARAMS, ...overrides });
+
+    expect(validateGcpAddressCreateParams(null).ok).toBe(false);
+    expect(validateGcpAddressCreateParams([]).ok).toBe(false);
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false);
+    expect(bad({ region: undefined }).ok).toBe(false);
+    expect(bad({ region: "australia-southeast1-a" }).ok).toBe(false); // a zone
+    expect(bad({ region: "australia-southeast1/../.." }).ok).toBe(false); // traversal
+    expect(bad({ addressName: undefined }).ok).toBe(false);
+    expect(bad({ addressName: "" }).ok).toBe(false);
+    expect(bad({ addressName: "Bad-Name" }).ok).toBe(false);
+    expect(bad({ addressName: "1ip" }).ok).toBe(false);
+    expect(bad({ addressName: "a/b" }).ok).toBe(false);
+    expect(bad({ addressName: "35.244.66.16" }).ok).toBe(false); // an ADDRESS, not a name
+    expect(bad({ addressName: `a${"b".repeat(63)}` }).ok).toBe(false);
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ region: "nope" }, /^region must be/],
+      [{ addressName: "Bad" }, /^addressName must be/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
   });
 });
 
@@ -2061,6 +2495,59 @@ describe("POST /actuate route", () => {
     return calls;
   }
 
+  /**
+   * Route the Google calls for a MULTI-call op: the token endpoint always succeeds; each Compute call
+   * consumes the NEXT programmed reply in order (an extra call throws — a test must program every call
+   * it expects). Records every call: URL, method, auth header, the raw + parsed JSON body, and the
+   * token form.
+   */
+  function mockGcpApiQueue(computeReplies: Array<{ body: unknown; status?: number }>) {
+    const calls: Array<{
+      method: string;
+      url: string;
+      auth: string | null;
+      body?: unknown;
+      rawBody?: string;
+      form?: URLSearchParams;
+    }> = [];
+    const queue = [...computeReplies];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = urlOf(input);
+      const method = init?.method ?? "GET";
+      const auth = new Headers(init?.headers).get("authorization");
+      if (url === "https://oauth2.googleapis.com/token") {
+        calls.push({ method, url, auth, form: new URLSearchParams(String(init?.body)) });
+        return jsonResponse({ access_token: GCP_ACCESS_TOKEN, expires_in: 3600, token_type: "Bearer" });
+      }
+      if (url.startsWith("https://compute.googleapis.com/")) {
+        const rawBody = init?.body ? String(init.body) : undefined;
+        calls.push({ method, url, auth, rawBody, body: rawBody ? JSON.parse(rawBody) : undefined });
+        const reply = queue.shift();
+        if (!reply) throw new Error(`unexpected extra Compute call ${method} ${url}`);
+        return jsonResponse(reply.body, reply.status ?? 200);
+      }
+      throw new Error(`unexpected fetch ${method} ${url}`);
+    });
+    return calls;
+  }
+
+  /** Only the Compute Engine calls (the token mint filtered out). */
+  function computeCalls<T extends { url: string }>(calls: T[]): T[] {
+    return calls.filter((call) => call.url.startsWith("https://compute.googleapis.com/"));
+  }
+
+  const GCP_PROJECT_URL = "https://compute.googleapis.com/compute/v1/projects/dy-agency-proof";
+  const GCP_REGION_URL = `${GCP_PROJECT_URL}/regions/australia-southeast1`;
+  /** Google's 409 for an insert of a name that already exists. */
+  function alreadyExists409(resource: string) {
+    const message = `The resource '${resource}' already exists`;
+    return { status: 409, body: { error: { code: 409, message, errors: [{ reason: "alreadyExists", message }] } } };
+  }
+  /** Google's 403 for a missing IAM permission. */
+  function denied403(permission: string) {
+    return { status: 403, body: { error: { code: 403, message: `Required '${permission}' permission`, status: "PERMISSION_DENIED" } } };
+  }
+
   it("gcp-instance-create: mints a FULL-scope token from the agency's SA key and POSTs a minimal PRIVATE instance", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const job = gcpInstanceCreateJob();
@@ -2399,5 +2886,650 @@ describe("POST /actuate route", () => {
     const body = (await response.json()) as { reason: string };
     expect(body.reason).toMatch(/^dataDiskGb/);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── gcp-instance-create: the OPTIONAL networking fields through the registry ──────────
+  // Backward compatibility is the load-bearing claim: with NONE of the new fields present the
+  // instances.insert body is BYTE-identical to the pre-extension body (pinned as the exact JSON
+  // string below). With them present, each adds exactly its own piece: the cell's own network +
+  // subnet (project-relative paths derived from the validated names, the subnet's region from the
+  // zone), a ONE_TO_ONE_NAT access config carrying the reserved IP, network tags, and the
+  // startup-script metadata item — verbatim, as a JSON value, never in a URL.
+
+  const PRE_EXTENSION_INSTANCE_BODY =
+    '{"name":"dy-dirb-proof-vm","machineType":"zones/australia-southeast1-a/machineTypes/e2-small",' +
+    '"disks":[{"boot":true,"autoDelete":true,"initializeParams":{"sourceImage":"projects/debian-cloud/global/images/family/debian-12"}}],' +
+    '"networkInterfaces":[{"network":"global/networks/default"}]}';
+
+  it("gcp-instance-create: with NO optional networking field the insert body is BYTE-identical to the pre-extension body", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([{ body: { name: "operation-1234", status: "PENDING" } }]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const [insertCall] = computeCalls(calls);
+    expect(insertCall.rawBody).toBe(PRE_EXTENSION_INSTANCE_BODY);
+  });
+
+  it("gcp-instance-create: with every optional field present the body carries the cell's network/subnet, the reserved IP, tags and the startup script", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const startupScript = "#!/bin/sh\necho 'hello; $(whoami)' > \"/tmp/x y\"\n";
+    const job = gcpInstanceCreateJob({
+      params: JSON.stringify({
+        ...GCP_INSTANCE_PARAMS,
+        dataDiskGb: 200,
+        network: "dy-cell-australia-southeast1",
+        subnetwork: "dy-cell-australia-southeast1-subnet",
+        tags: ["dy-gateway", "dy-cell-node"],
+        externalIp: "35.244.66.16",
+        startupScript,
+      }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([{ body: { name: "operation-1234", status: "PENDING" } }]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { ok: boolean }).ok).toBe(true);
+
+    const [insertCall] = computeCalls(calls);
+    expect(insertCall.url).toBe(GCP_INSERT_URL);
+    expect(insertCall.body).toEqual({
+      name: "dy-dirb-proof-vm",
+      machineType: "zones/australia-southeast1-a/machineTypes/e2-small",
+      disks: [
+        { boot: true, autoDelete: true, initializeParams: { sourceImage: "projects/debian-cloud/global/images/family/debian-12" } },
+        { boot: false, autoDelete: false, initializeParams: { diskType: "zones/australia-southeast1-a/diskTypes/pd-balanced", diskSizeGb: 200 } },
+      ],
+      networkInterfaces: [
+        {
+          // Project-relative paths built from the validated NAMES; the subnet's region derived from the zone.
+          network: "global/networks/dy-cell-australia-southeast1",
+          subnetwork: "regions/australia-southeast1/subnetworks/dy-cell-australia-southeast1-subnet",
+          accessConfigs: [{ name: "External NAT", type: "ONE_TO_ONE_NAT", natIP: "35.244.66.16" }],
+        },
+      ],
+      tags: { items: ["dy-gateway", "dy-cell-node"] },
+      metadata: { items: [{ key: "startup-script", value: startupScript }] },
+    });
+    // The default network is NOT also present, and the script is verbatim (a JSON value, not a URL).
+    expect(insertCall.rawBody).not.toContain("global/networks/default");
+    expect(insertCall.url).not.toContain("startup");
+  });
+
+  it("gcp-instance-create: `subnetwork` alone attaches to the subnet with NO `network` key (Google infers it) and still NO external IP", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob({ params: JSON.stringify({ ...GCP_INSTANCE_PARAMS, subnetwork: "dy-subnet" }) });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([{ body: { name: "operation-1234", status: "PENDING" } }]);
+
+    await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const [insertCall] = computeCalls(calls);
+    const insertBody = insertCall.body as { networkInterfaces: Array<Record<string, unknown>>; tags?: unknown; metadata?: unknown };
+    expect(insertBody.networkInterfaces).toEqual([{ subnetwork: "regions/australia-southeast1/subnetworks/dy-subnet" }]);
+    expect(insertBody.networkInterfaces[0]).not.toHaveProperty("accessConfigs");
+    expect(insertBody).not.toHaveProperty("tags");
+    expect(insertBody).not.toHaveProperty("metadata");
+  });
+
+  it("gcp-instance-create: `externalIp` alone keeps the default network and adds ONLY the ONE_TO_ONE_NAT access config", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob({ params: JSON.stringify({ ...GCP_INSTANCE_PARAMS, externalIp: "35.244.66.16" }) });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([{ body: { name: "operation-1234", status: "PENDING" } }]);
+
+    await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const [insertCall] = computeCalls(calls);
+    const insertBody = insertCall.body as { networkInterfaces: Array<Record<string, unknown>>; tags?: unknown; metadata?: unknown };
+    expect(insertBody.networkInterfaces).toEqual([
+      { network: "global/networks/default", accessConfigs: [{ name: "External NAT", type: "ONE_TO_ONE_NAT", natIP: "35.244.66.16" }] },
+    ]);
+    expect(insertBody).not.toHaveProperty("tags");
+    expect(insertBody).not.toHaveProperty("metadata");
+  });
+
+  it("gcp-instance-create: `tags` alone adds ONLY tags.items; the interface stays the private default", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob({ params: JSON.stringify({ ...GCP_INSTANCE_PARAMS, tags: ["dy-web"] }) });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([{ body: { name: "operation-1234", status: "PENDING" } }]);
+
+    await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const [insertCall] = computeCalls(calls);
+    const insertBody = insertCall.body as { networkInterfaces: unknown; tags?: unknown; metadata?: unknown };
+    expect(insertBody.networkInterfaces).toEqual([{ network: "global/networks/default" }]);
+    expect(insertBody.tags).toEqual({ items: ["dy-web"] });
+    expect(insertBody).not.toHaveProperty("metadata");
+  });
+
+  it("gcp-instance-create: a URL-shaped or other-project `network` is 400 with NO Google call (bare names only)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    for (const network of ["projects/victim/global/networks/vpc", "https://www.googleapis.com/compute/v1/projects/victim/global/networks/vpc", "global/networks/default"]) {
+      const job = gcpInstanceCreateJob({ params: JSON.stringify({ ...GCP_INSTANCE_PARAMS, network }) });
+      const signature = await signAsApp(job, privateKey);
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { reason: string };
+      expect(body.reason).toMatch(/^network, when present/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+    }
+  });
+
+  // ── gcp-network-create through the registry ──────────────────────────────────────────
+  // The cell's VPC: networks.insert (custom mode) -> WAIT for its operation -> subnetworks.insert
+  // -> WAIT for its operation. Load-bearing: the FULL-scope token from the agency's own SA key goes
+  // ONLY into Compute Authorization headers; the URLs are built from the grammar-checked project +
+  // region; both bodies hold exactly the validated fields; a 409 alreadyExists on either insert is
+  // an idempotent SUCCESS (with no wait — nothing to wait on); any other failure stops the sequence
+  // (a network failure means NO subnet insert); the project pin fires with ZERO fetches.
+
+  it("gcp-network-create: creates the custom-mode VPC, WAITS for it, creates the regional subnet, WAITS for it — agency SA only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-net", status: "RUNNING", operationType: "insert" } }, // networks.insert
+      { body: { name: "operation-net", status: "DONE" } }, // globalOperations.wait
+      { body: { name: "operation-subnet", status: "RUNNING", operationType: "insert" } }, // subnetworks.insert
+      { body: { name: "operation-subnet", status: "DONE" } }, // regionOperations.wait
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const resultBody = await response.json();
+    expect(resultBody).toEqual({
+      ok: true,
+      op: "gcp-network-create",
+      networkName: "dy-cell-australia-southeast1",
+      networkStatus: "created",
+      subnetName: "dy-cell-australia-southeast1-subnet",
+      subnetStatus: "created",
+    });
+    expect(JSON.stringify(resultBody)).not.toContain(GCP_ACCESS_TOKEN);
+
+    // The token mint asks for the FULL scope with the agency's SA identity.
+    expect(calls).toHaveLength(5);
+    const [tokenCall] = calls;
+    expect(tokenCall.url).toBe("https://oauth2.googleapis.com/token");
+    const claims = jwtClaimsOf(tokenCall.form?.get("assertion") ?? "");
+    expect(claims.scope).toBe(GOOGLE_SCOPE_CLOUD_PLATFORM);
+    expect(claims.iss).toBe("sa@dy-agency-proof.iam.gserviceaccount.com");
+
+    const [networkInsert, networkWait, subnetInsert, subnetWait] = computeCalls(calls);
+    for (const call of [networkInsert, networkWait, subnetInsert, subnetWait]) {
+      expect(call.method).toBe("POST");
+      expect(call.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+    }
+    expect(networkInsert.url).toBe(`${GCP_PROJECT_URL}/global/networks`);
+    expect(networkInsert.body).toEqual({ name: "dy-cell-australia-southeast1", autoCreateSubnetworks: false });
+    expect(networkWait.url).toBe(`${GCP_PROJECT_URL}/global/operations/operation-net/wait`);
+    expect(subnetInsert.url).toBe(`${GCP_REGION_URL}/subnetworks`);
+    expect(subnetInsert.body).toEqual({
+      name: "dy-cell-australia-southeast1-subnet",
+      network: "global/networks/dy-cell-australia-southeast1",
+      ipCidrRange: "10.20.0.0/24",
+      region: "regions/australia-southeast1",
+    });
+    expect(subnetWait.url).toBe(`${GCP_REGION_URL}/operations/operation-subnet/wait`);
+    // The SA private key never leaves the Worker.
+    expect(JSON.stringify(calls.map((call) => call.body))).not.toContain("PRIVATE KEY");
+  });
+
+  it("gcp-network-create: a re-run where BOTH already exist (409 + 409) is ok:true already-existed, with NO wait calls", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      alreadyExists409("projects/dy-agency-proof/global/networks/dy-cell-australia-southeast1"),
+      alreadyExists409("projects/dy-agency-proof/regions/australia-southeast1/subnetworks/dy-cell-australia-southeast1-subnet"),
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-network-create",
+      networkName: "dy-cell-australia-southeast1",
+      networkStatus: "already-existed",
+      subnetName: "dy-cell-australia-southeast1-subnet",
+      subnetStatus: "already-existed",
+    });
+    // Exactly the two inserts — no operation to wait on.
+    expect(computeCalls(calls).map((call) => call.url)).toEqual([`${GCP_PROJECT_URL}/global/networks`, `${GCP_REGION_URL}/subnetworks`]);
+  });
+
+  it("gcp-network-create: network already exists but the subnet is new => waits ONLY for the subnet (resume of a half-built cell)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      alreadyExists409("projects/dy-agency-proof/global/networks/dy-cell-australia-southeast1"),
+      { body: { name: "operation-subnet", status: "RUNNING" } },
+      { body: { name: "operation-subnet", status: "DONE" } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; networkStatus: string; subnetStatus: string };
+    expect(body.ok).toBe(true);
+    expect(body.networkStatus).toBe("already-existed");
+    expect(body.subnetStatus).toBe("created");
+    expect(computeCalls(calls).map((call) => call.url)).toEqual([
+      `${GCP_PROJECT_URL}/global/networks`,
+      `${GCP_REGION_URL}/subnetworks`,
+      `${GCP_REGION_URL}/operations/operation-subnet/wait`,
+    ]);
+  });
+
+  it("gcp-network-create: a 403 on the network insert is a TERMINAL ok:false with Google's message and NO subnet insert", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([denied403("compute.networks.create")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; op: string; networkName: string; subnetName: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-network-create");
+    expect(body.networkName).toBe("dy-cell-australia-southeast1");
+    expect(body.subnetName).toBe("dy-cell-australia-southeast1-subnet");
+    expect(body.detail).toMatch(/denied the network "dy-cell-australia-southeast1" create \(HTTP 403\)/);
+    expect(body.detail).toContain("Required 'compute.networks.create' permission");
+    expect(body.detail).toMatch(/roles\/compute\.networkAdmin/);
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+    expect(computeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-network-create: a network operation that finishes with errors is ok:false and NO subnet insert follows", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-net", status: "RUNNING" } },
+      { body: { name: "operation-net", status: "DONE", error: { errors: [{ code: "QUOTA_EXCEEDED", message: "Quota 'NETWORKS' exceeded." }] } } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/network "dy-cell-australia-southeast1" create operation failed: Quota 'NETWORKS' exceeded/);
+    expect(computeCalls(calls)).toHaveLength(2);
+  });
+
+  it("gcp-network-create: an operation still RUNNING after every bounded wait is ok:false (re-run resumes), NO subnet insert", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-net", status: "RUNNING" } },
+      { body: { name: "operation-net", status: "RUNNING" } },
+      { body: { name: "operation-net", status: "RUNNING" } },
+      { body: { name: "operation-net", status: "RUNNING" } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/still not DONE after 3 waits/);
+    // 1 insert + exactly 3 waits, then it stopped.
+    const urls = computeCalls(calls).map((call) => call.url);
+    expect(urls).toHaveLength(4);
+    expect(urls.filter((url) => url.endsWith("/operations/operation-net/wait"))).toHaveLength(3);
+  });
+
+  it("gcp-network-create: a subnet insert rejected by Google (e.g. resourceNotReady / bad range) is ok:false with Google's message", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([
+      alreadyExists409("projects/dy-agency-proof/global/networks/dy-cell-australia-southeast1"),
+      { status: 400, body: { error: { code: 400, message: "The resource 'projects/dy-agency-proof/global/networks/dy-cell-australia-southeast1' is not ready", errors: [{ reason: "resourceNotReady" }] } } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/subnetwork "dy-cell-australia-southeast1-subnet" create failed with HTTP 400: .*is not ready/);
+  });
+
+  it("gcp-network-create: a 409 whose reason is NOT alreadyExists is a failure, not an idempotent success", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { status: 409, body: { error: { code: 409, message: "Operation in progress", errors: [{ reason: "resourceInUseByAnotherResource" }] } } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/create failed with HTTP 409: Operation in progress/);
+    expect(computeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-network-create: REJECTS a project that is not the SA key's own project — no token minted, ZERO GCP calls", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([{ body: { name: "operation-should-not-happen", status: "RUNNING" } }]);
+    const otherProjectKey = await makeServiceAccountKey("some-other-project");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: otherProjectKey }));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-network-create");
+    expect(body.detail).toMatch(/does not match the service-account key's own project \("some-other-project"\)/);
+    expect(body.detail).toMatch(/own project/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("gcp-network-create: a public ipCidr is 400 with NO Google call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkCreateJob({ params: JSON.stringify({ ...GCP_NETWORK_PARAMS, ipCidr: "8.8.8.0/24" }) });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { reason: string };
+    expect(body.reason).toMatch(/^ipCidr must be a private/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("gcp-network-create: reports a clean failure and touches NO API when GCP_SERVICE_ACCOUNT_KEY is missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    // Every OTHER agency credential is present — none may be used as a substitute.
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/GCP_SERVICE_ACCOUNT_KEY is not configured/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── gcp-firewall-create through the registry ─────────────────────────────────────────
+
+  it("gcp-firewall-create: POSTs ONE INGRESS rule with the validated allowed/sources/tags (protocol -> IPProtocol), agency SA only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpFirewallCreateJob({
+      params: JSON.stringify({
+        ...GCP_FIREWALL_PARAMS,
+        allowed: [{ protocol: "tcp", ports: ["22", "8000-8080"] }, { protocol: "icmp" }],
+        sourceRanges: ["0.0.0.0/0", "10.20.0.0/24"],
+        targetTags: ["dy-gateway", "dy-web"],
+      }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([{ body: { name: "operation-fw", status: "RUNNING", operationType: "insert" } }]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const resultBody = await response.json();
+    expect(resultBody).toEqual({ ok: true, op: "gcp-firewall-create", ruleName: "dy-cell-allow-gateway-ssh", status: "created" });
+    expect(JSON.stringify(resultBody)).not.toContain(GCP_ACCESS_TOKEN);
+
+    const [tokenCall] = calls;
+    expect(jwtClaimsOf(tokenCall.form?.get("assertion") ?? "").scope).toBe(GOOGLE_SCOPE_CLOUD_PLATFORM);
+    const [insertCall] = computeCalls(calls);
+    expect(insertCall.method).toBe("POST");
+    expect(insertCall.url).toBe(`${GCP_PROJECT_URL}/global/firewalls`);
+    expect(insertCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+    expect(insertCall.body).toEqual({
+      name: "dy-cell-allow-gateway-ssh",
+      network: "global/networks/dy-cell-australia-southeast1",
+      direction: "INGRESS",
+      allowed: [{ IPProtocol: "tcp", ports: ["22", "8000-8080"] }, { IPProtocol: "icmp" }],
+      sourceRanges: ["0.0.0.0/0", "10.20.0.0/24"],
+      targetTags: ["dy-gateway", "dy-web"],
+    });
+    // icmp carries NO ports key at all, and nothing else rides along.
+    const allowed = (insertCall.body as { allowed: Array<Record<string, unknown>> }).allowed;
+    expect(allowed[1]).not.toHaveProperty("ports");
+    expect(insertCall.body).not.toHaveProperty("denied");
+    expect(insertCall.body).not.toHaveProperty("sourceTags");
+  });
+
+  it("gcp-firewall-create: the allow-all internal rule maps protocol \"all\" to IPProtocol \"all\"", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpFirewallCreateJob({
+      params: JSON.stringify({
+        ...GCP_FIREWALL_PARAMS,
+        ruleName: "dy-cell-allow-internal",
+        allowed: [{ protocol: "all" }],
+        sourceRanges: ["10.20.0.0/24"],
+        targetTags: ["dy-cell-node"],
+      }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([{ body: { name: "operation-fw", status: "RUNNING" } }]);
+
+    await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const [insertCall] = computeCalls(calls);
+    expect((insertCall.body as { allowed: unknown }).allowed).toEqual([{ IPProtocol: "all" }]);
+    expect((insertCall.body as { sourceRanges: unknown }).sourceRanges).toEqual(["10.20.0.0/24"]);
+  });
+
+  it("gcp-firewall-create: a 409 (rule already exists) is ok:true already-existed — idempotent by name", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpFirewallCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([alreadyExists409("projects/dy-agency-proof/global/firewalls/dy-cell-allow-gateway-ssh")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await response.json()).toEqual({ ok: true, op: "gcp-firewall-create", ruleName: "dy-cell-allow-gateway-ssh", status: "already-existed" });
+    expect(computeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-firewall-create: a 403 is a TERMINAL ok:false naming the permission, token not echoed", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpFirewallCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([denied403("compute.firewalls.create")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; ruleName: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-firewall-create");
+    expect(body.ruleName).toBe("dy-cell-allow-gateway-ssh");
+    expect(body.detail).toMatch(/denied the firewall rule "dy-cell-allow-gateway-ssh" create \(HTTP 403\)/);
+    expect(body.detail).toMatch(/roles\/compute\.securityAdmin/);
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+  });
+
+  it("gcp-firewall-create: REJECTS a project that is not the SA key's own project — ZERO GCP calls", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpFirewallCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([{ body: { name: "operation-should-not-happen", status: "RUNNING" } }]);
+    const otherProjectKey = await makeServiceAccountKey("some-other-project");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: otherProjectKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-firewall-create");
+    expect(body.detail).toMatch(/own project/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("gcp-firewall-create: ports on icmp (or an empty targetTags) is 400 with NO Google call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    for (const [overrides, expected] of [
+      [{ allowed: [{ protocol: "icmp", ports: ["22"] }] }, /ports apply to tcp\/udp only/],
+      [{ targetTags: [] }, /^targetTags must be an array of 1-256/],
+    ] as Array<[Record<string, unknown>, RegExp]>) {
+      const job = gcpFirewallCreateJob({ params: JSON.stringify({ ...GCP_FIREWALL_PARAMS, ...overrides }) });
+      const signature = await signAsApp(job, privateKey);
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { reason: string };
+      expect(body.reason).toMatch(expected);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+    }
+  });
+
+  // ── gcp-address-create through the registry ──────────────────────────────────────────
+  // addresses.insert (EXTERNAL, regional) then addresses.get to read the reserved IP back.
+
+  it("gcp-address-create: reserves an EXTERNAL regional address, reads it back, and returns the IP — agency SA only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpAddressCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-addr", status: "RUNNING", operationType: "insert" } }, // addresses.insert
+      { body: { name: "dy-cell-gateway-ip", address: "35.244.66.16", status: "RESERVED", addressType: "EXTERNAL" } }, // addresses.get
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const resultBody = await response.json();
+    expect(resultBody).toEqual({
+      ok: true,
+      op: "gcp-address-create",
+      addressName: "dy-cell-gateway-ip",
+      address: "35.244.66.16",
+      status: "created",
+    });
+    expect(JSON.stringify(resultBody)).not.toContain(GCP_ACCESS_TOKEN);
+
+    const [tokenCall] = calls;
+    expect(jwtClaimsOf(tokenCall.form?.get("assertion") ?? "").scope).toBe(GOOGLE_SCOPE_CLOUD_PLATFORM);
+    const [insertCall, getCall] = computeCalls(calls);
+    expect(insertCall.method).toBe("POST");
+    expect(insertCall.url).toBe(`${GCP_REGION_URL}/addresses`);
+    expect(insertCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+    expect(insertCall.body).toEqual({ name: "dy-cell-gateway-ip", addressType: "EXTERNAL" });
+    expect(getCall.method).toBe("GET");
+    expect(getCall.url).toBe(`${GCP_REGION_URL}/addresses/dy-cell-gateway-ip`);
+    expect(getCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+    expect(getCall.body).toBeUndefined();
+  });
+
+  it("gcp-address-create: a 409 (already reserved) reads the EXISTING reservation back — ok:true already-existed with its IP", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpAddressCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      alreadyExists409("projects/dy-agency-proof/regions/australia-southeast1/addresses/dy-cell-gateway-ip"),
+      { body: { name: "dy-cell-gateway-ip", address: "35.244.66.16", status: "IN_USE" } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-address-create",
+      addressName: "dy-cell-gateway-ip",
+      address: "35.244.66.16",
+      status: "already-existed",
+    });
+    expect(computeCalls(calls).map((call) => call.method)).toEqual(["POST", "GET"]);
+  });
+
+  it("gcp-address-create: an IP not yet assigned (RESERVING without `address`, or a 404 before it is visible) is ok:true with address null", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    for (const getReply of [
+      { body: { name: "dy-cell-gateway-ip", status: "RESERVING" } },
+      { status: 404, body: { error: { code: 404, message: "The resource 'projects/dy-agency-proof/regions/australia-southeast1/addresses/dy-cell-gateway-ip' was not found" } } },
+    ]) {
+      const job = gcpAddressCreateJob();
+      const signature = await signAsApp(job, privateKey);
+      mockGcpApiQueue([{ body: { name: "operation-addr", status: "RUNNING" } }, getReply]);
+
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+      expect(await response.json()).toEqual({
+        ok: true,
+        op: "gcp-address-create",
+        addressName: "dy-cell-gateway-ip",
+        address: null,
+        status: "created",
+      });
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("gcp-address-create: a read-back failure other than not-yet-visible (e.g. 403 on get) is ok:false — the reservation stands, a re-run re-reads", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpAddressCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([{ body: { name: "operation-addr", status: "RUNNING" } }, denied403("compute.addresses.get")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; addressName: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.addressName).toBe("dy-cell-gateway-ip");
+    expect(body.detail).toMatch(/was reserved but reading it back failed with HTTP 403/);
+    expect(body.detail).toContain("Required 'compute.addresses.get' permission");
+  });
+
+  it("gcp-address-create: a 403 on the insert is a TERMINAL ok:false and NO read-back follows", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpAddressCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([denied403("compute.addresses.create")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-address-create");
+    expect(body.detail).toMatch(/denied the address "dy-cell-gateway-ip" create \(HTTP 403\)/);
+    expect(body.detail).toMatch(/roles\/compute\.networkAdmin/);
+    expect(computeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-address-create: REJECTS a project that is not the SA key's own project — ZERO GCP calls", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpAddressCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([{ body: { name: "operation-should-not-happen", status: "RUNNING" } }]);
+    const otherProjectKey = await makeServiceAccountKey("some-other-project");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: otherProjectKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-address-create");
+    expect(body.detail).toMatch(/own project/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("gcp-address-create: a zone in place of the region is 400 with NO Google call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpAddressCreateJob({ params: JSON.stringify({ ...GCP_ADDRESS_PARAMS, region: "australia-southeast1-a" }) });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { reason: string };
+    expect(body.reason).toMatch(/^region must be/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("the three cell-infra ops given another op's params are 400 with NO Google call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const jobs = [
+      gcpNetworkCreateJob({ params: JSON.stringify(GCP_INSTANCE_PARAMS) }),
+      gcpFirewallCreateJob({ params: JSON.stringify(GCP_NETWORK_PARAMS) }),
+      gcpAddressCreateJob({ params: JSON.stringify(GCP_FIREWALL_PARAMS) }),
+    ];
+    for (const job of jobs) {
+      const signature = await signAsApp(job, privateKey);
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+      expect(response.status).toBe(400);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+    }
   });
 });
