@@ -671,13 +671,27 @@ export async function mintGoogleAccessToken(options: {
   return data.access_token;
 }
 
-// The permissions doubleyoup's GCP integration REQUIRES. TODAY the only GCP use is a read-only
-// project probe — every provisioning op runs through Cloudflare + the cell-agent (planning/36).
-// When GCP compute provisioning into the agency's own project is wired (planning/34/38), ADD the
-// permissions the provisioning code actually calls here (e.g. "compute.instances.create") and
-// validateGCP reports any the service account is missing. This is the single source of truth for
-// the required set — keep it matched to what the code actually does with the key (do NOT over-ask).
-const REQUIRED_GCP_PERMISSIONS = ["resourcemanager.projects.get"];
+// The permissions doubleyoup's GCP integration REQUIRES. Cell provisioning (planning/34) builds a
+// whole cell in the agency's OWN project through signed jobs -> the agency Worker: a VPC + subnet,
+// two firewall rules, a Cloud NAT (via a router), a static gateway address, and one VM per node.
+// These are the EXACT compute.*.create permissions those actuators call (actuate.ts) — no more:
+// the VM body attaches no service account, so no iam.serviceAccounts.actAs is needed. A single
+// `roles/compute.admin` grant on the project covers every one of them (the onboarding page tells the
+// agency to grant exactly that). This is the single source of truth for the required set — keep it
+// matched to what the provisioning code actually does with the key (do NOT over-ask).
+//
+// We no longer require resourcemanager.projects.get (the old read-only probe): the provisioning code
+// never calls it, so requiring it would force a second Viewer grant for nothing. The project's
+// existence + the Cloud Resource Manager API being on are still confirmed implicitly — testIamPermissions
+// runs on the cloudresourcemanager endpoint and 403s if that API is off (handled below).
+export const REQUIRED_GCP_PERMISSIONS = [
+  "compute.networks.create",
+  "compute.subnetworks.create",
+  "compute.firewalls.create",
+  "compute.routers.create",
+  "compute.addresses.create",
+  "compute.instances.create",
+];
 
 // Parse the SA-key JSON, mint an access token, then check the service account holds every
 // REQUIRED_GCP_PERMISSIONS via testIamPermissions. ok when the token mints AND none are missing.
@@ -751,7 +765,7 @@ export async function validateGCP(env: Env): Promise<ValidationResult> {
       }
       return {
         ok: false,
-        detail: `Google Cloud authenticated as ${clientEmail}, but the service account is missing ${missing.length} required permission(s): ${missing.join(", ")}. Grant a role that includes them (the Viewer role covers today's read-only needs).`,
+        detail: `Google Cloud authenticated as ${clientEmail}, but the service account is missing ${missing.length} required permission(s): ${missing.join(", ")}. Grant the service account "roles/compute.admin" on the project — it covers every permission the cell provisioner needs.`,
       };
     }
     if (response.status === 403) {

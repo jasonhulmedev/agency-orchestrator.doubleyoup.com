@@ -8,6 +8,7 @@ import {
   validateOpenAI,
   validateAI,
   validateGCP,
+  REQUIRED_GCP_PERMISSIONS,
   validateR2Provision,
   validateCfDns,
   validateAll,
@@ -544,7 +545,8 @@ describe("validateGCP", () => {
     const key = await makeServiceAccountKey();
     const fetchMock = routedFetch([
       { match: (u) => u === "https://oauth2.googleapis.com/token", respond: () => jsonResponse({ access_token: "ya29.test", expires_in: 3600 }) },
-      { match: (u) => u.includes("cloudresourcemanager.googleapis.com/v1/projects/demo-project:testIamPermissions"), respond: () => jsonResponse({ permissions: ["resourcemanager.projects.get"] }) },
+      // The SA holds every required permission (a full roles/compute.admin grant on the project).
+      { match: (u) => u.includes("cloudresourcemanager.googleapis.com/v1/projects/demo-project:testIamPermissions"), respond: () => jsonResponse({ permissions: [...REQUIRED_GCP_PERMISSIONS] }) },
     ]);
     vi.stubGlobal("fetch", fetchMock);
 
@@ -553,29 +555,38 @@ describe("validateGCP", () => {
     expect(result.detail).toContain("demo-project");
 
     // The token request is a JWT-bearer assertion; the permission check is a POST that carries the
-    // bearer and asks for the required permissions.
+    // bearer and asks for EVERY required permission (the compute.*.create set the cell provisioner uses).
     const [, tokenInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     expect(String(tokenInit.body)).toContain("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer");
     expect(String(tokenInit.body)).toContain("assertion=");
     const [, projectInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
     expect(new Headers(projectInit.headers).get("authorization")).toBe("Bearer ya29.test");
     expect(projectInit.method).toBe("POST");
-    expect(String(projectInit.body)).toContain("resourcemanager.projects.get");
+    const requestedPermissions = JSON.parse(String(projectInit.body)).permissions as string[];
+    expect(requestedPermissions).toEqual(REQUIRED_GCP_PERMISSIONS);
+    expect(requestedPermissions).toContain("compute.instances.create");
   });
 
   it("reports missing permissions when testIamPermissions returns a smaller set", async () => {
     const key = await makeServiceAccountKey();
+    // The SA holds the network perms but not the compute-instance / router / address ones — e.g. a
+    // partial custom role, or roles/compute.networkAdmin without roles/compute.admin.
+    const held = ["compute.networks.create", "compute.subnetworks.create", "compute.firewalls.create"];
     vi.stubGlobal(
       "fetch",
       routedFetch([
         { match: (u) => u.includes("oauth2.googleapis.com/token"), respond: () => jsonResponse({ access_token: "ya29.test" }) },
-        { match: (u) => u.includes("cloudresourcemanager.googleapis.com"), respond: () => jsonResponse({ permissions: [] }) },
+        { match: (u) => u.includes("cloudresourcemanager.googleapis.com"), respond: () => jsonResponse({ permissions: held }) },
       ]),
     );
     const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
     expect(result.ok).toBe(false);
     expect(result.detail).toMatch(/missing/);
-    expect(result.detail).toMatch(/resourcemanager\.projects\.get/);
+    // The three it lacks are named; the ones it holds are not reported as missing.
+    expect(result.detail).toMatch(/compute\.instances\.create/);
+    expect(result.detail).toMatch(/compute\.routers\.create/);
+    expect(result.detail).toMatch(/compute\.addresses\.create/);
+    expect(result.detail).not.toMatch(/compute\.networks\.create/);
   });
 
   it("reports a 403 (API disabled / no project access) after the token mints", async () => {
@@ -608,10 +619,12 @@ describe("validateGCP", () => {
     const key = await makeServiceAccountKey();
     const fetchMock = routedFetch([
       { match: (u) => u.includes("oauth2.googleapis.com/token"), respond: () => jsonResponse({ access_token: "ya29.test" }) },
-      { match: (u) => u.includes("cloudresourcemanager.googleapis.com"), respond: () => jsonResponse({ permissions: ["resourcemanager.projects.get"] }) },
+      { match: (u) => u.includes("cloudresourcemanager.googleapis.com"), respond: () => jsonResponse({ permissions: [...REQUIRED_GCP_PERMISSIONS] }) },
     ]);
     vi.stubGlobal("fetch", fetchMock);
 
+    // Checking permissions is a READ — validateGCP mints the read-only scope even though the required
+    // permissions are compute WRITES (testIamPermissions reports what a role grants without exercising it).
     const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
     expect(result.ok).toBe(true);
     const [, tokenInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
