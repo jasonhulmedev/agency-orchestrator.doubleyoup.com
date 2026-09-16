@@ -58,12 +58,27 @@ per credential; secret values are never shown).
 ## Deploy (no terminal needed)
 
 Deploy the Worker into **your** Cloudflare account via **Cloudflare Workers
-Builds**: in the Cloudflare dashboard → **Workers & Pages** → **Create** →
-**Connect to Git**, pick this repository, and let Cloudflare build & deploy it.
-Every push to `main` re-deploys automatically. (`APP_BASE_URL` is already set in
-`wrangler.toml` and points at our app.) Add your secrets via the onboarding
-wizard's instructions, then open the Worker's root URL and press **Check my
-setup** until every item is green.
+Builds**:
+
+1. **Fork this repo into your own GitHub account** (the **Fork** button, top
+   right). Cloudflare Workers Builds connects through the Cloudflare GitHub App,
+   which you can only install on a repo you own — so you connect it to *your
+   fork*, not to this upstream repo.
+2. In the Cloudflare dashboard → **Workers & Pages** → **Create** → **Connect to
+   Git**, pick **your fork**, and let Cloudflare build & deploy it. Every push to
+   your fork's `main` re-deploys automatically. (`APP_BASE_URL` is already set in
+   `wrangler.toml` and points at our app.)
+3. Add your secrets via the onboarding wizard's instructions, then open the
+   Worker's root URL and press **Check my setup** until every item is green.
+
+### Keeping your Worker up to date
+
+Your fork does **not** update on its own — it drifts behind this upstream repo
+until you sync it, so you would miss our fixes and new capabilities. To pull the
+latest: open your fork on GitHub, and on the `main` branch use **Sync fork →
+Update branch**. That fast-forwards your fork to our latest `main`, which triggers
+your Workers Build to redeploy. Your Cloudflare **secrets live on the Worker, not
+in the repo**, so a sync never touches them. Re-run **Check my setup** afterwards.
 
 ## Onboarding flow
 
