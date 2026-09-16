@@ -508,6 +508,12 @@ const GCP_INSTANCE_TAGS_MAX = 64;
 // Google caps a metadata VALUE at 256 KB; the startup script is one metadata value. Measured in
 // JS string length (UTF-16 units) — for an ASCII shell script that equals its byte length.
 const GCP_STARTUP_SCRIPT_MAX_LENGTH = 256 * 1024;
+// A NAME PREFIX for the resume instances.list filter: like a Compute resource name but, being a
+// PREFIX, it MAY end in a hyphen (e.g. "dy-"). 1-63 chars, lowercase-letter start, [-a-z0-9] only —
+// no regex metacharacter, so it is safe to embed in the server-side aggregatedList `name` filter.
+const GCP_NAME_PREFIX_RE = /^[a-z][-a-z0-9]{0,62}$/;
+const GCP_NAME_PREFIX_RULE =
+  "namePrefix must be an instance-name prefix (1-63 chars: lowercase letter first, then lowercase letters, digits, hyphens; a trailing hyphen is allowed)";
 
 /**
  * Validate a list of Compute Engine resource names (tags / target tags): a non-empty array of
@@ -1085,6 +1091,40 @@ export function validateGcpRouterGetParams(raw: unknown): ParamsVerdict<GcpRoute
 
   // A FRESH object of only the known keys — never the caller's object.
   return { ok: true, params: { project, region, routerName } };
+}
+
+// ── gcp-instances-list ───────────────────────────────────────────────────────────
+// READ-ONLY: list the agency's Compute Engine instances whose name starts with `namePrefix`, so a
+// caller resuming a half-built cell can DISCOVER which of the cell's VMs already exist and in which
+// ZONE (planning/34 zone fallback — a cell lives in ONE zone, and there is no registry, so resume-
+// safety comes from discovery, not storage). Two REQUIRED strings: `project` (pinned to the SA key's
+// own project) and `namePrefix` (the server-side `name` filter, so the response is bounded). The
+// caller narrows the returned list to the cell's EXACT node names, so an over-broad prefix is safe.
+//
+// IDEMPOTENT: a read has no side effect. Registered `true` in AGENCY_OP_IDEMPOTENT.
+
+export interface GcpInstancesListParams {
+  /** The agency's GCP project id to list instances in. */
+  project: string;
+  /** The instance-name prefix the server-side aggregatedList filter narrows to (e.g. "dy-"). */
+  namePrefix: string;
+}
+
+export function validateGcpInstancesListParams(raw: unknown): ParamsVerdict<GcpInstancesListParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, namePrefix } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof namePrefix !== "string" || !GCP_NAME_PREFIX_RE.test(namePrefix)) {
+    return { ok: false, reason: GCP_NAME_PREFIX_RULE };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, namePrefix } };
 }
 
 // ── shared ─────────────────────────────────────────────────────────────────────────

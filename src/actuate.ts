@@ -34,6 +34,7 @@ import type {
   GcpRouterNatCreateParams,
   GcpFirewallGetParams,
   GcpRouterGetParams,
+  GcpInstancesListParams,
 } from "./dispatch-params.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken } from "./validators.js";
@@ -78,9 +79,14 @@ export type DbImportResult =
 // see actuateGcpInstanceCreate), but a CELL-level caller resuming a half-built cell (planning/34
 // "resume on re-run") needs a discriminable "the node is already there" signal it can treat as
 // skip-and-continue, rather than matching on the detail string. Absent on every other failure.
+//
+// `exhausted` (ok:false ONLY) is set to true when the insert's operation COMPLETED with a
+// ZONE_RESOURCE_POOL_EXHAUSTED error — the zone lacked capacity for the machine type (planning/34
+// zone fallback). Like `alreadyExisted` it is a DISCRIMINABLE field (never a detail-string match),
+// so the cell-level caller can retry the create in another zone. Absent on every other failure.
 export type GcpInstanceCreateResult =
   | { ok: true; op: "gcp-instance-create"; instanceName: string; operationName: string; status: string }
-  | { ok: false; op: "gcp-instance-create"; instanceName: string; detail: string; alreadyExisted?: true };
+  | { ok: false; op: "gcp-instance-create"; instanceName: string; detail: string; alreadyExisted?: true; exhausted?: true };
 
 // The IDEMPOTENT cell-infra ops report, per resource, whether THIS run created it or found it
 // already there (Google's 409 alreadyExists) — the same vocabulary as provision-r2's status.
@@ -133,6 +139,15 @@ export type GcpRouterGetResult =
   | { ok: true; op: "gcp-router-get"; routerName: string; found: boolean; natNames: string[] }
   | { ok: false; op: "gcp-router-get"; routerName: string; detail: string };
 
+// READ-ONLY zone discovery (planning/34 zone fallback). `instances` is every Compute Engine instance
+// whose name matches the caller's prefix, each with its SHORT zone name (e.g. australia-southeast1-b),
+// so a caller resuming a half-built cell can find which of its VMs already exist and pin the whole
+// cell to their one zone. ok:false is a read failure (auth / unreachable / a non-2xx / an
+// incomplete paged read) — the caller must NOT treat that as "no VMs" (it would risk a duplicate).
+export type GcpInstancesListResult =
+  | { ok: true; op: "gcp-instances-list"; instances: Array<{ name: string; zone: string }> }
+  | { ok: false; op: "gcp-instances-list"; detail: string };
+
 export type ActuateResult =
   | ProvisionR2Result
   | DnsRecordUpsertResult
@@ -146,7 +161,8 @@ export type ActuateResult =
   | GcpAddressCreateResult
   | GcpRouterNatCreateResult
   | GcpFirewallGetResult
-  | GcpRouterGetResult;
+  | GcpRouterGetResult
+  | GcpInstancesListResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -1100,6 +1116,16 @@ const GCP_COMPUTE_API = "https://compute.googleapis.com/compute/v1";
 // project, addressed by image FAMILY so it always resolves to the current patched image.
 const GCP_INSTANCE_BOOT_IMAGE = "projects/debian-cloud/global/images/family/debian-12";
 const GOOGLE_DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token";
+// Google's operation error CODE for a zone that lacks capacity for the requested machine type. Read
+// off the completed operation's error.errors[].code — a DISCRIMINABLE code, never a detail-string
+// match. This is the signal the cell-level zone fallback keys on (planning/34).
+const ZONE_RESOURCE_POOL_EXHAUSTED_CODE = "ZONE_RESOURCE_POOL_EXHAUSTED";
+// How many operations.wait calls the instance create makes before it gives up and reports the
+// accepted insert as async-ok. Deliberately SMALL (one ~2 min wait): exhaustion and success both
+// surface within that window, and this op feeds a SYNC endpoint (planning/34 review finding 3), so
+// it must fail fast to async-ok rather than block per-VM for the full 3-wait budget the regional
+// network/router ops use.
+const INSTANCE_CREATE_WAIT_ATTEMPTS = 1;
 
 /**
  * What instances.insert answers with. A 2xx is an Operation (`name`, `status`, and — only once
@@ -1342,8 +1368,60 @@ export async function actuateGcpInstanceCreate(
     const operationErrors = body?.error?.errors ?? [];
     if (operationErrors.length > 0) {
       const messages = operationErrors.map((entry) => entry.message ?? entry.code ?? "unknown error").join("; ");
+      const alreadyDoneCodes = operationErrors
+        .map((entry) => entry.code)
+        .filter((code): code is string => typeof code === "string");
+      // The rare already-DONE-at-insert path can ALSO be a zone exhaustion — surface it discriminably
+      // so the caller's zone fallback triggers here too, not only after a wait.
+      if (alreadyDoneCodes.includes(ZONE_RESOURCE_POOL_EXHAUSTED_CODE)) {
+        return {
+          ok: false,
+          op: "gcp-instance-create",
+          instanceName,
+          detail: `instance create operation ${operationName} failed: ${messages}.`,
+          exhausted: true,
+        };
+      }
       return gcpInstanceCreateFailure(instanceName, `instance create operation ${operationName} failed: ${messages}.`);
     }
+
+    // planning/34 zone fallback: the insert is async, and a ZONE_RESOURCE_POOL_EXHAUSTED is reported
+    // only when the operation COMPLETES — so, unlike the fire-and-forget original, WAIT (bounded) for
+    // this insert's ZONAL operation, reusing the same operations.wait pattern the network/router ops
+    // use. The bound is SMALL (INSTANCE_CREATE_WAIT_ATTEMPTS): this feeds a sync endpoint, so a
+    // still-running insert must fall back to async-ok rather than block.
+    const waitUrl =
+      `${GCP_COMPUTE_API}/projects/${encodeURIComponent(params.project)}` +
+      `/zones/${encodeURIComponent(params.zone)}/operations/${encodeURIComponent(operationName)}/wait`;
+    const waited = await waitForComputeOperation({
+      waitUrl,
+      accessToken,
+      what: `instance "${instanceName}"`,
+      maxAttempts: INSTANCE_CREATE_WAIT_ATTEMPTS,
+    });
+    if (waited.ok) {
+      // The insert operation finished cleanly — the VM exists (or is booting).
+      return { ok: true, op: "gcp-instance-create", instanceName, operationName, status: "DONE" };
+    }
+    if (waited.completed && waited.errorCodes.includes(ZONE_RESOURCE_POOL_EXHAUSTED_CODE)) {
+      // The zone ran out of capacity for this machine type. A DISCRIMINABLE `exhausted:true` field
+      // (mirrors alreadyExisted — never a detail-string match) so the cell-level caller retries the
+      // create in another zone without parsing the message. The failed operation left NO VM.
+      return { ok: false, op: "gcp-instance-create", instanceName, detail: waited.detail, exhausted: true };
+    }
+    if (waited.completed) {
+      // The operation finished with a NON-exhaustion error we OBSERVED (e.g. a bad image, a quota
+      // other than zone capacity): a genuine create failure. Report it rather than the old
+      // always-async-ok. Not exhaustion, so the caller does NOT retry another zone.
+      return gcpInstanceCreateFailure(instanceName, waited.detail);
+    }
+    // The operation was still RUNNING/PENDING after the bounded wait, or the wait poll could not be
+    // completed. We CANNOT observe the outcome, so fall back to the op's ORIGINAL async contract:
+    // report the accepted insert as ok:true + its operation to poll. DOCUMENTED RESIDUAL: a
+    // ZONE_RESOURCE_POOL_EXHAUSTED that surfaces ONLY after this bounded window is therefore missed —
+    // the provision reports ok, but that VM never boots. Acceptable (a re-run's discovery re-checks
+    // the zone, and operator telemetry catches a non-booting node); stated so it is a known limit,
+    // not a silent gap.
     return {
       ok: true,
       op: "gcp-instance-create",
@@ -1479,25 +1557,44 @@ async function insertComputeResource(input: {
   return { kind: "failed", detail: `${what} create failed with HTTP ${response.status}${googleErrorMessage(body)}.` };
 }
 
-// globalOperations.wait / regionOperations.wait hold the request until the operation is DONE or
-// about two minutes pass, then return its current state. A network insert takes tens of seconds,
-// so one wait normally suffices; a small bounded count covers a slow region without an unbounded
-// loop.
+// globalOperations.wait / regionOperations.wait / zoneOperations.wait hold the request until the
+// operation is DONE or about two minutes pass, then return its current state. A network/instance
+// insert takes tens of seconds, so one wait normally suffices; a small bounded count covers a slow
+// region without an unbounded loop.
 const GCP_OPERATION_WAIT_ATTEMPTS = 3;
 
 /**
- * Block until the Compute operation at `waitUrl` (.../operations/{name}/wait) is DONE. ok:true only
- * when it reached DONE with no errors; ok:false when it finished with errors, the wait call itself
- * failed, or it was still not DONE after GCP_OPERATION_WAIT_ATTEMPTS waits.
+ * The outcome of waiting for a Compute operation to finish.
+ *   - ok:true                            — the operation reached DONE with NO errors (the resource exists).
+ *   - ok:false, completed:true           — the operation reached DONE but CARRIED errors (a real,
+ *                                          observed create failure); `errorCodes` are its
+ *                                          error.errors[].code values, so a caller can discriminate a
+ *                                          specific failure (e.g. ZONE_RESOURCE_POOL_EXHAUSTED).
+ *   - ok:false, completed:false          — the wait could NOT confirm the outcome: the wait call
+ *                                          itself failed (unreachable / non-2xx) OR the operation was
+ *                                          still not DONE within the bound. `errorCodes` is [].
+ * Existing callers read only `ok`/`detail`; the extra fields are additive.
+ */
+type ComputeOperationWaitOutcome =
+  | { ok: true }
+  | { ok: false; detail: string; completed: boolean; errorCodes: string[] };
+
+/**
+ * Block until the Compute operation at `waitUrl` (.../operations/{name}/wait) is DONE, bounded to
+ * `maxAttempts` wait calls (default GCP_OPERATION_WAIT_ATTEMPTS). The instance-create zone-fallback
+ * path passes a SMALL value so a still-running insert falls back to async-ok quickly rather than
+ * blocking the sync endpoint (see actuateGcpInstanceCreate).
  */
 async function waitForComputeOperation(input: {
   waitUrl: string;
   accessToken: string;
   what: string;
-}): Promise<{ ok: true } | { ok: false; detail: string }> {
+  maxAttempts?: number;
+}): Promise<ComputeOperationWaitOutcome> {
   const { waitUrl, accessToken, what } = input;
+  const maxAttempts = input.maxAttempts ?? GCP_OPERATION_WAIT_ATTEMPTS;
 
-  for (let attempt = 1; attempt <= GCP_OPERATION_WAIT_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     let response: Response;
     try {
       response = await fetch(waitUrl, { method: "POST", headers: gcpHeaders(accessToken) });
@@ -1505,6 +1602,8 @@ async function waitForComputeOperation(input: {
       return {
         ok: false,
         detail: `could not reach Google Compute Engine while waiting for the ${what} create to finish: ${errorMessage(err)}`,
+        completed: false,
+        errorCodes: [],
       };
     }
     const body = (await response.json().catch(() => null)) as ComputeInsertResponse | null;
@@ -1512,6 +1611,8 @@ async function waitForComputeOperation(input: {
       return {
         ok: false,
         detail: `waiting for the ${what} create to finish failed with HTTP ${response.status}${googleErrorMessage(body)}.`,
+        completed: false,
+        errorCodes: [],
       };
     }
     if (body?.status !== "DONE") {
@@ -1519,14 +1620,24 @@ async function waitForComputeOperation(input: {
     }
     const operationErrors = body?.error?.errors ?? [];
     if (operationErrors.length > 0) {
-      return { ok: false, detail: `${what} create operation failed: ${operationErrorMessages(operationErrors)}.` };
+      const errorCodes = operationErrors
+        .map((entry) => entry.code)
+        .filter((code): code is string => typeof code === "string" && code.length > 0);
+      return {
+        ok: false,
+        detail: `${what} create operation failed: ${operationErrorMessages(operationErrors)}.`,
+        completed: true,
+        errorCodes,
+      };
     }
     return { ok: true };
   }
 
   return {
     ok: false,
-    detail: `the ${what} create operation was still not DONE after ${GCP_OPERATION_WAIT_ATTEMPTS} waits — re-run to resume once it finishes.`,
+    detail: `the ${what} create operation was still not DONE after ${maxAttempts} waits — re-run to resume once it finishes.`,
+    completed: false,
+    errorCodes: [],
   };
 }
 
@@ -1943,4 +2054,151 @@ export async function readComputeRouter(params: GcpRouterGetParams, env: Env): P
         .filter((name): name is string => typeof name === "string" && name.length > 0)
     : [];
   return { ok: true, op: "gcp-router-get", routerName, found: true, natNames };
+}
+
+// ── gcp-instances-list ───────────────────────────────────────────────────────────────────────
+// READ-ONLY zone discovery (planning/34 zone fallback): list every Compute Engine instance in the
+// agency's own project whose name starts with the caller's prefix, across ALL zones, so a caller
+// resuming a half-built cell can find which of its VMs already exist and pin the WHOLE cell to their
+// one zone (creating in another zone would DUPLICATE VMs = double billing + a split cell). Uses
+// compute.instances.aggregatedList (spans every zone). Same agency-token-only, read-only contract as
+// the other GET ops: auth / an unreachable API / a non-2xx is ok:false.
+//
+// The response is paged; this reads EVERY page (bounded) and, if it cannot finish within the bound,
+// returns ok:false rather than a possibly-truncated list — the caller relies on the list being
+// COMPLETE to be sure a zone is empty, so a partial read must fail closed.
+
+/** Google's max page size for aggregatedList, and a generous page bound (a cell is a few VMs). */
+const GCP_AGGREGATED_LIST_PAGE_SIZE = 500;
+const GCP_AGGREGATED_LIST_MAX_PAGES = 50;
+
+/** What instances.aggregatedList answers with (the fields this op reads). */
+interface ComputeAggregatedListResponse {
+  /** Keyed by scope, e.g. "zones/australia-southeast1-a"; each scope may carry `instances`. */
+  items?: Record<string, { instances?: Array<{ name?: string; zone?: string }> } | undefined>;
+  nextPageToken?: string;
+  /**
+   * Scopes (e.g. "zones/australia-southeast1-b") that could NOT be reached on a PARTIAL-SUCCESS
+   * response. When present, that scope's instances are OMITTED from `items` while the call still
+   * returns HTTP 200 — so a non-empty `unreachables` means the list is INCOMPLETE and must fail
+   * closed (a missed VM would let the caller pick a fresh zone and duplicate it).
+   */
+  unreachables?: string[];
+  error?: ComputeInsertResponse["error"];
+}
+
+/**
+ * The SHORT zone name for a listed instance: prefer the last path segment of its `zone` URL
+ * (".../zones/australia-southeast1-b" -> "australia-southeast1-b"); fall back to the aggregatedList
+ * scope key ("zones/<zone>"). Returns null when neither yields a name (the instance is skipped).
+ */
+function shortZoneName(zoneUrl: string | undefined, scopeKey: string): string | null {
+  if (typeof zoneUrl === "string" && zoneUrl.length > 0) {
+    const last = zoneUrl.slice(zoneUrl.lastIndexOf("/") + 1);
+    if (last.length > 0) {
+      return last;
+    }
+  }
+  if (scopeKey.startsWith("zones/")) {
+    const name = scopeKey.slice("zones/".length);
+    if (name.length > 0) {
+      return name;
+    }
+  }
+  return null;
+}
+
+export async function readComputeInstancesList(params: GcpInstancesListParams, env: Env): Promise<GcpInstancesListResult> {
+  const { project, namePrefix } = params;
+  const failure = (detail: string): GcpInstancesListResult => ({ ok: false, op: "gcp-instances-list", detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+
+  const instances: Array<{ name: string; zone: string }> = [];
+  let pageToken: string | undefined;
+  for (let page = 1; page <= GCP_AGGREGATED_LIST_MAX_PAGES; page += 1) {
+    // Server-side name filter, in Compute Engine's REGEX form: `name eq <RE2>` where the regex must
+    // match the ENTIRE field (Compute filter grammar — the `~` operator is gcloud CLIENT-side only, so
+    // it is NOT used here). `<prefix>.*` matches a full name that STARTS WITH the prefix. `namePrefix`
+    // is grammar-checked upstream to [a-z0-9-] with a leading letter, so it carries NO regex
+    // metacharacter (a hyphen is literal), and values go through URLSearchParams — no job value is
+    // string-interpolated into the URL. The caller still narrows the result to the cell's EXACT node
+    // names, so an over-broad prefix is harmless; only an under-broad/invalid filter would matter, and
+    // this cannot exclude a name that starts with the prefix.
+    const query = new URLSearchParams();
+    query.set("filter", `name eq "${namePrefix}.*"`);
+    query.set("maxResults", String(GCP_AGGREGATED_LIST_PAGE_SIZE));
+    // Ask Google to HARD-FAIL (non-2xx) instead of returning a partial 200 when a zone scope is
+    // unreachable. aggregatedList has been defaulting this toward `true` (partial success), which we
+    // must NOT accept for discovery — an omitted zone would read as "empty" and duplicate a VM. We set
+    // it false AND re-check `unreachables` below, so a partial slips through neither path.
+    query.set("returnPartialSuccess", "false");
+    if (pageToken !== undefined) {
+      query.set("pageToken", pageToken);
+    }
+    const url = `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}/aggregated/instances?${query.toString()}`;
+
+    let response: Response;
+    try {
+      response = await fetch(url, { headers: gcpHeaders(token.accessToken) });
+    } catch (err) {
+      return failure(`could not reach Google Compute Engine to list instances in project "${project}": ${errorMessage(err)}`);
+    }
+    const body = (await response.json().catch(() => null)) as ComputeAggregatedListResponse | null;
+
+    if (response.status === 401 || response.status === 403) {
+      return failure(
+        `Google Cloud denied listing instances (HTTP ${response.status})${googleErrorMessage(body)} — the service account ` +
+          `needs compute.instances.list (e.g. roles/compute.viewer) on project "${project}".`,
+      );
+    }
+    if (!response.ok) {
+      return failure(`listing instances failed with HTTP ${response.status}${googleErrorMessage(body)}.`);
+    }
+    // A 200 can still be a PARTIAL read: aggregatedList may report `unreachables` (a zone scope it
+    // could not read, its instances omitted) or a body-level `error` while returning 200. Discovery
+    // relies on the list being COMPLETE to conclude a zone is empty, so treat either as a failure and
+    // fail closed — never as "these are all the VMs" (that path duplicates a VM in a new zone).
+    if (Array.isArray(body?.unreachables) && body.unreachables.length > 0) {
+      const shown = body.unreachables.slice(0, 3).join(", ");
+      const more = body.unreachables.length > 3 ? ", …" : "";
+      return failure(
+        `listing instances returned an incomplete result — ${body.unreachables.length} scope(s) unreachable ` +
+          `(${shown}${more}); re-run to resume`,
+      );
+    }
+    if (body?.error) {
+      return failure(`listing instances returned a body-level error${googleErrorMessage(body)} — incomplete; re-run to resume`);
+    }
+
+    const items = body?.items ?? {};
+    for (const [scopeKey, group] of Object.entries(items)) {
+      const groupInstances = group?.instances;
+      if (!Array.isArray(groupInstances)) {
+        continue;
+      }
+      for (const instance of groupInstances) {
+        if (typeof instance?.name !== "string" || instance.name.length === 0) {
+          continue;
+        }
+        const zone = shortZoneName(instance.zone, scopeKey);
+        if (zone === null) {
+          continue;
+        }
+        instances.push({ name: instance.name, zone });
+      }
+    }
+
+    if (!body?.nextPageToken) {
+      return { ok: true, op: "gcp-instances-list", instances };
+    }
+    pageToken = body.nextPageToken;
+  }
+
+  // More pages remained after the bound. Fail closed (see the header note): the caller must not treat
+  // a truncated list as "these are all the VMs" or it could create a duplicate in a new zone.
+  return failure(`listing instances did not complete within ${GCP_AGGREGATED_LIST_MAX_PAGES} pages — re-run to resume`);
 }

@@ -39,6 +39,7 @@ import {
   type GcpRouterNatCreateParams,
   type GcpFirewallGetParams,
   type GcpRouterGetParams,
+  type GcpInstancesListParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
@@ -52,6 +53,7 @@ import {
   validateGcpRouterNatCreateParams,
   validateGcpFirewallGetParams,
   validateGcpRouterGetParams,
+  validateGcpInstancesListParams,
 } from "./dispatch-params.js";
 import {
   type ActuateResult,
@@ -68,6 +70,7 @@ import {
   actuateGcpRouterNatCreate,
   readComputeFirewall,
   readComputeRouter,
+  readComputeInstancesList,
 } from "./actuate.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
@@ -146,6 +149,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "gcp-router-get": defineOp<GcpRouterGetParams>({
     validateParams: validateGcpRouterGetParams,
     actuate: (params, env) => readComputeRouter(params, env),
+  }),
+  "gcp-instances-list": defineOp<GcpInstancesListParams>({
+    validateParams: validateGcpInstancesListParams,
+    actuate: (params, env) => readComputeInstancesList(params, env),
   }),
 };
 

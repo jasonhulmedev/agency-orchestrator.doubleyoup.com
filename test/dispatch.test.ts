@@ -38,6 +38,7 @@ import {
   validateGcpRouterNatCreateParams,
   validateGcpFirewallGetParams,
   validateGcpRouterGetParams,
+  validateGcpInstancesListParams,
   GCP_FIREWALL_PROTOCOLS,
 } from "../src/dispatch-params.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
@@ -281,6 +282,20 @@ function gcpRouterGetJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
     op: "gcp-router-get",
     params: JSON.stringify(GCP_ROUTER_GET_PARAMS),
     nonce: "66ff66ff66ff66ff66ff66ff66ff66ff",
+    ...overrides,
+  });
+}
+
+// A gcp-instances-list job — READ-ONLY zone discovery: list the cell's VMs by name prefix on resume.
+const GCP_INSTANCES_LIST_PARAMS = {
+  project: "dy-agency-proof",
+  namePrefix: "dy-",
+};
+function gcpInstancesListJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-instances-list",
+    params: JSON.stringify(GCP_INSTANCES_LIST_PARAMS),
+    nonce: "77aa77aa77aa77aa77aa77aa77aa77aa",
     ...overrides,
   });
 }
@@ -593,6 +608,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-firewall-create",
       "gcp-firewall-get",
       "gcp-instance-create",
+      "gcp-instances-list",
       "gcp-network-create",
       "gcp-router-get",
       "gcp-router-nat-create",
@@ -1437,6 +1453,39 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       [{ project: "Bad" }, /^project must be/],
       [{ region: "nope" }, /^region must be/],
       [{ routerName: "Bad" }, /^routerName must be/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  // ── gcp-instances-list (twin of the app's rules) ──────────────────────────────────
+
+  it("gcp-instances-list: accepts valid params and returns ONLY the two known keys (a trailing-hyphen prefix is allowed)", () => {
+    expect(validateGcpInstancesListParams({ ...GCP_INSTANCES_LIST_PARAMS, extra: "x" })).toEqual({ ok: true, params: GCP_INSTANCES_LIST_PARAMS });
+    expect(validateGcpInstancesListParams({ project: "dy-agency-proof", namePrefix: "dy-web-australia-southeast1-" }).ok).toBe(true);
+    expect(validateGcpInstancesListParams({ project: "dy-agency-proof", namePrefix: "d" }).ok).toBe(true);
+  });
+
+  it("gcp-instances-list: rejects bad input field by field, and names the field", () => {
+    const bad = (overrides: Record<string, unknown>) => validateGcpInstancesListParams({ ...GCP_INSTANCES_LIST_PARAMS, ...overrides });
+
+    expect(validateGcpInstancesListParams(null).ok).toBe(false);
+    expect(validateGcpInstancesListParams([]).ok).toBe(false);
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false);
+    expect(bad({ namePrefix: undefined }).ok).toBe(false);
+    expect(bad({ namePrefix: "" }).ok).toBe(false);
+    expect(bad({ namePrefix: "Dy-" }).ok).toBe(false); // uppercase
+    expect(bad({ namePrefix: "1dy" }).ok).toBe(false); // must start with a letter
+    expect(bad({ namePrefix: "dy/.." }).ok).toBe(false); // path/regex metacharacter
+    expect(bad({ namePrefix: `a${"b".repeat(63)}` }).ok).toBe(false); // 64 chars, over the cap
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ namePrefix: "Bad" }, /^namePrefix must be/],
     ];
     for (const [overrides, expected] of cases) {
       const verdict = bad(overrides);
@@ -2692,7 +2741,17 @@ describe("POST /actuate route", () => {
         const rawBody = init?.body ? String(init.body) : undefined;
         calls.push({ method, url, auth, rawBody, body: rawBody ? JSON.parse(rawBody) : undefined });
         const reply = queue.shift();
-        if (!reply) throw new Error(`unexpected extra Compute call ${method} ${url}`);
+        if (!reply) {
+          // gcp-instance-create now WAITS on its insert operation (planning/34 zone fallback). A test
+          // that does not care about that follow-up poll need not program it: an UNPROGRAMMED
+          // operations.wait call auto-answers with a clean DONE (the VM's insert finished). A test that
+          // DOES care (exhaustion, still-running) programs the wait reply itself, so the queue is
+          // non-empty here and this fallback never fires. Any other unexpected call still throws.
+          if (url.includes("/operations/") && url.endsWith("/wait")) {
+            return jsonResponse({ status: "DONE" }, 200);
+          }
+          throw new Error(`unexpected extra Compute call ${method} ${url}`);
+        }
         return jsonResponse(reply.body, reply.status ?? 200);
       }
       throw new Error(`unexpected fetch ${method} ${url}`);
@@ -2729,7 +2788,9 @@ describe("POST /actuate route", () => {
     );
     expect(response.status).toBe(200);
     const resultBody = await response.json();
-    // ACCEPTED: the async Operation is reported, not the VM.
+    // The insert is ACCEPTED, then its operation is WAITED (planning/34 zone fallback). This mock
+    // returns the SAME PENDING operation for the wait poll too, so within the bounded wait the op is
+    // still not DONE — the op falls back to reporting the accepted async Operation (status PENDING).
     expect(resultBody).toEqual({
       ok: true,
       op: "gcp-instance-create",
@@ -2740,8 +2801,11 @@ describe("POST /actuate route", () => {
     // The minted token is NEVER echoed in the result.
     expect(JSON.stringify(resultBody)).not.toContain(GCP_ACCESS_TOKEN);
 
-    expect(calls).toHaveLength(2);
-    const [tokenCall, insertCall] = calls;
+    // token mint + instances.insert + ONE bounded operations.wait poll.
+    expect(calls).toHaveLength(3);
+    const [tokenCall, insertCall, waitCall] = calls;
+    expect(waitCall.method).toBe("POST");
+    expect(waitCall.url).toBe(`${GCP_INSERT_URL.replace("/instances", "")}/operations/operation-1234/wait`);
 
     // 1) The JWT-bearer grant, signed by the agency's SA key, asks for the FULL cloud-platform
     //    scope — the write scope this op needs (validateGCP's probe stays read-only, tested in
@@ -2922,6 +2986,117 @@ describe("POST /actuate route", () => {
     const body = (await response.json()) as { ok: boolean; detail: string };
     expect(body.ok).toBe(false);
     expect(body.detail).toMatch(/operation operation-err failed: Quota 'CPUS' exceeded/);
+  });
+
+  // ── gcp-instance-create: the bounded operation WAIT + the zone-exhaustion signal (planning/34) ──
+
+  it("gcp-instance-create: WAITS on the insert operation and, when it completes DONE, reports status DONE", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-1234", status: "PENDING" } }, // insert ACCEPTED (async)
+      { body: { name: "operation-1234", status: "DONE" } }, // operations.wait: finished cleanly
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-instance-create",
+      instanceName: "dy-dirb-proof-vm",
+      operationName: "operation-1234",
+      status: "DONE",
+    });
+    const [insertCall, waitCall] = computeCalls(calls);
+    expect(insertCall.method).toBe("POST");
+    expect(insertCall.url).toBe(GCP_INSERT_URL);
+    expect(waitCall.method).toBe("POST");
+    expect(waitCall.url).toBe(`${GCP_PROJECT_URL}/zones/australia-southeast1-a/operations/operation-1234/wait`);
+    expect(waitCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+  });
+
+  it("gcp-instance-create: an insert operation that completes with ZONE_RESOURCE_POOL_EXHAUSTED is ok:false with the DISCRIMINABLE exhausted:true (never a detail-string match) — the zone-fallback signal", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([
+      { body: { name: "operation-1234", status: "PENDING" } },
+      {
+        body: {
+          name: "operation-1234",
+          status: "DONE",
+          error: { errors: [{ code: "ZONE_RESOURCE_POOL_EXHAUSTED", message: "The zone 'australia-southeast1-a' does not have enough resources available." }] },
+        },
+      },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; op: string; instanceName: string; detail: string; exhausted?: boolean; alreadyExisted?: boolean };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-instance-create");
+    expect(body.instanceName).toBe("dy-dirb-proof-vm");
+    expect(body.exhausted).toBe(true);
+    expect("alreadyExisted" in body).toBe(false);
+    expect(body.detail).toMatch(/does not have enough resources/);
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+  });
+
+  it("gcp-instance-create: an insert operation that completes with a NON-exhaustion error is ok:false WITHOUT exhausted (a genuine create failure, not a zone retry)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([
+      { body: { name: "operation-1234", status: "PENDING" } },
+      { body: { name: "operation-1234", status: "DONE", error: { errors: [{ code: "QUOTA_EXCEEDED", message: "Quota 'CPUS' exceeded." }] } } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string; exhausted?: boolean };
+    expect(body.ok).toBe(false);
+    expect("exhausted" in body).toBe(false);
+    expect(body.detail).toMatch(/Quota 'CPUS' exceeded/);
+  });
+
+  it("gcp-instance-create: an insert operation STILL RUNNING after the bounded wait falls back to async ok:true (the documented residual — a late exhaustion is missed)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([
+      { body: { name: "operation-1234", status: "PENDING" } }, // insert ACCEPTED
+      { body: { name: "operation-1234", status: "RUNNING" } }, // wait: still not DONE within the bound
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-instance-create",
+      instanceName: "dy-dirb-proof-vm",
+      operationName: "operation-1234",
+      status: "PENDING",
+    });
+  });
+
+  it("gcp-instance-create: an already-DONE-at-insert ZONE_RESOURCE_POOL_EXHAUSTED is exhausted:true too (no separate wait needed)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceCreateJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([
+      {
+        body: {
+          name: "operation-1234",
+          status: "DONE",
+          error: { errors: [{ code: "ZONE_RESOURCE_POOL_EXHAUSTED", message: "The zone does not have enough resources available." }] },
+        },
+      },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; exhausted?: boolean };
+    expect(body.ok).toBe(false);
+    expect(body.exhausted).toBe(true);
   });
 
   it("gcp-instance-create: a token-mint failure is ok:false and Compute is NEVER called", async () => {
@@ -3982,10 +4157,150 @@ describe("POST /actuate route", () => {
     expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
   });
 
-  it("the two cell-infra GET ops REJECT a project that is not the SA key's own project — ZERO GCP calls", async () => {
+  // ── gcp-instances-list through the registry ──────────────────────────────────────────
+  // instances.aggregatedList (spans ALL zones) — resume zone discovery (planning/34 zone fallback).
+
+  it("gcp-instances-list: aggregatedList returns each matching instance's name + SHORT zone (parsed from the zone URL), across zones — agency SA only, read-only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstancesListJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      {
+        body: {
+          items: {
+            "zones/australia-southeast1-b": {
+              instances: [
+                { name: "dy-web-australia-southeast1-1", zone: "https://www.googleapis.com/compute/v1/projects/dy-agency-proof/zones/australia-southeast1-b" },
+                { name: "dy-file-australia-southeast1-1", zone: "https://www.googleapis.com/compute/v1/projects/dy-agency-proof/zones/australia-southeast1-b" },
+              ],
+            },
+            // a scope with no instances (Google's NO_RESULTS_ON_PAGE warning) is skipped cleanly.
+            "zones/australia-southeast1-a": { warning: { code: "NO_RESULTS_ON_PAGE" } },
+          },
+        },
+      },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-instances-list",
+      instances: [
+        { name: "dy-web-australia-southeast1-1", zone: "australia-southeast1-b" },
+        { name: "dy-file-australia-southeast1-1", zone: "australia-southeast1-b" },
+      ],
+    });
+    const [listCall] = computeCalls(calls);
+    expect(listCall.method).toBe("GET");
+    expect(listCall.url.startsWith(`${GCP_PROJECT_URL}/aggregated/instances?`)).toBe(true);
+    expect(listCall.url).toContain("filter=");
+    expect(listCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+  });
+
+  it("gcp-instances-list: no matching instances is ok:true with instances [] (a clean 'none' — the fresh-cell case)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstancesListJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([{ body: { items: { "zones/australia-southeast1-a": { warning: { code: "NO_RESULTS_ON_PAGE" } } } } }]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await response.json()).toEqual({ ok: true, op: "gcp-instances-list", instances: [] });
+  });
+
+  it("gcp-instances-list: instances in DIFFERENT zones are each returned with their own zone (so the caller can detect a corrupt multi-zone cell)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstancesListJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([
+      {
+        body: {
+          items: {
+            "zones/australia-southeast1-a": { instances: [{ name: "dy-web-australia-southeast1-1", zone: "zones/australia-southeast1-a" }] },
+            "zones/australia-southeast1-b": { instances: [{ name: "dy-data-australia-southeast1-1", zone: "zones/australia-southeast1-b" }] },
+          },
+        },
+      },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-instances-list",
+      instances: [
+        { name: "dy-web-australia-southeast1-1", zone: "australia-southeast1-a" },
+        { name: "dy-data-australia-southeast1-1", zone: "australia-southeast1-b" },
+      ],
+    });
+  });
+
+  it("gcp-instances-list: follows nextPageToken across pages and returns the UNION (a truncated read would risk a duplicate VM)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstancesListJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { items: { "zones/australia-southeast1-a": { instances: [{ name: "dy-web-australia-southeast1-1", zone: "zones/australia-southeast1-a" }] } }, nextPageToken: "PAGE2" } },
+      { body: { items: { "zones/australia-southeast1-a": { instances: [{ name: "dy-data-australia-southeast1-1", zone: "zones/australia-southeast1-a" }] } } } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-instances-list",
+      instances: [
+        { name: "dy-web-australia-southeast1-1", zone: "australia-southeast1-a" },
+        { name: "dy-data-australia-southeast1-1", zone: "australia-southeast1-a" },
+      ],
+    });
+    const listCalls = computeCalls(calls);
+    expect(listCalls).toHaveLength(2);
+    expect(listCalls[1]!.url).toContain("pageToken=PAGE2");
+  });
+
+  it("gcp-instances-list: a 403 is ok:false naming the read permission, token not echoed", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstancesListJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([denied403("compute.instances.list")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-instances-list");
+    expect(body.detail).toMatch(/denied listing instances \(HTTP 403\)/);
+    expect(body.detail).toMatch(/compute\.instances\.list/);
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+  });
+
+  it("gcp-instances-list: a 200 PARTIAL success (unreachables) FAILS CLOSED — never reported as a complete 'none' (a missed zone would duplicate a VM)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstancesListJob();
+    const signature = await signAsApp(job, privateKey);
+    // Zone -a is reachable and empty; zone -b could NOT be read (its instances are OMITTED) but the
+    // call still returns HTTP 200 with `unreachables`. If this were treated as complete, discovery
+    // would say "none" and the orchestrator would create a duplicate VM in a fresh zone.
+    mockGcpApiQueue([
+      {
+        body: {
+          items: { "zones/australia-southeast1-a": { instances: [] } },
+          unreachables: ["zones/australia-southeast1-b"],
+        },
+      },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-instances-list");
+    expect(body.detail).toMatch(/unreachable/);
+    expect(body.detail).toMatch(/australia-southeast1-b/);
+    expect(body.detail).toMatch(/re-run to resume/);
+  });
+
+  it("the three cell-infra GET ops REJECT a project that is not the SA key's own project — ZERO GCP calls", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const otherProjectKey = await makeServiceAccountKey("some-other-project");
-    for (const job of [gcpFirewallGetJob(), gcpRouterGetJob()]) {
+    for (const job of [gcpFirewallGetJob(), gcpRouterGetJob(), gcpInstancesListJob()]) {
       const signature = await signAsApp(job, privateKey);
       const calls = mockGcpApiQueue([{ body: { name: "should-not-happen" } }]);
       const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: otherProjectKey }));
