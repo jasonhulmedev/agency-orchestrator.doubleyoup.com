@@ -1012,6 +1012,81 @@ export function validateGcpRouterNatCreateParams(raw: unknown): ParamsVerdict<Gc
   return { ok: true, params: { project, region, networkName, routerName, natName } };
 }
 
+// ── gcp-firewall-get ───────────────────────────────────────────────────────────────
+// READ-ONLY: confirm ONE cell firewall rule EXISTS in the AGENCY's own project (planning/34 resume
+// verification — review finding 1). On a re-run an already-existed rule was trusted by NAME; this op
+// GETs it so the caller can turn "trusted by name" into a real confirmation, or warn clearly if the
+// rule is gone. Firewalls are GLOBAL resources, so there is NO region. Two REQUIRED strings, each
+// pinned to a strict grammar: `project` (pinned to the SA key's own project) and `ruleName` (a
+// resource name). Low blast radius (a read), but validated with the SAME rigor as the create ops —
+// it still extends the signed-dispatch surface.
+//
+// IDEMPOTENT: a read has no side effect, so a re-run converges trivially. Registered `true` in
+// AGENCY_OP_IDEMPOTENT.
+
+export interface GcpFirewallGetParams {
+  /** The agency's GCP project id the rule lives in. */
+  project: string;
+  /** The firewall rule's resource name to read back. */
+  ruleName: string;
+}
+
+export function validateGcpFirewallGetParams(raw: unknown): ParamsVerdict<GcpFirewallGetParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, ruleName } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof ruleName !== "string" || !GCP_RESOURCE_NAME_RE.test(ruleName)) {
+    return { ok: false, reason: `ruleName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, ruleName } };
+}
+
+// ── gcp-router-get ─────────────────────────────────────────────────────────────────
+// READ-ONLY: confirm ONE cell Cloud Router EXISTS and carries its NAT in the AGENCY's own project
+// (planning/34 resume verification). On a re-run an already-existed router was trusted by NAME, but a
+// same-named router WITHOUT the cell NAT would leave the private VMs with no egress — so this op GETs
+// the router and (in the actuator) reports its inline NAT config names. Routers are REGIONAL. Three
+// REQUIRED strings, each pinned to a strict grammar: `project` (pinned to the SA key's own project),
+// `region` (a URL path segment) and `routerName` (a resource name).
+//
+// IDEMPOTENT: a read has no side effect. Registered `true` in AGENCY_OP_IDEMPOTENT.
+
+export interface GcpRouterGetParams {
+  /** The agency's GCP project id the router lives in. */
+  project: string;
+  /** The Compute Engine region of the router, e.g. "australia-southeast1". */
+  region: string;
+  /** The Cloud Router's resource name to read back. */
+  routerName: string;
+}
+
+export function validateGcpRouterGetParams(raw: unknown): ParamsVerdict<GcpRouterGetParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region, routerName } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast1)" };
+  }
+  if (typeof routerName !== "string" || !GCP_RESOURCE_NAME_RE.test(routerName)) {
+    return { ok: false, reason: `routerName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, region, routerName } };
+}
+
 // ── shared ─────────────────────────────────────────────────────────────────────────
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

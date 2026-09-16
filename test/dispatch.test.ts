@@ -36,6 +36,8 @@ import {
   validateGcpFirewallCreateParams,
   validateGcpAddressCreateParams,
   validateGcpRouterNatCreateParams,
+  validateGcpFirewallGetParams,
+  validateGcpRouterGetParams,
   GCP_FIREWALL_PROTOCOLS,
 } from "../src/dispatch-params.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
@@ -249,6 +251,36 @@ function gcpRouterNatCreateJob(overrides: Partial<DispatchJob> = {}): DispatchJo
     op: "gcp-router-nat-create",
     params: JSON.stringify(GCP_ROUTER_NAT_PARAMS),
     nonce: "44dd44dd44dd44dd44dd44dd44dd44dd",
+    ...overrides,
+  });
+}
+
+// A gcp-firewall-get job — READ-BACK a cell firewall rule on resume (finding 1 verification). Global,
+// so no region.
+const GCP_FIREWALL_GET_PARAMS = {
+  project: "dy-agency-proof",
+  ruleName: "dy-cell-australia-southeast1-gw-ssh",
+};
+function gcpFirewallGetJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-firewall-get",
+    params: JSON.stringify(GCP_FIREWALL_GET_PARAMS),
+    nonce: "55ee55ee55ee55ee55ee55ee55ee55ee",
+    ...overrides,
+  });
+}
+
+// A gcp-router-get job — READ-BACK a cell Cloud Router (and its NAT config names) on resume.
+const GCP_ROUTER_GET_PARAMS = {
+  project: "dy-agency-proof",
+  region: "australia-southeast1",
+  routerName: "dy-cell-australia-southeast1-router",
+};
+function gcpRouterGetJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-router-get",
+    params: JSON.stringify(GCP_ROUTER_GET_PARAMS),
+    nonce: "66ff66ff66ff66ff66ff66ff66ff66ff",
     ...overrides,
   });
 }
@@ -559,8 +591,10 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "dns-record-upsert",
       "gcp-address-create",
       "gcp-firewall-create",
+      "gcp-firewall-get",
       "gcp-instance-create",
       "gcp-network-create",
+      "gcp-router-get",
       "gcp-router-nat-create",
       "provision-r2",
       "wp-cli",
@@ -1333,6 +1367,76 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       [{ networkName: "Bad" }, /^networkName must be/],
       [{ routerName: "Bad" }, /^routerName must be/],
       [{ natName: "Bad" }, /^natName must be/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  // ── gcp-firewall-get (twin of the app's rules) ────────────────────────────────────
+
+  it("gcp-firewall-get: accepts valid params and returns ONLY the two known keys (no region — firewalls are global)", () => {
+    expect(validateGcpFirewallGetParams({ ...GCP_FIREWALL_GET_PARAMS, extra: "x", region: "australia-southeast1" })).toEqual({
+      ok: true,
+      params: GCP_FIREWALL_GET_PARAMS,
+    });
+    expect(validateGcpFirewallGetParams({ ...GCP_FIREWALL_GET_PARAMS, ruleName: "r" }).ok).toBe(true);
+  });
+
+  it("gcp-firewall-get: rejects bad input field by field, and names the field", () => {
+    const bad = (overrides: Record<string, unknown>) => validateGcpFirewallGetParams({ ...GCP_FIREWALL_GET_PARAMS, ...overrides });
+
+    expect(validateGcpFirewallGetParams(null).ok).toBe(false);
+    expect(validateGcpFirewallGetParams([]).ok).toBe(false);
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false);
+    expect(bad({ ruleName: undefined }).ok).toBe(false);
+    expect(bad({ ruleName: "" }).ok).toBe(false);
+    expect(bad({ ruleName: "Bad-Name" }).ok).toBe(false);
+    expect(bad({ ruleName: "1rule" }).ok).toBe(false);
+    expect(bad({ ruleName: "a/b" }).ok).toBe(false);
+    expect(bad({ ruleName: `a${"b".repeat(63)}` }).ok).toBe(false);
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ ruleName: "Bad" }, /^ruleName must be/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  // ── gcp-router-get (twin of the app's rules) ──────────────────────────────────────
+
+  it("gcp-router-get: accepts valid params and returns ONLY the three known keys", () => {
+    expect(validateGcpRouterGetParams({ ...GCP_ROUTER_GET_PARAMS, extra: "x" })).toEqual({ ok: true, params: GCP_ROUTER_GET_PARAMS });
+    expect(validateGcpRouterGetParams({ ...GCP_ROUTER_GET_PARAMS, region: "us-central1" }).ok).toBe(true);
+    expect(validateGcpRouterGetParams({ ...GCP_ROUTER_GET_PARAMS, routerName: "r" }).ok).toBe(true);
+  });
+
+  it("gcp-router-get: rejects bad input field by field, and names the field", () => {
+    const bad = (overrides: Record<string, unknown>) => validateGcpRouterGetParams({ ...GCP_ROUTER_GET_PARAMS, ...overrides });
+
+    expect(validateGcpRouterGetParams(null).ok).toBe(false);
+    expect(validateGcpRouterGetParams([]).ok).toBe(false);
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false);
+    expect(bad({ region: undefined }).ok).toBe(false);
+    expect(bad({ region: "australia-southeast1-a" }).ok).toBe(false); // a zone
+    expect(bad({ region: "australia-southeast1/../.." }).ok).toBe(false); // traversal
+    expect(bad({ routerName: undefined }).ok).toBe(false);
+    expect(bad({ routerName: "" }).ok).toBe(false);
+    expect(bad({ routerName: "Bad-Name" }).ok).toBe(false);
+    expect(bad({ routerName: "a/b" }).ok).toBe(false);
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ region: "nope" }, /^region must be/],
+      [{ routerName: "Bad" }, /^routerName must be/],
     ];
     for (const [overrides, expected] of cases) {
       const verdict = bad(overrides);
@@ -3750,6 +3854,147 @@ describe("POST /actuate route", () => {
     expect(body.ok).toBe(false);
     expect(body.detail).toMatch(/GCP_SERVICE_ACCOUNT_KEY is not configured/);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── gcp-firewall-get through the registry ────────────────────────────────────────────
+  // firewalls.get (GLOBAL) — resume verification: confirm a cell rule is really present (finding 1).
+
+  it("gcp-firewall-get: GETs the GLOBAL firewall rule and reports found:true — agency SA only, read-only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpFirewallGetJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([{ body: { name: "dy-cell-australia-southeast1-gw-ssh", network: "x" } }]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const resultBody = await response.json();
+    expect(resultBody).toEqual({ ok: true, op: "gcp-firewall-get", ruleName: "dy-cell-australia-southeast1-gw-ssh", found: true });
+    expect(JSON.stringify(resultBody)).not.toContain(GCP_ACCESS_TOKEN);
+
+    const [getCall] = computeCalls(calls);
+    expect(getCall.method).toBe("GET");
+    expect(getCall.url).toBe(`${GCP_PROJECT_URL}/global/firewalls/dy-cell-australia-southeast1-gw-ssh`);
+    expect(getCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+    expect(getCall.body).toBeUndefined();
+  });
+
+  it("gcp-firewall-get: a 404 is a clean found:false (NOT a failure)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpFirewallGetJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([{ status: 404, body: { error: { code: 404, message: "not found" } } }]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-firewall-get",
+      ruleName: "dy-cell-australia-southeast1-gw-ssh",
+      found: false,
+    });
+  });
+
+  it("gcp-firewall-get: a 403 is ok:false naming the read permission, token not echoed", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpFirewallGetJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([denied403("compute.firewalls.get")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-firewall-get");
+    expect(body.detail).toMatch(/denied reading firewall rule "dy-cell-australia-southeast1-gw-ssh" \(HTTP 403\)/);
+    expect(body.detail).toMatch(/compute\.firewalls\.get/);
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+  });
+
+  // ── gcp-router-get through the registry ──────────────────────────────────────────────
+  // routers.get (REGIONAL) — resume verification: confirm the router AND its NAT are present.
+
+  it("gcp-router-get: GETs the REGIONAL router and reports found:true with its NAT config names", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRouterGetJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "dy-cell-australia-southeast1-router", nats: [{ name: "dy-cell-australia-southeast1-nat" }] } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-router-get",
+      routerName: "dy-cell-australia-southeast1-router",
+      found: true,
+      natNames: ["dy-cell-australia-southeast1-nat"],
+    });
+
+    const [getCall] = computeCalls(calls);
+    expect(getCall.method).toBe("GET");
+    expect(getCall.url).toBe(`${GCP_REGION_URL}/routers/dy-cell-australia-southeast1-router`);
+    expect(getCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+  });
+
+  it("gcp-router-get: a router present WITHOUT any NAT config reports found:true, natNames [] (the no-egress case)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRouterGetJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([{ body: { name: "dy-cell-australia-southeast1-router" } }]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-router-get",
+      routerName: "dy-cell-australia-southeast1-router",
+      found: true,
+      natNames: [],
+    });
+  });
+
+  it("gcp-router-get: a 404 is a clean found:false with natNames [] (NOT a failure)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRouterGetJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([{ status: 404, body: { error: { code: 404, message: "not found" } } }]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-router-get",
+      routerName: "dy-cell-australia-southeast1-router",
+      found: false,
+      natNames: [],
+    });
+  });
+
+  it("gcp-router-get: a 403 is ok:false naming the read permission, token not echoed", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRouterGetJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([denied403("compute.routers.get")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-router-get");
+    expect(body.detail).toMatch(/denied reading router "dy-cell-australia-southeast1-router" \(HTTP 403\)/);
+    expect(body.detail).toMatch(/compute\.routers\.get/);
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+  });
+
+  it("the two cell-infra GET ops REJECT a project that is not the SA key's own project — ZERO GCP calls", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const otherProjectKey = await makeServiceAccountKey("some-other-project");
+    for (const job of [gcpFirewallGetJob(), gcpRouterGetJob()]) {
+      const signature = await signAsApp(job, privateKey);
+      const calls = mockGcpApiQueue([{ body: { name: "should-not-happen" } }]);
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: otherProjectKey }));
+      const body = (await response.json()) as { ok: boolean; detail: string };
+      expect(body.ok).toBe(false);
+      expect(body.detail).toMatch(/own project/);
+      expect(calls).toHaveLength(0);
+      vi.restoreAllMocks();
+    }
   });
 
   it("the four cell-infra ops given another op's params are 400 with NO Google call", async () => {

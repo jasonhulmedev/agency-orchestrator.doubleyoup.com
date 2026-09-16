@@ -32,6 +32,8 @@ import type {
   GcpFirewallCreateParams,
   GcpAddressCreateParams,
   GcpRouterNatCreateParams,
+  GcpFirewallGetParams,
+  GcpRouterGetParams,
 } from "./dispatch-params.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken } from "./validators.js";
@@ -115,6 +117,22 @@ export type GcpRouterNatCreateResult =
   | { ok: true; op: "gcp-router-nat-create"; routerName: string; natName: string; status: GcpResourceStatus }
   | { ok: false; op: "gcp-router-nat-create"; routerName: string; natName: string; detail: string };
 
+// READ-ONLY resume verification (planning/34, review finding 1). `found` says whether the named rule
+// is actually present now (404 => false), so a caller resuming a half-built cell can turn an
+// already-existed rule from "trusted by name" into a real confirmation. ok:false is a read failure
+// (auth / unreachable / an unexpected non-2xx) — the reservation-style "the resource stands, re-run".
+export type GcpFirewallGetResult =
+  | { ok: true; op: "gcp-firewall-get"; ruleName: string; found: boolean }
+  | { ok: false; op: "gcp-firewall-get"; ruleName: string; detail: string };
+
+// READ-ONLY resume verification. `found` says whether the router exists now; `natNames` lists its
+// inline NAT config names so the caller can confirm the CELL's NAT is present (a same-named router
+// WITHOUT it leaves the private VMs with no egress). `natNames` is [] when the router has no NAT or
+// was not found. ok:false is a read failure.
+export type GcpRouterGetResult =
+  | { ok: true; op: "gcp-router-get"; routerName: string; found: boolean; natNames: string[] }
+  | { ok: false; op: "gcp-router-get"; routerName: string; detail: string };
+
 export type ActuateResult =
   | ProvisionR2Result
   | DnsRecordUpsertResult
@@ -126,7 +144,9 @@ export type ActuateResult =
   | GcpNetworkCreateResult
   | GcpFirewallCreateResult
   | GcpAddressCreateResult
-  | GcpRouterNatCreateResult;
+  | GcpRouterNatCreateResult
+  | GcpFirewallGetResult
+  | GcpRouterGetResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -1820,4 +1840,107 @@ export async function actuateGcpRouterNatCreate(
   }
 
   return { ok: true, op: "gcp-router-nat-create", routerName, natName, status: outcome.kind };
+}
+
+// ── gcp-firewall-get ───────────────────────────────────────────────────────────────────────
+// READ-ONLY resume verification (planning/34, review finding 1): GET a cell firewall rule so a caller
+// resuming a half-built cell can turn an already-existed rule from "trusted by name" into a real
+// confirmation, or warn clearly if it is gone. Firewalls are GLOBAL, so the path has no region. Like
+// every gcp-* op it mints the agency's OWN token (there is no platform fallback) — it just reads.
+// A 404 is a clean "not present" (found:false, ok:true), NOT a failure; only auth / an unreachable
+// API / an unexpected non-2xx is ok:false. The read-back body is NOT diffed against the fixed cell
+// policy here — that deeper compare is a separate follow-up; this op confirms EXISTENCE.
+
+export async function readComputeFirewall(params: GcpFirewallGetParams, env: Env): Promise<GcpFirewallGetResult> {
+  const { project, ruleName } = params;
+  const failure = (detail: string): GcpFirewallGetResult => ({ ok: false, op: "gcp-firewall-get", ruleName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  // Path segments are grammar-checked upstream AND URL-encoded here.
+  const url =
+    `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}` +
+    `/global/firewalls/${encodeURIComponent(ruleName)}`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: gcpHeaders(token.accessToken) });
+  } catch (err) {
+    return failure(`could not reach Google Compute Engine to read firewall rule "${ruleName}": ${errorMessage(err)}`);
+  }
+  const body = (await response.json().catch(() => null)) as ComputeInsertResponse | null;
+
+  if (response.status === 404) {
+    return { ok: true, op: "gcp-firewall-get", ruleName, found: false };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return failure(
+      `Google Cloud denied reading firewall rule "${ruleName}" (HTTP ${response.status})${googleErrorMessage(body)} — the ` +
+        `service account needs compute.firewalls.get (e.g. roles/compute.viewer) on project "${project}".`,
+    );
+  }
+  if (!response.ok) {
+    return failure(`reading firewall rule "${ruleName}" failed with HTTP ${response.status}${googleErrorMessage(body)}.`);
+  }
+  return { ok: true, op: "gcp-firewall-get", ruleName, found: true };
+}
+
+// ── gcp-router-get ─────────────────────────────────────────────────────────────────────────
+// READ-ONLY resume verification: GET a cell Cloud Router and report its inline NAT config names, so a
+// caller resuming a half-built cell can confirm both the router AND its cell NAT are really present (a
+// same-named router WITHOUT the NAT leaves the private VMs with no egress). Routers are REGIONAL. Same
+// agency-token-only, read-only contract as gcp-firewall-get: a 404 is a clean found:false (natNames
+// []), only auth / an unreachable API / an unexpected non-2xx is ok:false.
+
+/** What routers.get answers with (the fields this op reads). */
+interface ComputeRouterResponse {
+  name?: string;
+  /** The router's inline Cloud NAT configs; each has a `name` this op reports back. */
+  nats?: Array<{ name?: string }>;
+  error?: ComputeInsertResponse["error"];
+}
+
+export async function readComputeRouter(params: GcpRouterGetParams, env: Env): Promise<GcpRouterGetResult> {
+  const { project, region, routerName } = params;
+  const failure = (detail: string): GcpRouterGetResult => ({ ok: false, op: "gcp-router-get", routerName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  // Path segments are grammar-checked upstream AND URL-encoded here.
+  const url =
+    `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}` +
+    `/regions/${encodeURIComponent(region)}/routers/${encodeURIComponent(routerName)}`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: gcpHeaders(token.accessToken) });
+  } catch (err) {
+    return failure(`could not reach Google Compute Engine to read router "${routerName}": ${errorMessage(err)}`);
+  }
+  const body = (await response.json().catch(() => null)) as ComputeRouterResponse | null;
+
+  if (response.status === 404) {
+    return { ok: true, op: "gcp-router-get", routerName, found: false, natNames: [] };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return failure(
+      `Google Cloud denied reading router "${routerName}" (HTTP ${response.status})${googleErrorMessage(body)} — the ` +
+        `service account needs compute.routers.get (e.g. roles/compute.viewer) on project "${project}".`,
+    );
+  }
+  if (!response.ok) {
+    return failure(`reading router "${routerName}" failed with HTTP ${response.status}${googleErrorMessage(body)}.`);
+  }
+  // Collect the inline NAT config names so the caller can confirm the CELL's NAT is present. A router
+  // with no NAT config yields an empty list (the exact "no egress" case the caller must catch).
+  const natNames = Array.isArray(body?.nats)
+    ? body.nats
+        .map((nat) => nat?.name)
+        .filter((name): name is string => typeof name === "string" && name.length > 0)
+    : [];
+  return { ok: true, op: "gcp-router-get", routerName, found: true, natNames };
 }
