@@ -52,6 +52,11 @@ export const DISPATCH_OPS = [
   "gcp-firewall-get",
   "gcp-router-get",
   "gcp-instances-list",
+  "gcp-instance-delete",
+  "gcp-address-delete",
+  "gcp-firewall-delete",
+  "gcp-router-delete",
+  "gcp-network-delete",
   "provision-ssh-keys",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];

@@ -39,6 +39,11 @@ import {
   validateGcpFirewallGetParams,
   validateGcpRouterGetParams,
   validateGcpInstancesListParams,
+  validateGcpInstanceDeleteParams,
+  validateGcpAddressDeleteParams,
+  validateGcpFirewallDeleteParams,
+  validateGcpRouterDeleteParams,
+  validateGcpNetworkDeleteParams,
   validateProvisionSshKeysParams,
   GCP_FIREWALL_PROTOCOLS,
 } from "../src/dispatch-params.js";
@@ -313,6 +318,84 @@ function gcpInstancesListJob(overrides: Partial<DispatchJob> = {}): DispatchJob 
     op: "gcp-instances-list",
     params: JSON.stringify(GCP_INSTANCES_LIST_PARAMS),
     nonce: "77aa77aa77aa77aa77aa77aa77aa77aa",
+    ...overrides,
+  });
+}
+
+// The TEARDOWN ops (planning/34 teardown) — the reverse of the cell-infra creates above, against the
+// same cell in the same agency project. Every one is idempotent: Google's 404 = already gone = ok.
+// A gcp-instance-delete job — remove ONE cell VM (the FIRST teardown step; everything else is in use
+// while a VM lives).
+const GCP_INSTANCE_DELETE_PARAMS = {
+  project: "dy-agency-proof",
+  zone: "australia-southeast1-a",
+  name: "dy-web-australia-southeast1-1",
+};
+function gcpInstanceDeleteJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-instance-delete",
+    params: JSON.stringify(GCP_INSTANCE_DELETE_PARAMS),
+    nonce: "88bb88bb88bb88bb88bb88bb88bb88bb",
+    ...overrides,
+  });
+}
+
+// A gcp-address-delete job — release the gateway's reserved static external IP (after the VMs).
+const GCP_ADDRESS_DELETE_PARAMS = {
+  project: "dy-agency-proof",
+  region: "australia-southeast1",
+  addressName: "dy-cell-gateway-ip",
+};
+function gcpAddressDeleteJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-address-delete",
+    params: JSON.stringify(GCP_ADDRESS_DELETE_PARAMS),
+    nonce: "99cc99cc99cc99cc99cc99cc99cc99cc",
+    ...overrides,
+  });
+}
+
+// A gcp-firewall-delete job — remove one cell firewall rule (GLOBAL, so no region).
+const GCP_FIREWALL_DELETE_PARAMS = {
+  project: "dy-agency-proof",
+  ruleName: "dy-cell-australia-southeast1-gw-ssh",
+};
+function gcpFirewallDeleteJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-firewall-delete",
+    params: JSON.stringify(GCP_FIREWALL_DELETE_PARAMS),
+    nonce: "aa11aa11aa11aa11aa11aa11aa11aa11",
+    ...overrides,
+  });
+}
+
+// A gcp-router-delete job — remove the cell's Cloud Router; its inline NAT goes with it.
+const GCP_ROUTER_DELETE_PARAMS = {
+  project: "dy-agency-proof",
+  region: "australia-southeast1",
+  routerName: "dy-cell-australia-southeast1-router",
+};
+function gcpRouterDeleteJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-router-delete",
+    params: JSON.stringify(GCP_ROUTER_DELETE_PARAMS),
+    nonce: "bb22bb22bb22bb22bb22bb22bb22bb22",
+    ...overrides,
+  });
+}
+
+// A gcp-network-delete job — remove the cell's VPC: the subnet FIRST, then the network.
+const GCP_NETWORK_DELETE_PARAMS = {
+  project: "dy-agency-proof",
+  region: "australia-southeast1",
+  networkName: "dy-cell-australia-southeast1",
+  subnetName: "dy-cell-australia-southeast1-subnet",
+};
+function gcpNetworkDeleteJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-network-delete",
+    params: JSON.stringify(GCP_NETWORK_DELETE_PARAMS),
+    nonce: "cc33cc33cc33cc33cc33cc33cc33cc33",
     ...overrides,
   });
 }
@@ -622,11 +705,16 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "db-import",
       "dns-record-upsert",
       "gcp-address-create",
+      "gcp-address-delete",
       "gcp-firewall-create",
+      "gcp-firewall-delete",
       "gcp-firewall-get",
       "gcp-instance-create",
+      "gcp-instance-delete",
       "gcp-instances-list",
       "gcp-network-create",
+      "gcp-network-delete",
+      "gcp-router-delete",
       "gcp-router-get",
       "gcp-router-nat-create",
       "provision-r2",
@@ -1571,6 +1659,233 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     const cases: Array<[Record<string, unknown>, RegExp]> = [
       [{ project: "Bad" }, /^project must be/],
       [{ namePrefix: "Bad" }, /^namePrefix must be/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  // ── the five teardown ops (twin of the app's rules) ───────────────────────────────
+  // Each delete reuses the SAME grammar as its create twin, because every value is still a URL path
+  // segment of a Compute call. So a name the create ops could never have produced can never be named
+  // for deletion either, and a verdict always names the offending field.
+
+  it("gcp-instance-delete: accepts valid params and returns ONLY the three known keys", () => {
+    expect(validateGcpInstanceDeleteParams({ ...GCP_INSTANCE_DELETE_PARAMS, extra: "x" })).toEqual({
+      ok: true,
+      params: GCP_INSTANCE_DELETE_PARAMS,
+    });
+    expect(validateGcpInstanceDeleteParams({ ...GCP_INSTANCE_DELETE_PARAMS, zone: "us-central1-b" }).ok).toBe(true);
+  });
+
+  it("gcp-instance-delete: rejects bad input field by field, and names the field", () => {
+    const bad = (overrides: Record<string, unknown>) =>
+      validateGcpInstanceDeleteParams({ ...GCP_INSTANCE_DELETE_PARAMS, ...overrides });
+
+    expect(validateGcpInstanceDeleteParams(null).ok).toBe(false);
+    expect(validateGcpInstanceDeleteParams("string").ok).toBe(false);
+    expect(validateGcpInstanceDeleteParams([]).ok).toBe(false);
+    expect(validateGcpInstanceDeleteParams({}).ok).toBe(false);
+    // project
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false); // uppercase
+    expect(bad({ project: "../dy-agency" }).ok).toBe(false); // traversal
+    expect(bad({ project: 42 }).ok).toBe(false);
+    // zone — a REGION is not a zone
+    expect(bad({ zone: undefined }).ok).toBe(false);
+    expect(bad({ zone: "australia-southeast1" }).ok).toBe(false);
+    expect(bad({ zone: "Australia-Southeast1-A" }).ok).toBe(false); // uppercase
+    expect(bad({ zone: "australia-southeast1-a/../.." }).ok).toBe(false); // traversal
+    expect(bad({ zone: "australia southeast1-a" }).ok).toBe(false); // space
+    expect(bad({ zone: `${"a".repeat(62)}-b1-c` }).ok).toBe(false); // over the length cap
+    // name
+    expect(bad({ name: undefined }).ok).toBe(false);
+    expect(bad({ name: "" }).ok).toBe(false);
+    expect(bad({ name: "Bad-Name" }).ok).toBe(false); // uppercase
+    expect(bad({ name: "1web" }).ok).toBe(false); // digit first
+    expect(bad({ name: "web-" }).ok).toBe(false); // hyphen last
+    expect(bad({ name: "a/b" }).ok).toBe(false); // path separator
+    expect(bad({ name: "dy-web-*" }).ok).toBe(false); // wildcard
+    expect(bad({ name: `a${"b".repeat(63)}` }).ok).toBe(false); // 64 chars
+    expect(bad({ name: 42 }).ok).toBe(false);
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ zone: "australia-southeast1" }, /^zone must be/],
+      [{ name: "Bad" }, /^name must be/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  it("gcp-address-delete: accepts valid params and returns ONLY the three known keys", () => {
+    expect(validateGcpAddressDeleteParams({ ...GCP_ADDRESS_DELETE_PARAMS, extra: "x" })).toEqual({
+      ok: true,
+      params: GCP_ADDRESS_DELETE_PARAMS,
+    });
+    expect(validateGcpAddressDeleteParams({ ...GCP_ADDRESS_DELETE_PARAMS, region: "europe-west4" }).ok).toBe(true);
+  });
+
+  it("gcp-address-delete: rejects bad input field by field, and names the field", () => {
+    const bad = (overrides: Record<string, unknown>) =>
+      validateGcpAddressDeleteParams({ ...GCP_ADDRESS_DELETE_PARAMS, ...overrides });
+
+    expect(validateGcpAddressDeleteParams(null).ok).toBe(false);
+    expect(validateGcpAddressDeleteParams([]).ok).toBe(false);
+    expect(validateGcpAddressDeleteParams({}).ok).toBe(false);
+    // project
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false);
+    // region — a ZONE is not a region
+    expect(bad({ region: undefined }).ok).toBe(false);
+    expect(bad({ region: "australia-southeast1-a" }).ok).toBe(false);
+    expect(bad({ region: "australia-southeast1/../.." }).ok).toBe(false);
+    expect(bad({ region: `${"a".repeat(62)}-b1` }).ok).toBe(false); // over the length cap
+    // addressName
+    expect(bad({ addressName: undefined }).ok).toBe(false);
+    expect(bad({ addressName: "" }).ok).toBe(false);
+    expect(bad({ addressName: "Bad-Name" }).ok).toBe(false);
+    expect(bad({ addressName: "ip-" }).ok).toBe(false);
+    expect(bad({ addressName: "a/b" }).ok).toBe(false);
+    expect(bad({ addressName: 42 }).ok).toBe(false);
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ region: "australia-southeast1-a" }, /^region must be/],
+      [{ addressName: "Bad" }, /^addressName must be/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  it("gcp-firewall-delete: accepts valid params and returns ONLY the two known keys (GLOBAL — no region)", () => {
+    expect(validateGcpFirewallDeleteParams({ ...GCP_FIREWALL_DELETE_PARAMS, extra: "x", region: "australia-southeast1" })).toEqual({
+      ok: true,
+      params: GCP_FIREWALL_DELETE_PARAMS,
+    });
+  });
+
+  it("gcp-firewall-delete: rejects bad input field by field, and names the field", () => {
+    const bad = (overrides: Record<string, unknown>) =>
+      validateGcpFirewallDeleteParams({ ...GCP_FIREWALL_DELETE_PARAMS, ...overrides });
+
+    expect(validateGcpFirewallDeleteParams(null).ok).toBe(false);
+    expect(validateGcpFirewallDeleteParams([]).ok).toBe(false);
+    expect(validateGcpFirewallDeleteParams({}).ok).toBe(false);
+    // project
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false);
+    expect(bad({ project: "dy-agency/x" }).ok).toBe(false);
+    // ruleName
+    expect(bad({ ruleName: undefined }).ok).toBe(false);
+    expect(bad({ ruleName: "" }).ok).toBe(false);
+    expect(bad({ ruleName: "Bad-Name" }).ok).toBe(false);
+    expect(bad({ ruleName: "rule-" }).ok).toBe(false);
+    expect(bad({ ruleName: "global/firewalls/rule" }).ok).toBe(false); // a path, not a name
+    expect(bad({ ruleName: `a${"b".repeat(63)}` }).ok).toBe(false);
+    expect(bad({ ruleName: 42 }).ok).toBe(false);
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ ruleName: "Bad" }, /^ruleName must be/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  it("gcp-router-delete: accepts valid params and returns ONLY the three known keys (the NAT needs no param)", () => {
+    expect(validateGcpRouterDeleteParams({ ...GCP_ROUTER_DELETE_PARAMS, extra: "x", natName: "dy-cell-nat" })).toEqual({
+      ok: true,
+      params: GCP_ROUTER_DELETE_PARAMS,
+    });
+  });
+
+  it("gcp-router-delete: rejects bad input field by field, and names the field", () => {
+    const bad = (overrides: Record<string, unknown>) =>
+      validateGcpRouterDeleteParams({ ...GCP_ROUTER_DELETE_PARAMS, ...overrides });
+
+    expect(validateGcpRouterDeleteParams(null).ok).toBe(false);
+    expect(validateGcpRouterDeleteParams([]).ok).toBe(false);
+    expect(validateGcpRouterDeleteParams({}).ok).toBe(false);
+    // project
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false);
+    // region — a ZONE is not a region
+    expect(bad({ region: undefined }).ok).toBe(false);
+    expect(bad({ region: "australia-southeast1-a" }).ok).toBe(false);
+    expect(bad({ region: "australia-southeast1?x=1" }).ok).toBe(false); // URL metachar
+    expect(bad({ region: `${"a".repeat(62)}-b1` }).ok).toBe(false); // over the length cap
+    // routerName
+    expect(bad({ routerName: undefined }).ok).toBe(false);
+    expect(bad({ routerName: "" }).ok).toBe(false);
+    expect(bad({ routerName: "Bad-Name" }).ok).toBe(false);
+    expect(bad({ routerName: "router-" }).ok).toBe(false);
+    expect(bad({ routerName: "a.b" }).ok).toBe(false);
+    expect(bad({ routerName: 42 }).ok).toBe(false);
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ region: "australia-southeast1-a" }, /^region must be/],
+      [{ routerName: "Bad" }, /^routerName must be/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  it("gcp-network-delete: accepts valid params and returns ONLY the four known keys (no ipCidr — a delete names no range)", () => {
+    expect(validateGcpNetworkDeleteParams({ ...GCP_NETWORK_DELETE_PARAMS, extra: "x", ipCidr: "10.20.0.0/24" })).toEqual({
+      ok: true,
+      params: GCP_NETWORK_DELETE_PARAMS,
+    });
+    expect(validateGcpNetworkDeleteParams({ ...GCP_NETWORK_DELETE_PARAMS, region: "us-central1" }).ok).toBe(true);
+  });
+
+  it("gcp-network-delete: rejects bad input field by field, and names the field", () => {
+    const bad = (overrides: Record<string, unknown>) =>
+      validateGcpNetworkDeleteParams({ ...GCP_NETWORK_DELETE_PARAMS, ...overrides });
+
+    expect(validateGcpNetworkDeleteParams(null).ok).toBe(false);
+    expect(validateGcpNetworkDeleteParams([]).ok).toBe(false);
+    expect(validateGcpNetworkDeleteParams({}).ok).toBe(false);
+    // project
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false);
+    // region — a ZONE is not a region
+    expect(bad({ region: undefined }).ok).toBe(false);
+    expect(bad({ region: "australia-southeast1-a" }).ok).toBe(false);
+    expect(bad({ region: `${"a".repeat(62)}-b1` }).ok).toBe(false); // over the length cap
+    // networkName / subnetName (resource-name grammar)
+    for (const field of ["networkName", "subnetName"]) {
+      expect(bad({ [field]: undefined }).ok).toBe(false);
+      expect(bad({ [field]: "" }).ok).toBe(false);
+      expect(bad({ [field]: "Bad-Name" }).ok).toBe(false); // uppercase
+      expect(bad({ [field]: "1net" }).ok).toBe(false); // digit first
+      expect(bad({ [field]: "net-" }).ok).toBe(false); // hyphen last
+      expect(bad({ [field]: "a/b" }).ok).toBe(false); // path separator
+      expect(bad({ [field]: "global/networks/dy-cell" }).ok).toBe(false); // a path, not a name
+      expect(bad({ [field]: `a${"b".repeat(63)}` }).ok).toBe(false); // 64 chars
+      expect(bad({ [field]: 42 }).ok).toBe(false);
+    }
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ region: "australia-southeast1-a" }, /^region must be/],
+      [{ networkName: "Bad" }, /^networkName must be/],
+      [{ subnetName: "Bad" }, /^subnetName must be/],
     ];
     for (const [overrides, expected] of cases) {
       const verdict = bad(overrides);
@@ -4527,6 +4842,514 @@ describe("POST /actuate route", () => {
       gcpFirewallCreateJob({ params: JSON.stringify(GCP_NETWORK_PARAMS) }),
       gcpAddressCreateJob({ params: JSON.stringify(GCP_FIREWALL_PARAMS) }),
       gcpRouterNatCreateJob({ params: JSON.stringify(GCP_ADDRESS_PARAMS) }),
+    ];
+    for (const job of jobs) {
+      const signature = await signAsApp(job, privateKey);
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+      expect(response.status).toBe(400);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+    }
+  });
+
+  // ── the five teardown (delete) ops through the registry ──────────────────────────────
+  // The mirror of the create ops: each DELETEs one Compute resource with the agency's OWN SA token
+  // and WAITS for the operation, so "deleted" means GONE (a later step fails with resourceInUse
+  // otherwise). Load-bearing assertions: a 404 is the idempotent "already-absent" SUCCESS with
+  // nothing to wait on; a 401/403 names the delete permission; gcp-instance-delete reports an
+  // unconfirmed operation with the DISCRIMINABLE `stillRunning: true` (never a detail-string match);
+  // and gcp-network-delete removes the SUBNET first and only then the network.
+
+  const GCP_ZONE_URL = `${GCP_PROJECT_URL}/zones/australia-southeast1-a`;
+  /** Google's 404 for a delete of a resource that is not there — the idempotent teardown success. */
+  function notFound404(resource: string) {
+    const message = `The resource '${resource}' was not found`;
+    return { status: 404, body: { error: { code: 404, message, errors: [{ reason: "notFound", message }] } } };
+  }
+
+  it("gcp-instance-delete: DELETEs the ZONAL VM and WAITS for its operation — ok:true deleted, agency SA only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-del-web", status: "RUNNING", operationType: "delete" } }, // instances.delete
+      { body: { name: "operation-del-web", status: "DONE" } }, // zoneOperations.wait
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const resultBody = await response.json();
+    expect(resultBody).toEqual({
+      ok: true,
+      op: "gcp-instance-delete",
+      instanceName: "dy-web-australia-southeast1-1",
+      status: "deleted",
+      operationName: "operation-del-web",
+    });
+    expect(JSON.stringify(resultBody)).not.toContain(GCP_ACCESS_TOKEN);
+
+    // The token mint asks for the FULL scope with the agency's SA identity.
+    const [tokenCall] = calls;
+    expect(tokenCall.url).toBe("https://oauth2.googleapis.com/token");
+    expect(jwtClaimsOf(tokenCall.form?.get("assertion") ?? "").scope).toBe(GOOGLE_SCOPE_CLOUD_PLATFORM);
+
+    const [deleteCall, waitCall] = computeCalls(calls);
+    expect(deleteCall.method).toBe("DELETE");
+    expect(deleteCall.url).toBe(`${GCP_ZONE_URL}/instances/dy-web-australia-southeast1-1`);
+    expect(deleteCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+    expect(deleteCall.body).toBeUndefined();
+    expect(waitCall.method).toBe("POST");
+    expect(waitCall.url).toBe(`${GCP_ZONE_URL}/operations/operation-del-web/wait`);
+    expect(computeCalls(calls)).toHaveLength(2);
+  });
+
+  it("gcp-instance-delete: a 404 is already-absent (ok:true) with NOTHING to wait on — the idempotent re-run path", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      notFound404("projects/dy-agency-proof/zones/australia-southeast1-a/instances/dy-web-australia-southeast1-1"),
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    // No operationName: nothing was deleted, so there is no operation to report.
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-instance-delete",
+      instanceName: "dy-web-australia-southeast1-1",
+      status: "already-absent",
+    });
+    expect(computeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-instance-delete: an operation still RUNNING after every bounded wait is ok:false with stillRunning:true (re-run to resume)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-del-web", status: "RUNNING" } },
+      { body: { name: "operation-del-web", status: "RUNNING" } },
+      { body: { name: "operation-del-web", status: "RUNNING" } },
+      { body: { name: "operation-del-web", status: "RUNNING" } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; op: string; instanceName: string; detail: string; stillRunning?: true };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-instance-delete");
+    expect(body.instanceName).toBe("dy-web-australia-southeast1-1");
+    // The DISCRIMINABLE field is the contract; the detail string is for humans only.
+    expect(body.stillRunning).toBe(true);
+    expect(body.detail).toMatch(/delete operation was still not DONE after 3 waits/);
+    // 1 delete + exactly 3 waits, then it stopped.
+    expect(computeCalls(calls)).toHaveLength(4);
+  });
+
+  it("gcp-instance-delete: a 2xx WITHOUT an operation is ok:false WITH stillRunning:true (unconfirmed, not an observed failure)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([{ body: {} }]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string; stillRunning?: true };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-instance-delete");
+    // Google may well have ACCEPTED this delete, so the caller must be able to re-run and resume.
+    expect(body.stillRunning).toBe(true);
+    expect(body.detail).toMatch(/HTTP 200 but no operation — cannot confirm the instance "dy-web-australia-southeast1-1" delete was accepted/);
+    // The delete was issued once; with no operation name there is nothing to wait on.
+    expect(computeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-instance-delete: an operation that FINISHES with errors is ok:false WITHOUT stillRunning (an observed failure, not an unconfirmed one)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-del-web", status: "RUNNING" } },
+      {
+        body: {
+          name: "operation-del-web",
+          status: "DONE",
+          error: { errors: [{ code: "RESOURCE_IN_USE_BY_ANOTHER_RESOURCE", message: "The instance is in use." }] },
+        },
+      },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body).not.toHaveProperty("stillRunning");
+    expect(body.detail).toMatch(/instance "dy-web-australia-southeast1-1" delete operation failed: The instance is in use/);
+    expect(computeCalls(calls)).toHaveLength(2);
+  });
+
+  it("gcp-instance-delete: a 403 is ok:false naming compute.instances.delete, token not echoed, NO wait", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([denied403("compute.instances.delete")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-instance-delete");
+    expect(body).not.toHaveProperty("stillRunning");
+    expect(body.detail).toMatch(/denied the instance "dy-web-australia-southeast1-1" delete \(HTTP 403\)/);
+    expect(body.detail).toContain("Required 'compute.instances.delete' permission");
+    expect(body.detail).toMatch(/roles\/compute\.instanceAdmin\.v1/);
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+    expect(computeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-address-delete: DELETEs the REGIONAL reservation and WAITS for its operation", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpAddressDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-del-ip", status: "RUNNING" } },
+      { body: { name: "operation-del-ip", status: "DONE" } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-address-delete",
+      addressName: "dy-cell-gateway-ip",
+      status: "deleted",
+    });
+    const [deleteCall, waitCall] = computeCalls(calls);
+    expect(deleteCall.method).toBe("DELETE");
+    expect(deleteCall.url).toBe(`${GCP_REGION_URL}/addresses/dy-cell-gateway-ip`);
+    expect(waitCall.url).toBe(`${GCP_REGION_URL}/operations/operation-del-ip/wait`);
+  });
+
+  it("gcp-address-delete: a 404 is already-absent (ok:true); a 403 names compute.addresses.delete", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpAddressDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([notFound404("projects/dy-agency-proof/regions/australia-southeast1/addresses/dy-cell-gateway-ip")]);
+
+    const absent = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await absent.json()).toEqual({
+      ok: true,
+      op: "gcp-address-delete",
+      addressName: "dy-cell-gateway-ip",
+      status: "already-absent",
+    });
+
+    vi.restoreAllMocks();
+    vi.setSystemTime(new Date(FREEZE_MS));
+    mockGcpApiQueue([denied403("compute.addresses.delete")]);
+    const denied = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await denied.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/denied the address "dy-cell-gateway-ip" delete \(HTTP 403\)/);
+    expect(body.detail).toContain("Required 'compute.addresses.delete' permission");
+  });
+
+  it("gcp-firewall-delete: DELETEs the GLOBAL rule and waits on the GLOBAL operation", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpFirewallDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-del-rule", status: "RUNNING" } },
+      { body: { name: "operation-del-rule", status: "DONE" } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-firewall-delete",
+      ruleName: "dy-cell-australia-southeast1-gw-ssh",
+      status: "deleted",
+    });
+    expect(computeCalls(calls).map((call) => call.url)).toEqual([
+      `${GCP_PROJECT_URL}/global/firewalls/dy-cell-australia-southeast1-gw-ssh`,
+      `${GCP_PROJECT_URL}/global/operations/operation-del-rule/wait`,
+    ]);
+  });
+
+  it("gcp-firewall-delete: a 404 is already-absent (ok:true); a 403 names compute.firewalls.delete", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpFirewallDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([notFound404("projects/dy-agency-proof/global/firewalls/dy-cell-australia-southeast1-gw-ssh")]);
+
+    const absent = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await absent.json()).toEqual({
+      ok: true,
+      op: "gcp-firewall-delete",
+      ruleName: "dy-cell-australia-southeast1-gw-ssh",
+      status: "already-absent",
+    });
+
+    vi.restoreAllMocks();
+    vi.setSystemTime(new Date(FREEZE_MS));
+    mockGcpApiQueue([denied403("compute.firewalls.delete")]);
+    const denied = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await denied.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/denied the firewall rule "dy-cell-australia-southeast1-gw-ssh" delete \(HTTP 403\)/);
+    expect(body.detail).toContain("Required 'compute.firewalls.delete' permission");
+    expect(body.detail).toMatch(/roles\/compute\.securityAdmin/);
+  });
+
+  it("gcp-router-delete: DELETEs the REGIONAL router (its inline NAT goes with it — no separate NAT call)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRouterDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-del-router", status: "RUNNING" } },
+      { body: { name: "operation-del-router", status: "DONE" } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-router-delete",
+      routerName: "dy-cell-australia-southeast1-router",
+      status: "deleted",
+    });
+    // Exactly the router delete + its wait — the NAT is a FIELD of the router, never its own call.
+    expect(computeCalls(calls).map((call) => call.url)).toEqual([
+      `${GCP_REGION_URL}/routers/dy-cell-australia-southeast1-router`,
+      `${GCP_REGION_URL}/operations/operation-del-router/wait`,
+    ]);
+  });
+
+  it("gcp-router-delete: a 404 is already-absent (ok:true); a 403 names compute.routers.delete", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRouterDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([notFound404("projects/dy-agency-proof/regions/australia-southeast1/routers/dy-cell-australia-southeast1-router")]);
+
+    const absent = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await absent.json()).toEqual({
+      ok: true,
+      op: "gcp-router-delete",
+      routerName: "dy-cell-australia-southeast1-router",
+      status: "already-absent",
+    });
+
+    vi.restoreAllMocks();
+    vi.setSystemTime(new Date(FREEZE_MS));
+    mockGcpApiQueue([denied403("compute.routers.delete")]);
+    const denied = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await denied.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/denied the router "dy-cell-australia-southeast1-router" delete \(HTTP 403\)/);
+    expect(body.detail).toContain("Required 'compute.routers.delete' permission");
+  });
+
+  it("gcp-network-delete: deletes the SUBNET first (waiting for it) and only THEN the network", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-del-subnet", status: "RUNNING" } }, // subnetworks.delete
+      { body: { name: "operation-del-subnet", status: "DONE" } }, // regionOperations.wait
+      { body: { name: "operation-del-net", status: "RUNNING" } }, // networks.delete
+      { body: { name: "operation-del-net", status: "DONE" } }, // globalOperations.wait
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-network-delete",
+      networkName: "dy-cell-australia-southeast1",
+      subnetName: "dy-cell-australia-southeast1-subnet",
+      subnetStatus: "deleted",
+      networkStatus: "deleted",
+    });
+    // The ORDER is the contract: a networks.delete with a live subnet is Google's resourceInUse.
+    const computed = computeCalls(calls);
+    expect(computed.map((call) => call.url)).toEqual([
+      `${GCP_REGION_URL}/subnetworks/dy-cell-australia-southeast1-subnet`,
+      `${GCP_REGION_URL}/operations/operation-del-subnet/wait`,
+      `${GCP_PROJECT_URL}/global/networks/dy-cell-australia-southeast1`,
+      `${GCP_PROJECT_URL}/global/operations/operation-del-net/wait`,
+    ]);
+    expect(computed.map((call) => call.method)).toEqual(["DELETE", "POST", "DELETE", "POST"]);
+  });
+
+  it("gcp-network-delete: BOTH already gone (404 + 404) is ok:true already-absent, with NO wait calls", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      notFound404("projects/dy-agency-proof/regions/australia-southeast1/subnetworks/dy-cell-australia-southeast1-subnet"),
+      notFound404("projects/dy-agency-proof/global/networks/dy-cell-australia-southeast1"),
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-network-delete",
+      networkName: "dy-cell-australia-southeast1",
+      subnetName: "dy-cell-australia-southeast1-subnet",
+      subnetStatus: "already-absent",
+      networkStatus: "already-absent",
+    });
+    expect(computeCalls(calls).map((call) => call.url)).toEqual([
+      `${GCP_REGION_URL}/subnetworks/dy-cell-australia-southeast1-subnet`,
+      `${GCP_PROJECT_URL}/global/networks/dy-cell-australia-southeast1`,
+    ]);
+  });
+
+  it("gcp-network-delete: a re-run that already removed the subnet still removes the network (mixed statuses)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([
+      notFound404("projects/dy-agency-proof/regions/australia-southeast1/subnetworks/dy-cell-australia-southeast1-subnet"),
+      { body: { name: "operation-del-net", status: "RUNNING" } },
+      { body: { name: "operation-del-net", status: "DONE" } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; subnetStatus: string; networkStatus: string };
+    expect(body.ok).toBe(true);
+    expect(body.subnetStatus).toBe("already-absent");
+    expect(body.networkStatus).toBe("deleted");
+  });
+
+  it("gcp-network-delete: a FAILED subnet delete stops the op — the network delete is never issued", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    // Google's answer while something (a VM) still holds the subnet.
+    const calls = mockGcpApiQueue([
+      {
+        status: 400,
+        body: { error: { code: 400, message: "The subnetwork resource is already being used", errors: [{ reason: "resourceInUse" }] } },
+      },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; op: string; networkName: string; subnetName: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-network-delete");
+    expect(body.networkName).toBe("dy-cell-australia-southeast1");
+    expect(body.subnetName).toBe("dy-cell-australia-southeast1-subnet");
+    expect(body.detail).toMatch(/subnetwork "dy-cell-australia-southeast1-subnet" delete failed with HTTP 400: .*already being used/);
+    expect(computeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-network-delete: an UNCONFIRMED subnet delete also stops the op — the network is never deleted under a live subnet", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      { body: { name: "operation-del-subnet", status: "RUNNING" } },
+      { body: { name: "operation-del-subnet", status: "RUNNING" } },
+      { body: { name: "operation-del-subnet", status: "RUNNING" } },
+      { body: { name: "operation-del-subnet", status: "RUNNING" } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/subnetwork "dy-cell-australia-southeast1-subnet" delete operation was still not DONE after 3 waits/);
+    // 1 subnet delete + exactly 3 waits — the network delete never ran.
+    expect(computeCalls(calls)).toHaveLength(4);
+  });
+
+  it("gcp-network-delete: a 403 on the SUBNET delete names compute.subnetworks.delete and issues no network delete", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([denied403("compute.subnetworks.delete")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/denied the subnetwork "dy-cell-australia-southeast1-subnet" delete \(HTTP 403\)/);
+    expect(body.detail).toContain("Required 'compute.subnetworks.delete' permission");
+    expect(computeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-network-delete: a 403 on the NETWORK delete names compute.networks.delete (the subnet already went)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpNetworkDeleteJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([
+      notFound404("projects/dy-agency-proof/regions/australia-southeast1/subnetworks/dy-cell-australia-southeast1-subnet"),
+      denied403("compute.networks.delete"),
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/denied the network "dy-cell-australia-southeast1" delete \(HTTP 403\)/);
+    expect(body.detail).toContain("Required 'compute.networks.delete' permission");
+    expect(body.detail).toMatch(/roles\/compute\.networkAdmin/);
+  });
+
+  it("the five teardown ops REJECT a project that is not the SA key's own project — ZERO GCP calls", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const otherProjectKey = await makeServiceAccountKey("some-other-project");
+    const jobs = [
+      gcpInstanceDeleteJob(),
+      gcpAddressDeleteJob(),
+      gcpFirewallDeleteJob(),
+      gcpRouterDeleteJob(),
+      gcpNetworkDeleteJob(),
+    ];
+    for (const job of jobs) {
+      const signature = await signAsApp(job, privateKey);
+      const calls = mockGcpApiQueue([{ body: { name: "operation-should-not-happen", status: "RUNNING" } }]);
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: otherProjectKey }));
+      const body = (await response.json()) as { ok: boolean; detail: string };
+      expect(body.ok).toBe(false);
+      expect(body.detail).toMatch(/own project/);
+      expect(calls).toHaveLength(0);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("the five teardown ops report a clean failure and touch NO API when GCP_SERVICE_ACCOUNT_KEY is missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const jobs = [
+      gcpInstanceDeleteJob(),
+      gcpAddressDeleteJob(),
+      gcpFirewallDeleteJob(),
+      gcpRouterDeleteJob(),
+      gcpNetworkDeleteJob(),
+    ];
+    for (const job of jobs) {
+      const signature = await signAsApp(job, privateKey);
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      // Every OTHER agency credential is present — none may be used as a substitute.
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { ok: boolean; detail: string };
+      expect(body.ok).toBe(false);
+      expect(body.detail).toMatch(/GCP_SERVICE_ACCOUNT_KEY is not configured/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("the teardown ops given another op's params are 400 with NO Google call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const jobs = [
+      // No zone / name.
+      gcpInstanceDeleteJob({ params: JSON.stringify(GCP_ADDRESS_DELETE_PARAMS) }),
+      // No addressName.
+      gcpAddressDeleteJob({ params: JSON.stringify(GCP_ROUTER_DELETE_PARAMS) }),
+      // No ruleName.
+      gcpFirewallDeleteJob({ params: JSON.stringify(GCP_NETWORK_DELETE_PARAMS) }),
+      // No routerName.
+      gcpRouterDeleteJob({ params: JSON.stringify(GCP_INSTANCE_DELETE_PARAMS) }),
+      // No networkName / subnetName.
+      gcpNetworkDeleteJob({ params: JSON.stringify(GCP_ADDRESS_DELETE_PARAMS) }),
     ];
     for (const job of jobs) {
       const signature = await signAsApp(job, privateKey);

@@ -1127,6 +1127,217 @@ export function validateGcpInstancesListParams(raw: unknown): ParamsVerdict<GcpI
   return { ok: true, params: { project, namePrefix } };
 }
 
+// ── GCP teardown ops (the five deletes) ──────────────────────────────────────────────
+// The reverse of the cell-infra create ops above: everything a cell teardown removes (planning/34
+// teardown). Each delete reuses the SAME grammar as its create twin, because every value is still a
+// URL path segment of a Compute Engine call — the grammar IS the injection guard, and a name these
+// ops could never have created can never be named for deletion either.
+//
+// ALL FIVE ARE IDEMPOTENT: Google answers a delete of a resource that is not there with 404
+// notFound, which the actuators report as success ("already-absent"). That is what lets a re-run of
+// a partly-torn-down cell RESUME rather than fail on what it already removed.
+//
+// A caller cannot ask these ops to delete an arbitrary resource by accident of naming alone: the
+// platform derives every name from the cell's fixed naming scheme before it signs the job. These
+// validators are the second guard — shape + grammar — not the first.
+
+// ── gcp-instance-delete ──────────────────────────────────────────────────────────────
+// Delete ONE Compute Engine VM in the AGENCY's own project (planning/34 teardown). This is the FIRST
+// teardown step: while a VM is alive its subnet, its reserved IP and its network are all in use, so
+// every later delete would fail with Google's resourceInUse. Three REQUIRED strings:
+//   1. `project` — the project id (the actuator pins it to the SA key's own project).
+//   2. `zone`    — the Compute zone the VM lives in, e.g. australia-southeast1-a (a URL path segment).
+//   3. `name`    — the instance's resource name.
+// The file node's DATA DISK is deliberately NOT removed with the VM: gcp-instance-create attaches it
+// with autoDelete:false because it holds the sites' files, so it survives as an orphaned disk for an
+// operator to deal with. Only the boot disk goes with the VM.
+//
+// IDEMPOTENT: a 404 notFound is reported as "already-absent", so a re-run resumes.
+
+export interface GcpInstanceDeleteParams {
+  /** The agency's GCP project id the VM lives in. */
+  project: string;
+  /** The Compute Engine zone of the VM, e.g. "australia-southeast1-a". */
+  zone: string;
+  /** The instance's resource name. */
+  name: string;
+}
+
+export function validateGcpInstanceDeleteParams(raw: unknown): ParamsVerdict<GcpInstanceDeleteParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, zone, name } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof zone !== "string" || zone.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a Compute Engine zone name (e.g. australia-southeast1-a)" };
+  }
+  if (typeof name !== "string" || !GCP_RESOURCE_NAME_RE.test(name)) {
+    return { ok: false, reason: `name ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, zone, name } };
+}
+
+// ── gcp-address-delete ───────────────────────────────────────────────────────────────
+// Release the cell gateway's reserved regional static external IP in the AGENCY's own project
+// (planning/34 teardown). Runs AFTER the VMs: a reservation attached to a live VM is in use and
+// Google refuses to release it. Three REQUIRED strings, the same three gcp-address-create takes:
+// `project` (pinned to the SA key's own project by the actuator), `region` (a URL path segment) and
+// `addressName` (a resource name).
+//
+// IDEMPOTENT: a 404 notFound is reported as "already-absent".
+
+export interface GcpAddressDeleteParams {
+  /** The agency's GCP project id the reservation lives in. */
+  project: string;
+  /** The Compute Engine region of the reservation, e.g. "australia-southeast1". */
+  region: string;
+  /** The reserved address's resource name. */
+  addressName: string;
+}
+
+export function validateGcpAddressDeleteParams(raw: unknown): ParamsVerdict<GcpAddressDeleteParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region, addressName } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast1)" };
+  }
+  if (typeof addressName !== "string" || !GCP_RESOURCE_NAME_RE.test(addressName)) {
+    return { ok: false, reason: `addressName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, region, addressName } };
+}
+
+// ── gcp-firewall-delete ──────────────────────────────────────────────────────────────
+// Delete ONE firewall rule from a cell's VPC in the AGENCY's own project (planning/34 teardown — a
+// network delete fails while any rule still attaches to it). Firewalls are GLOBAL resources, so
+// there is NO region: two REQUIRED strings, `project` (pinned to the SA key's own project by the
+// actuator) and `ruleName` (a resource name) — the same pair gcp-firewall-get takes.
+//
+// IDEMPOTENT: a 404 notFound is reported as "already-absent".
+
+export interface GcpFirewallDeleteParams {
+  /** The agency's GCP project id the rule lives in. */
+  project: string;
+  /** The firewall rule's resource name. */
+  ruleName: string;
+}
+
+export function validateGcpFirewallDeleteParams(raw: unknown): ParamsVerdict<GcpFirewallDeleteParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, ruleName } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof ruleName !== "string" || !GCP_RESOURCE_NAME_RE.test(ruleName)) {
+    return { ok: false, reason: `ruleName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, ruleName } };
+}
+
+// ── gcp-router-delete ────────────────────────────────────────────────────────────────
+// Delete the cell's regional Cloud Router in the AGENCY's own project (planning/34 teardown). The
+// inline Cloud NAT goes WITH it: the NAT is a FIELD of the router, not a resource of its own, so
+// there is deliberately no separate NAT delete op — the mirror of gcp-router-nat-create, which
+// creates both in one insert. Three REQUIRED strings: `project` (pinned to the SA key's own project
+// by the actuator), `region` (a URL path segment — a router is regional) and `routerName`.
+//
+// IDEMPOTENT: a 404 notFound is reported as "already-absent".
+
+export interface GcpRouterDeleteParams {
+  /** The agency's GCP project id the router lives in. */
+  project: string;
+  /** The Compute Engine region of the router, e.g. "australia-southeast1". */
+  region: string;
+  /** The Cloud Router's resource name (its inline NAT is deleted with it). */
+  routerName: string;
+}
+
+export function validateGcpRouterDeleteParams(raw: unknown): ParamsVerdict<GcpRouterDeleteParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region, routerName } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast1)" };
+  }
+  if (typeof routerName !== "string" || !GCP_RESOURCE_NAME_RE.test(routerName)) {
+    return { ok: false, reason: `routerName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, region, routerName } };
+}
+
+// ── gcp-network-delete ───────────────────────────────────────────────────────────────
+// Delete a cell's dedicated VPC in the AGENCY's own project: its ONE regional subnet FIRST, then the
+// network itself (planning/34 teardown). ONE op for both, because the order is not optional — a
+// networks.delete while the subnet still exists is Google's resourceInUse. The exact mirror of
+// gcp-network-create, which creates the network then the subnet. Four REQUIRED strings:
+//   1. `project`     — the project id (pinned to the SA key's own project by the actuator).
+//   2. `region`      — the subnet's Compute region (a URL path segment; the network is global).
+//   3. `networkName` — the VPC's resource name.
+//   4. `subnetName`  — the subnet's resource name.
+//
+// IDEMPOTENT: a 404 notFound on EITHER delete is reported as that resource's "already-absent", so a
+// re-run that already removed the subnet still goes on to remove the network.
+
+export interface GcpNetworkDeleteParams {
+  /** The agency's GCP project id the VPC lives in. */
+  project: string;
+  /** The Compute Engine region of the subnet, e.g. "australia-southeast1". */
+  region: string;
+  /** The custom-mode VPC network's name. */
+  networkName: string;
+  /** The regional subnetwork's name — deleted BEFORE the network. */
+  subnetName: string;
+}
+
+export function validateGcpNetworkDeleteParams(raw: unknown): ParamsVerdict<GcpNetworkDeleteParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region, networkName, subnetName } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast1)" };
+  }
+  if (typeof networkName !== "string" || !GCP_RESOURCE_NAME_RE.test(networkName)) {
+    return { ok: false, reason: `networkName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+  if (typeof subnetName !== "string" || !GCP_RESOURCE_NAME_RE.test(subnetName)) {
+    return { ok: false, reason: `subnetName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, region, networkName, subnetName } };
+}
+
 // ── provision-ssh-keys ───────────────────────────────────────────────────────────────
 // Declare the FULL set of authorized SSH public keys for a cell site's shell login on the
 // gateway (planning/39 — cell SSH access, increment 1). This is the per-ACCOUNT key spine:

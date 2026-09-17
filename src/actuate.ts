@@ -35,6 +35,11 @@ import type {
   GcpFirewallGetParams,
   GcpRouterGetParams,
   GcpInstancesListParams,
+  GcpInstanceDeleteParams,
+  GcpAddressDeleteParams,
+  GcpFirewallDeleteParams,
+  GcpRouterDeleteParams,
+  GcpNetworkDeleteParams,
   ProvisionSshKeysParams,
 } from "./dispatch-params.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
@@ -149,6 +154,49 @@ export type GcpInstancesListResult =
   | { ok: true; op: "gcp-instances-list"; instances: Array<{ name: string; zone: string }> }
   | { ok: false; op: "gcp-instances-list"; detail: string };
 
+// The IDEMPOTENT teardown ops report, per resource, whether THIS run deleted it or found it already
+// gone (Google's 404 notFound) — the teardown mirror of the create ops' created | already-existed.
+export type GcpDeleteStatus = "deleted" | "already-absent";
+
+// "deleted" means the Worker WAITED for the delete Operation to reach DONE, so the VM is GONE on
+// return — a later subnet delete fails with resourceInUse while a VM is still alive, so this op must
+// confirm, not merely accept. `operationName` is the delete Operation (absent when the VM was
+// already gone — there was nothing to delete and nothing to wait on).
+//
+// `stillRunning` (ok:false ONLY) is set when Google ACCEPTED the delete but its operation did not
+// reach DONE inside the bounded wait (or the wait poll itself could not be completed). A
+// DISCRIMINABLE field, like gcp-instance-create's `exhausted` — the caller reports "re-run to
+// resume" off this field, NEVER off a string match on `detail`. Absent on every other failure.
+export type GcpInstanceDeleteResult =
+  | { ok: true; op: "gcp-instance-delete"; instanceName: string; status: GcpDeleteStatus; operationName?: string }
+  | { ok: false; op: "gcp-instance-delete"; instanceName: string; detail: string; stillRunning?: true };
+
+export type GcpAddressDeleteResult =
+  | { ok: true; op: "gcp-address-delete"; addressName: string; status: GcpDeleteStatus }
+  | { ok: false; op: "gcp-address-delete"; addressName: string; detail: string };
+
+export type GcpFirewallDeleteResult =
+  | { ok: true; op: "gcp-firewall-delete"; ruleName: string; status: GcpDeleteStatus }
+  | { ok: false; op: "gcp-firewall-delete"; ruleName: string; detail: string };
+
+// One delete, one status: the inline Cloud NAT is a field of the router, so it goes with it.
+export type GcpRouterDeleteResult =
+  | { ok: true; op: "gcp-router-delete"; routerName: string; status: GcpDeleteStatus }
+  | { ok: false; op: "gcp-router-delete"; routerName: string; detail: string };
+
+// Two resources, two statuses — the subnet is deleted (and confirmed) FIRST, then the network, so a
+// caller sees exactly which of the two this run removed and which was already gone.
+export type GcpNetworkDeleteResult =
+  | {
+      ok: true;
+      op: "gcp-network-delete";
+      networkName: string;
+      subnetName: string;
+      subnetStatus: GcpDeleteStatus;
+      networkStatus: GcpDeleteStatus;
+    }
+  | { ok: false; op: "gcp-network-delete"; networkName: string; subnetName: string; detail: string };
+
 // Deliberately SMALL: the authorized_keys file lives ON the gateway; nothing sensitive comes back.
 // `count` echoes how many key lines the gateway wrote (0 = the set was revoked), so the caller can
 // confirm the whole desired set landed without the Worker re-reading the file.
@@ -171,6 +219,11 @@ export type ActuateResult =
   | GcpFirewallGetResult
   | GcpRouterGetResult
   | GcpInstancesListResult
+  | GcpInstanceDeleteResult
+  | GcpAddressDeleteResult
+  | GcpFirewallDeleteResult
+  | GcpRouterDeleteResult
+  | GcpNetworkDeleteResult
   | ProvisionSshKeysResult;
 
 interface CloudflareEnvelope {
@@ -1690,15 +1743,20 @@ type ComputeOperationWaitOutcome =
  * `maxAttempts` wait calls (default GCP_OPERATION_WAIT_ATTEMPTS). The instance-create zone-fallback
  * path passes a SMALL value so a still-running insert falls back to async-ok quickly rather than
  * blocking the sync endpoint (see actuateGcpInstanceCreate).
+ *
+ * `verb` only names the ACTION in the detail strings ("create" by default, "delete" for the teardown
+ * ops) so a teardown failure reads as a delete failure. It changes no behaviour.
  */
 async function waitForComputeOperation(input: {
   waitUrl: string;
   accessToken: string;
   what: string;
   maxAttempts?: number;
+  verb?: string;
 }): Promise<ComputeOperationWaitOutcome> {
   const { waitUrl, accessToken, what } = input;
   const maxAttempts = input.maxAttempts ?? GCP_OPERATION_WAIT_ATTEMPTS;
+  const verb = input.verb ?? "create";
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     let response: Response;
@@ -1707,7 +1765,7 @@ async function waitForComputeOperation(input: {
     } catch (err) {
       return {
         ok: false,
-        detail: `could not reach Google Compute Engine while waiting for the ${what} create to finish: ${errorMessage(err)}`,
+        detail: `could not reach Google Compute Engine while waiting for the ${what} ${verb} to finish: ${errorMessage(err)}`,
         completed: false,
         errorCodes: [],
       };
@@ -1716,7 +1774,7 @@ async function waitForComputeOperation(input: {
     if (!response.ok) {
       return {
         ok: false,
-        detail: `waiting for the ${what} create to finish failed with HTTP ${response.status}${googleErrorMessage(body)}.`,
+        detail: `waiting for the ${what} ${verb} to finish failed with HTTP ${response.status}${googleErrorMessage(body)}.`,
         completed: false,
         errorCodes: [],
       };
@@ -1731,7 +1789,7 @@ async function waitForComputeOperation(input: {
         .filter((code): code is string => typeof code === "string" && code.length > 0);
       return {
         ok: false,
-        detail: `${what} create operation failed: ${operationErrorMessages(operationErrors)}.`,
+        detail: `${what} ${verb} operation failed: ${operationErrorMessages(operationErrors)}.`,
         completed: true,
         errorCodes,
       };
@@ -1741,10 +1799,123 @@ async function waitForComputeOperation(input: {
 
   return {
     ok: false,
-    detail: `the ${what} create operation was still not DONE after ${maxAttempts} waits — re-run to resume once it finishes.`,
+    detail: `the ${what} ${verb} operation was still not DONE after ${maxAttempts} waits — re-run to resume once it finishes.`,
     completed: false,
     errorCodes: [],
   };
+}
+
+// ── GCP shared: idempotent delete ───────────────────────────────────────────────────────────
+// The teardown ops (planning/34 teardown) are the mirror of the create ops above and are IDEMPOTENT
+// the other way round: Google answers a delete of a resource that is not there with 404 notFound,
+// which is reported as success ("already-absent") so a re-run of a partly-torn-down cell resumes.
+
+/** How a Compute Engine delete of a teardown resource ended. */
+type ComputeDeleteOutcome =
+  | { kind: "deleted"; operationName: string }
+  | { kind: "already-absent" }
+  // `unconfirmed` is true ONLY when Google ACCEPTED the delete but the wait could not confirm the
+  // operation reached DONE (still running at the bound, or the wait poll itself failed). The
+  // resource may well be on its way out, so the caller must say "re-run to resume" rather than
+  // treat it as gone — gcp-instance-delete surfaces exactly this as `stillRunning: true`.
+  | { kind: "failed"; detail: string; unconfirmed: boolean };
+
+/**
+ * DELETE one Compute Engine resource and WAIT for its operation to finish. The twin of
+ * insertComputeResource, with the same failure vocabulary (unreachable / 401-403 with a permission
+ * hint / any other non-2xx carrying Google's own message).
+ *
+ * Two things differ from the insert side:
+ *   1. A 404 is SUCCESS ("already-absent"), not a failure. That is what makes teardown resumable —
+ *      a re-run must converge, not fail on what it already removed. There is no operation to wait on.
+ *   2. The wait is NOT optional. Google rejects a subnet delete with resourceInUse while an instance
+ *      still holds it, and a network delete the same way while its subnet lives, so each step must be
+ *      CONFIRMED gone before the caller runs the next. "deleted" therefore means the resource is
+ *      gone, not merely that Google accepted the delete.
+ *
+ * `url` is built by the caller from grammar-checked, encodeURIComponent'd segments; `waitUrlBase` is
+ * the ".../operations" collection for this delete's SCOPE (zonal / regional / global), which the
+ * operation name is appended to. `what` names the resource for detail strings; `permissionHint`
+ * names what a 403 most likely lacks.
+ */
+async function deleteComputeResource(input: {
+  url: string;
+  waitUrlBase: string;
+  accessToken: string;
+  what: string;
+  project: string;
+  permissionHint: string;
+}): Promise<ComputeDeleteOutcome> {
+  const { url, waitUrlBase, accessToken, what, project, permissionHint } = input;
+
+  // Default redirect handling, NOT redirect:"error" — workerd throws on that value at runtime.
+  let response: Response;
+  try {
+    response = await fetch(url, { method: "DELETE", headers: gcpHeaders(accessToken) });
+  } catch (err) {
+    return {
+      kind: "failed",
+      detail: `could not reach Google Compute Engine to delete ${what}: ${errorMessage(err)}`,
+      unconfirmed: false,
+    };
+  }
+
+  const body = (await response.json().catch(() => null)) as ComputeInsertResponse | null;
+
+  if (response.status === 404) {
+    return { kind: "already-absent" };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return {
+      kind: "failed",
+      detail:
+        `Google Cloud denied the ${what} delete (HTTP ${response.status})${googleErrorMessage(body)} — the service account ` +
+        `needs ${permissionHint} on project "${project}".`,
+      unconfirmed: false,
+    };
+  }
+  if (!response.ok) {
+    return {
+      kind: "failed",
+      detail: `${what} delete failed with HTTP ${response.status}${googleErrorMessage(body)}.`,
+      unconfirmed: false,
+    };
+  }
+
+  // A 2xx must carry an Operation; its ABSENCE means we cannot confirm Google accepted the delete.
+  // `unconfirmed` becomes the caller's `stillRunning`, so it MUST be true here: a 2xx with no
+  // Operation may well mean Google DID accept the delete and it is running. Reporting it as an
+  // observed hard failure would be a lie, and it would tell the operator the teardown is terminal
+  // when the right move is to re-run and resume (review FIX 5).
+  const operationName = body?.name;
+  if (!operationName) {
+    return {
+      kind: "failed",
+      detail: `Compute Engine returned HTTP ${response.status} but no operation — cannot confirm the ${what} delete was accepted.`,
+      unconfirmed: true,
+    };
+  }
+  const operationErrors = body?.error?.errors ?? [];
+  if (operationErrors.length > 0) {
+    return {
+      kind: "failed",
+      detail: `${what} delete operation ${operationName} failed: ${operationErrorMessages(operationErrors)}.`,
+      unconfirmed: false,
+    };
+  }
+
+  const waited = await waitForComputeOperation({
+    waitUrl: `${waitUrlBase}/${encodeURIComponent(operationName)}/wait`,
+    accessToken,
+    what,
+    verb: "delete",
+  });
+  if (waited.ok) {
+    return { kind: "deleted", operationName };
+  }
+  // completed:true = the operation finished CARRYING errors (a real, observed delete failure).
+  // completed:false = we could not observe the outcome at all (see ComputeDeleteOutcome).
+  return { kind: "failed", detail: waited.detail, unconfirmed: !waited.completed };
 }
 
 // ── gcp-network-create ───────────────────────────────────────────────────────────────────
@@ -2307,4 +2478,224 @@ export async function readComputeInstancesList(params: GcpInstancesListParams, e
   // More pages remained after the bound. Fail closed (see the header note): the caller must not treat
   // a truncated list as "these are all the VMs" or it could create a duplicate in a new zone.
   return failure(`listing instances did not complete within ${GCP_AGGREGATED_LIST_MAX_PAGES} pages — re-run to resume`);
+}
+
+// ── gcp-instance-delete ──────────────────────────────────────────────────────────────────────
+// Delete ONE cell VM in the agency's own project — the FIRST teardown step (planning/34 teardown).
+// The wait is load-bearing here: a subnet delete fails with Google's resourceInUse while a VM still
+// holds it, so this op must confirm the VM is GONE, not merely that Google accepted the delete. When
+// the wait cannot confirm DONE, the result carries `stillRunning: true` so the caller reports
+// "re-run to resume" off a field, never off the detail string.
+//
+// The file node's DATA DISK survives on purpose (gcp-instance-create attaches it autoDelete:false —
+// it holds the sites' files), so this op leaves an orphaned disk behind by design.
+
+export async function actuateGcpInstanceDelete(
+  params: GcpInstanceDeleteParams,
+  env: Env,
+): Promise<GcpInstanceDeleteResult> {
+  const { project, zone } = params;
+  const instanceName = params.name;
+  const failure = (detail: string): GcpInstanceDeleteResult => ({
+    ok: false,
+    op: "gcp-instance-delete",
+    instanceName,
+    detail,
+  });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  // Path segments are grammar-checked upstream AND URL-encoded here.
+  const zonePath =
+    `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}` +
+    `/zones/${encodeURIComponent(zone)}`;
+
+  const outcome = await deleteComputeResource({
+    url: `${zonePath}/instances/${encodeURIComponent(instanceName)}`,
+    waitUrlBase: `${zonePath}/operations`,
+    accessToken: token.accessToken,
+    what: `instance "${instanceName}"`,
+    project,
+    permissionHint: "compute.instances.delete (e.g. roles/compute.instanceAdmin.v1)",
+  });
+  if (outcome.kind === "failed" && outcome.unconfirmed) {
+    return { ok: false, op: "gcp-instance-delete", instanceName, detail: outcome.detail, stillRunning: true };
+  }
+  if (outcome.kind === "failed") {
+    return failure(outcome.detail);
+  }
+  if (outcome.kind === "already-absent") {
+    // Nothing was deleted, so there is no operation to report.
+    return { ok: true, op: "gcp-instance-delete", instanceName, status: "already-absent" };
+  }
+  return { ok: true, op: "gcp-instance-delete", instanceName, status: "deleted", operationName: outcome.operationName };
+}
+
+// ── gcp-address-delete ───────────────────────────────────────────────────────────────────────
+// Release the cell gateway's reserved regional static external IP (planning/34 teardown). Runs AFTER
+// the VMs: a reservation attached to a live VM is in use and Google refuses to release it.
+
+export async function actuateGcpAddressDelete(
+  params: GcpAddressDeleteParams,
+  env: Env,
+): Promise<GcpAddressDeleteResult> {
+  const { project, region, addressName } = params;
+  const failure = (detail: string): GcpAddressDeleteResult => ({ ok: false, op: "gcp-address-delete", addressName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  // Path segments are grammar-checked upstream AND URL-encoded here.
+  const regionPath =
+    `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}` +
+    `/regions/${encodeURIComponent(region)}`;
+
+  const outcome = await deleteComputeResource({
+    url: `${regionPath}/addresses/${encodeURIComponent(addressName)}`,
+    waitUrlBase: `${regionPath}/operations`,
+    accessToken: token.accessToken,
+    what: `address "${addressName}"`,
+    project,
+    permissionHint: "compute.addresses.delete (e.g. roles/compute.networkAdmin)",
+  });
+  if (outcome.kind === "failed") {
+    return failure(outcome.detail);
+  }
+  return { ok: true, op: "gcp-address-delete", addressName, status: outcome.kind };
+}
+
+// ── gcp-firewall-delete ──────────────────────────────────────────────────────────────────────
+// Delete ONE firewall rule from the cell's VPC (planning/34 teardown) — a network delete fails while
+// any rule still attaches to it. Firewalls are GLOBAL, so the path has no region.
+
+export async function actuateGcpFirewallDelete(
+  params: GcpFirewallDeleteParams,
+  env: Env,
+): Promise<GcpFirewallDeleteResult> {
+  const { project, ruleName } = params;
+  const failure = (detail: string): GcpFirewallDeleteResult => ({ ok: false, op: "gcp-firewall-delete", ruleName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  // Path segments are grammar-checked upstream AND URL-encoded here.
+  const projectPath = `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}`;
+
+  const outcome = await deleteComputeResource({
+    url: `${projectPath}/global/firewalls/${encodeURIComponent(ruleName)}`,
+    waitUrlBase: `${projectPath}/global/operations`,
+    accessToken: token.accessToken,
+    what: `firewall rule "${ruleName}"`,
+    project,
+    permissionHint: "compute.firewalls.delete (e.g. roles/compute.securityAdmin)",
+  });
+  if (outcome.kind === "failed") {
+    return failure(outcome.detail);
+  }
+  return { ok: true, op: "gcp-firewall-delete", ruleName, status: outcome.kind };
+}
+
+// ── gcp-router-delete ────────────────────────────────────────────────────────────────────────
+// Delete the cell's regional Cloud Router (planning/34 teardown). The inline Cloud NAT goes WITH it —
+// a NAT is a field of the router, not a resource of its own, so there is no separate NAT delete op
+// (the mirror of gcp-router-nat-create, which creates both in one insert).
+
+export async function actuateGcpRouterDelete(
+  params: GcpRouterDeleteParams,
+  env: Env,
+): Promise<GcpRouterDeleteResult> {
+  const { project, region, routerName } = params;
+  const failure = (detail: string): GcpRouterDeleteResult => ({ ok: false, op: "gcp-router-delete", routerName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  // Path segments are grammar-checked upstream AND URL-encoded here.
+  const regionPath =
+    `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}` +
+    `/regions/${encodeURIComponent(region)}`;
+
+  const outcome = await deleteComputeResource({
+    url: `${regionPath}/routers/${encodeURIComponent(routerName)}`,
+    waitUrlBase: `${regionPath}/operations`,
+    accessToken: token.accessToken,
+    what: `router "${routerName}"`,
+    project,
+    permissionHint: "compute.routers.delete (e.g. roles/compute.networkAdmin)",
+  });
+  if (outcome.kind === "failed") {
+    return failure(outcome.detail);
+  }
+  return { ok: true, op: "gcp-router-delete", routerName, status: outcome.kind };
+}
+
+// ── gcp-network-delete ───────────────────────────────────────────────────────────────────────
+// Delete the cell's VPC: the SUBNET first, then the network (planning/34 teardown). ONE op for both,
+// because the order is not optional — a networks.delete while the subnet still exists is Google's
+// resourceInUse. The exact mirror of gcp-network-create, which creates the network then the subnet.
+// Each delete is WAITED to DONE inside deleteComputeResource, so the network delete only starts once
+// the subnet is really gone.
+//
+// A failure on the subnet stops the op: the network delete is NOT attempted, because it would fail
+// anyway and the caller re-runs the whole op to resume (both halves are idempotent).
+
+export async function actuateGcpNetworkDelete(
+  params: GcpNetworkDeleteParams,
+  env: Env,
+): Promise<GcpNetworkDeleteResult> {
+  const { project, region, networkName, subnetName } = params;
+  const failure = (detail: string): GcpNetworkDeleteResult => ({
+    ok: false,
+    op: "gcp-network-delete",
+    networkName,
+    subnetName,
+    detail,
+  });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const accessToken = token.accessToken;
+  // Path segments are grammar-checked upstream AND URL-encoded here.
+  const projectPath = `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}`;
+  const regionPath = `${projectPath}/regions/${encodeURIComponent(region)}`;
+
+  const subnetOutcome = await deleteComputeResource({
+    url: `${regionPath}/subnetworks/${encodeURIComponent(subnetName)}`,
+    waitUrlBase: `${regionPath}/operations`,
+    accessToken,
+    what: `subnetwork "${subnetName}"`,
+    project,
+    permissionHint: "compute.subnetworks.delete (e.g. roles/compute.networkAdmin)",
+  });
+  if (subnetOutcome.kind === "failed") {
+    return failure(subnetOutcome.detail);
+  }
+
+  const networkOutcome = await deleteComputeResource({
+    url: `${projectPath}/global/networks/${encodeURIComponent(networkName)}`,
+    waitUrlBase: `${projectPath}/global/operations`,
+    accessToken,
+    what: `network "${networkName}"`,
+    project,
+    permissionHint: "compute.networks.delete (e.g. roles/compute.networkAdmin)",
+  });
+  if (networkOutcome.kind === "failed") {
+    return failure(networkOutcome.detail);
+  }
+
+  return {
+    ok: true,
+    op: "gcp-network-delete",
+    networkName,
+    subnetName,
+    subnetStatus: subnetOutcome.kind,
+    networkStatus: networkOutcome.kind,
+  };
 }

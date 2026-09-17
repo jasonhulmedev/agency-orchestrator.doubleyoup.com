@@ -21,6 +21,13 @@
 // `gcp-network-create` / `gcp-firewall-create` / `gcp-address-create` / `gcp-router-nat-create` ARE
 // idempotent — each treats Google's 409 alreadyExists as success so a half-built cell resumes on
 // re-run (planning/34).
+//
+// ALL FIVE TEARDOWN ops — `gcp-instance-delete` / `gcp-address-delete` / `gcp-firewall-delete` /
+// `gcp-router-delete` / `gcp-network-delete` — are IDEMPOTENT, the mirror of that: Google's 404
+// notFound means the resource is already gone, which each reports as success ("already-absent"), so
+// a re-run of a partly-torn-down cell RESUMES rather than failing on what it already removed
+// (planning/34 teardown). Note the contrast with gcp-instance-delete's CREATE twin — deleting a VM
+// converges, creating one does not.
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -40,6 +47,11 @@ import {
   type GcpFirewallGetParams,
   type GcpRouterGetParams,
   type GcpInstancesListParams,
+  type GcpInstanceDeleteParams,
+  type GcpAddressDeleteParams,
+  type GcpFirewallDeleteParams,
+  type GcpRouterDeleteParams,
+  type GcpNetworkDeleteParams,
   type ProvisionSshKeysParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
@@ -55,6 +67,11 @@ import {
   validateGcpFirewallGetParams,
   validateGcpRouterGetParams,
   validateGcpInstancesListParams,
+  validateGcpInstanceDeleteParams,
+  validateGcpAddressDeleteParams,
+  validateGcpFirewallDeleteParams,
+  validateGcpRouterDeleteParams,
+  validateGcpNetworkDeleteParams,
   validateProvisionSshKeysParams,
 } from "./dispatch-params.js";
 import {
@@ -73,6 +90,11 @@ import {
   readComputeFirewall,
   readComputeRouter,
   readComputeInstancesList,
+  actuateGcpInstanceDelete,
+  actuateGcpAddressDelete,
+  actuateGcpFirewallDelete,
+  actuateGcpRouterDelete,
+  actuateGcpNetworkDelete,
   actuateProvisionSshKeys,
 } from "./actuate.js";
 
@@ -156,6 +178,26 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "gcp-instances-list": defineOp<GcpInstancesListParams>({
     validateParams: validateGcpInstancesListParams,
     actuate: (params, env) => readComputeInstancesList(params, env),
+  }),
+  "gcp-instance-delete": defineOp<GcpInstanceDeleteParams>({
+    validateParams: validateGcpInstanceDeleteParams,
+    actuate: (params, env) => actuateGcpInstanceDelete(params, env),
+  }),
+  "gcp-address-delete": defineOp<GcpAddressDeleteParams>({
+    validateParams: validateGcpAddressDeleteParams,
+    actuate: (params, env) => actuateGcpAddressDelete(params, env),
+  }),
+  "gcp-firewall-delete": defineOp<GcpFirewallDeleteParams>({
+    validateParams: validateGcpFirewallDeleteParams,
+    actuate: (params, env) => actuateGcpFirewallDelete(params, env),
+  }),
+  "gcp-router-delete": defineOp<GcpRouterDeleteParams>({
+    validateParams: validateGcpRouterDeleteParams,
+    actuate: (params, env) => actuateGcpRouterDelete(params, env),
+  }),
+  "gcp-network-delete": defineOp<GcpNetworkDeleteParams>({
+    validateParams: validateGcpNetworkDeleteParams,
+    actuate: (params, env) => actuateGcpNetworkDelete(params, env),
   }),
   "provision-ssh-keys": defineOp<ProvisionSshKeysParams>({
     validateParams: validateProvisionSshKeysParams,
