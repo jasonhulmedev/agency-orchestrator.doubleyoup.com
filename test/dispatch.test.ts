@@ -39,6 +39,7 @@ import {
   validateGcpFirewallGetParams,
   validateGcpRouterGetParams,
   validateGcpInstancesListParams,
+  validateProvisionSshKeysParams,
   GCP_FIREWALL_PROTOCOLS,
 } from "../src/dispatch-params.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
@@ -168,6 +169,22 @@ function dbImportJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
     op: "db-import",
     params: JSON.stringify(DB_IMPORT_PARAMS),
     nonce: "dd88dd88dd88dd88dd88dd88dd88dd88",
+    ...overrides,
+  });
+}
+
+// A provision-ssh-keys job — declare the FULL authorized-key set for a storage-tier dogfood site
+// (planning/39). The gateway cell-agent writes them; nothing sensitive comes back.
+const SSH_KEYS_JOB_PARAMS = {
+  project: "dy-agency-proof",
+  slug: "geelongns",
+  authorizedKeys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample000000000000000000000000000000000 dev@laptop"],
+};
+function sshKeysJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "provision-ssh-keys",
+    params: JSON.stringify(SSH_KEYS_JOB_PARAMS),
+    nonce: "ee99ee99ee99ee99ee99ee99ee99ee99",
     ...overrides,
   });
 }
@@ -613,6 +630,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-router-get",
       "gcp-router-nat-create",
       "provision-r2",
+      "provision-ssh-keys",
       "wp-cli",
     ]);
     for (const entry of Object.values(DISPATCH_OP_REGISTRY)) {
@@ -849,6 +867,73 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     const keyVerdict = validateDbImportParams({ docroot: DB_IMPORT_PARAMS.docroot, objectKey: "x.sql" });
     expect(keyVerdict.ok).toBe(false);
     if (!keyVerdict.ok) expect(keyVerdict.reason).toMatch(/^objectKey must be db-exports\//);
+  });
+
+  // ── provision-ssh-keys (twin of the app's rules) ──────────────────────────────────
+  // The gateway writes each `authorizedKeys` line into an authorized_keys FILE, so the strict
+  // single-line OpenSSH grammar (+ the length/array caps) is the guard against a smuggled second
+  // authorized_keys line or a private key.
+  const SSH_ED25519 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample000000000000000000000000000000000 dev@laptop";
+  const SSH_RSA = `ssh-rsa ${"A".repeat(372)}== ci@runner`;
+  const SSH_ECDSA = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBExample00000000000";
+  const SSH_KEYS_PARAMS = { project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_ED25519] };
+
+  it("provision-ssh-keys: accepts ed25519 / rsa / ecdsa keys, an EMPTY set (revoke-all), and returns only known keys", () => {
+    expect(validateProvisionSshKeysParams({ ...SSH_KEYS_PARAMS, extra: "x" })).toEqual({ ok: true, params: SSH_KEYS_PARAMS });
+    expect(validateProvisionSshKeysParams({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_RSA] }).ok).toBe(true);
+    expect(validateProvisionSshKeysParams({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_ECDSA] }).ok).toBe(true);
+    // A key WITHOUT a comment is valid (the comment is optional).
+    expect(
+      validateProvisionSshKeysParams({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_ED25519.split(" ").slice(0, 2).join(" ")] }).ok,
+    ).toBe(true);
+    // The FULL desired set can be empty — that revokes every key on the gateway.
+    expect(validateProvisionSshKeysParams({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [] })).toEqual({
+      ok: true,
+      params: { project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [] },
+    });
+    // Multiple keys are rebuilt into a fresh array of exactly the validated lines.
+    expect(
+      validateProvisionSshKeysParams({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_ED25519, SSH_RSA] }),
+    ).toEqual({ ok: true, params: { project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_ED25519, SSH_RSA] } });
+  });
+
+  it("provision-ssh-keys: rejects a bad project / slug field by field", () => {
+    const bad = (overrides: Record<string, unknown>) => validateProvisionSshKeysParams({ ...SSH_KEYS_PARAMS, ...overrides });
+    expect(validateProvisionSshKeysParams(null).ok).toBe(false);
+    expect(validateProvisionSshKeysParams("string").ok).toBe(false);
+    expect(validateProvisionSshKeysParams([]).ok).toBe(false);
+    // project (GCP project grammar)
+    expect(bad({ project: "" }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false); // uppercase
+    expect(bad({ project: "ab" }).ok).toBe(false); // too short
+    expect(bad({ project: 42 }).ok).toBe(false);
+    // slug (storage-tier grammar, <=27)
+    expect(bad({ slug: "" }).ok).toBe(false);
+    expect(bad({ slug: "Geelongns" }).ok).toBe(false); // uppercase
+    expect(bad({ slug: "a".repeat(28) }).ok).toBe(false); // too long for site_<slug>
+    expect(bad({ slug: "bad_slug" }).ok).toBe(false); // underscore not in [a-z0-9-]
+    expect(bad({ slug: 7 }).ok).toBe(false);
+  });
+
+  it("provision-ssh-keys: rejects a private key, a multi-line value, garbage, an over-cap key, and an over-long list", () => {
+    const bad = (authorizedKeys: unknown) => validateProvisionSshKeysParams({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys });
+    // A PEM PRIVATE key has no key-type token -> rejected.
+    expect(bad(["-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"]).ok).toBe(false);
+    // A multi-line value could smuggle a second authorized_keys line -> rejected (anchored regex).
+    expect(bad([`${SSH_ED25519}\nssh-ed25519 AAAAsecond key`]).ok).toBe(false);
+    expect(bad([`${SSH_ED25519}\r\nevil`]).ok).toBe(false);
+    // Garbage / wrong type / empty entry / non-string.
+    expect(bad(["not a key"]).ok).toBe(false);
+    expect(bad(["ssh-dss AAAAB3Nza..."]).ok).toBe(false); // dss is not on the type allowlist
+    expect(bad([""]).ok).toBe(false);
+    expect(bad([42]).ok).toBe(false);
+    // authorizedKeys must be an ARRAY.
+    expect(bad(SSH_ED25519).ok).toBe(false);
+    expect(bad(undefined).ok).toBe(false);
+    // Over the per-key length cap (8192).
+    expect(bad([`ssh-rsa ${"A".repeat(9000)}`]).ok).toBe(false);
+    // Over the array cap (50).
+    expect(bad(Array.from({ length: 51 }, () => SSH_ED25519)).ok).toBe(false);
   });
 
   // ── gcp-instance-create (twin of the app's rules) ─────────────────────────────────
@@ -2257,6 +2342,129 @@ describe("POST /actuate route", () => {
     expect(response.status).toBe(400);
     const body = (await response.json()) as { reason: string };
     expect(body.reason).toMatch(/docroot must be/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── provision-ssh-keys through the registry ────────────────────────────────────────
+  // The Worker relays {slug, authorizedKeys} to the gateway cell-agent's DEDICATED
+  // /provision-ssh-keys endpoint (NOT /exec — key material must never be shell-quoted), using the
+  // agency's OWN CELL_AGENT_TOKEN. The load-bearing assertions: it hits the right endpoint with the
+  // right body + token, the project is NOT forwarded (the gateway needs only slug + keys), and every
+  // relay failure mode is fail-closed exactly like wp-cli.
+  function mockSshKeysAgent(reply: { ok?: boolean; slug?: string; count?: number; error?: string }, status = 200) {
+    const calls: Array<{
+      url: string;
+      method: string;
+      auth: string | null;
+      body: { slug?: string; authorizedKeys?: string[]; project?: string };
+    }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = urlOf(input);
+      const method = init?.method ?? "GET";
+      const auth = new Headers(init?.headers).get("authorization");
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      calls.push({ url, method, auth, body });
+      if (url.endsWith("/provision-ssh-keys") && method === "POST") {
+        return jsonResponse(reply, status);
+      }
+      throw new Error(`unexpected fetch ${method} ${url}`);
+    });
+    return calls;
+  }
+
+  it("provision-ssh-keys: relays {slug, authorizedKeys} to the gateway /provision-ssh-keys using CELL_AGENT_TOKEN only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = sshKeysJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockSshKeysAgent({ ok: true, slug: "geelongns", count: 1 });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, op: "provision-ssh-keys", slug: "geelongns", count: 1 });
+    expect(calls).toHaveLength(1);
+    const call = calls[0];
+    expect(call.url).toBe("https://cell.example.test/provision-ssh-keys");
+    expect(call.method).toBe("POST");
+    // The agency's OWN cell token — never a platform / Cloudflare credential.
+    expect(call.auth).toBe("Bearer cell-token-123");
+    expect(call.auth).not.toContain("cf-token-xyz");
+    // The gateway needs only slug + the full key set; the platform-layer project is NOT forwarded.
+    expect(call.body.slug).toBe("geelongns");
+    expect(call.body.authorizedKeys).toEqual(SSH_KEYS_JOB_PARAMS.authorizedKeys);
+    expect(call.body.project).toBeUndefined();
+  });
+
+  it("provision-ssh-keys: an EMPTY set (revoke-all) relays authorizedKeys:[] and reports count 0", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = sshKeysJob({ params: JSON.stringify({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [] }) });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockSshKeysAgent({ ok: true, slug: "geelongns", count: 0 });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, op: "provision-ssh-keys", slug: "geelongns", count: 0 });
+    expect(calls[0].body.authorizedKeys).toEqual([]);
+  });
+
+  it("provision-ssh-keys: a cell-agent 401 becomes a clean ok:false (no bypass)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = sshKeysJob();
+    const signature = await signAsApp(job, privateKey);
+    mockSshKeysAgent({ error: "unauthorized" }, 401);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/rejected CELL_AGENT_TOKEN/);
+  });
+
+  it("provision-ssh-keys: a cell-agent 500 (script failure) surfaces as ok:false, still HTTP 200", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = sshKeysJob();
+    const signature = await signAsApp(job, privateKey);
+    mockSshKeysAgent({ error: "chroot /sites/geelongns missing" }, 500);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/cell-agent \/provision-ssh-keys failed with HTTP 500/);
+  });
+
+  it("provision-ssh-keys: reports a clean failure and touches NO cell-agent when CELL_AGENT_URL/TOKEN are missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = sshKeysJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ CELL_AGENT_URL: undefined, CELL_AGENT_TOKEN: undefined }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/CELL_AGENT_URL \/ CELL_AGENT_TOKEN are not configured/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("provision-ssh-keys: a signed job carrying a private key is 400 with no cell-agent call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = sshKeysJob({
+      params: JSON.stringify({
+        project: "dy-agency-proof",
+        slug: "geelongns",
+        authorizedKeys: ["-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"],
+      }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { reason: string };
+    expect(body.reason).toMatch(/each authorizedKeys entry must be a single-line OpenSSH public key/);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 

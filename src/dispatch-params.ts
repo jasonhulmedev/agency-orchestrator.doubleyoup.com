@@ -1127,6 +1127,103 @@ export function validateGcpInstancesListParams(raw: unknown): ParamsVerdict<GcpI
   return { ok: true, params: { project, namePrefix } };
 }
 
+// ── provision-ssh-keys ───────────────────────────────────────────────────────────────
+// Declare the FULL set of authorized SSH public keys for a cell site's shell login on the
+// gateway (planning/39 — cell SSH access, increment 1). This is the per-ACCOUNT key spine:
+// the app fans an account's keys out to every one of its cell-hosted sites, and the actuator
+// RELAYS the whole set to the gateway cell-agent's /provision-ssh-keys, which writes one
+// authorized_keys file for the site login. The op DECLARES the whole desired set (not
+// add/remove deltas), which is what makes it idempotent + resume-safe (planning/39): a re-run
+// converges on the same file.
+//
+// SAFE + ADDITIVE (planning/39 increment 1): this only writes a public-key FILE on the gateway;
+// it changes no sshd_config and does nothing until a LATER shell Match block references the file.
+//
+// Three params, each strictly grammared:
+//   1. `project` — the agency's GCP project id (the existing GCP project grammar). It selects the
+//      agency's cell at the platform layer; the gateway cell-agent itself only needs slug + keys.
+//   2. `slug`    — the site slug (the existing storage-tier slug grammar, <=27 so `site_<slug>`
+//      fits the 32-char Linux login cap — the SFTP precedent). Selects the site's login.
+//   3. `authorizedKeys` — the FULL desired set of authorized public keys (0..MAX). Each entry is
+//      re-checked against the strict single-line OpenSSH public-key grammar (type + base64 blob +
+//      optional comment) — the SAME grammar the SFTP file-node script enforces. An EMPTY set is
+//      legitimate: it revokes every key (the gateway writes an empty file). Charset + a per-key
+//      length cap + a bounded array length are the guard; the gateway script re-validates every
+//      line (defence in depth), so a malformed key can never reach an authorized_keys file.
+
+export interface ProvisionSshKeysParams {
+  /** The agency's GCP project id — selects the agency's cell at the platform layer. */
+  project: string;
+  /** The site slug — selects the site's gateway login. */
+  slug: string;
+  /** The FULL desired set of authorized OpenSSH public keys (0..MAX). */
+  authorizedKeys: string[];
+}
+
+// The agency's GCP project id (6-30 chars: lowercase-letter start, [a-z0-9-], alphanumeric end) —
+// the SAME grammar the gcp-* ops use. Redeclared here (not shared) so this op's twin section stays
+// byte-identical across the two repos without depending on where the gcp constant is defined.
+const SSH_KEYS_PROJECT_RE = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
+// The storage-tier slug: [a-z0-9-], 1..27 chars, so the derived login `site_<slug>` fits Linux's
+// 32-char cap (the SFTP precedent: site-provision-sftp-user.sh). Anchored, no metacharacter.
+const SSH_KEYS_SLUG_RE = /^[a-z0-9-]{1,27}$/;
+// A well-formed single-line OpenSSH public key: a known key-type token, then the base64 blob, then
+// an OPTIONAL comment of printable ASCII. Byte-for-byte the grammar the SFTP file-node script
+// enforces (site-provision-sftp-user.sh) — accepts ed25519 / rsa / the three ecdsa curves / the two
+// FIDO sk- types; rejects a PEM private key (no key-type token), any control char, and (being
+// anchored, with [ -~] excluding newline) a multi-line value.
+const SSH_PUBLIC_KEY_LINE_RE =
+  /^(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]{20,}={0,3}(?: [ -~]*)?$/;
+// A generous per-key ceiling — an ed25519 line is ~90 chars, a 4096-bit rsa line ~740; 8192 leaves
+// room for a long comment and still rejects a junk mega-string.
+const SSH_PUBLIC_KEY_MAX_LENGTH = 8192;
+// The desired set can be empty (revoke all) up to this ceiling — an account's admins hold a handful
+// of keys, so 50 is generous and stops a junk mega-list.
+const SSH_KEYS_MAX = 50;
+
+export function validateProvisionSshKeysParams(raw: unknown): ParamsVerdict<ProvisionSshKeysParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, slug, authorizedKeys } = raw;
+
+  if (typeof project !== "string" || !SSH_KEYS_PROJECT_RE.test(project)) {
+    return {
+      ok: false,
+      reason:
+        "project must be a GCP project id (6-30 chars: lowercase letter first, then lowercase letters, digits, hyphens; alphanumeric last)",
+    };
+  }
+  if (typeof slug !== "string" || !SSH_KEYS_SLUG_RE.test(slug)) {
+    return { ok: false, reason: "slug must be a storage-tier slug ([a-z0-9-], 1-27 chars)" };
+  }
+  // The desired set: an array of 0..MAX keys. Empty is legitimate (revoke every key).
+  if (!Array.isArray(authorizedKeys) || authorizedKeys.length > SSH_KEYS_MAX) {
+    return { ok: false, reason: `authorizedKeys must be an array of 0-${SSH_KEYS_MAX} OpenSSH public keys` };
+  }
+  // Build a FRESH array of only the validated key lines — never the caller's array — so an extra
+  // element property can't ride along into the signed params. Every entry must be a single-line
+  // OpenSSH public key within the length cap; a private key, a multi-line value, or garbage is
+  // rejected here (and re-rejected by the gateway script).
+  const cleanKeys: string[] = [];
+  for (const entry of authorizedKeys) {
+    if (
+      typeof entry !== "string" ||
+      entry.length === 0 ||
+      entry.length > SSH_PUBLIC_KEY_MAX_LENGTH ||
+      !SSH_PUBLIC_KEY_LINE_RE.test(entry)
+    ) {
+      return {
+        ok: false,
+        reason: `each authorizedKeys entry must be a single-line OpenSSH public key (max ${SSH_PUBLIC_KEY_MAX_LENGTH} chars)`,
+      };
+    }
+    cleanKeys.push(entry);
+  }
+
+  return { ok: true, params: { project, slug, authorizedKeys: cleanKeys } };
+}
+
 // ── shared ─────────────────────────────────────────────────────────────────────────
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

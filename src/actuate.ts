@@ -35,6 +35,7 @@ import type {
   GcpFirewallGetParams,
   GcpRouterGetParams,
   GcpInstancesListParams,
+  ProvisionSshKeysParams,
 } from "./dispatch-params.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken } from "./validators.js";
@@ -148,6 +149,13 @@ export type GcpInstancesListResult =
   | { ok: true; op: "gcp-instances-list"; instances: Array<{ name: string; zone: string }> }
   | { ok: false; op: "gcp-instances-list"; detail: string };
 
+// Deliberately SMALL: the authorized_keys file lives ON the gateway; nothing sensitive comes back.
+// `count` echoes how many key lines the gateway wrote (0 = the set was revoked), so the caller can
+// confirm the whole desired set landed without the Worker re-reading the file.
+export type ProvisionSshKeysResult =
+  | { ok: true; op: "provision-ssh-keys"; slug: string; count: number }
+  | { ok: false; op: "provision-ssh-keys"; slug: string; detail: string };
+
 export type ActuateResult =
   | ProvisionR2Result
   | DnsRecordUpsertResult
@@ -162,7 +170,8 @@ export type ActuateResult =
   | GcpRouterNatCreateResult
   | GcpFirewallGetResult
   | GcpRouterGetResult
-  | GcpInstancesListResult;
+  | GcpInstancesListResult
+  | ProvisionSshKeysResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -796,6 +805,103 @@ export async function actuateWpCli(params: WpCliParams, env: Env): Promise<WpCli
     stdout: truncateOutput(exec.stdout),
     stderr: truncateOutput(exec.stderr),
   };
+}
+
+// ── provision-ssh-keys ───────────────────────────────────────────────────────────────
+// Declare a cell site's FULL authorized-SSH-key set on the GATEWAY (planning/39 increment 1).
+// Unlike wp-cli/db-export, this does NOT go through /exec: key material must never be
+// shell-quoted into a command line (a comment could carry a metacharacter, and a key line is
+// exactly the kind of value that belongs in a request BODY, not an argv). It relays to the
+// gateway cell-agent's DEDICATED /provision-ssh-keys endpoint, which hands the JSON straight to
+// the sudoers-whitelisted writer script on STDIN — the same STDIN-JSON convention the SFTP
+// endpoint uses. The Worker sends ONLY {slug, authorizedKeys}: the gateway writes one
+// authorized_keys file per site login and needs no GCP/project data. Uses the agency's OWN
+// CELL_AGENT_TOKEN, never a platform credential.
+//
+// v1 LIMITATION (shared with wp-cli): CELL_AGENT_URL is SINGLE-CELL and, for THIS op, MUST point
+// at the agency's GATEWAY cell-agent (where the SFTP jails + /etc/ssh/doubleyoup-keys live), not
+// the web node. A multi-node / multi-cell agency needs per-node resolution before this can target
+// more than that one gateway.
+
+// A small reply is expected (a status object); cap the buffered body so a misconfigured endpoint
+// can never make the Worker OOM (same reasoning as WP_CLI_RESPONSE_MAX_BYTES).
+const SSH_KEYS_RESPONSE_MAX_BYTES = 64 * 1024;
+
+function provisionSshKeysFailure(slug: string, detail: string): ProvisionSshKeysResult {
+  return { ok: false, op: "provision-ssh-keys", slug, detail };
+}
+
+/**
+ * Write the FULL authorized-key set for `params.slug` on the agency's GATEWAY via the cell-agent's
+ * /provision-ssh-keys endpoint, using the agency's OWN CELL_AGENT_TOKEN. Idempotent (declare-the-
+ * whole-set): a re-run converges on the same file. Returns a structured result; a cell-agent-side
+ * failure is ok:false + detail (the route still answers HTTP 200 so the orchestrator classifies it),
+ * never a thrown 500.
+ */
+export async function actuateProvisionSshKeys(
+  params: ProvisionSshKeysParams,
+  env: Env,
+): Promise<ProvisionSshKeysResult> {
+  const cellAgentUrl = env.CELL_AGENT_URL;
+  const cellAgentToken = env.CELL_AGENT_TOKEN;
+  if (!cellAgentUrl || !cellAgentToken) {
+    return provisionSshKeysFailure(params.slug, "CELL_AGENT_URL / CELL_AGENT_TOKEN are not configured on this Worker.");
+  }
+
+  // The exact request shape the gateway cell-agent's /provision-ssh-keys endpoint accepts
+  // (infra/cell-agent/agent.php): POST, Authorization: Bearer <token>, JSON body { slug,
+  // authorizedKeys }. It answers HTTP 200 { ok, slug, count } on success and a non-2xx on failure.
+  let response: Response;
+  try {
+    response = await fetch(stripTrailingSlash(cellAgentUrl) + "/provision-ssh-keys", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${cellAgentToken}`,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify({ slug: params.slug, authorizedKeys: params.authorizedKeys }),
+      // "manual", not "error": workerd rejects redirect:"error" at runtime. We still refuse to
+      // FOLLOW a redirect (a signed job must reach the configured gateway agent, not be bounced
+      // elsewhere) — a redirect surfaces below as a fail-closed error.
+      redirect: "manual",
+    });
+  } catch (err) {
+    return provisionSshKeysFailure(params.slug, `could not reach the cell-agent /provision-ssh-keys: ${errorMessage(err)}`);
+  }
+
+  // The cell-agent should never 3xx (status 0 is workerd's opaqueredirect). Treat either as
+  // fail-closed rather than following it: a redirect means a misconfigured CELL_AGENT_URL.
+  if (response.status === 0 || (response.status >= 300 && response.status < 400)) {
+    await response.body?.cancel().catch(() => {});
+    return provisionSshKeysFailure(params.slug, `cell-agent redirected unexpectedly (HTTP ${response.status}) — refusing to follow.`);
+  }
+  if (response.status === 401 || response.status === 403) {
+    await response.body?.cancel().catch(() => {});
+    return provisionSshKeysFailure(params.slug, "the cell-agent rejected CELL_AGENT_TOKEN (bearer auth failed).");
+  }
+
+  const read = await readBodyCapped(response, SSH_KEYS_RESPONSE_MAX_BYTES);
+  if (!read.ok) {
+    return provisionSshKeysFailure(params.slug, read.detail);
+  }
+
+  // Only NOW parse the bounded text. A non-JSON reply is a cell-agent-side error.
+  let body: { ok?: boolean; count?: number; error?: string } | null;
+  try {
+    body = JSON.parse(read.text) as { ok?: boolean; count?: number; error?: string };
+  } catch {
+    body = null;
+  }
+
+  if (!response.ok || !body || body.ok !== true) {
+    const detail = body?.error ? `: ${body.error}` : "";
+    return provisionSshKeysFailure(params.slug, `cell-agent /provision-ssh-keys failed with HTTP ${response.status}${detail}.`);
+  }
+
+  // Prefer the count the gateway actually wrote; fall back to the set we sent.
+  const count = typeof body.count === "number" ? body.count : params.authorizedKeys.length;
+  return { ok: true, op: "provision-ssh-keys", slug: params.slug, count };
 }
 
 // ── db-export ──────────────────────────────────────────────────────────────────────────

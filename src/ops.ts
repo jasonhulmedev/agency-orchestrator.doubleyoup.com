@@ -40,6 +40,7 @@ import {
   type GcpFirewallGetParams,
   type GcpRouterGetParams,
   type GcpInstancesListParams,
+  type ProvisionSshKeysParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
@@ -54,6 +55,7 @@ import {
   validateGcpFirewallGetParams,
   validateGcpRouterGetParams,
   validateGcpInstancesListParams,
+  validateProvisionSshKeysParams,
 } from "./dispatch-params.js";
 import {
   type ActuateResult,
@@ -71,6 +73,7 @@ import {
   readComputeFirewall,
   readComputeRouter,
   readComputeInstancesList,
+  actuateProvisionSshKeys,
 } from "./actuate.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
@@ -153,6 +156,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "gcp-instances-list": defineOp<GcpInstancesListParams>({
     validateParams: validateGcpInstancesListParams,
     actuate: (params, env) => readComputeInstancesList(params, env),
+  }),
+  "provision-ssh-keys": defineOp<ProvisionSshKeysParams>({
+    validateParams: validateProvisionSshKeysParams,
+    actuate: (params, env) => actuateProvisionSshKeys(params, env),
   }),
 };
 

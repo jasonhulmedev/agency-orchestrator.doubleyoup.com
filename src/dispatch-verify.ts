@@ -52,6 +52,7 @@ export const DISPATCH_OPS = [
   "gcp-firewall-get",
   "gcp-router-get",
   "gcp-instances-list",
+  "provision-ssh-keys",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 
