@@ -287,6 +287,114 @@ export function validateCachePurgeParams(raw: unknown): ParamsVerdict<CachePurge
   return { ok: false, reason: `mode must be one of ${CACHE_PURGE_MODES.join(", ")}` };
 }
 
+// ── cf-tunnel-create ─────────────────────────────────────────────────────────────────
+// Create (idempotently, by name) a per-cell Cloudflare **named tunnel** in the agency's own CF
+// account and return its id + connector token (planning/40 Component A). Actuated with the agency's
+// own CF_DNS_API_TOKEN, which now also carries account-level `Cloudflare Tunnel: Edit` (a deploy-time
+// scope add, not a new secret). One platform-generated param:
+//   1. `tunnelName` — the per-cell tunnel name the platform derives (e.g. "dy-cell-<region>"). It
+//      reaches Cloudflare only as a JSON body field of the cfd_tunnel create; the grammar (a lowercase
+//      resource name) is defense-in-depth alongside JSON.stringify in the actuator.
+// IDEMPOTENT: the actuator reuses a non-deleted tunnel of the same name (registered `true` in the
+// orchestrator's AGENCY_OP_IDEMPOTENT, so a transient failure may auto-retry; a re-run reuses the
+// existing tunnel + re-fetches its token).
+
+export interface CfTunnelCreateParams {
+  /** The per-cell tunnel name the platform derives, e.g. "dy-cell-australia-southeast2". */
+  tunnelName: string;
+}
+
+// A lowercase Compute-style resource name: 1-63 chars, alphanumeric start + end, [a-z0-9-] within.
+const CF_TUNNEL_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+export function validateCfTunnelCreateParams(raw: unknown): ParamsVerdict<CfTunnelCreateParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { tunnelName } = raw;
+  if (typeof tunnelName !== "string" || !CF_TUNNEL_NAME_RE.test(tunnelName)) {
+    return {
+      ok: false,
+      reason:
+        "tunnelName must be a lowercase name (1-63 chars: letter/digit first and last, letters, digits, hyphens within)",
+    };
+  }
+  return { ok: true, params: { tunnelName } };
+}
+
+// ── cf-tunnel-config ─────────────────────────────────────────────────────────────────
+// Set a per-cell tunnel's remotely-managed ingress (planning/40 Component A): map public hostnames to
+// origin services the connector (cloudflared on the gateway) reaches over the VPC — e.g. the web
+// node's cell-agent at http://<web-internal-dns>:9440. Actuated with the same CF_DNS_API_TOKEN /
+// tunnel scope. Two params:
+//   1. `tunnelId` — the cfd_tunnel id from cf-tunnel-create (a 32-char hex id; a URL path segment).
+//   2. `ingress` — 1..20 { hostname, service } rules. The tunnel is per-cell (dedicated), so the
+//      actuator writes the FULL config (a PUT) and appends the mandatory catch-all rule itself, so a
+//      caller can neither omit it nor smuggle a second catch-all.
+// The `service` is an http(s) origin URL (scheme + host + optional port, NO path) — the host may be a
+// GCP-internal DNS name (dots + hyphens), which cloudflared on the gateway resolves over the VPC.
+
+export interface CfTunnelConfigIngressRule {
+  /** The public hostname (a FQDN on the agency's zone), e.g. "cell-australia-southeast2.example.com". */
+  hostname: string;
+  /** The origin service URL, e.g. "http://dy-web-...internal:9440" (scheme + host + optional port). */
+  service: string;
+}
+
+export interface CfTunnelConfigParams {
+  /** The cfd_tunnel id to configure (from cf-tunnel-create). */
+  tunnelId: string;
+  /** The ingress rules; the actuator appends the mandatory catch-all (http_status:404). */
+  ingress: CfTunnelConfigIngressRule[];
+}
+
+// A Cloudflare tunnel id: 32 lowercase hex chars (also a URL path segment; encodeURIComponent'd anyway).
+const CF_TUNNEL_ID_RE = /^[0-9a-f]{32}$/;
+// An http(s) origin service: scheme + host (alnum, dots, hyphens — a public host OR a GCP-internal DNS
+// name) + OPTIONAL port. No path/query, no userinfo, no shell/URL metacharacter.
+const CF_TUNNEL_SERVICE_RE = /^https?:\/\/[a-z0-9](?:[a-z0-9.-]{0,253})(?::([0-9]{1,5}))?$/;
+const CF_TUNNEL_INGRESS_MAX = 20;
+const TCP_PORT_MAX = 65_535;
+
+export function validateCfTunnelConfigParams(raw: unknown): ParamsVerdict<CfTunnelConfigParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { tunnelId, ingress } = raw;
+
+  if (typeof tunnelId !== "string" || !CF_TUNNEL_ID_RE.test(tunnelId)) {
+    return { ok: false, reason: "tunnelId must be a 32-char lowercase hex Cloudflare tunnel id" };
+  }
+  if (!Array.isArray(ingress) || ingress.length < 1 || ingress.length > CF_TUNNEL_INGRESS_MAX) {
+    return { ok: false, reason: `ingress must be an array of 1-${CF_TUNNEL_INGRESS_MAX} { hostname, service } rules` };
+  }
+  // Build a FRESH array of only the validated { hostname, service } — never the caller's objects — so
+  // an extra key on a rule can never ride along into the tunnel config the actuator writes.
+  const cleanIngress: CfTunnelConfigIngressRule[] = [];
+  for (const rule of ingress) {
+    if (!isPlainObject(rule)) {
+      return { ok: false, reason: "each ingress rule must be an object { hostname, service }" };
+    }
+    const { hostname, service } = rule;
+    if (typeof hostname !== "string" || hostname.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(hostname)) {
+      return { ok: false, reason: "each ingress hostname must be a lowercase fully-qualified hostname (2+ labels)" };
+    }
+    if (typeof service !== "string") {
+      return { ok: false, reason: "each ingress service must be an http(s) origin URL (scheme + host + optional port, no path)" };
+    }
+    const serviceMatch = CF_TUNNEL_SERVICE_RE.exec(service);
+    if (!serviceMatch) {
+      return { ok: false, reason: "each ingress service must be an http(s) origin URL (scheme + host + optional port, no path)" };
+    }
+    if (serviceMatch[1] !== undefined && Number(serviceMatch[1]) > TCP_PORT_MAX) {
+      return { ok: false, reason: "each ingress service port must be 0-65535" };
+    }
+    cleanIngress.push({ hostname, service });
+  }
+
+  return { ok: true, params: { tunnelId, ingress: cleanIngress } };
+}
+
 // ── wp-cli ─────────────────────────────────────────────────────────────────────────
 // Run a wp-cli command in a cell site's docroot, through the on-VM cell-agent (the first
 // "heavy"/data-plane Direction-B op — see actuate.ts::actuateWpCli). Unlike the Cloudflare

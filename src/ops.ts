@@ -36,6 +36,8 @@ import {
   type ProvisionR2Params,
   type DnsRecordUpsertParams,
   type CachePurgeParams,
+  type CfTunnelCreateParams,
+  type CfTunnelConfigParams,
   type WpCliParams,
   type DbExportParams,
   type DbImportParams,
@@ -56,6 +58,8 @@ import {
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
+  validateCfTunnelCreateParams,
+  validateCfTunnelConfigParams,
   validateWpCliParams,
   validateDbExportParams,
   validateDbImportParams,
@@ -79,6 +83,8 @@ import {
   actuateProvisionR2,
   actuateDnsRecordUpsert,
   actuateCachePurge,
+  actuateCfTunnelCreate,
+  actuateCfTunnelConfig,
   actuateWpCli,
   actuateDbExport,
   actuateDbImport,
@@ -134,6 +140,14 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "cache-purge": defineOp<CachePurgeParams>({
     validateParams: validateCachePurgeParams,
     actuate: (params, env) => actuateCachePurge(params, env),
+  }),
+  "cf-tunnel-create": defineOp<CfTunnelCreateParams>({
+    validateParams: validateCfTunnelCreateParams,
+    actuate: (params, env) => actuateCfTunnelCreate(params, env),
+  }),
+  "cf-tunnel-config": defineOp<CfTunnelConfigParams>({
+    validateParams: validateCfTunnelConfigParams,
+    actuate: (params, env) => actuateCfTunnelConfig(params, env),
   }),
   "wp-cli": defineOp<WpCliParams>({
     validateParams: validateWpCliParams,

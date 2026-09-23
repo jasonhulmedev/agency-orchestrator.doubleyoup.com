@@ -441,18 +441,55 @@ describe("validateCfDns", () => {
         match: (u) => u === "https://api.cloudflare.com/client/v4/zones?per_page=1",
         respond: () => jsonResponse({ success: true, result: [{ id: "z1", name: "jasonhulme.com" }] }),
       },
+      // planning/40: after a green zone read, validateCfDns also probes the account-level Cloudflare
+      // Tunnel scope (resolve account -> list one cfd_tunnel). Both are READ-ONLY GETs.
+      {
+        match: (u) => u === "https://api.cloudflare.com/client/v4/accounts?per_page=1",
+        respond: () => jsonResponse({ success: true, result: [{ id: "acc1" }] }),
+      },
+      {
+        match: (u) => u.startsWith("https://api.cloudflare.com/client/v4/accounts/acc1/cfd_tunnel"),
+        respond: () => jsonResponse({ success: true, result: [] }),
+      },
     ]);
     vi.stubGlobal("fetch", fetchMock);
     const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
     expect(result.ok).toBe(true);
     expect(result.detail).toContain("jasonhulme.com");
     expect(result.detail).toMatch(/edit permission is exercised on the first DNS dispatch/i);
+    // The tunnel-scope probe folded its OK status into the detail.
+    expect(result.detail).toMatch(/Tunnel management: OK/i);
 
-    // Strictly read-only: exactly one GET, the token as bearer, nothing written.
-    expect(fetchMock.mock.calls.length).toBe(1);
-    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit | undefined];
-    expect(init?.method ?? "GET").toBe("GET");
-    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer cf-dns-token");
+    // Strictly read-only: the zone read plus the two tunnel-scope probes, all GETs with the bearer.
+    expect(fetchMock.mock.calls.length).toBe(3);
+    for (const call of fetchMock.mock.calls) {
+      const [, init] = call as unknown as [string, RequestInit | undefined];
+      expect(init?.method ?? "GET").toBe("GET");
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer cf-dns-token");
+    }
+  });
+
+  it("stays green on DNS but flags a MISSING tunnel scope (401 on the cfd_tunnel probe)", async () => {
+    const fetchMock = routedFetch([
+      {
+        match: (u) => u === "https://api.cloudflare.com/client/v4/zones?per_page=1",
+        respond: () => jsonResponse({ success: true, result: [{ id: "z1", name: "jasonhulme.com" }] }),
+      },
+      {
+        match: (u) => u === "https://api.cloudflare.com/client/v4/accounts?per_page=1",
+        respond: () => jsonResponse({ success: true, result: [{ id: "acc1" }] }),
+      },
+      {
+        match: (u) => u.startsWith("https://api.cloudflare.com/client/v4/accounts/acc1/cfd_tunnel"),
+        respond: () => new Response("", { status: 403 }),
+      },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
+    // DNS is still valid, so the row stays green; the missing tunnel scope is surfaced in the detail.
+    expect(result.ok).toBe(true);
+    expect(result.detail).toMatch(/Tunnel management: NOT available/i);
+    expect(result.detail).toMatch(/Cloudflare Tunnel: Edit/i);
   });
 
   it("fails closed when the token authenticates but can list NO zones (wrong scope)", async () => {

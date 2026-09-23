@@ -28,6 +28,8 @@ import {
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
+  validateCfTunnelCreateParams,
+  validateCfTunnelConfigParams,
   validateWpCliParams,
   validateDbExportParams,
   validateDbImportParams,
@@ -698,9 +700,75 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(bad({ ttl: "1.5" }).ok).toBe(false);
   });
 
+  it("cf-tunnel-create: accepts a valid tunnelName and returns ONLY the known key", () => {
+    expect(validateCfTunnelCreateParams({ tunnelName: "dy-cell-australia-southeast2", extra: "x" })).toEqual({
+      ok: true,
+      params: { tunnelName: "dy-cell-australia-southeast2" },
+    });
+  });
+
+  it("cf-tunnel-create: rejects a non-object and a bad tunnelName", () => {
+    expect(validateCfTunnelCreateParams(null).ok).toBe(false);
+    expect(validateCfTunnelCreateParams("dy-cell").ok).toBe(false);
+    expect(validateCfTunnelCreateParams({}).ok).toBe(false);
+    expect(validateCfTunnelCreateParams({ tunnelName: "" }).ok).toBe(false);
+    expect(validateCfTunnelCreateParams({ tunnelName: "UPPER" }).ok).toBe(false);
+    expect(validateCfTunnelCreateParams({ tunnelName: "-lead" }).ok).toBe(false);
+    expect(validateCfTunnelCreateParams({ tunnelName: "trail-" }).ok).toBe(false);
+    expect(validateCfTunnelCreateParams({ tunnelName: "has space" }).ok).toBe(false);
+    expect(validateCfTunnelCreateParams({ tunnelName: "a".repeat(64) }).ok).toBe(false);
+    expect(validateCfTunnelCreateParams({ tunnelName: 42 }).ok).toBe(false);
+  });
+
+  it("cf-tunnel-config: accepts valid ingress and returns only known keys (fresh rule objects)", () => {
+    const params = {
+      tunnelId: "0123456789abcdef0123456789abcdef",
+      ingress: [
+        { hostname: "cell-australia-southeast2.example.com", service: "http://dy-web-x.internal:9440", extra: "x" },
+      ],
+    };
+    expect(validateCfTunnelConfigParams(params)).toEqual({
+      ok: true,
+      params: {
+        tunnelId: "0123456789abcdef0123456789abcdef",
+        ingress: [{ hostname: "cell-australia-southeast2.example.com", service: "http://dy-web-x.internal:9440" }],
+      },
+    });
+    // https origin + no explicit port is fine too.
+    expect(
+      validateCfTunnelConfigParams({
+        tunnelId: "0123456789abcdef0123456789abcdef",
+        ingress: [{ hostname: "a.example.com", service: "https://origin.example.com" }],
+      }).ok,
+    ).toBe(true);
+  });
+
+  it("cf-tunnel-config: rejects a bad tunnelId, empty/oversized ingress, and bad rules", () => {
+    const okId = "0123456789abcdef0123456789abcdef";
+    const rule = { hostname: "a.example.com", service: "http://x.internal:9440" };
+    expect(validateCfTunnelConfigParams(null).ok).toBe(false);
+    expect(validateCfTunnelConfigParams("x").ok).toBe(false);
+    // tunnelId must be 32 lowercase hex.
+    expect(validateCfTunnelConfigParams({ tunnelId: "not-hex", ingress: [rule] }).ok).toBe(false);
+    expect(validateCfTunnelConfigParams({ tunnelId: okId.toUpperCase(), ingress: [rule] }).ok).toBe(false);
+    // ingress bounds.
+    expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [] }).ok).toBe(false);
+    expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: "x" }).ok).toBe(false);
+    expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: Array(21).fill(rule) }).ok).toBe(false);
+    // rule shape.
+    expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [{ hostname: "a.example.com" }] }).ok).toBe(false);
+    expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [{ hostname: "localhost", service: "http://x:9440" }] }).ok).toBe(false); // single-label host
+    expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [{ hostname: "a.example.com", service: "ftp://x:9440" }] }).ok).toBe(false); // bad scheme
+    expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [{ hostname: "a.example.com", service: "http://x/path" }] }).ok).toBe(false); // path not allowed
+    expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [{ hostname: "a.example.com", service: "http://x:99999" }] }).ok).toBe(false); // port > 65535
+    expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [{ hostname: "a.example.com", service: "http_status:404" }] }).ok).toBe(false); // caller can't inject the catch-all
+  });
+
   it("the op registry has exactly the allowlisted ops, each with validateParams + actuate", () => {
     expect(Object.keys(DISPATCH_OP_REGISTRY).sort()).toEqual([
       "cache-purge",
+      "cf-tunnel-config",
+      "cf-tunnel-create",
       "db-export",
       "db-import",
       "dns-record-upsert",

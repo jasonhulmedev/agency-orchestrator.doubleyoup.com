@@ -24,6 +24,8 @@ import type { Env } from "./env.js";
 import type {
   DnsRecordUpsertParams,
   CachePurgeParams,
+  CfTunnelCreateParams,
+  CfTunnelConfigParams,
   WpCliParams,
   DbExportParams,
   DbImportParams,
@@ -59,6 +61,19 @@ export type DnsRecordUpsertResult =
 export type CachePurgeResult =
   | { ok: true; op: "cache-purge"; mode: "everything" | "files" | "hosts"; zone: string; count: number }
   | { ok: false; op: "cache-purge"; zone: string; detail: string };
+
+// `connectorToken` is the ONE deliberate secret in a result (planning/40 decision 3 (c)): the
+// orchestrator consumes it transiently — injects it into the gateway's cloudflared exactly as the
+// manual token path does — and NEVER logs or stores it (the dispatch layer logs no result bodies, and
+// provision-cell keeps it out of the summary). The purer Worker-side-injection model is a later
+// hardening. `status` is "already-existed" when a non-deleted tunnel of the same name was reused.
+export type CfTunnelCreateResult =
+  | { ok: true; op: "cf-tunnel-create"; tunnelId: string; connectorToken: string; status: "created" | "already-existed" }
+  | { ok: false; op: "cf-tunnel-create"; detail: string };
+
+export type CfTunnelConfigResult =
+  | { ok: true; op: "cf-tunnel-config"; tunnelId: string; ruleCount: number }
+  | { ok: false; op: "cf-tunnel-config"; tunnelId: string; detail: string };
 
 export type WpCliResult =
   | { ok: true; op: "wp-cli"; exitCode: number; stdout: string; stderr: string }
@@ -208,6 +223,8 @@ export type ActuateResult =
   | ProvisionR2Result
   | DnsRecordUpsertResult
   | CachePurgeResult
+  | CfTunnelCreateResult
+  | CfTunnelConfigResult
   | WpCliResult
   | DbExportResult
   | DbImportResult
@@ -250,7 +267,10 @@ function cloudflareHeaders(token: string): Record<string, string> {
  * scoped to exactly one account, so GET /accounts?per_page=1 returns it — the same cheap,
  * account-scoped read the R2 validator already uses. Avoids a separate account-id secret.
  */
-async function resolveAccountId(token: string): Promise<{ id: string } | { error: string }> {
+async function resolveAccountId(
+  token: string,
+  unauthorizedHint?: string,
+): Promise<{ id: string } | { error: string }> {
   let response: Response;
   try {
     response = await fetch(`${CF_API}/accounts?per_page=1`, {
@@ -263,6 +283,7 @@ async function resolveAccountId(token: string): Promise<{ id: string } | { error
   if (response.status === 401 || response.status === 403) {
     return {
       error:
+        unauthorizedHint ??
         "Cloudflare rejected R2_PROVISION_API_TOKEN — it must be an ACCOUNT-owned token (Manage Account → Account API Tokens) with Workers R2 Storage: Edit.",
     };
   }
@@ -540,6 +561,208 @@ export async function actuateDnsRecordUpsert(
   }
 
   return { ok: true, op: "dns-record-upsert", action, recordId: written.id, name: params.name };
+}
+
+// ── cf-tunnel-create / cf-tunnel-config ────────────────────────────────────────────────
+// Create + configure a per-cell Cloudflare named tunnel in the agency's own account (planning/40
+// Component A), with the agency's own CF_DNS_API_TOKEN (now also carrying account-level Cloudflare
+// Tunnel: Edit). Tunnels are ACCOUNT-level, so both ops resolve the token's account id first (the same
+// cheap read the R2 path uses) — the account-level scope is what makes that read succeed for a token
+// that was previously zone-only. NEVER falls back to a platform credential (there is none).
+
+const CF_TUNNEL_UNAUTHORIZED_HINT =
+  "Cloudflare rejected CF_DNS_API_TOKEN for tunnel management — it needs account-level Cloudflare Tunnel: Edit (Manage Account → Account API Tokens).";
+
+/** A cfd_tunnel summary row (only the fields we read). */
+interface CloudflareTunnelSummary {
+  id?: string;
+  name?: string;
+  deleted_at?: string | null;
+}
+
+/**
+ * Find a NON-deleted tunnel of this exact name (idempotency). Returns `{ tunnelId }` when exactly one
+ * matches, `{ tunnelId: null }` when none, or `{ error }` on an ambiguous match or an API failure.
+ * `is_deleted=false` filters server-side; we re-check name + deleted_at defensively.
+ */
+async function findCfTunnelByName(
+  token: string,
+  accountId: string,
+  name: string,
+): Promise<{ tunnelId: string | null } | { error: string }> {
+  const query = new URLSearchParams({ name, is_deleted: "false", per_page: "5" });
+  let response: Response;
+  try {
+    response = await fetch(`${CF_API}/accounts/${encodeURIComponent(accountId)}/cfd_tunnel?${query.toString()}`, {
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+    });
+  } catch (err) {
+    return { error: `could not reach Cloudflare to list tunnels: ${errorMessage(err)}` };
+  }
+  if (response.status === 401 || response.status === 403) {
+    await response.text().catch(() => "");
+    return { error: CF_TUNNEL_UNAUTHORIZED_HINT };
+  }
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  if (!body?.success || !Array.isArray(body.result)) {
+    return { error: `tunnel lookup failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
+  }
+  const matches = (body.result as CloudflareTunnelSummary[]).filter(
+    (tunnel) => tunnel.id && tunnel.name === name && !tunnel.deleted_at,
+  );
+  if (matches.length > 1) {
+    return { error: `${matches.length} non-deleted tunnels are named "${name}" — ambiguous, refusing to guess.` };
+  }
+  return { tunnelId: matches.length === 1 ? (matches[0].id as string) : null };
+}
+
+/** Create a remotely-managed (config_src: cloudflare) named tunnel; returns its id. */
+async function createCfTunnel(
+  token: string,
+  accountId: string,
+  name: string,
+): Promise<{ tunnelId: string } | { error: string }> {
+  let response: Response;
+  try {
+    response = await fetch(`${CF_API}/accounts/${encodeURIComponent(accountId)}/cfd_tunnel`, {
+      method: "POST",
+      headers: cloudflareHeaders(token),
+      body: JSON.stringify({ name, config_src: "cloudflare" }),
+    });
+  } catch (err) {
+    return { error: `could not reach Cloudflare to create the tunnel: ${errorMessage(err)}` };
+  }
+  if (response.status === 401 || response.status === 403) {
+    await response.text().catch(() => "");
+    return { error: CF_TUNNEL_UNAUTHORIZED_HINT };
+  }
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  const created = body?.success ? (body.result as CloudflareTunnelSummary | undefined) : undefined;
+  if (!created?.id) {
+    return { error: `tunnel create failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
+  }
+  return { tunnelId: created.id };
+}
+
+/**
+ * Fetch a tunnel's connector token (`cloudflared tunnel run --token <token>`). The `/token` endpoint
+ * returns the token STRING directly as `result`. This is the one secret the op returns; see
+ * CfTunnelCreateResult for how the orchestrator handles it.
+ */
+async function fetchCfTunnelToken(
+  token: string,
+  accountId: string,
+  tunnelId: string,
+): Promise<{ token: string } | { error: string }> {
+  let response: Response;
+  try {
+    response = await fetch(
+      `${CF_API}/accounts/${encodeURIComponent(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}/token`,
+      { headers: { authorization: `Bearer ${token}`, accept: "application/json" } },
+    );
+  } catch (err) {
+    return { error: `could not reach Cloudflare to fetch the tunnel token: ${errorMessage(err)}` };
+  }
+  if (response.status === 401 || response.status === 403) {
+    await response.text().catch(() => "");
+    return { error: CF_TUNNEL_UNAUTHORIZED_HINT };
+  }
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  const connectorToken = body?.success && typeof body.result === "string" ? body.result : undefined;
+  if (!connectorToken) {
+    return { error: `tunnel token fetch failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
+  }
+  return { token: connectorToken };
+}
+
+export async function actuateCfTunnelCreate(params: CfTunnelCreateParams, env: Env): Promise<CfTunnelCreateResult> {
+  const token = env.CF_DNS_API_TOKEN;
+  if (!token) {
+    return { ok: false, op: "cf-tunnel-create", detail: "CF_DNS_API_TOKEN is not configured on this Worker." };
+  }
+
+  const account = await resolveAccountId(token, CF_TUNNEL_UNAUTHORIZED_HINT);
+  if ("error" in account) {
+    return { ok: false, op: "cf-tunnel-create", detail: account.error };
+  }
+
+  const existing = await findCfTunnelByName(token, account.id, params.tunnelName);
+  if ("error" in existing) {
+    return { ok: false, op: "cf-tunnel-create", detail: existing.error };
+  }
+
+  let tunnelId: string;
+  let status: "created" | "already-existed";
+  if (existing.tunnelId) {
+    tunnelId = existing.tunnelId;
+    status = "already-existed";
+  } else {
+    const created = await createCfTunnel(token, account.id, params.tunnelName);
+    if ("error" in created) {
+      return { ok: false, op: "cf-tunnel-create", detail: created.error };
+    }
+    tunnelId = created.tunnelId;
+    status = "created";
+  }
+
+  const connector = await fetchCfTunnelToken(token, account.id, tunnelId);
+  if ("error" in connector) {
+    return { ok: false, op: "cf-tunnel-create", detail: connector.error };
+  }
+  return { ok: true, op: "cf-tunnel-create", tunnelId, connectorToken: connector.token, status };
+}
+
+export async function actuateCfTunnelConfig(params: CfTunnelConfigParams, env: Env): Promise<CfTunnelConfigResult> {
+  const token = env.CF_DNS_API_TOKEN;
+  if (!token) {
+    return {
+      ok: false,
+      op: "cf-tunnel-config",
+      tunnelId: params.tunnelId,
+      detail: "CF_DNS_API_TOKEN is not configured on this Worker.",
+    };
+  }
+
+  const account = await resolveAccountId(token, CF_TUNNEL_UNAUTHORIZED_HINT);
+  if ("error" in account) {
+    return { ok: false, op: "cf-tunnel-config", tunnelId: params.tunnelId, detail: account.error };
+  }
+
+  // Per-cell dedicated tunnel => write the FULL ingress config, appending the mandatory catch-all
+  // rule (a remotely-managed tunnel config's last rule must be a service-only catch-all).
+  const ingress = [
+    ...params.ingress.map((rule) => ({ hostname: rule.hostname, service: rule.service })),
+    { service: "http_status:404" },
+  ];
+
+  let response: Response;
+  try {
+    response = await fetch(
+      `${CF_API}/accounts/${encodeURIComponent(account.id)}/cfd_tunnel/${encodeURIComponent(params.tunnelId)}/configurations`,
+      { method: "PUT", headers: cloudflareHeaders(token), body: JSON.stringify({ config: { ingress } }) },
+    );
+  } catch (err) {
+    return {
+      ok: false,
+      op: "cf-tunnel-config",
+      tunnelId: params.tunnelId,
+      detail: `could not reach Cloudflare to write the tunnel config: ${errorMessage(err)}`,
+    };
+  }
+  if (response.status === 401 || response.status === 403) {
+    await response.text().catch(() => "");
+    return { ok: false, op: "cf-tunnel-config", tunnelId: params.tunnelId, detail: CF_TUNNEL_UNAUTHORIZED_HINT };
+  }
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  if (!body?.success) {
+    return {
+      ok: false,
+      op: "cf-tunnel-config",
+      tunnelId: params.tunnelId,
+      detail: `tunnel config write failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.`,
+    };
+  }
+  return { ok: true, op: "cf-tunnel-config", tunnelId: params.tunnelId, ruleCount: params.ingress.length };
 }
 
 // ── cache-purge ──────────────────────────────────────────────────────────────────────

@@ -362,6 +362,44 @@ export async function validateR2Provision(env: Env): Promise<ValidationResult> {
 // >= 1 zone but NOT Zone:DNS:Edit or Zone:Cache Purge — those scopes are exercised for
 // real on the first dns-record-upsert / cache-purge dispatch, which reports a clear denial
 // if the scope is missing. We never write a record or purge a cache from a validator.
+/**
+ * READ-ONLY probe of the account-level Cloudflare Tunnel scope (planning/40): resolve the token's
+ * account, then GET one cfd_tunnel. Returns a short human status string (never throws) folded into
+ * the cfDns detail — a 200 proves the token can manage tunnels; a 401/403 means the account-level
+ * Cloudflare Tunnel scope is missing (add it for automated cell provisioning).
+ */
+async function probeCfTunnelScope(token: string): Promise<string> {
+  try {
+    const acctResponse = await fetch("https://api.cloudflare.com/client/v4/accounts?per_page=1", {
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+    });
+    if (acctResponse.status === 401 || acctResponse.status === 403) {
+      return "Tunnel management: NOT available — token cannot access an account (add account-level Cloudflare Tunnel: Edit for automated cell provisioning).";
+    }
+    const acctBody = (await acctResponse.json().catch(() => null)) as {
+      success?: boolean;
+      result?: Array<{ id?: string }>;
+    } | null;
+    const accountId = acctBody?.success && acctBody.result && acctBody.result.length > 0 ? acctBody.result[0]?.id : undefined;
+    if (!accountId) {
+      return "Tunnel management: could not resolve the token's account to probe the Cloudflare Tunnel scope.";
+    }
+    const tunnelResponse = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/cfd_tunnel?per_page=1`,
+      { headers: { authorization: `Bearer ${token}`, accept: "application/json" } },
+    );
+    if (tunnelResponse.status === 200) {
+      return "Tunnel management: OK (account-level Cloudflare Tunnel present).";
+    }
+    if (tunnelResponse.status === 401 || tunnelResponse.status === 403) {
+      return "Tunnel management: NOT available — add account-level Cloudflare Tunnel: Edit for automated cell provisioning.";
+    }
+    return `Tunnel management: check inconclusive (HTTP ${tunnelResponse.status}).`;
+  } catch (err) {
+    return `Tunnel management: probe could not be sent (${errorMessage(err)}).`;
+  }
+}
+
 export async function validateCfDns(env: Env): Promise<ValidationResult> {
   if (!env.CF_DNS_API_TOKEN) {
     return {
@@ -385,9 +423,14 @@ export async function validateCfDns(env: Env): Promise<ValidationResult> {
       } | null;
       if (body?.success && body.result && body.result.length > 0) {
         const zoneName = body.result[0]?.name;
+        // planning/40: the SAME token now also drives cf-tunnel-create/-config (automated cell
+        // routing), which need account-level Cloudflare Tunnel. Probe that scope and fold its status
+        // into the detail — non-fatal so a DNS-only token still validates green, but a missing tunnel
+        // scope is surfaced here (a routable-cell provision would otherwise fail on first dispatch).
+        const tunnelStatus = await probeCfTunnelScope(env.CF_DNS_API_TOKEN);
         return {
           ok: true,
-          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch.`,
+          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch. ${tunnelStatus}`,
         };
       }
       return {
