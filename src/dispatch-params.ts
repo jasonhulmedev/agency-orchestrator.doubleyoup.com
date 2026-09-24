@@ -348,8 +348,10 @@ export interface CfTunnelConfigParams {
   ingress: CfTunnelConfigIngressRule[];
 }
 
-// A Cloudflare tunnel id: 32 lowercase hex chars (also a URL path segment; encodeURIComponent'd anyway).
-const CF_TUNNEL_ID_RE = /^[0-9a-f]{32}$/;
+// A Cloudflare tunnel id: a lowercase-hex UUID (the cfd_tunnel API returns a 36-char hyphenated UUID,
+// e.g. 031b5bee-a61a-444f-882e-451fd644e59f); also accept a bare 32-hex form for robustness. Also a URL
+// path segment; encodeURIComponent'd in the actuator anyway.
+const CF_TUNNEL_ID_RE = /^([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 // An http(s) origin service: scheme + host (alnum, dots, hyphens — a public host OR a GCP-internal DNS
 // name) + OPTIONAL port. No path/query, no userinfo, no shell/URL metacharacter.
 const CF_TUNNEL_SERVICE_RE = /^https?:\/\/[a-z0-9](?:[a-z0-9.-]{0,253})(?::([0-9]{1,5}))?$/;
@@ -363,7 +365,7 @@ export function validateCfTunnelConfigParams(raw: unknown): ParamsVerdict<CfTunn
   const { tunnelId, ingress } = raw;
 
   if (typeof tunnelId !== "string" || !CF_TUNNEL_ID_RE.test(tunnelId)) {
-    return { ok: false, reason: "tunnelId must be a 32-char lowercase hex Cloudflare tunnel id" };
+    return { ok: false, reason: "tunnelId must be a lowercase-hex Cloudflare tunnel id (a 36-char UUID, or 32 hex chars)" };
   }
   if (!Array.isArray(ingress) || ingress.length < 1 || ingress.length > CF_TUNNEL_INGRESS_MAX) {
     return { ok: false, reason: `ingress must be an array of 1-${CF_TUNNEL_INGRESS_MAX} { hostname, service } rules` };

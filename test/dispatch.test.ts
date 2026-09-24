@@ -741,6 +741,14 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
         ingress: [{ hostname: "a.example.com", service: "https://origin.example.com" }],
       }).ok,
     ).toBe(true);
+    // The REAL cfd_tunnel id format is a 36-char hyphenated UUID (regression: the live provision
+    // returned 031b5bee-a61a-444f-882e-451fd644e59f and the old 32-hex-only grammar rejected it).
+    expect(
+      validateCfTunnelConfigParams({
+        tunnelId: "031b5bee-a61a-444f-882e-451fd644e59f",
+        ingress: [{ hostname: "a.example.com", service: "http://x.internal:9440" }],
+      }).ok,
+    ).toBe(true);
   });
 
   it("cf-tunnel-config: rejects a bad tunnelId, empty/oversized ingress, and bad rules", () => {
