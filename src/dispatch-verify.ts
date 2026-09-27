@@ -43,6 +43,8 @@ export const DISPATCH_OPS = [
   "cache-purge",
   "cf-tunnel-create",
   "cf-tunnel-config",
+  "cf-tunnel-delete",
+  "dns-record-delete",
   "wp-cli",
   "db-export",
   "db-import",

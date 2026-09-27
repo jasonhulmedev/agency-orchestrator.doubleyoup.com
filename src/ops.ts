@@ -38,6 +38,8 @@ import {
   type CachePurgeParams,
   type CfTunnelCreateParams,
   type CfTunnelConfigParams,
+  type CfTunnelDeleteParams,
+  type DnsRecordDeleteParams,
   type WpCliParams,
   type DbExportParams,
   type DbImportParams,
@@ -60,6 +62,8 @@ import {
   validateCachePurgeParams,
   validateCfTunnelCreateParams,
   validateCfTunnelConfigParams,
+  validateCfTunnelDeleteParams,
+  validateDnsRecordDeleteParams,
   validateWpCliParams,
   validateDbExportParams,
   validateDbImportParams,
@@ -85,6 +89,8 @@ import {
   actuateCachePurge,
   actuateCfTunnelCreate,
   actuateCfTunnelConfig,
+  actuateCfTunnelDelete,
+  actuateDnsRecordDelete,
   actuateWpCli,
   actuateDbExport,
   actuateDbImport,
@@ -148,6 +154,14 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "cf-tunnel-config": defineOp<CfTunnelConfigParams>({
     validateParams: validateCfTunnelConfigParams,
     actuate: (params, env) => actuateCfTunnelConfig(params, env),
+  }),
+  "cf-tunnel-delete": defineOp<CfTunnelDeleteParams>({
+    validateParams: validateCfTunnelDeleteParams,
+    actuate: (params, env) => actuateCfTunnelDelete(params, env),
+  }),
+  "dns-record-delete": defineOp<DnsRecordDeleteParams>({
+    validateParams: validateDnsRecordDeleteParams,
+    actuate: (params, env) => actuateDnsRecordDelete(params, env),
   }),
   "wp-cli": defineOp<WpCliParams>({
     validateParams: validateWpCliParams,

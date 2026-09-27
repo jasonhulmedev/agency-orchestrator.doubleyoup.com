@@ -397,6 +397,64 @@ export function validateCfTunnelConfigParams(raw: unknown): ParamsVerdict<CfTunn
   return { ok: true, params: { tunnelId, ingress: cleanIngress } };
 }
 
+// ── cf-tunnel-delete ─────────────────────────────────────────────────────────────────
+// Delete a per-cell Cloudflare tunnel on teardown (planning/40 Phase B) — the mirror of
+// cf-tunnel-create, so an auto-cell teardown doesn't orphan the tunnel in the agency's account.
+// One param: the cfd_tunnel id (same UUID grammar as cf-tunnel-config). IDEMPOTENT: a 404 (already
+// deleted) is success, so a resumed teardown converges.
+
+export interface CfTunnelDeleteParams {
+  /** The cfd_tunnel id to delete (from the Cell row's tunnelId). */
+  tunnelId: string;
+}
+
+export function validateCfTunnelDeleteParams(raw: unknown): ParamsVerdict<CfTunnelDeleteParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { tunnelId } = raw;
+  if (typeof tunnelId !== "string" || !CF_TUNNEL_ID_RE.test(tunnelId)) {
+    return { ok: false, reason: "tunnelId must be a lowercase-hex Cloudflare tunnel id (a 36-char UUID, or 32 hex chars)" };
+  }
+  return { ok: true, params: { tunnelId } };
+}
+
+// ── dns-record-delete ────────────────────────────────────────────────────────────────
+// Delete ONE DNS record (type + name) in an agency zone on teardown (planning/40 Phase B) — the
+// mirror of dns-record-upsert, so an auto-cell teardown removes the agent-host CNAME. Three params,
+// the same grammars dns-record-upsert uses (no content/ttl/proxied — a delete keys on type + name).
+// IDEMPOTENT: a record already gone is success.
+
+export interface DnsRecordDeleteParams {
+  /** The zone NAME (e.g. "example.com") — resolved to a zone id by the actuator. */
+  zone: string;
+  type: DnsRecordType;
+  /** Fully-qualified record name, within `zone`. */
+  name: string;
+}
+
+export function validateDnsRecordDeleteParams(raw: unknown): ParamsVerdict<DnsRecordDeleteParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { zone, type, name } = raw;
+  if (typeof zone !== "string" || zone.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a lowercase DNS zone name (e.g. example.com)" };
+  }
+  if (typeof type !== "string" || !(DNS_RECORD_TYPES as readonly string[]).includes(type)) {
+    return { ok: false, reason: `type must be one of ${DNS_RECORD_TYPES.join(", ")}` };
+  }
+  if (typeof name !== "string" || name.length > DNS_NAME_MAX_LENGTH || !DNS_RECORD_NAME_RE.test(name)) {
+    return { ok: false, reason: "name must be a lowercase fully-qualified DNS record name" };
+  }
+  const nameWithoutWildcard = name.startsWith("*.") ? name.slice(2) : name;
+  const nameIsInZone = nameWithoutWildcard === zone || nameWithoutWildcard.endsWith(`.${zone}`);
+  if (!nameIsInZone) {
+    return { ok: false, reason: "name must be within zone (equal to it or a subdomain of it)" };
+  }
+  return { ok: true, params: { zone, type: type as DnsRecordType, name } };
+}
+
 // ── wp-cli ─────────────────────────────────────────────────────────────────────────
 // Run a wp-cli command in a cell site's docroot, through the on-VM cell-agent (the first
 // "heavy"/data-plane Direction-B op — see actuate.ts::actuateWpCli). Unlike the Cloudflare

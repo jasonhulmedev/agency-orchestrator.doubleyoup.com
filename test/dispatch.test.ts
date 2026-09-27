@@ -30,6 +30,8 @@ import {
   validateCachePurgeParams,
   validateCfTunnelCreateParams,
   validateCfTunnelConfigParams,
+  validateCfTunnelDeleteParams,
+  validateDnsRecordDeleteParams,
   validateWpCliParams,
   validateDbExportParams,
   validateDbImportParams,
@@ -772,13 +774,38 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [{ hostname: "a.example.com", service: "http_status:404" }] }).ok).toBe(false); // caller can't inject the catch-all
   });
 
+  it("cf-tunnel-delete: accepts a UUID/32-hex tunnelId and rejects junk (planning/40 Phase B)", () => {
+    expect(validateCfTunnelDeleteParams({ tunnelId: "031b5bee-a61a-444f-882e-451fd644e59f", extra: "x" })).toEqual({
+      ok: true,
+      params: { tunnelId: "031b5bee-a61a-444f-882e-451fd644e59f" },
+    });
+    expect(validateCfTunnelDeleteParams({ tunnelId: "0123456789abcdef0123456789abcdef" }).ok).toBe(true);
+    expect(validateCfTunnelDeleteParams(null).ok).toBe(false);
+    expect(validateCfTunnelDeleteParams({}).ok).toBe(false);
+    expect(validateCfTunnelDeleteParams({ tunnelId: "not-hex" }).ok).toBe(false);
+    expect(validateCfTunnelDeleteParams({ tunnelId: "031B5BEE-A61A-444F-882E-451FD644E59F" }).ok).toBe(false); // uppercase
+  });
+
+  it("dns-record-delete: accepts an in-zone type+name and rejects out-of-zone / bad input (planning/40 Phase B)", () => {
+    expect(validateDnsRecordDeleteParams({ zone: "example.com", type: "CNAME", name: "cell-x.example.com", extra: "x" })).toEqual({
+      ok: true,
+      params: { zone: "example.com", type: "CNAME", name: "cell-x.example.com" },
+    });
+    expect(validateDnsRecordDeleteParams(null).ok).toBe(false);
+    expect(validateDnsRecordDeleteParams({ zone: "example.com", type: "CNAME", name: "cell-x.other.com" }).ok).toBe(false); // out of zone
+    expect(validateDnsRecordDeleteParams({ zone: "example.com", type: "MX", name: "cell-x.example.com" }).ok).toBe(false); // type not allowed
+    expect(validateDnsRecordDeleteParams({ zone: "Example.com", type: "CNAME", name: "cell-x.example.com" }).ok).toBe(false); // uppercase zone
+  });
+
   it("the op registry has exactly the allowlisted ops, each with validateParams + actuate", () => {
     expect(Object.keys(DISPATCH_OP_REGISTRY).sort()).toEqual([
       "cache-purge",
       "cf-tunnel-config",
       "cf-tunnel-create",
+      "cf-tunnel-delete",
       "db-export",
       "db-import",
+      "dns-record-delete",
       "dns-record-upsert",
       "gcp-address-create",
       "gcp-address-delete",

@@ -23,9 +23,11 @@
 import type { Env } from "./env.js";
 import type {
   DnsRecordUpsertParams,
+  DnsRecordDeleteParams,
   CachePurgeParams,
   CfTunnelCreateParams,
   CfTunnelConfigParams,
+  CfTunnelDeleteParams,
   WpCliParams,
   DbExportParams,
   DbImportParams,
@@ -74,6 +76,16 @@ export type CfTunnelCreateResult =
 export type CfTunnelConfigResult =
   | { ok: true; op: "cf-tunnel-config"; tunnelId: string; ruleCount: number }
   | { ok: false; op: "cf-tunnel-config"; tunnelId: string; detail: string };
+
+// planning/40 Phase B teardown: a delete CONVERGES — "already-absent" (Cloudflare 404) is success, so
+// a resumed teardown re-runs harmlessly (mirrors the GCP delete ops).
+export type CfTunnelDeleteResult =
+  | { ok: true; op: "cf-tunnel-delete"; tunnelId: string; status: "deleted" | "already-absent" }
+  | { ok: false; op: "cf-tunnel-delete"; tunnelId: string; detail: string };
+
+export type DnsRecordDeleteResult =
+  | { ok: true; op: "dns-record-delete"; name: string; status: "deleted" | "already-absent" }
+  | { ok: false; op: "dns-record-delete"; name: string; detail: string };
 
 export type WpCliResult =
   | { ok: true; op: "wp-cli"; exitCode: number; stdout: string; stderr: string }
@@ -225,6 +237,8 @@ export type ActuateResult =
   | CachePurgeResult
   | CfTunnelCreateResult
   | CfTunnelConfigResult
+  | CfTunnelDeleteResult
+  | DnsRecordDeleteResult
   | WpCliResult
   | DbExportResult
   | DbImportResult
@@ -463,9 +477,10 @@ async function resolveZoneId(token: string, zoneName: string): Promise<{ id: str
 async function findExistingRecords(
   token: string,
   zoneId: string,
-  params: DnsRecordUpsertParams,
+  type: string,
+  name: string,
 ): Promise<{ records: CloudflareDnsRecordSummary[] } | { error: string }> {
-  const query = new URLSearchParams({ type: params.type, name: params.name, per_page: "5" });
+  const query = new URLSearchParams({ type, name, per_page: "5" });
   let response: Response;
   try {
     response = await fetch(`${CF_API}/zones/${encodeURIComponent(zoneId)}/dns_records?${query.toString()}`, {
@@ -484,7 +499,7 @@ async function findExistingRecords(
   }
   // Re-check type + name on each row (defensive, as with the zone lookup).
   const records = (body.result as CloudflareDnsRecordSummary[]).filter(
-    (record) => record.id && record.type === params.type && record.name === params.name,
+    (record) => record.id && record.type === type && record.name === name,
   );
   return { records };
 }
@@ -508,7 +523,7 @@ export async function actuateDnsRecordUpsert(
     return dnsFailure(params.name, zone.error);
   }
 
-  const existing = await findExistingRecords(token, zone.id, params);
+  const existing = await findExistingRecords(token, zone.id, params.type, params.name);
   if ("error" in existing) {
     return dnsFailure(params.name, existing.error);
   }
@@ -561,6 +576,52 @@ export async function actuateDnsRecordUpsert(
   }
 
   return { ok: true, op: "dns-record-upsert", action, recordId: written.id, name: params.name };
+}
+
+// planning/40 Phase B: delete the agent-host CNAME on teardown. Idempotent — a record already gone
+// (0 matches) is "already-absent" success; >1 match is refused (never guess which to delete).
+export async function actuateDnsRecordDelete(params: DnsRecordDeleteParams, env: Env): Promise<DnsRecordDeleteResult> {
+  const token = env.CF_DNS_API_TOKEN;
+  if (!token) return { ok: false, op: "dns-record-delete", name: params.name, detail: "CF_DNS_API_TOKEN is not configured on this Worker." };
+
+  const zone = await resolveZoneId(token, params.zone);
+  if ("error" in zone) return { ok: false, op: "dns-record-delete", name: params.name, detail: zone.error };
+
+  const existing = await findExistingRecords(token, zone.id, params.type, params.name);
+  if ("error" in existing) return { ok: false, op: "dns-record-delete", name: params.name, detail: existing.error };
+  if (existing.records.length === 0) {
+    return { ok: true, op: "dns-record-delete", name: params.name, status: "already-absent" };
+  }
+  if (existing.records.length > 1) {
+    return {
+      ok: false,
+      op: "dns-record-delete",
+      name: params.name,
+      detail: `${existing.records.length} ${params.type} records match "${params.name}" — ambiguous, refusing to delete one.`,
+    };
+  }
+
+  const recordId = existing.records[0].id as string;
+  let response: Response;
+  try {
+    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zone.id)}/dns_records/${encodeURIComponent(recordId)}`, {
+      method: "DELETE",
+      headers: cloudflareHeaders(token),
+    });
+  } catch (err) {
+    return { ok: false, op: "dns-record-delete", name: params.name, detail: `could not reach Cloudflare to delete the DNS record: ${errorMessage(err)}` };
+  }
+  if (response.status === 404) {
+    return { ok: true, op: "dns-record-delete", name: params.name, status: "already-absent" };
+  }
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  if (response.status === 401 || response.status === 403) {
+    return { ok: false, op: "dns-record-delete", name: params.name, detail: "Cloudflare denied the DNS delete — CF_DNS_API_TOKEN needs Zone:DNS:Edit on this zone." };
+  }
+  if (!body?.success) {
+    return { ok: false, op: "dns-record-delete", name: params.name, detail: `DNS record delete failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
+  }
+  return { ok: true, op: "dns-record-delete", name: params.name, status: "deleted" };
 }
 
 // ── cf-tunnel-create / cf-tunnel-config ────────────────────────────────────────────────
@@ -763,6 +824,53 @@ export async function actuateCfTunnelConfig(params: CfTunnelConfigParams, env: E
     };
   }
   return { ok: true, op: "cf-tunnel-config", tunnelId: params.tunnelId, ruleCount: params.ingress.length };
+}
+
+// planning/40 Phase B: delete the per-cell tunnel on teardown. Idempotent — a 404 (already deleted) is
+// "already-absent" success. By teardown time the gateway VM (cloudflared) has been deleted, so the
+// tunnel's connections are gone; if Cloudflare still reports active connections, that surfaces as a
+// clean failure and a resumed teardown retries.
+export async function actuateCfTunnelDelete(params: CfTunnelDeleteParams, env: Env): Promise<CfTunnelDeleteResult> {
+  const token = env.CF_DNS_API_TOKEN;
+  if (!token) return { ok: false, op: "cf-tunnel-delete", tunnelId: params.tunnelId, detail: "CF_DNS_API_TOKEN is not configured on this Worker." };
+
+  const account = await resolveAccountId(token, CF_TUNNEL_UNAUTHORIZED_HINT);
+  if ("error" in account) return { ok: false, op: "cf-tunnel-delete", tunnelId: params.tunnelId, detail: account.error };
+
+  // Best-effort: clean up any stale connector connections FIRST — Cloudflare refuses to delete a tunnel
+  // that still reports active connections. By teardown time the gateway VM (cloudflared) is deleted, so
+  // its connections are stale; this forces them cleared so the delete below succeeds on the first try
+  // (review #4). Ignore the outcome — a 404/none is fine, and if it fails the delete still tries.
+  try {
+    await fetch(`${CF_API}/accounts/${encodeURIComponent(account.id)}/cfd_tunnel/${encodeURIComponent(params.tunnelId)}/connections`, {
+      method: "DELETE",
+      headers: cloudflareHeaders(token),
+    });
+  } catch {
+    // ignored — best-effort; the tunnel delete below reports the real outcome.
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${CF_API}/accounts/${encodeURIComponent(account.id)}/cfd_tunnel/${encodeURIComponent(params.tunnelId)}`, {
+      method: "DELETE",
+      headers: cloudflareHeaders(token),
+    });
+  } catch (err) {
+    return { ok: false, op: "cf-tunnel-delete", tunnelId: params.tunnelId, detail: `could not reach Cloudflare to delete the tunnel: ${errorMessage(err)}` };
+  }
+  if (response.status === 404) {
+    return { ok: true, op: "cf-tunnel-delete", tunnelId: params.tunnelId, status: "already-absent" };
+  }
+  if (response.status === 401 || response.status === 403) {
+    await response.text().catch(() => "");
+    return { ok: false, op: "cf-tunnel-delete", tunnelId: params.tunnelId, detail: CF_TUNNEL_UNAUTHORIZED_HINT };
+  }
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  if (!body?.success) {
+    return { ok: false, op: "cf-tunnel-delete", tunnelId: params.tunnelId, detail: `tunnel delete failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
+  }
+  return { ok: true, op: "cf-tunnel-delete", tunnelId: params.tunnelId, status: "deleted" };
 }
 
 // ── cache-purge ──────────────────────────────────────────────────────────────────────
