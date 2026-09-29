@@ -326,11 +326,17 @@ export function validateCfTunnelCreateParams(raw: unknown): ParamsVerdict<CfTunn
 // Set a per-cell tunnel's remotely-managed ingress (planning/40 Component A): map public hostnames to
 // origin services the connector (cloudflared on the gateway) reaches over the VPC — e.g. the web
 // node's cell-agent at http://<web-internal-dns>:9440. Actuated with the same CF_DNS_API_TOKEN /
-// tunnel scope. Two params:
+// tunnel scope. Two params, plus one optional:
 //   1. `tunnelId` — the cfd_tunnel id from cf-tunnel-create (a 32-char hex id; a URL path segment).
 //   2. `ingress` — 1..20 { hostname, service } rules. The tunnel is per-cell (dedicated), so the
 //      actuator writes the FULL config (a PUT) and appends the mandatory catch-all rule itself, so a
 //      caller can neither omit it nor smuggle a second catch-all.
+//   3. `catchAllService` (OPTIONAL) — what the appended catch-all points at: an http(s) origin URL
+//      under the SAME grammar as a rule's `service`, or `http_status:<3 digits>`. Absent => the
+//      actuator's default, http_status:404, so every existing caller's config is byte-identical. A
+//      cell sets it to the web node's nginx (:80) so EVERY site host on the cell (a DNS CNAME to the
+//      tunnel) lands on nginx, which selects the site by server_name — per-site edge wiring is then
+//      DNS-only and never edits this config (the platform's CF token can't reach an agency tunnel).
 // The `service` is an http(s) origin URL (scheme + host + optional port, NO path) — the host may be a
 // GCP-internal DNS name (dots + hyphens), which cloudflared on the gateway resolves over the VPC.
 
@@ -344,8 +350,11 @@ export interface CfTunnelConfigIngressRule {
 export interface CfTunnelConfigParams {
   /** The cfd_tunnel id to configure (from cf-tunnel-create). */
   tunnelId: string;
-  /** The ingress rules; the actuator appends the mandatory catch-all (http_status:404). */
+  /** The ingress rules; the actuator appends the mandatory catch-all (`catchAllService`, else http_status:404). */
   ingress: CfTunnelConfigIngressRule[];
+  /** OPTIONAL: the catch-all's service — an http(s) origin URL (a rule's `service` grammar) or
+   *  `http_status:<3 digits>`. Absent => http_status:404 (unchanged). */
+  catchAllService?: string;
 }
 
 // A Cloudflare tunnel id: a lowercase-hex UUID (the cfd_tunnel API returns a 36-char hyphenated UUID,
@@ -355,6 +364,11 @@ const CF_TUNNEL_ID_RE = /^([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 // An http(s) origin service: scheme + host (alnum, dots, hyphens — a public host OR a GCP-internal DNS
 // name) + OPTIONAL port. No path/query, no userinfo, no shell/URL metacharacter.
 const CF_TUNNEL_SERVICE_RE = /^https?:\/\/[a-z0-9](?:[a-z0-9.-]{0,253})(?::([0-9]{1,5}))?$/;
+// The ONLY non-origin form a catch-all may take: cloudflared's fixed-status responder (http_status:404
+// is the actuator's default). Exactly 3 digits — a status code, nothing else.
+const CF_TUNNEL_HTTP_STATUS_SERVICE_RE = /^http_status:[0-9]{3}$/;
+const CF_TUNNEL_CATCH_ALL_REASON =
+  "catchAllService, when present, must be http_status:<3 digits> or an http(s) origin URL (scheme + host + optional port, no path)";
 const CF_TUNNEL_INGRESS_MAX = 20;
 const TCP_PORT_MAX = 65_535;
 
@@ -362,7 +376,7 @@ export function validateCfTunnelConfigParams(raw: unknown): ParamsVerdict<CfTunn
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
   }
-  const { tunnelId, ingress } = raw;
+  const { tunnelId, ingress, catchAllService } = raw;
 
   if (typeof tunnelId !== "string" || !CF_TUNNEL_ID_RE.test(tunnelId)) {
     return { ok: false, reason: "tunnelId must be a lowercase-hex Cloudflare tunnel id (a 36-char UUID, or 32 hex chars)" };
@@ -394,7 +408,27 @@ export function validateCfTunnelConfigParams(raw: unknown): ParamsVerdict<CfTunn
     cleanIngress.push({ hostname, service });
   }
 
-  return { ok: true, params: { tunnelId, ingress: cleanIngress } };
+  // The optional catch-all. ABSENT => return exactly the two-key params object every earlier caller
+  // gets (no `catchAllService` key at all), so the signed bytes and the written config are unchanged.
+  // PRESENT => either the http_status form or an origin URL under the SAME grammar (and port bound)
+  // as a rule's `service` above — a catch-all is just a hostname-less rule, so it may reach only what
+  // a named rule may reach. Anything else (null, a number, "") fails closed.
+  if (catchAllService === undefined) {
+    return { ok: true, params: { tunnelId, ingress: cleanIngress } };
+  }
+  if (typeof catchAllService !== "string") {
+    return { ok: false, reason: CF_TUNNEL_CATCH_ALL_REASON };
+  }
+  if (!CF_TUNNEL_HTTP_STATUS_SERVICE_RE.test(catchAllService)) {
+    const catchAllMatch = CF_TUNNEL_SERVICE_RE.exec(catchAllService);
+    if (!catchAllMatch) {
+      return { ok: false, reason: CF_TUNNEL_CATCH_ALL_REASON };
+    }
+    if (catchAllMatch[1] !== undefined && Number(catchAllMatch[1]) > TCP_PORT_MAX) {
+      return { ok: false, reason: "catchAllService port must be 0-65535" };
+    }
+  }
+  return { ok: true, params: { tunnelId, ingress: cleanIngress, catchAllService } };
 }
 
 // ── cf-tunnel-delete ─────────────────────────────────────────────────────────────────

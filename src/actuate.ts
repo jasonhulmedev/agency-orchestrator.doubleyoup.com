@@ -790,10 +790,12 @@ export async function actuateCfTunnelConfig(params: CfTunnelConfigParams, env: E
   }
 
   // Per-cell dedicated tunnel => write the FULL ingress config, appending the mandatory catch-all
-  // rule (a remotely-managed tunnel config's last rule must be a service-only catch-all).
+  // rule (a remotely-managed tunnel config's last rule must be a service-only catch-all). The caller
+  // may name the catch-all's service (a cell points it at the web node's nginx so every site host
+  // on the cell routes there by server_name); absent => http_status:404, exactly as before.
   const ingress = [
     ...params.ingress.map((rule) => ({ hostname: rule.hostname, service: rule.service })),
-    { service: "http_status:404" },
+    { service: params.catchAllService ?? "http_status:404" },
   ];
 
   let response: Response;

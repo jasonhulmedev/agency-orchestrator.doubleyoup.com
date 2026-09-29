@@ -52,7 +52,7 @@ import {
   GCP_FIREWALL_PROTOCOLS,
 } from "../src/dispatch-params.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
-import { buildDbExportScript, buildDbImportScript } from "../src/actuate.js";
+import { actuateCfTunnelConfig, buildDbExportScript, buildDbImportScript } from "../src/actuate.js";
 import { GOOGLE_SCOPE_CLOUD_PLATFORM } from "../src/validators.js";
 
 // ── Web-Crypto helpers (no Node APIs) ───────────────────────────────────────────────
@@ -772,6 +772,47 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [{ hostname: "a.example.com", service: "http://x/path" }] }).ok).toBe(false); // path not allowed
     expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [{ hostname: "a.example.com", service: "http://x:99999" }] }).ok).toBe(false); // port > 65535
     expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [{ hostname: "a.example.com", service: "http_status:404" }] }).ok).toBe(false); // caller can't inject the catch-all
+  });
+
+  it("cf-tunnel-config: catchAllService is OPTIONAL — absent => no key (the 404 default); present => an origin URL (a rule's grammar) or http_status:<3 digits>", () => {
+    const okId = "0123456789abcdef0123456789abcdef";
+    const rule = { hostname: "a.example.com", service: "http://x.internal:9440" };
+
+    // Absent: the params object carries NO catchAllService key at all — the signed bytes + the
+    // written config of every pre-existing caller are byte-identical (toEqual ignores undefined
+    // props, so pin the key's absence explicitly).
+    const absent = validateCfTunnelConfigParams({ tunnelId: okId, ingress: [rule] });
+    expect(absent).toEqual({ ok: true, params: { tunnelId: okId, ingress: [rule] } });
+    expect(absent.ok && "catchAllService" in absent.params).toBe(false);
+
+    // The cell case: the web node's nginx over the VPC (an http origin URL, same grammar as a rule).
+    expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [rule], catchAllService: "http://dy-web-x.internal:80" })).toEqual({
+      ok: true,
+      params: { tunnelId: okId, ingress: [rule], catchAllService: "http://dy-web-x.internal:80" },
+    });
+    expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [rule], catchAllService: "https://origin.example.com" }).ok).toBe(true);
+    // The fixed-status form (the explicit default, or any other 3-digit status).
+    expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [rule], catchAllService: "http_status:404" }).ok).toBe(true);
+    expect(validateCfTunnelConfigParams({ tunnelId: okId, ingress: [rule], catchAllService: "http_status:503" }).ok).toBe(true);
+
+    // Fails closed on anything else: wrong type, empty, a malformed status, a bad scheme/path/port.
+    const bad: unknown[] = [
+      null,
+      42,
+      "",
+      "http_status:40",
+      "http_status:4040",
+      "http_status:abc",
+      "ftp://x.internal:80",
+      "http://x.internal/path",
+      "http://x.internal:99999",
+      "x.internal:80",
+    ];
+    for (const catchAllService of bad) {
+      const verdict = validateCfTunnelConfigParams({ tunnelId: okId, ingress: [rule], catchAllService });
+      expect(verdict.ok, `should reject ${JSON.stringify(catchAllService)}`).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(/^catchAllService/);
+    }
   });
 
   it("cf-tunnel-delete: accepts a UUID/32-hex tunnelId and rejects junk (planning/40 Phase B)", () => {
@@ -5462,5 +5503,57 @@ describe("POST /actuate route", () => {
       expect(fetchSpy).not.toHaveBeenCalled();
       vi.restoreAllMocks();
     }
+  });
+});
+
+// ── cf-tunnel-config: the appended catch-all rule ──────────────────────────────────────────
+// The actuator writes the FULL ingress (a PUT) and appends the catch-all itself. Pin the two shapes
+// the config PUT can take: the default (http_status:404 — every pre-existing caller) and a caller-
+// named service (a cell's web-node nginx, so site hosts on the cell route by nginx server_name).
+describe("actuateCfTunnelConfig: the catch-all rule", () => {
+  const TUNNEL_ID = "031b5bee-a61a-444f-882e-451fd644e59f";
+  const RULE = { hostname: "cell-australia-southeast2.example.com", service: "http://dy-web-x.internal:9440" };
+  const env: Env = {
+    APP_BASE_URL: "https://app.example.test",
+    DY_CLIENT_ID: "client-abc",
+    DY_CLIENT_SECRET: "secret-xyz",
+    CF_DNS_API_TOKEN: "cf-dns-token-abc",
+    NONCE_STORE: undefined as unknown as Env["NONCE_STORE"],
+  };
+
+  /** Mock CF: account resolution + the config PUT; returns the PUT body's ingress for assertions. */
+  function mockConfigPut(): { putIngress: () => Array<{ hostname?: string; service: string }> | null } {
+    let captured: Array<{ hostname?: string; service: string }> | null = null;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/accounts?per_page=1")) {
+        return new Response(JSON.stringify({ success: true, result: [{ id: "acct-cf-1" }] }), { status: 200 });
+      }
+      if (url.endsWith(`/accounts/acct-cf-1/cfd_tunnel/${TUNNEL_ID}/configurations`) && init?.method === "PUT") {
+        captured = (JSON.parse(String(init.body)) as { config: { ingress: Array<{ hostname?: string; service: string }> } }).config.ingress;
+        return new Response(JSON.stringify({ success: true, result: {} }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    });
+    return { putIngress: () => captured };
+  }
+
+  it("omitted catchAllService => the config ends with http_status:404 (unchanged default)", async () => {
+    const { putIngress } = mockConfigPut();
+    const result = await actuateCfTunnelConfig({ tunnelId: TUNNEL_ID, ingress: [RULE] }, env);
+    expect(result).toEqual({ ok: true, op: "cf-tunnel-config", tunnelId: TUNNEL_ID, ruleCount: 1 });
+    expect(putIngress()).toEqual([RULE, { service: "http_status:404" }]);
+  });
+
+  it("a given catchAllService becomes the LAST (hostname-less) rule, after every named rule", async () => {
+    const { putIngress } = mockConfigPut();
+    const result = await actuateCfTunnelConfig(
+      { tunnelId: TUNNEL_ID, ingress: [RULE], catchAllService: "http://dy-web-x.internal:80" },
+      env,
+    );
+    expect(result.ok).toBe(true);
+    expect(putIngress()).toEqual([RULE, { service: "http://dy-web-x.internal:80" }]);
+    // ruleCount reports the NAMED rules only — the catch-all is the actuator's, not the caller's.
+    expect(result.ok && result.ruleCount).toBe(1);
   });
 });
