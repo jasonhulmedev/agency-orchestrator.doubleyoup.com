@@ -16,7 +16,8 @@
 //                     through us, using the AGENCY's own credentials. Ops live in the
 //                     registry (src/ops.ts): provision-r2 (create an R2 bucket),
 //                     dns-record-upsert (upsert a record in an agency zone),
-//                     cache-purge (purge an agency zone's cache), wp-cli (run a
+//                     cache-purge (purge an agency zone's cache), cache-rule-upsert
+//                     (the one "edge page cache" Cache Rule in an agency zone), wp-cli (run a
 //                     wp-cli command on the agency's cell via its on-VM cell-agent),
 //                     db-export (the cell exports its WP DB and uploads it to the
 //                     agency's object store via a presigned URL), db-import (the cell

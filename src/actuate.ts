@@ -1,6 +1,7 @@
 // Direction-B ACTUATION (agency Worker side). Runs a verified job using the AGENCY's
 // OWN credentials — R2_PROVISION_API_TOKEN to create an R2 bucket, CF_DNS_API_TOKEN to
-// upsert a DNS record / purge cache in one of the agency's zones, CELL_AGENT_TOKEN to run
+// upsert a DNS record / purge cache / upsert the edge page-cache rule in one of the agency's
+// zones, CELL_AGENT_TOKEN to run
 // a wp-cli command on the agency's own cell via its on-VM cell-agent (the first "heavy"
 // data-plane op), the agency's S3_* object-store credential to PRESIGN a URL the cell
 // uploads a DB dump to (`db-export`) or downloads one from (`db-import`), and — for the
@@ -25,6 +26,7 @@ import type {
   DnsRecordUpsertParams,
   DnsRecordDeleteParams,
   CachePurgeParams,
+  CacheRuleUpsertParams,
   CfTunnelCreateParams,
   CfTunnelConfigParams,
   CfTunnelDeleteParams,
@@ -46,6 +48,15 @@ import type {
   GcpNetworkDeleteParams,
   ProvisionSshKeysParams,
 } from "./dispatch-params.js";
+import { edgeCacheZoneFromHostSuffix } from "./dispatch-params.js";
+import {
+  EDGE_CACHE_PHASE,
+  EDGE_CACHE_RULE_DESCRIPTIONS,
+  buildEdgeCacheRules,
+  edgeCacheRuleDrifted,
+  edgeCacheRulesInOrder,
+  type EdgeCacheRule,
+} from "./edge-cache-rule.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken } from "./validators.js";
 import { errorMessage, stripTrailingSlash } from "./util.js";
@@ -63,6 +74,30 @@ export type DnsRecordUpsertResult =
 export type CachePurgeResult =
   | { ok: true; op: "cache-purge"; mode: "everything" | "files" | "hosts"; zone: string; count: number }
   | { ok: false; op: "cache-purge"; zone: string; detail: string };
+
+/** What one upsert did to one rule: created it (or created the entrypoint with it), PATCHed it, or left it. */
+export type CacheRuleAction = "created" | "updated" | "unchanged";
+
+// The op manages TWO rules (edge-cache-rule.ts: the personal-cookie BYPASS rule + the CACHE rule).
+// `ruleId` / `action` describe the whole op from the CACHE rule's point of view (`action` is the
+// strongest of the two: created > updated > unchanged), the bypass* fields the bypass rule;
+// `otherCacheRules` lists every cache-settings rule in the zone that is NOT ours (a stray
+// force-cache rule under another name would otherwise sit next to the safe pair unnoticed — the
+// platform warns the operator; this Worker never touches them).
+export type CacheRuleUpsertResult =
+  | {
+      ok: true;
+      op: "cache-rule-upsert";
+      zone: string;
+      action: CacheRuleAction;
+      ruleId: string;
+      enabled: boolean;
+      cacheAction: CacheRuleAction;
+      bypassRuleId: string;
+      bypassAction: CacheRuleAction;
+      otherCacheRules: string[];
+    }
+  | { ok: false; op: "cache-rule-upsert"; zone: string; detail: string };
 
 // `connectorToken` is the ONE deliberate secret in a result (planning/40 decision 3 (c)): the
 // orchestrator consumes it transiently — injects it into the gateway's cloudflared exactly as the
@@ -235,6 +270,7 @@ export type ActuateResult =
   | ProvisionR2Result
   | DnsRecordUpsertResult
   | CachePurgeResult
+  | CacheRuleUpsertResult
   | CfTunnelCreateResult
   | CfTunnelConfigResult
   | CfTunnelDeleteResult
@@ -949,6 +985,312 @@ export async function actuateCachePurge(params: CachePurgeParams, env: Env): Pro
   }
 
   return { ok: true, op: "cache-purge", mode: params.mode, zone: params.zone, count };
+}
+
+// ── cache-rule-upsert ────────────────────────────────────────────────────────────────
+// Upsert the ONE "edge page cache" Cache Rule in an agency zone with the agency's own
+// CF_DNS_API_TOKEN (which now also carries Zone → Cache Rules: Edit — a deploy-time scope add):
+//   1. GET  /zones?name=<zone>                                              -> one zone id (resolveZoneId)
+//   2. GET  /zones/:zid/rulesets/phases/http_request_cache_settings/entrypoint
+//        404 => POST /zones/:zid/rulesets {kind:"zone", phase, rules:[rule]} (creates the entrypoint)
+//   3. find OUR rule by its stable description:
+//        absent  => POST  /zones/:zid/rulesets/:rid/rules           (append; other rules untouched)
+//        drifted => PATCH /zones/:zid/rulesets/:rid/rules/:ruleId   (in place)
+//        equal   => nothing
+// The zone is DERIVED from the validated suffix ("-production.<zone>"), so the rule can only ever
+// land in a zone the agency's own token can see, matching only that zone's production hosts. The
+// rule body is built HERE (edge-cache-rule.ts) — the job never carries an expression.
+//
+// Creating the entrypoint with POST (not PUT on the entrypoint path) is deliberate: Cloudflare
+// allows ONE entrypoint per phase per zone, so if one appeared between our GET and our write, the
+// POST fails cleanly instead of replacing the agency's own cache rules.
+//
+// IDEMPOTENT (find-by-description, PATCH only on drift), so the nonce-burned-before-actuation F1
+// rule does not bite: a retry re-signs a fresh job and converges on the same single rule.
+
+/** One rule of a Cloudflare ruleset, as the ruleset API returns it (only the fields we read). */
+interface CloudflareRulesetRule {
+  id?: string;
+  description?: string;
+  expression?: string;
+  action?: string;
+  action_parameters?: unknown;
+  enabled?: boolean;
+}
+
+interface CloudflareRuleset {
+  id?: string;
+  rules?: CloudflareRulesetRule[];
+}
+
+const CACHE_RULES_DENIED_DETAIL =
+  "Cloudflare denied the cache rule change — CF_DNS_API_TOKEN needs Zone → Cache Rules: Edit on this zone.";
+
+function cacheRuleFailure(zone: string, detail: string): CacheRuleUpsertResult {
+  return { ok: false, op: "cache-rule-upsert", zone, detail };
+}
+
+/**
+ * Read the zone's cache-settings phase entrypoint. `missing` = the zone has no Cache Rules yet
+ * (Cloudflare answers 404), which the caller handles by creating the entrypoint.
+ */
+async function getCacheSettingsEntrypoint(
+  token: string,
+  zoneId: string,
+): Promise<{ ruleset: CloudflareRuleset } | { missing: true } | { error: string }> {
+  let response: Response;
+  try {
+    response = await fetch(
+      `${CF_API}/zones/${encodeURIComponent(zoneId)}/rulesets/phases/${EDGE_CACHE_PHASE}/entrypoint`,
+      { headers: { authorization: `Bearer ${token}`, accept: "application/json" } },
+    );
+  } catch (err) {
+    return { error: `could not reach Cloudflare to read the cache rules: ${errorMessage(err)}` };
+  }
+  if (response.status === 404) {
+    await response.text().catch(() => "");
+    return { missing: true };
+  }
+  if (response.status === 401 || response.status === 403) {
+    await response.text().catch(() => "");
+    return { error: CACHE_RULES_DENIED_DETAIL };
+  }
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  const ruleset = body?.result as CloudflareRuleset | undefined;
+  if (!body?.success || !ruleset || typeof ruleset.id !== "string") {
+    return { error: `cache rules read failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
+  }
+  return { ruleset };
+}
+
+/**
+ * One ruleset write (create entrypoint / append rule / patch rule). All three return the full
+ * updated ruleset on success, which the caller reads our rule's id from.
+ */
+async function writeCacheRuleset(
+  token: string,
+  method: "POST" | "PATCH",
+  url: string,
+  body: unknown,
+): Promise<{ ruleset: CloudflareRuleset } | { error: string }> {
+  let response: Response;
+  try {
+    response = await fetch(url, { method, headers: cloudflareHeaders(token), body: JSON.stringify(body) });
+  } catch (err) {
+    return { error: `could not reach Cloudflare to write the cache rule: ${errorMessage(err)}` };
+  }
+  if (response.status === 401 || response.status === 403) {
+    await response.text().catch(() => "");
+    return { error: CACHE_RULES_DENIED_DETAIL };
+  }
+  const envelope = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  if (!envelope?.success) {
+    return { error: `cache rule write failed with HTTP ${response.status}${cloudflareErrorMessage(envelope)}.` };
+  }
+  return { ruleset: (envelope.result ?? {}) as CloudflareRuleset };
+}
+
+/** The id of the rule carrying `description` in a ruleset Cloudflare returned, or "" when absent. */
+function cacheRuleIdIn(ruleset: CloudflareRuleset, description: string): string {
+  const rule = (ruleset.rules ?? []).find((candidate) => candidate.description === description);
+  return rule?.id ?? "";
+}
+
+/**
+ * One-line summaries of the rules in the zone's cache-settings ruleset that are NOT ours. Reported
+ * (never acted on) so the platform can warn about a stray force-cache rule under another name.
+ */
+function describeOtherCacheRules(ruleset: CloudflareRuleset | null): string[] {
+  const summaries: string[] = [];
+  for (const rule of ruleset?.rules ?? []) {
+    const description = rule.description ?? "";
+    if (EDGE_CACHE_RULE_DESCRIPTIONS.includes(description)) {
+      continue;
+    }
+    const params = (rule.action_parameters ?? {}) as { cache?: unknown; edge_ttl?: { mode?: string; default?: number } };
+    const parts: string[] = [`cache=${String(params.cache ?? "unset")}`];
+    if (params.edge_ttl !== undefined) {
+      parts.push(`edge_ttl.mode=${params.edge_ttl.mode ?? "unset"}`);
+      if (params.edge_ttl.default !== undefined) {
+        parts.push(`edge_ttl.default=${params.edge_ttl.default}`);
+      }
+    }
+    const label = description === "" ? "(no description)" : description;
+    const state = rule.enabled === false ? "disabled" : "enabled";
+    summaries.push(`${label} [${rule.id ?? "no id"}] ${state} ${parts.join(" ")}`);
+  }
+  return summaries;
+}
+
+type OneCacheRuleOutcome =
+  | { action: CacheRuleAction; ruleId: string; ruleset: CloudflareRuleset }
+  | { error: string };
+
+/**
+ * Upsert ONE of our rules against the ruleset as we currently know it (null = the zone has no
+ * cache-settings entrypoint yet). Returns the ruleset to carry into the next rule: for a create /
+ * append that is what Cloudflare returned (it carries the new ids); for a PATCH, our copy with the
+ * patched rule replaced (the PATCH reply is not relied on); unchanged = untouched.
+ */
+async function upsertOneCacheRule(
+  token: string,
+  zonePath: string,
+  ruleset: CloudflareRuleset | null,
+  desired: EdgeCacheRule,
+): Promise<OneCacheRuleOutcome> {
+  // No Cache Rules in this zone yet: create the phase entrypoint holding just this rule.
+  if (ruleset === null) {
+    const created = await writeCacheRuleset(token, "POST", `${zonePath}/rulesets`, {
+      name: "default",
+      kind: "zone",
+      phase: EDGE_CACHE_PHASE,
+      rules: [desired],
+    });
+    if ("error" in created) {
+      return created;
+    }
+    return { action: "created", ruleId: cacheRuleIdIn(created.ruleset, desired.description), ruleset: created.ruleset };
+  }
+
+  const rulesetId = ruleset.id as string;
+  const rulesetPath = `${zonePath}/rulesets/${encodeURIComponent(rulesetId)}`;
+  const matches = (ruleset.rules ?? []).filter((candidate) => candidate.description === desired.description);
+
+  // Two rules with our description is AMBIGUOUS: patching one would leave the other in force, so
+  // fail closed and let an operator clean it up (mirrors dns-record-upsert's 2+ match rule).
+  if (matches.length > 1) {
+    return {
+      error: `${matches.length} cache rules already carry the description "${desired.description}" — ambiguous, refusing to change any of them.`,
+    };
+  }
+
+  const existing = matches[0];
+  if (existing === undefined) {
+    // Absent: APPEND our rule. Every other rule in the agency's ruleset stays untouched.
+    const appended = await writeCacheRuleset(token, "POST", `${rulesetPath}/rules`, desired);
+    if ("error" in appended) {
+      return appended;
+    }
+    // Carry Cloudflare's reply when it lists rules (it carries the new id); else our own copy.
+    let next = appended.ruleset;
+    if (!Array.isArray(next.rules)) {
+      next = { ...ruleset, rules: [...(ruleset.rules ?? []), { ...desired, id: "" }] };
+    }
+    return { action: "created", ruleId: cacheRuleIdIn(next, desired.description), ruleset: next };
+  }
+
+  const existingId = existing.id ?? "";
+  if (!edgeCacheRuleDrifted(existing, desired)) {
+    return { action: "unchanged", ruleId: existingId, ruleset };
+  }
+  if (!existingId) {
+    return { error: `Cloudflare returned our rule "${desired.description}" without an id — cannot update it.` };
+  }
+
+  const patched = await writeCacheRuleset(token, "PATCH", `${rulesetPath}/rules/${encodeURIComponent(existingId)}`, desired);
+  if ("error" in patched) {
+    return patched;
+  }
+  const replaced = (ruleset.rules ?? []).map((rule) => (rule.id === existingId ? { ...desired, id: existingId } : rule));
+  return { action: "updated", ruleId: existingId, ruleset: { ...ruleset, rules: replaced } };
+}
+
+/** The strongest of two per-rule actions: created > updated > unchanged. */
+function combinedCacheRuleAction(first: CacheRuleAction, second: CacheRuleAction): CacheRuleAction {
+  if (first === "created" || second === "created") {
+    return "created";
+  }
+  if (first === "updated" || second === "updated") {
+    return "updated";
+  }
+  return "unchanged";
+}
+
+/**
+ * Upsert the edge page-cache rule with the agency's own CF_DNS_API_TOKEN. Returns a structured
+ * result; never throws for a Cloudflare-side failure. NEVER falls back to a platform credential
+ * (there is none). Never touches any other rule in the zone.
+ */
+export async function actuateCacheRuleUpsert(
+  params: CacheRuleUpsertParams,
+  env: Env,
+): Promise<CacheRuleUpsertResult> {
+  // The validator already proved the suffix is "-production.<zone>"; this re-derives the zone.
+  const zoneName = edgeCacheZoneFromHostSuffix(params.hostSuffix);
+  if (zoneName === null) {
+    return cacheRuleFailure(params.hostSuffix, "hostSuffix is not \"-production.\" + a zone name.");
+  }
+
+  const token = env.CF_DNS_API_TOKEN;
+  if (!token) {
+    return cacheRuleFailure(zoneName, "CF_DNS_API_TOKEN is not configured on this Worker.");
+  }
+
+  const built = buildEdgeCacheRules(params);
+  if (!built.ok) {
+    return cacheRuleFailure(zoneName, built.reason);
+  }
+  // Bypass first, cache second: a fresh ruleset then lists the bypass rule first (cosmetic — the two
+  // expressions are mutually exclusive, see edge-cache-rule.ts).
+  const desiredRules = edgeCacheRulesInOrder(built.rules);
+
+  // Fail closed unless the agency's own token can see EXACTLY this zone.
+  const zone = await resolveZoneId(token, zoneName);
+  if ("error" in zone) {
+    return cacheRuleFailure(zoneName, zone.error);
+  }
+  const zonePath = `${CF_API}/zones/${encodeURIComponent(zone.id)}`;
+
+  // ONE read; the ruleset is then carried in memory from write to write, so the second rule sees the
+  // first one's write and a missing entrypoint is created exactly once (Cloudflare allows one per
+  // phase per zone — a second POST would fail, not clobber).
+  const entrypoint = await getCacheSettingsEntrypoint(token, zone.id);
+  if ("error" in entrypoint) {
+    return cacheRuleFailure(zoneName, entrypoint.error);
+  }
+  let ruleset: CloudflareRuleset | null = null;
+  if (!("missing" in entrypoint)) {
+    ruleset = entrypoint.ruleset;
+  }
+  const otherCacheRules = describeOtherCacheRules(ruleset);
+
+  // Fail closed BEFORE any write: two rules carrying one of our descriptions is ambiguous (patching
+  // one would leave the other in force). Checked for both rules up front so the first rule's write
+  // never lands when the second rule's state is ambiguous (mirrors dns-record-upsert's 2+ rule).
+  for (const desired of desiredRules) {
+    const matchCount = (ruleset?.rules ?? []).filter((candidate) => candidate.description === desired.description).length;
+    if (matchCount > 1) {
+      return cacheRuleFailure(
+        zoneName,
+        `${matchCount} cache rules already carry the description "${desired.description}" — ambiguous, refusing to change any of them.`,
+      );
+    }
+  }
+
+  const outcomes: Array<{ action: CacheRuleAction; ruleId: string }> = [];
+  for (const desired of desiredRules) {
+    const outcome = await upsertOneCacheRule(token, zonePath, ruleset, desired);
+    if ("error" in outcome) {
+      return cacheRuleFailure(zoneName, outcome.error);
+    }
+    ruleset = outcome.ruleset;
+    outcomes.push({ action: outcome.action, ruleId: outcome.ruleId });
+  }
+  const bypassOutcome = outcomes[0] as { action: CacheRuleAction; ruleId: string };
+  const cacheOutcome = outcomes[1] as { action: CacheRuleAction; ruleId: string };
+
+  return {
+    ok: true,
+    op: "cache-rule-upsert",
+    zone: zoneName,
+    action: combinedCacheRuleAction(bypassOutcome.action, cacheOutcome.action),
+    ruleId: cacheOutcome.ruleId,
+    enabled: built.rules.cache.enabled,
+    cacheAction: cacheOutcome.action,
+    bypassRuleId: bypassOutcome.ruleId,
+    bypassAction: bypassOutcome.action,
+    otherCacheRules,
+  };
 }
 
 // ── wp-cli ─────────────────────────────────────────────────────────────────────────────

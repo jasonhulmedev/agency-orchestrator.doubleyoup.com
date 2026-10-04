@@ -39,7 +39,7 @@ Worker never persists them anywhere else and we never hold them. See
 | `S3_ENDPOINT` | secret (optional) | set for Cloudflare R2 (recommended) or another S3-compatible store (MinIO/Wasabi); uses path-style addressing. When set, `/validate` proves the credential can actually **write** the bucket with an object **PUT** probe (no bucket list, best-effort deleted after), so a normally-scoped R2 Object Read&Write key — which is denied bucket-level `ListObjectsV2` — still validates green, while a read-only key or a non-S3 endpoint is correctly caught |
 | `STRIPE_SECRET_KEY` | secret | the agency's Stripe secret key |
 | `R2_PROVISION_API_TOKEN` | secret | Cloudflare **account-owned** token (Manage Account → Account API Tokens in their account) with Workers R2 Storage: Edit + Account API Tokens: Edit — creates per-site media buckets + mints per-site keys. Must NOT be a My Profile → API Tokens (user) token — those fail the account-scoped check |
-| `CF_DNS_API_TOKEN` | secret | Cloudflare API token with **Zone:DNS:Edit + Zone:Read + Zone:Cache Purge** on the agency zone(s) the platform may manage — used by the Direction-B `dns-record-upsert` (create/update DNS records) and `cache-purge` (purge a zone's cache) actuators (`POST /actuate`) so the platform manages your zones **through this Worker**, never with direct access. `/validate` probes it read-only (zone list); the edit + purge scopes are exercised on first use |
+| `CF_DNS_API_TOKEN` | secret | Cloudflare API token with **Zone:DNS:Edit + Zone:Read + Zone:Cache Purge + Zone → Cache Rules: Edit** on the agency zone(s) the platform may manage — used by the Direction-B `dns-record-upsert` (create/update DNS records), `cache-purge` (purge a zone's cache) and `cache-rule-upsert` (the one "edge page cache" Cache Rule for `*-production.<zone>` hosts — the Worker builds the rule itself; the platform sends only a host suffix, a TTL and on/off) actuators (`POST /actuate`) so the platform manages your zones **through this Worker**, never with direct access. `/validate` probes it read-only (zone list, plus a Cache Rules read probe); the edit + purge scopes are exercised on first use |
 | `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` | secrets | AI provider keys — set at least one (`OPENAI_API_KEY` also covers Codex) |
 
 ## Where setup instructions live
@@ -155,7 +155,7 @@ npm run typecheck                # tsc --noEmit
   hand-rolled against Web Crypto.
 - The Direction-B signed handshake (our app → this Worker) is **live**: `POST
   /actuate` verifies an ed25519 signature + a single-use nonce before running any
-  allowlisted op (provision-r2, dns-record-upsert, cache-purge, wp-cli,
+  allowlisted op (provision-r2, dns-record-upsert, cache-purge, cache-rule-upsert, wp-cli,
   db-export, db-import, gcp-instance-create, gcp-network-create,
   gcp-firewall-create, gcp-address-create, gcp-router-nat-create). `/validate`
   and `/complete` stay agency-triggered.

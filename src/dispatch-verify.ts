@@ -41,6 +41,7 @@ export const DISPATCH_OPS = [
   "provision-r2",
   "dns-record-upsert",
   "cache-purge",
+  "cache-rule-upsert",
   "cf-tunnel-create",
   "cf-tunnel-config",
   "cf-tunnel-delete",

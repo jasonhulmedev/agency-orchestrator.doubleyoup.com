@@ -72,12 +72,13 @@ export interface Env {
   R2_PROVISION_API_TOKEN?: string;
 
   // Cloudflare API token for the agency's OWN zones — Zone:DNS:Edit + Zone:Read +
-  // Zone:Cache Purge on the zone(s) the platform may manage. Used by the Direction-B
-  // actuators (src/actuate.ts): `dns-record-upsert` (create/update DNS records) and
-  // `cache-purge` (purge a zone's cache), both through this Worker, so the platform
-  // never needs direct access to the agency's Cloudflare zones. Also probed read-only
-  // by /validate (validators.ts::validateCfDns); the edit + purge scopes are exercised
-  // for real on first use. Set only as a Worker secret, never in [vars].
+  // Zone:Cache Purge + Zone → Cache Rules: Edit on the zone(s) the platform may manage.
+  // Used by the Direction-B actuators (src/actuate.ts): `dns-record-upsert` (create/update
+  // DNS records), `cache-purge` (purge a zone's cache) and `cache-rule-upsert` (the one
+  // "edge page cache" Cache Rule), all through this Worker, so the platform never needs
+  // direct access to the agency's Cloudflare zones. Also probed read-only by /validate
+  // (validators.ts::validateCfDns, including a Cache Rules read probe); the edit + purge
+  // scopes are exercised for real on first use. Set only as a Worker secret, never in [vars].
   CF_DNS_API_TOKEN?: string;
 
   // ── Direction-B cell-agent access (secrets) ───────────────────────────────

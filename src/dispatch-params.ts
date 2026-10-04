@@ -287,6 +287,90 @@ export function validateCachePurgeParams(raw: unknown): ParamsVerdict<CachePurge
   return { ok: false, reason: `mode must be one of ${CACHE_PURGE_MODES.join(", ")}` };
 }
 
+// ── cache-rule-upsert ────────────────────────────────────────────────────────────────
+// Upsert the ONE standing "edge page cache" Cache Rule (phase http_request_cache_settings) in an
+// agency zone, so anonymous visitors to the agency's WordPress production hosts are served from
+// Cloudflare's edge. Actuated with the agency's own CF_DNS_API_TOKEN, which now also carries
+// Zone → Cache Rules: Edit (a deploy-time scope add, not a new secret).
+//
+// NARROW AUTHORITY (Direction-B principle, fail-closed): the job carries only a host SUFFIX, a TTL
+// and an on/off switch — NEVER a raw expression or raw action_parameters. The Worker builds the
+// whole rule itself (edge-cache-rule.ts) from these three values, so the platform can at most turn
+// a fixed, WordPress-safe cache rule on or off for `*-production.<zone>` hosts. The suffix must be
+// EXACTLY "-production." + a zone name; the actuator then resolves that zone with the agency's own
+// token and fails closed when the token cannot see it — the same "restricted to its own zone" rule
+// dns-record-upsert follows. Unlike the older all-strings ops, the TTL is a real number and
+// `enabled` a real boolean (the signed `params` rides as an opaque string, so that is safe).
+
+/** Every edge-cache host suffix is this prefix + the zone name. */
+export const EDGE_CACHE_HOST_SUFFIX_PREFIX = "-production.";
+// The edge TTL bounds: below 60s the cache barely helps; above an hour a published edit stays
+// stale too long for an agency site without an automatic purge-on-publish.
+export const EDGE_CACHE_TTL_MIN_SECONDS = 60;
+export const EDGE_CACHE_TTL_MAX_SECONDS = 3600;
+
+export interface CacheRuleUpsertParams {
+  /** "-production." + the agency zone, e.g. "-production.example.com". */
+  hostSuffix: string;
+  /** The edge TTL in whole seconds, 60..3600. */
+  edgeTtlSeconds: number;
+  /** false disables the rule in place (a rollback that keeps the rule). Absent in the job => true. */
+  enabled: boolean;
+}
+
+/**
+ * The zone a valid edge-cache host suffix names ("-production.example.com" -> "example.com"), or
+ * null when the suffix is not exactly the prefix + a lowercase zone name (same grammar as the DNS
+ * op's zone). The grammar admits only [a-z0-9_.-], so the suffix is safe to embed in a quoted
+ * Rules-language string.
+ */
+export function edgeCacheZoneFromHostSuffix(hostSuffix: string): string | null {
+  if (!hostSuffix.startsWith(EDGE_CACHE_HOST_SUFFIX_PREFIX)) {
+    return null;
+  }
+  const zone = hostSuffix.slice(EDGE_CACHE_HOST_SUFFIX_PREFIX.length);
+  if (zone.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(zone)) {
+    return null;
+  }
+  return zone;
+}
+
+export function validateCacheRuleUpsertParams(raw: unknown): ParamsVerdict<CacheRuleUpsertParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { hostSuffix, edgeTtlSeconds, enabled } = raw;
+
+  if (typeof hostSuffix !== "string" || edgeCacheZoneFromHostSuffix(hostSuffix) === null) {
+    return {
+      ok: false,
+      reason: 'hostSuffix must be "-production." followed by a lowercase DNS zone name (e.g. -production.example.com)',
+    };
+  }
+  if (
+    typeof edgeTtlSeconds !== "number" ||
+    !Number.isInteger(edgeTtlSeconds) ||
+    edgeTtlSeconds < EDGE_CACHE_TTL_MIN_SECONDS ||
+    edgeTtlSeconds > EDGE_CACHE_TTL_MAX_SECONDS
+  ) {
+    return {
+      ok: false,
+      reason: `edgeTtlSeconds must be an integer from ${EDGE_CACHE_TTL_MIN_SECONDS} to ${EDGE_CACHE_TTL_MAX_SECONDS}`,
+    };
+  }
+  if (enabled !== undefined && typeof enabled !== "boolean") {
+    return { ok: false, reason: "enabled, when present, must be true or false" };
+  }
+
+  // An absent `enabled` means "on". Normalize it here so the actuator always sees a boolean.
+  let enabledValue = true;
+  if (enabled === false) {
+    enabledValue = false;
+  }
+  // A FRESH object holding only the known keys, so an extra key can never ride along.
+  return { ok: true, params: { hostSuffix, edgeTtlSeconds, enabled: enabledValue } };
+}
+
 // ── cf-tunnel-create ─────────────────────────────────────────────────────────────────
 // Create (idempotently, by name) a per-cell Cloudflare **named tunnel** in the agency's own CF
 // account and return its id + connector token (planning/40 Component A). Actuated with the agency's

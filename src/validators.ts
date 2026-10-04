@@ -354,7 +354,7 @@ export async function validateR2Provision(env: Env): Promise<ValidationResult> {
   }
 }
 
-// ── Cloudflare DNS (Direction-B dns-record-upsert + cache-purge) ─────────────
+// ── Cloudflare DNS (Direction-B dns-record-upsert + cache-purge + cache-rule-upsert) ─
 
 // READ-ONLY probe: GET /zones?per_page=1 proves CF_DNS_API_TOKEN authenticates and can
 // list at least one zone (Zone:Read). Like validateR2Provision, Cloudflare can't tell us
@@ -400,6 +400,35 @@ async function probeCfTunnelScope(token: string): Promise<string> {
   }
 }
 
+/**
+ * READ-ONLY probe of the Zone → Cache Rules scope (the `cache-rule-upsert` op, edge page caching):
+ * GET the cache-settings phase entrypoint of the zone the zone list returned. Returns a short human
+ * status string (never throws) folded into the cfDns detail. A 200 (rules exist) or 404 (no Cache
+ * Rules yet) proves the token may READ cache rules; Cloudflare cannot tell us whether it may also
+ * EDIT them, so that is exercised on the first cache-rule-upsert. A 401/403 means the scope is
+ * missing entirely.
+ */
+async function probeCacheRulesScope(token: string, zoneId: string | undefined): Promise<string> {
+  if (!zoneId) {
+    return "Cache Rules: could not probe (the zone list returned no zone id).";
+  }
+  try {
+    const response = await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(zoneId)}/rulesets/phases/http_request_cache_settings/entrypoint`,
+      { headers: { authorization: `Bearer ${token}`, accept: "application/json" } },
+    );
+    if (response.status === 200 || response.status === 404) {
+      return "Cache Rules: read access OK (Zone → Cache Rules: Edit is exercised on the first edge-cache rule upsert).";
+    }
+    if (response.status === 401 || response.status === 403) {
+      return "Cache Rules: NOT available — add Zone → Cache Rules: Edit for edge page caching.";
+    }
+    return `Cache Rules: check inconclusive (HTTP ${response.status}).`;
+  } catch (err) {
+    return `Cache Rules: probe could not be sent (${errorMessage(err)}).`;
+  }
+}
+
 export async function validateCfDns(env: Env): Promise<ValidationResult> {
   if (!env.CF_DNS_API_TOKEN) {
     return {
@@ -419,7 +448,7 @@ export async function validateCfDns(env: Env): Promise<ValidationResult> {
     if (response.status === 200) {
       const body = (await response.json().catch(() => null)) as {
         success?: boolean;
-        result?: Array<{ name?: string }>;
+        result?: Array<{ id?: string; name?: string }>;
       } | null;
       if (body?.success && body.result && body.result.length > 0) {
         const zoneName = body.result[0]?.name;
@@ -428,9 +457,11 @@ export async function validateCfDns(env: Env): Promise<ValidationResult> {
         // into the detail — non-fatal so a DNS-only token still validates green, but a missing tunnel
         // scope is surfaced here (a routable-cell provision would otherwise fail on first dispatch).
         const tunnelStatus = await probeCfTunnelScope(env.CF_DNS_API_TOKEN);
+        // Edge page caching: the same token also drives cache-rule-upsert. Same non-fatal pattern.
+        const cacheRulesStatus = await probeCacheRulesScope(env.CF_DNS_API_TOKEN, body.result[0]?.id);
         return {
           ok: true,
-          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch. ${tunnelStatus}`,
+          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch. ${tunnelStatus} ${cacheRulesStatus}`,
         };
       }
       return {

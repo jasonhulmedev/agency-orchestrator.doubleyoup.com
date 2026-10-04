@@ -49,8 +49,19 @@ import {
   validateGcpRouterDeleteParams,
   validateGcpNetworkDeleteParams,
   validateProvisionSshKeysParams,
+  validateCacheRuleUpsertParams,
+  edgeCacheZoneFromHostSuffix,
   GCP_FIREWALL_PROTOCOLS,
 } from "../src/dispatch-params.js";
+import {
+  EDGE_CACHE_BYPASS_RULE_DESCRIPTION,
+  EDGE_CACHE_RULE_DESCRIPTION,
+  buildEdgeCacheRules,
+  clampEdgeCacheTtl,
+  edgeCacheRuleDrifted,
+  edgeCacheRulesInOrder,
+  jsonValuesEqual,
+} from "../src/edge-cache-rule.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
 import { actuateCfTunnelConfig, buildDbExportScript, buildDbImportScript } from "../src/actuate.js";
 import { GOOGLE_SCOPE_CLOUD_PLATFORM } from "../src/validators.js";
@@ -136,6 +147,17 @@ function cachePurgeJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
     op: "cache-purge",
     params: JSON.stringify(CACHE_PARAMS),
     nonce: "aa55aa55aa55aa55aa55aa55aa55aa55",
+    ...overrides,
+  });
+}
+
+// A cache-rule-upsert job — the edge page-cache rule for an agency zone's production hosts.
+const CACHE_RULE_PARAMS = { hostSuffix: "-production.example.com", edgeTtlSeconds: 600, enabled: true };
+function cacheRuleJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "cache-rule-upsert",
+    params: JSON.stringify(CACHE_RULE_PARAMS),
+    nonce: "ab12ab12ab12ab12ab12ab12ab12ab12",
     ...overrides,
   });
 }
@@ -841,6 +863,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
   it("the op registry has exactly the allowlisted ops, each with validateParams + actuate", () => {
     expect(Object.keys(DISPATCH_OP_REGISTRY).sort()).toEqual([
       "cache-purge",
+      "cache-rule-upsert",
       "cf-tunnel-config",
       "cf-tunnel-create",
       "cf-tunnel-delete",
@@ -934,6 +957,63 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(bad({ mode: "hosts", hosts: ["*.doubleyoup.com"] }).ok).toBe(false); // wildcard
     expect(bad({ mode: "hosts", hosts: ["evil.com"] }).ok).toBe(false); // out of zone
     expect(bad({ mode: "hosts", hosts: ["notdoubleyoup.com"] }).ok).toBe(false); // suffix trick
+  });
+
+  // ── cache-rule-upsert (twin of the app's rules) ───────────────────────────────────
+
+  it("cache-rule-upsert: accepts a suffix + TTL, defaults enabled to true, and returns only known keys", () => {
+    expect(
+      validateCacheRuleUpsertParams({ hostSuffix: "-production.example.com", edgeTtlSeconds: 600, extra: "x" }),
+    ).toEqual({ ok: true, params: { hostSuffix: "-production.example.com", edgeTtlSeconds: 600, enabled: true } });
+    expect(
+      validateCacheRuleUpsertParams({ hostSuffix: "-production.sbmstudio.com.au", edgeTtlSeconds: 60, enabled: false }),
+    ).toEqual({ ok: true, params: { hostSuffix: "-production.sbmstudio.com.au", edgeTtlSeconds: 60, enabled: false } });
+    expect(validateCacheRuleUpsertParams({ hostSuffix: "-production.example.com", edgeTtlSeconds: 3600 }).ok).toBe(true);
+    // NEVER a raw rule: an expression / action_parameters smuggled into the job is dropped.
+    const smuggled = validateCacheRuleUpsertParams({
+      ...CACHE_RULE_PARAMS,
+      expression: "true",
+      action_parameters: { cache: true, edge_ttl: { mode: "override_origin", default: 31536000 } },
+    });
+    expect(smuggled).toEqual({ ok: true, params: CACHE_RULE_PARAMS });
+  });
+
+  it("cache-rule-upsert: rejects bad input field by field (fails closed)", () => {
+    const bad = (overrides: Record<string, unknown>) => validateCacheRuleUpsertParams({ ...CACHE_RULE_PARAMS, ...overrides });
+
+    expect(validateCacheRuleUpsertParams(null).ok).toBe(false);
+    expect(validateCacheRuleUpsertParams([]).ok).toBe(false);
+    // hostSuffix
+    expect(bad({ hostSuffix: undefined }).ok).toBe(false);
+    expect(bad({ hostSuffix: "" }).ok).toBe(false);
+    expect(bad({ hostSuffix: "example.com" }).ok).toBe(false); // no prefix
+    expect(bad({ hostSuffix: ".example.com" }).ok).toBe(false); // no prefix
+    expect(bad({ hostSuffix: "-staging.example.com" }).ok).toBe(false); // wrong environment
+    expect(bad({ hostSuffix: "-production.com" }).ok).toBe(false); // single-label zone
+    expect(bad({ hostSuffix: "-production.Example.com" }).ok).toBe(false); // uppercase
+    expect(bad({ hostSuffix: "-production.*.example.com" }).ok).toBe(false); // wildcard
+    expect(bad({ hostSuffix: " -production.example.com" }).ok).toBe(false); // padded
+    expect(bad({ hostSuffix: '-production.example.com") or (true' }).ok).toBe(false); // expression injection
+    expect(bad({ hostSuffix: "-production.example.com\\" }).ok).toBe(false); // backslash
+    expect(bad({ hostSuffix: 42 }).ok).toBe(false);
+    // edgeTtlSeconds
+    expect(bad({ edgeTtlSeconds: undefined }).ok).toBe(false);
+    expect(bad({ edgeTtlSeconds: 59 }).ok).toBe(false);
+    expect(bad({ edgeTtlSeconds: 3601 }).ok).toBe(false);
+    expect(bad({ edgeTtlSeconds: 600.5 }).ok).toBe(false); // not an integer
+    expect(bad({ edgeTtlSeconds: "600" }).ok).toBe(false); // a string, not a number
+    expect(bad({ edgeTtlSeconds: Number.NaN }).ok).toBe(false);
+    // enabled
+    expect(bad({ enabled: "false" }).ok).toBe(false);
+    expect(bad({ enabled: 0 }).ok).toBe(false);
+    expect(bad({ enabled: null }).ok).toBe(false);
+  });
+
+  it("cache-rule-upsert: the zone is exactly the suffix minus the -production. prefix", () => {
+    expect(edgeCacheZoneFromHostSuffix("-production.example.com")).toBe("example.com");
+    expect(edgeCacheZoneFromHostSuffix("-production.sbmstudio.com.au")).toBe("sbmstudio.com.au");
+    expect(edgeCacheZoneFromHostSuffix("-production.com")).toBeNull();
+    expect(edgeCacheZoneFromHostSuffix("x-production.example.com")).toBeNull();
   });
 
   // ── wp-cli (twin of the app's rules) ──────────────────────────────────────────────
@@ -2572,6 +2652,357 @@ describe("POST /actuate route", () => {
     expect(response.status).toBe(400);
     const body = (await response.json()) as { reason: string };
     expect(body.reason).toMatch(/within zone/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── cache-rule-upsert through the registry ────────────────────────────────────────
+
+  // The TWO rules the Worker must build for CACHE_RULE_PARAMS — what every write body is compared to.
+  // The op applies the BYPASS rule first, then the CACHE rule (edgeCacheRulesInOrder).
+  function expectedRules(enabled = true) {
+    const built = buildEdgeCacheRules({ hostSuffix: "-production.example.com", edgeTtlSeconds: 600, enabled });
+    if (!built.ok) throw new Error(built.reason);
+    return built.rules;
+  }
+  function expectedCacheRule(enabled = true) {
+    return expectedRules(enabled).cache;
+  }
+  function expectedBypassRule(enabled = true) {
+    return expectedRules(enabled).bypass;
+  }
+  // The id the mock assigns a newly written rule, by which of our two rules it is.
+  function newIdFor(description: unknown) {
+    return description === EDGE_CACHE_BYPASS_RULE_DESCRIPTION ? "rule-new-bypass" : "rule-new-cache";
+  }
+
+  // A routed CF ruleset API mock: zone lookup, the cache-settings entrypoint GET, and the three
+  // writes (create entrypoint / append rule / patch rule). `entrypointRules` = the rules the zone
+  // already has; null => 404 (no Cache Rules yet). `denyStatus` makes the entrypoint GET answer
+  // 401/403. Every call must carry the DNS token — the op's own credential, never the R2 token.
+  function mockCacheRuleApi(entrypointRules: Array<Record<string, unknown>> | null, denyStatus?: number) {
+    const calls: Array<{ method: string; path: string; body?: Record<string, unknown> }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = urlOf(input);
+      const method = init?.method ?? "GET";
+      const auth = new Headers(init?.headers).get("authorization");
+      expect(auth).toBe("Bearer cf-dns-token-abc");
+      const parsed = new URL(url);
+      const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined;
+      calls.push({ method, path: parsed.pathname, body });
+
+      if (parsed.pathname === "/client/v4/zones" && method === "GET") {
+        expect(parsed.searchParams.get("name")).toBe("example.com");
+        return jsonResponse({ success: true, result: [{ id: "zone-1", name: "example.com" }] });
+      }
+      if (
+        parsed.pathname === "/client/v4/zones/zone-1/rulesets/phases/http_request_cache_settings/entrypoint" &&
+        method === "GET"
+      ) {
+        if (denyStatus !== undefined) {
+          return jsonResponse({ success: false, errors: [{ code: 10000, message: "Authentication error" }] }, denyStatus);
+        }
+        if (entrypointRules === null) {
+          return jsonResponse({ success: false, errors: [{ code: 10003, message: "could not find entrypoint ruleset" }] }, 404);
+        }
+        return jsonResponse({ success: true, result: { id: "rs-1", rules: entrypointRules } });
+      }
+      if (parsed.pathname === "/client/v4/zones/zone-1/rulesets" && method === "POST") {
+        const createdRules = (body?.rules as Array<Record<string, unknown>>).map((rule) => ({ ...rule, id: newIdFor(rule.description) }));
+        return jsonResponse({ success: true, result: { id: "rs-new", rules: createdRules } });
+      }
+      // Append to ANY ruleset id (rs-1 = the zone's existing entrypoint, rs-new = one this op just
+      // created for the bypass rule). Stateless: the reply is the initial rules + this write.
+      const appendMatch = /^\/client\/v4\/zones\/zone-1\/rulesets\/(rs-[a-z0-9-]+)\/rules$/.exec(parsed.pathname);
+      if (appendMatch && method === "POST") {
+        return jsonResponse({
+          success: true,
+          result: { id: appendMatch[1], rules: [...(entrypointRules ?? []), { ...body, id: newIdFor(body?.description) }] },
+        });
+      }
+      if (parsed.pathname.startsWith("/client/v4/zones/zone-1/rulesets/rs-1/rules/") && method === "PATCH") {
+        return jsonResponse({ success: true, result: { id: "rs-1", rules: entrypointRules } });
+      }
+      throw new Error(`unexpected fetch ${method} ${url}`);
+    });
+    return calls;
+  }
+
+  it("cache-rule-upsert: no Cache Rules yet => creates the entrypoint with the BYPASS rule, then appends the CACHE rule to it (one read, no second create)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cacheRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCacheRuleApi(null);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "cache-rule-upsert",
+      zone: "example.com",
+      action: "created",
+      ruleId: "rule-new-cache",
+      enabled: true,
+      cacheAction: "created",
+      bypassRuleId: "rule-new-bypass",
+      bypassAction: "created",
+      otherCacheRules: [],
+    });
+    // Exactly ONE entrypoint read, then two writes: create (bypass) + append (cache) to the NEW ruleset.
+    const entrypointReads = calls.filter((call) => call.method === "GET" && call.path.endsWith("/entrypoint"));
+    expect(entrypointReads).toHaveLength(1);
+    const writes = calls.filter((call) => call.method !== "GET");
+    expect(writes).toHaveLength(2);
+    expect(writes[0]?.path).toBe("/client/v4/zones/zone-1/rulesets");
+    expect(writes[0]?.body).toEqual({
+      name: "default",
+      kind: "zone",
+      phase: "http_request_cache_settings",
+      rules: [expectedBypassRule()],
+    });
+    expect(writes[1]?.method).toBe("POST");
+    expect(writes[1]?.path).toBe("/client/v4/zones/zone-1/rulesets/rs-new/rules");
+    expect(writes[1]?.body).toEqual(expectedCacheRule());
+  });
+
+  it("cache-rule-upsert: an existing ruleset without our rule => APPENDS it and never touches the other rules", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cacheRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const agencyOwnRule = {
+      id: "agency-rule-1",
+      description: "agency: cache images longer",
+      expression: 'http.request.uri.path.extension eq "jpg"',
+      action: "set_cache_settings",
+      action_parameters: { cache: true },
+      enabled: true,
+    };
+    const calls = mockCacheRuleApi([agencyOwnRule]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; action: string; ruleId: string; bypassRuleId: string; otherCacheRules: string[] };
+    expect(body).toMatchObject({ ok: true, action: "created", ruleId: "rule-new-cache", bypassRuleId: "rule-new-bypass" });
+    const writes = calls.filter((call) => call.method !== "GET");
+    expect(writes).toHaveLength(2);
+    expect(writes.map((call) => call.method)).toEqual(["POST", "POST"]);
+    expect(writes.map((call) => call.path)).toEqual([
+      "/client/v4/zones/zone-1/rulesets/rs-1/rules",
+      "/client/v4/zones/zone-1/rulesets/rs-1/rules",
+    ]);
+    expect(writes[0]?.body).toEqual(expectedBypassRule());
+    expect(writes[1]?.body).toEqual(expectedCacheRule());
+    // The agency's own rule is never the target of a write — but it IS reported, so the platform
+    // can warn if it turns out to be a stray force-cache rule.
+    expect(writes.some((call) => call.path.includes("agency-rule-1"))).toBe(false);
+    expect(body.otherCacheRules).toEqual(["agency: cache images longer [agency-rule-1] enabled cache=true"]);
+  });
+
+  it("cache-rule-upsert: enabled:false PATCHes BOTH existing rules in place (rollback without delete)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cacheRuleJob({ params: JSON.stringify({ ...CACHE_RULE_PARAMS, enabled: false }) });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCacheRuleApi([
+      { ...expectedBypassRule(true), id: "rule-ours-bypass" },
+      { ...expectedCacheRule(true), id: "rule-ours" },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "cache-rule-upsert",
+      zone: "example.com",
+      action: "updated",
+      ruleId: "rule-ours",
+      enabled: false,
+      cacheAction: "updated",
+      bypassRuleId: "rule-ours-bypass",
+      bypassAction: "updated",
+      otherCacheRules: [],
+    });
+    const writes = calls.filter((call) => call.method !== "GET");
+    expect(writes).toHaveLength(2);
+    expect(writes.map((call) => call.method)).toEqual(["PATCH", "PATCH"]);
+    expect(writes[0]?.path).toBe("/client/v4/zones/zone-1/rulesets/rs-1/rules/rule-ours-bypass");
+    expect(writes[0]?.body).toEqual(expectedBypassRule(false));
+    expect(writes[1]?.path).toBe("/client/v4/zones/zone-1/rulesets/rs-1/rules/rule-ours");
+    expect(writes[1]?.body).toEqual(expectedCacheRule(false));
+  });
+
+  it("cache-rule-upsert: a zone still carrying the shelved force-cache rule (override_origin) is PATCHed to the respect-origin action_parameters", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cacheRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    // The retired force-cache body, as a live zone would echo it: mode override_origin + a rule TTL +
+    // status_code_ttl. Re-applying the new rule must treat it as drift and PATCH it away.
+    const drifted = {
+      ...expectedCacheRule(),
+      id: "rule-ours",
+      action_parameters: {
+        cache: true,
+        edge_ttl: {
+          mode: "override_origin",
+          default: 600,
+          status_code_ttl: [
+            { status_code_range: { from: 302, to: 307 }, value: -1 },
+            { status_code_range: { from: 400, to: 599 }, value: -1 },
+          ],
+        },
+        browser_ttl: { mode: "respect_origin" },
+      },
+    };
+    const calls = mockCacheRuleApi([drifted]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    const body = (await response.json()) as { ok: boolean; action: string; cacheAction: string; bypassAction: string };
+    // The legacy zone had only the old cache rule: the bypass rule is NEW (appended) and the cache
+    // rule is PATCHed — the combined action reports the strongest, the per-rule fields the detail.
+    expect(body).toMatchObject({ ok: true, action: "created", cacheAction: "updated", bypassAction: "created" });
+    const patch = calls.find((call) => call.method === "PATCH");
+    expect(patch?.path).toBe("/client/v4/zones/zone-1/rulesets/rs-1/rules/rule-ours");
+    expect(patch?.body).toEqual(expectedCacheRule());
+    expect(calls.find((call) => call.method === "POST")?.body).toEqual(expectedBypassRule());
+  });
+
+  it("cache-rule-upsert: a matching rule (keys in another order) => NO write at all", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cacheRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const desired = expectedCacheRule();
+    // Cloudflare may echo object keys in a different order; the drift check must not care.
+    const sameButReordered = {
+      enabled: true,
+      id: "rule-ours",
+      action_parameters: {
+        browser_ttl: { mode: "respect_origin" },
+        edge_ttl: { mode: "bypass_by_default" },
+        cache: true,
+      },
+      action: desired.action,
+      expression: desired.expression,
+      description: desired.description,
+    };
+    const bypassReordered = {
+      action_parameters: { cache: false },
+      enabled: true,
+      expression: expectedBypassRule().expression,
+      id: "rule-ours-bypass",
+      action: "set_cache_settings",
+      description: expectedBypassRule().description,
+    };
+    const calls = mockCacheRuleApi([sameButReordered, bypassReordered]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "cache-rule-upsert",
+      zone: "example.com",
+      action: "unchanged",
+      ruleId: "rule-ours",
+      enabled: true,
+      cacheAction: "unchanged",
+      bypassRuleId: "rule-ours-bypass",
+      bypassAction: "unchanged",
+      otherCacheRules: [],
+    });
+    expect(calls.every((call) => call.method === "GET")).toBe(true);
+  });
+
+  it("cache-rule-upsert: two rules carrying our description => fails closed with no write", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cacheRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCacheRuleApi([
+      { ...expectedCacheRule(), id: "rule-a" },
+      { ...expectedCacheRule(), id: "rule-b" },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/ambiguous/);
+    expect(calls.every((call) => call.method === "GET")).toBe(true);
+  });
+
+  it("cache-rule-upsert: a token without the Cache Rules scope gets a clear denial and no write", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cacheRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCacheRuleApi([], 403);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; zone: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.zone).toBe("example.com");
+    expect(body.detail).toMatch(/Cache Rules: Edit/);
+    expect(calls.every((call) => call.method === "GET")).toBe(true);
+  });
+
+  it("cache-rule-upsert: an expression smuggled into the signed params never reaches Cloudflare", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cacheRuleJob({
+      params: JSON.stringify({
+        ...CACHE_RULE_PARAMS,
+        expression: "true",
+        action_parameters: { cache: true, edge_ttl: { mode: "override_origin", default: 31536000 } },
+      }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCacheRuleApi([]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const writes = calls.filter((call) => call.method === "POST");
+    expect(writes.map((call) => call.body)).toEqual([expectedBypassRule(), expectedCacheRule()]);
+    for (const write of writes) {
+      expect(write.body?.expression).not.toBe("true");
+      expect(JSON.stringify(write.body)).not.toContain("override_origin");
+    }
+  });
+
+  it("cache-rule-upsert: fails cleanly when the token cannot see the zone (no ruleset read or write)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cacheRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      jsonResponse({ success: true, result: [] }),
+    );
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/not visible to CF_DNS_API_TOKEN/);
+    expect(fetchSpy).toHaveBeenCalledTimes(1); // the zone lookup only
+  });
+
+  it("cache-rule-upsert: reports a clean failure and touches NO API when CF_DNS_API_TOKEN is missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cacheRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    // R2 token IS present — it must not be used as a substitute.
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ CF_DNS_API_TOKEN: undefined }));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/CF_DNS_API_TOKEN is not configured/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("cache-rule-upsert: a signed job with an invalid suffix is 400 with no API call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = cacheRuleJob({ params: JSON.stringify({ ...CACHE_RULE_PARAMS, hostSuffix: "-staging.example.com" }) });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { reason: string };
+    expect(body.reason).toMatch(/hostSuffix/);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -5555,5 +5986,164 @@ describe("actuateCfTunnelConfig: the catch-all rule", () => {
     expect(putIngress()).toEqual([RULE, { service: "http://dy-web-x.internal:80" }]);
     // ruleCount reports the NAMED rules only — the catch-all is the actuator's, not the caller's.
     expect(result.ok && result.ruleCount).toBe(1);
+  });
+});
+
+// ── edge page-cache rule builder (Worker copy — TWIN of the orchestrator's) ─────────────
+
+describe("buildEdgeCacheRules: the Worker builds BOTH rules from three narrow inputs", () => {
+  // Pinned line by line. The orchestrator's src/edge-cache-rule.test.ts pins the SAME text, so a
+  // change on only one side of the twin breaks that side's test.
+  const EXPECTED_EXPRESSION = [
+    '(http.request.method in {"GET" "HEAD"})',
+    'and ends_with(http.host, "-production.example.com")',
+    'and (http.request.uri.path.extension in {"" "php" "html"})',
+    'and not starts_with(http.request.uri.path, "/wp-admin")',
+    'and not starts_with(http.request.uri.path, "/wp-login.php")',
+    'and not starts_with(http.request.uri.path, "/wp-json")',
+    'and not starts_with(http.request.uri.path, "/xmlrpc.php")',
+    'and not starts_with(http.request.uri.path, "/wp-cron.php")',
+    'and not starts_with(http.request.uri.path, "/cart")',
+    'and not starts_with(http.request.uri.path, "/checkout")',
+    'and not starts_with(http.request.uri.path, "/my-account")',
+    'and not http.request.uri.query contains "preview="',
+    'and not http.request.uri.query contains "add-to-cart"',
+    'and not http.request.uri.query contains "wc-ajax"',
+    'and not http.cookie contains "wordpress_logged_in_"',
+    'and not http.cookie contains "wp-postpass_"',
+    'and not http.cookie contains "comment_author_"',
+    'and not http.cookie contains "woocommerce_items_in_cart"',
+    'and not http.cookie contains "wp_woocommerce_session_"',
+    'and not http.cookie contains "woocommerce_cart_hash"',
+  ].join(" ");
+
+  // The BYPASS rule: the same host + HTML-page clauses, then the personal cookies ORed. Byte-identical
+  // to the orchestrator's pin.
+  const EXPECTED_BYPASS_EXPRESSION = [
+    'ends_with(http.host, "-production.example.com")',
+    'and (http.request.uri.path.extension in {"" "php" "html"})',
+    'and (http.cookie contains "wordpress_logged_in_"',
+    'or http.cookie contains "wp-postpass_"',
+    'or http.cookie contains "comment_author_"',
+    'or http.cookie contains "woocommerce_items_in_cart"',
+    'or http.cookie contains "wp_woocommerce_session_"',
+    'or http.cookie contains "woocommerce_cart_hash")',
+  ].join(" ");
+
+  it("builds the exact TWO rule bodies (description, expression, action, action_parameters, enabled)", () => {
+    const built = buildEdgeCacheRules({ hostSuffix: "-production.example.com", edgeTtlSeconds: 600 });
+    expect(built).toEqual({
+      ok: true,
+      rules: {
+        bypass: {
+          description: "doubleyoup: edge page cache (bypass personal cookies)",
+          expression: EXPECTED_BYPASS_EXPRESSION,
+          action: "set_cache_settings",
+          // BYPASS: a personal-cookie request is neither served from nor stored to the cache.
+          action_parameters: { cache: false },
+          enabled: true,
+        },
+        cache: {
+          description: "doubleyoup: edge page cache",
+          expression: EXPECTED_EXPRESSION,
+          action: "set_cache_settings",
+          // RESPECT-ORIGIN: eligible for cache, but Cloudflare stores a response ONLY when the origin
+          // sends a cacheable Cache-Control (bypass_by_default) — no rule-side TTL, no status_code_ttl.
+          // Pinned so a drift back to the force-cache `override_origin` mode fails this test.
+          action_parameters: {
+            cache: true,
+            edge_ttl: { mode: "bypass_by_default" },
+            browser_ttl: { mode: "respect_origin" },
+          },
+          enabled: true,
+        },
+      },
+    });
+    if (!built.ok) throw new Error(built.reason);
+    expect(edgeCacheRulesInOrder(built.rules)).toEqual([built.rules.bypass, built.rules.cache]);
+    expect(EDGE_CACHE_RULE_DESCRIPTION).toBe("doubleyoup: edge page cache");
+    expect(EDGE_CACHE_BYPASS_RULE_DESCRIPTION).toBe("doubleyoup: edge page cache (bypass personal cookies)");
+  });
+
+  it("a personal-cookie request (woocommerce_items_in_cart, wordpress_logged_in_) is claimed by the BYPASS rule and refused by the CACHE rule", () => {
+    const built = buildEdgeCacheRules({ hostSuffix: "-production.example.com", edgeTtlSeconds: 600 });
+    if (!built.ok) throw new Error(built.reason);
+    for (const cookieFragment of ["woocommerce_items_in_cart", "wordpress_logged_in_", "wp_woocommerce_session_", "comment_author_", "wp-postpass_"]) {
+      // The bypass rule's cookie group CONTAINS the fragment (ORed) and carries cache:false ...
+      expect(built.rules.bypass.expression).toContain(`or http.cookie contains "${cookieFragment}"`.replace(/^or /, ""));
+      expect(built.rules.bypass.action_parameters).toEqual({ cache: false });
+      // ... and the cache rule NEGATES the same fragment, so the two can never both match one request.
+      expect(built.rules.cache.expression).toContain(`and not http.cookie contains "${cookieFragment}"`);
+    }
+    // Both rules are scoped to HTML-ish pages on the host, so a logged-in admin's static assets are
+    // left to Cloudflare's default (not bypassed).
+    expect(built.rules.bypass.expression).toContain('ends_with(http.host, "-production.example.com") and (http.request.uri.path.extension in {"" "php" "html"})');
+  });
+
+  it("enabled:false produces two disabled rules; absent means enabled", () => {
+    const disabled = buildEdgeCacheRules({ hostSuffix: "-production.example.com", edgeTtlSeconds: 600, enabled: false });
+    expect(disabled.ok && disabled.rules.cache.enabled).toBe(false);
+    expect(disabled.ok && disabled.rules.bypass.enabled).toBe(false);
+    const enabled = buildEdgeCacheRules({ hostSuffix: "-production.example.com", edgeTtlSeconds: 600 });
+    expect(enabled.ok && enabled.rules.cache.enabled).toBe(true);
+    expect(enabled.ok && enabled.rules.bypass.enabled).toBe(true);
+  });
+
+  it("clamps the edge TTL to 60..3600 whole seconds", () => {
+    expect(clampEdgeCacheTtl(600)).toBe(600);
+    expect(clampEdgeCacheTtl(10)).toBe(60);
+    expect(clampEdgeCacheTtl(0)).toBe(60);
+    expect(clampEdgeCacheTtl(-5)).toBe(60);
+    expect(clampEdgeCacheTtl(99_999)).toBe(3600);
+    expect(clampEdgeCacheTtl(600.4)).toBe(600);
+    expect(clampEdgeCacheTtl(Number.NaN)).toBeNull();
+    expect(clampEdgeCacheTtl(Number.POSITIVE_INFINITY)).toBeNull();
+    // The builder still runs the clamp (a non-finite TTL is refused) but the TTL never reaches a
+    // rule: the origin's s-maxage is the edge TTL now, so 86400s and 600s build the SAME rules.
+    const clamped = buildEdgeCacheRules({ hostSuffix: "-production.example.com", edgeTtlSeconds: 86_400 });
+    expect(clamped).toEqual(buildEdgeCacheRules({ hostSuffix: "-production.example.com", edgeTtlSeconds: 600 }));
+    expect(clamped.ok && "default" in (clamped.rules.cache.action_parameters.edge_ttl as Record<string, unknown>)).toBe(false);
+    expect(buildEdgeCacheRules({ hostSuffix: "-production.example.com", edgeTtlSeconds: Number.NaN }).ok).toBe(false);
+  });
+
+  it("refuses any suffix that is not exactly -production.<zone> (nothing unsafe reaches the quoted expression)", () => {
+    for (const hostSuffix of [
+      "",
+      "example.com",
+      "-production.com",
+      "-production.Example.com",
+      '-production.example.com") or (true',
+      "-production.example.com\\",
+      " -production.example.com",
+      "-staging.example.com",
+    ]) {
+      expect(buildEdgeCacheRules({ hostSuffix, edgeTtlSeconds: 600 }).ok).toBe(false);
+    }
+  });
+});
+
+describe("edge-cache drift check", () => {
+  it("jsonValuesEqual ignores object key order but not array order or types", () => {
+    expect(jsonValuesEqual({ a: 1, b: { c: [1, 2] } }, { b: { c: [1, 2] }, a: 1 })).toBe(true);
+    expect(jsonValuesEqual([1, 2], [2, 1])).toBe(false);
+    expect(jsonValuesEqual({ a: 1 }, { a: "1" })).toBe(false);
+    expect(jsonValuesEqual({ a: 1 }, { a: 1, b: undefined })).toBe(false);
+    expect(jsonValuesEqual(null, {})).toBe(false);
+    expect(jsonValuesEqual(undefined, { cache: true })).toBe(false);
+  });
+
+  it("edgeCacheRuleDrifted compares action, expression, enabled and action_parameters", () => {
+    const built = buildEdgeCacheRules({ hostSuffix: "-production.example.com", edgeTtlSeconds: 600 });
+    if (!built.ok) throw new Error(built.reason);
+    const desired = built.rules.cache;
+    // The bypass rule: a live copy "fixed" to cache:true is drift back to cache:false.
+    expect(edgeCacheRuleDrifted({ ...built.rules.bypass }, built.rules.bypass)).toBe(false);
+    expect(edgeCacheRuleDrifted({ ...built.rules.bypass, action_parameters: { cache: true } }, built.rules.bypass)).toBe(true);
+    expect(edgeCacheRuleDrifted({ ...desired }, desired)).toBe(false);
+    expect(edgeCacheRuleDrifted({ ...desired, enabled: false }, desired)).toBe(true);
+    expect(edgeCacheRuleDrifted({ ...desired, expression: "true" }, desired)).toBe(true);
+    expect(edgeCacheRuleDrifted({ ...desired, action: "set_config" }, desired)).toBe(true);
+    expect(edgeCacheRuleDrifted({ ...desired, action_parameters: { cache: false } }, desired)).toBe(true);
+    expect(edgeCacheRuleDrifted({ ...desired, action_parameters: undefined }, desired)).toBe(true);
   });
 });

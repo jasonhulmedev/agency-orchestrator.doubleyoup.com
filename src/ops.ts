@@ -20,7 +20,8 @@
 // exactly once under F1 (see actuate.ts::actuateGcpInstanceCreate). The cell-infra ops
 // `gcp-network-create` / `gcp-firewall-create` / `gcp-address-create` / `gcp-router-nat-create` ARE
 // idempotent — each treats Google's 409 alreadyExists as success so a half-built cell resumes on
-// re-run (planning/34).
+// re-run (planning/34). `cache-rule-upsert` is idempotent too: it finds the one "edge page cache"
+// rule by its stable description and PATCHes it only on drift, so a re-run converges.
 //
 // ALL FIVE TEARDOWN ops — `gcp-instance-delete` / `gcp-address-delete` / `gcp-firewall-delete` /
 // `gcp-router-delete` / `gcp-network-delete` — are IDEMPOTENT, the mirror of that: Google's 404
@@ -36,6 +37,7 @@ import {
   type ProvisionR2Params,
   type DnsRecordUpsertParams,
   type CachePurgeParams,
+  type CacheRuleUpsertParams,
   type CfTunnelCreateParams,
   type CfTunnelConfigParams,
   type CfTunnelDeleteParams,
@@ -60,6 +62,7 @@ import {
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
+  validateCacheRuleUpsertParams,
   validateCfTunnelCreateParams,
   validateCfTunnelConfigParams,
   validateCfTunnelDeleteParams,
@@ -87,6 +90,7 @@ import {
   actuateProvisionR2,
   actuateDnsRecordUpsert,
   actuateCachePurge,
+  actuateCacheRuleUpsert,
   actuateCfTunnelCreate,
   actuateCfTunnelConfig,
   actuateCfTunnelDelete,
@@ -146,6 +150,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "cache-purge": defineOp<CachePurgeParams>({
     validateParams: validateCachePurgeParams,
     actuate: (params, env) => actuateCachePurge(params, env),
+  }),
+  "cache-rule-upsert": defineOp<CacheRuleUpsertParams>({
+    validateParams: validateCacheRuleUpsertParams,
+    actuate: (params, env) => actuateCacheRuleUpsert(params, env),
   }),
   "cf-tunnel-create": defineOp<CfTunnelCreateParams>({
     validateParams: validateCfTunnelCreateParams,
