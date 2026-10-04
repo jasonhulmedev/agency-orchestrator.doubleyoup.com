@@ -17,7 +17,10 @@
 //                     registry (src/ops.ts): provision-r2 (create an R2 bucket),
 //                     dns-record-upsert (upsert a record in an agency zone),
 //                     cache-purge (purge an agency zone's cache), cache-rule-upsert
-//                     (the one "edge page cache" Cache Rule in an agency zone), wp-cli (run a
+//                     (the one "edge page cache" Cache Rule in an agency zone),
+//                     waf-rule-upsert (the three standing edge-defense WAF custom rules
+//                     in an agency zone: country block, WP admin/login geo-lockdown,
+//                     login managed-challenge), wp-cli (run a
 //                     wp-cli command on the agency's cell via its on-VM cell-agent),
 //                     db-export (the cell exports its WP DB and uploads it to the
 //                     agency's object store via a presigned URL), db-import (the cell
