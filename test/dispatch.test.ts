@@ -6006,6 +6006,7 @@ describe("buildEdgeCacheRules: the Worker builds BOTH rules from three narrow in
     'and not starts_with(http.request.uri.path, "/cart")',
     'and not starts_with(http.request.uri.path, "/checkout")',
     'and not starts_with(http.request.uri.path, "/my-account")',
+    'and not starts_with(http.request.uri.path, "/wc-api")',
     'and not http.request.uri.query contains "preview="',
     'and not http.request.uri.query contains "add-to-cart"',
     'and not http.request.uri.query contains "wc-ajax"',
@@ -6015,6 +6016,8 @@ describe("buildEdgeCacheRules: the Worker builds BOTH rules from three narrow in
     'and not http.cookie contains "woocommerce_items_in_cart"',
     'and not http.cookie contains "wp_woocommerce_session_"',
     'and not http.cookie contains "woocommerce_cart_hash"',
+    'and not http.cookie contains "woocommerce_recently_viewed"',
+    'and not http.cookie contains "store_notice"',
   ].join(" ");
 
   // The BYPASS rule: the same host + HTML-page clauses, then the personal cookies ORed. Byte-identical
@@ -6027,7 +6030,9 @@ describe("buildEdgeCacheRules: the Worker builds BOTH rules from three narrow in
     'or http.cookie contains "comment_author_"',
     'or http.cookie contains "woocommerce_items_in_cart"',
     'or http.cookie contains "wp_woocommerce_session_"',
-    'or http.cookie contains "woocommerce_cart_hash")',
+    'or http.cookie contains "woocommerce_cart_hash"',
+    'or http.cookie contains "woocommerce_recently_viewed"',
+    'or http.cookie contains "store_notice")',
   ].join(" ");
 
   it("builds the exact TWO rule bodies (description, expression, action, action_parameters, enabled)", () => {
@@ -6068,7 +6073,15 @@ describe("buildEdgeCacheRules: the Worker builds BOTH rules from three narrow in
   it("a personal-cookie request (woocommerce_items_in_cart, wordpress_logged_in_) is claimed by the BYPASS rule and refused by the CACHE rule", () => {
     const built = buildEdgeCacheRules({ hostSuffix: "-production.example.com", edgeTtlSeconds: 600 });
     if (!built.ok) throw new Error(built.reason);
-    for (const cookieFragment of ["woocommerce_items_in_cart", "wordpress_logged_in_", "wp_woocommerce_session_", "comment_author_", "wp-postpass_"]) {
+    for (const cookieFragment of [
+      "woocommerce_items_in_cart",
+      "wordpress_logged_in_",
+      "wp_woocommerce_session_",
+      "comment_author_",
+      "wp-postpass_",
+      "woocommerce_recently_viewed",
+      "store_notice",
+    ]) {
       // The bypass rule's cookie group CONTAINS the fragment (ORed) and carries cache:false ...
       expect(built.rules.bypass.expression).toContain(`or http.cookie contains "${cookieFragment}"`.replace(/^or /, ""));
       expect(built.rules.bypass.action_parameters).toEqual({ cache: false });

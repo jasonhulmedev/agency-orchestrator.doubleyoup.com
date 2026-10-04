@@ -56,6 +56,20 @@ export const EDGE_CACHE_RULE_DESCRIPTIONS: readonly string[] = [EDGE_CACHE_BYPAS
 export const EDGE_CACHE_PHASE = "http_request_cache_settings";
 
 // Paths that are per-user or state-changing in WordPress / WooCommerce: never cache them.
+// `/wc-api` is WooCommerce's payment-gateway callback endpoint: a cached answer there is a
+// correctness bug, not just a personalization one. (`/wp-json/wc` is covered by `/wp-json`.)
+//
+// DECIDED — deliberately NOT added, although WP Engine's default exclusions have them (so nobody
+// "completes" the parity later):
+//   - page names `store` / `check-out`: a shop archive at /store is high-traffic and exactly what we
+//     want cached; a real cart-holder is already caught by the cookie bypass. Keeping these
+//     cacheable is a deliberate improvement over WP Engine, not an oversight.
+//   - `/coupon`, `/products-compare`: plugin-specific paths, not core WooCommerce; a speculative
+//     path costs hit rate for no proven benefit.
+// The better long-term play for Woo personalization is WP Engine's own recommended pattern: render
+// the variants into the cached HTML and let client-side JS pick one from the cookie, so the page
+// stays cacheable instead of bypassed. That is a per-site theme change, not something this layer
+// can do.
 const EDGE_CACHE_EXCLUDED_PATH_PREFIXES = [
   "/wp-admin",
   "/wp-login.php",
@@ -65,6 +79,7 @@ const EDGE_CACHE_EXCLUDED_PATH_PREFIXES = [
   "/cart",
   "/checkout",
   "/my-account",
+  "/wc-api",
 ];
 
 // Query fragments that mark a preview or a cart action: never cache them.
@@ -88,6 +103,10 @@ const EDGE_CACHE_PERSONAL_COOKIE_FRAGMENTS = [
   "woocommerce_items_in_cart",
   "wp_woocommerce_session_",
   "woocommerce_cart_hash",
+  // WP Engine parity for WooCommerce: both are Woo-only, so a non-Woo site never carries them and
+  // loses no cache hits. `store_notice` is Woo's dismissed-store-notice cookie (`store_notice<id>`).
+  "woocommerce_recently_viewed",
+  "store_notice",
 ];
 
 /** The rule body Cloudflare's ruleset API takes (POST/PATCH of one rule). */
