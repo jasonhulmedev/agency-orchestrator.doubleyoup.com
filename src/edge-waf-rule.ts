@@ -145,6 +145,24 @@ function countrySetExpression(codes: readonly string[]): string {
   return `ip.geoip.country in {${set}}`;
 }
 
+/**
+ * The ONE path BOTH the admin geo-lockdown and the login gate exempt, built once so the two rules
+ * cannot drift apart on it.
+ *
+ * WHY admin-ajax.php is exempt from an "admin" rule: despite living under /wp-admin/ it serves
+ * FRONT-END functionality in most themes and plugins — contact forms, add-to-cart, search filters,
+ * load-more. Blocking or challenging it breaks ordinary visitors on the PUBLIC site, silently and
+ * half-way (the page renders, the interactions fail). It is not an admin surface in practice.
+ *
+ * It is still covered by the country BLOCK rule, which runs FIRST, so a blocked country gets no
+ * admin-ajax either.
+ */
+const WP_ADMIN_AJAX_PATH = "/wp-admin/admin-ajax.php";
+
+function wpAdminAjaxExemptionClause(): string {
+  return `not (http.request.uri.path eq "${WP_ADMIN_AJAX_PATH}")`;
+}
+
 /** The uniform country-BLOCK expression. Null for an empty set (CF rejects `{}`; it means "block nothing"). */
 export function wafCountryBlockExpression(codes: readonly string[]): string | null {
   const normalized = normalizeWafCountryCodes(codes);
@@ -158,9 +176,21 @@ export function wafCountryBlockExpression(codes: readonly string[]): string | nu
  * The WordPress admin/login geo-lockdown expression. Null for an empty set (CF rejects `{}`, and here
  * it would BLOCK the admin surface from everywhere — an allow-list of nobody).
  *
- * NOTE `contains "/wp-admin"` (not starts_with) is the PLATFORM's live text and is reproduced
- * verbatim: it also matches a path that merely contains "/wp-admin" anywhere. That is the existing
- * policy, deliberately not redesigned here.
+ * THE PREFIX HAS NO TRAILING SLASH — `starts_with(path, "/wp-admin")` — and that DIFFERS from the
+ * login gate below, which uses `"/wp-admin/"` WITH the slash. Do NOT "harmonise" them:
+ *   - here the bare `/wp-admin` (no slash) must match. WordPress 301s it to `/wp-admin/`, and that
+ *     redirect should not be reachable from a non-allow-listed country. With a trailing slash in
+ *     the prefix, bare `/wp-admin` would fall out of the rule entirely and reopen the hole.
+ *   - the login gate wants the opposite: it challenges the admin AREA, and the bare path is just a
+ *     redirect to a page this rule already covers.
+ *
+ * It was `contains "/wp-admin"` until 2026-10-04. `contains` matched the substring ANYWHERE, so an
+ * ordinary article at `/docs/wp-admin-tips/` was BLOCKED for every visitor outside the allow-list.
+ * `starts_with` is strictly narrower (every path it matches, `contains` matched too) and it still
+ * catches bare `/wp-admin`. It would lose a WordPress install BELOW the docroot root
+ * (`/blog/wp-admin/`), but the platform cannot produce one: core is installed AT the docroot with a
+ * path-less `--url`, an import rsyncs only `wp-content/` into that docroot, and a multisite dump is
+ * refused outright.
  */
 export function wafWpAdminGeoExpression(codes: readonly string[]): string | null {
   const normalized = normalizeWafCountryCodes(codes);
@@ -168,7 +198,8 @@ export function wafWpAdminGeoExpression(codes: readonly string[]): string | null
     return null;
   }
   return (
-    `(http.request.uri.path contains "/wp-admin" or http.request.uri.path eq "/wp-login.php") ` +
+    `(starts_with(http.request.uri.path, "/wp-admin") or http.request.uri.path eq "/wp-login.php") ` +
+    `and ${wpAdminAjaxExemptionClause()} ` +
     `and not (${countrySetExpression(normalized)})`
   );
 }
@@ -185,15 +216,21 @@ export function wafWpAdminGeoExpression(codes: readonly string[]): string | null
  *    real session just 302s back to the gated /wp-login.php, so the exemption only spares genuine
  *    logged-in admins (and the post-SSO redirect, which lands on /wp-admin/ already carrying the
  *    cookie) from re-friction.
+ *
+ * THE PREFIX HAS A TRAILING SLASH — `starts_with(path, "/wp-admin/")` — and that DIFFERS from the
+ * admin geo rule above, which uses `"/wp-admin"` WITHOUT it. Do NOT "harmonise" them: this rule
+ * gates the admin AREA, and bare `/wp-admin` is only a 301 to `/wp-admin/`, which IS gated. The geo
+ * rule needs the bare path too, because there the redirect itself must not be reachable.
  */
 export function wafLoginGateExpression(): string {
   return [
     // The login endpoint itself: challenged unconditionally (no forgeable exemption).
     '(http.request.uri.path eq "/wp-login.php")',
     "or",
-    // The admin area: challenged, but spare AJAX and genuine logged-in sessions.
+    // The admin area: challenged, but spare AJAX and genuine logged-in sessions. The admin-ajax
+    // clause is the SAME builder the geo rule uses, so the two exemptions cannot drift apart.
     '(starts_with(http.request.uri.path, "/wp-admin/")',
-    'and not (http.request.uri.path eq "/wp-admin/admin-ajax.php")',
+    `and ${wpAdminAjaxExemptionClause()}`,
     'and not (http.cookie contains "wordpress_logged_in_"))',
   ].join(" ");
 }

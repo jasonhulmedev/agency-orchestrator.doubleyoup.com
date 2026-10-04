@@ -1167,8 +1167,12 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
 
   const EXPECTED_COUNTRY_BLOCK_EXPRESSION = 'ip.geoip.country in {"RU" "CN" "KP"}';
 
+  // NOTE the two prefixes differ ON PURPOSE and must stay different: the geo rule uses "/wp-admin"
+  // (no trailing slash) so bare `/wp-admin` is caught, the login gate uses "/wp-admin/" (with)
+  // because the bare path is only a 301 into the area it already gates. See the builder's comments.
   const EXPECTED_WPADMIN_GEO_EXPRESSION =
-    '(http.request.uri.path contains "/wp-admin" or http.request.uri.path eq "/wp-login.php") ' +
+    '(starts_with(http.request.uri.path, "/wp-admin") or http.request.uri.path eq "/wp-login.php") ' +
+    'and not (http.request.uri.path eq "/wp-admin/admin-ajax.php") ' +
     'and not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE"})';
 
   const EXPECTED_LOGIN_GATE_EXPRESSION =
@@ -1371,10 +1375,52 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin/" })).toBe("block");
       expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-login.php" })).toBe("block");
       expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin/edit.php" })).toBe("block");
-      // The admin-geo rule runs BEFORE the login gate, so neither of the gate's exemptions applies.
-      expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin/admin-ajax.php" })).toBe("block");
+      expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin/network/sites.php" })).toBe("block");
+      // The BARE path, with no trailing slash: WordPress 301s it to /wp-admin/, and that redirect
+      // must not be reachable either. This is why the geo rule's prefix carries NO trailing slash
+      // while the login gate's does — do not harmonise them.
+      expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin" })).toBe("block");
+      // The admin-geo rule runs BEFORE the login gate, so the gate's logged-in-cookie exemption
+      // does not rescue a non-allowed country.
       expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin/", cookie: "wordpress_logged_in_x=a" })).toBe("block");
     }
+  });
+
+  it("waf-rule-upsert: admin-ajax.php from a NON-allowed country REACHES the site — it is front-end, not admin", () => {
+    // The bug this exemption fixes: admin-ajax.php serves contact forms, add-to-cart, search
+    // filters and load-more in most themes and plugins. Blocking it leaves an ordinary visitor on a
+    // page that renders but half-works. Both rules must agree, so assert the whole verdict.
+    for (const country of ["DE", "IN", "BR", "SG"]) {
+      expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin/admin-ajax.php" })).toBe("reaches-origin");
+    }
+    // An allow-listed country gets the same answer — the login gate exempts it too, so the two
+    // exemptions agree and neither rule challenges it.
+    expect(edgeVerdict({ ...ANON_PAGE, path: "/wp-admin/admin-ajax.php" })).toBe("reaches-origin");
+    // The exemption is EXACT, not a prefix: it must not become a hole.
+    expect(edgeVerdict({ ...ANON_PAGE, country: "DE", path: "/wp-admin/admin-ajax.php.bak" })).toBe("block");
+    expect(edgeVerdict({ ...ANON_PAGE, country: "DE", path: "/wp-admin/admin-ajax.phpx" })).toBe("block");
+    expect(edgeVerdict({ ...ANON_PAGE, country: "DE", path: "/wp-admin/admin-post.php" })).toBe("block");
+    // A BLOCKED country still gets nothing: the country rule runs first and has no exemptions.
+    for (const country of ["RU", "CN", "KP"]) {
+      expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin/admin-ajax.php" })).toBe("block");
+    }
+  });
+
+  it("waf-rule-upsert: the admin-geo rule is ANCHORED at the path root — an ordinary article is not admin", () => {
+    // The regression `starts_with` fixes (2026-10-04). The rule used to say `contains "/wp-admin"`,
+    // which matched the substring ANYWHERE, so a visitor outside the allow-list was blocked from an
+    // ordinary article whose URL happens to contain "wp-admin".
+    for (const country of ["DE", "IN", "BR", "SG"]) {
+      expect(edgeVerdict({ country, path: "/docs/wp-admin-tips/", cookie: "" })).toBe("reaches-origin");
+      expect(edgeVerdict({ country, path: "/blog/how-to-secure-wp-admin/", cookie: "" })).toBe("reaches-origin");
+      // A WordPress install BELOW the docroot root would also fall out of the rule — the deliberate
+      // trade. Nothing on this platform can produce one, so this pins the trade, not a layout.
+      expect(edgeVerdict({ country, path: "/blog/wp-admin/", cookie: "" })).toBe("reaches-origin");
+    }
+    expect(edgeVerdict({ country: "AU", path: "/docs/wp-admin-tips/", cookie: "" })).toBe("reaches-origin");
+    // The one false positive `starts_with` keeps: a ROOT path that begins "wp-admin". No WordPress
+    // route uses it, and it is a far smaller surface than any-substring-anywhere.
+    expect(edgeVerdict({ country: "DE", path: "/wp-administrator/", cookie: "" })).toBe("block");
   });
 
   it("waf-rule-upsert: the login gate challenges an ALLOWED country's login surface, with its two exemptions", () => {
@@ -1386,9 +1432,9 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     // ...except admin-ajax and a genuine logged-in session.
     expect(edgeVerdict({ ...ANON_PAGE, path: "/wp-admin/admin-ajax.php" })).toBe("reaches-origin");
     expect(edgeVerdict({ ...ANON_PAGE, path: "/wp-admin/", cookie: "_ga=1; wordpress_logged_in_abc=a%7C1" })).toBe("reaches-origin");
-    // `contains "/wp-admin"` is wider than it looks — the platform's existing text, reproduced.
-    expect(edgeVerdict({ country: "DE", path: "/docs/wp-admin-tips/", cookie: "" })).toBe("block");
-    expect(edgeVerdict({ country: "AU", path: "/docs/wp-admin-tips/", cookie: "" })).toBe("reaches-origin");
+    // The login gate's prefix DOES carry a trailing slash, so bare /wp-admin is not challenged —
+    // it is a 301 into /wp-admin/, which is. The geo rule above covers the bare path.
+    expect(edgeVerdict({ ...ANON_PAGE, path: "/wp-admin" })).toBe("reaches-origin");
   });
 
   // ── wp-cli (twin of the app's rules) ──────────────────────────────────────────────
