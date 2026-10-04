@@ -42,6 +42,7 @@ export const DISPATCH_OPS = [
   "dns-record-upsert",
   "cache-purge",
   "cache-rule-upsert",
+  "waf-rule-upsert",
   "cf-tunnel-create",
   "cf-tunnel-config",
   "cf-tunnel-delete",

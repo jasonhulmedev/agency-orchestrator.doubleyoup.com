@@ -371,6 +371,57 @@ export function validateCacheRuleUpsertParams(raw: unknown): ParamsVerdict<Cache
   return { ok: true, params: { hostSuffix, edgeTtlSeconds, enabled: enabledValue } };
 }
 
+// ── waf-rule-upsert ──────────────────────────────────────────────────────────────────
+// Upsert the THREE standing edge-defense WAF custom rules (phase http_request_firewall_custom) in an
+// agency zone: block RU/CN/KP, block the WordPress admin/login surface from outside the allow-list,
+// and managed-challenge the rest of the login surface. Actuated with the agency's own
+// CF_DNS_API_TOKEN, which needs Zone → WAF : Edit (a deploy-time scope add, not a new secret).
+//
+// THE NARROWEST AUTHORITY OF ANY OP (Direction-B principle, fail-closed): the job carries only a
+// zone NAME and an on/off switch — NEVER an expression, an action, a path, or a country list. The
+// Worker builds all three rules itself from CONSTANTS in edge-waf-rule.ts, so the most a signed job
+// can do is switch a fixed, known-safe rule set on or off for one zone. Letting a country list
+// travel would let one signed job block every visitor to every site on the agency's zone, so it does
+// not travel. The actuator resolves the zone with the agency's own token and fails closed when it
+// cannot see it — the same "restricted to its own zone" rule dns-record-upsert follows.
+//
+// The rules are ZONE-WIDE (no host clause) on purpose: a WAF custom rule runs per zone, which is what
+// makes it cover a site served on its own customer domain (a Cloudflare-for-SaaS custom hostname on
+// this zone). See edge-waf-rule.ts.
+
+export interface WafRuleUpsertParams {
+  /** The agency zone NAME (e.g. "sbmstudio.com.au"); the actuator resolves it to a zone id. */
+  zone: string;
+  /** false disables all three rules in place (a rollback that keeps them). Absent in the job => true. */
+  enabled: boolean;
+}
+
+export function validateWafRuleUpsertParams(raw: unknown): ParamsVerdict<WafRuleUpsertParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { zone, enabled } = raw;
+
+  // The same zone grammar the DNS ops use. The zone name never reaches a rule EXPRESSION (the rules
+  // carry no host clause), only the Cloudflare zone-lookup query, but the strict grammar stays: it
+  // is what stops a lookup for some other, longer name that happens to contain this one.
+  if (typeof zone !== "string" || zone.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a lowercase DNS zone name (e.g. example.com)" };
+  }
+  if (enabled !== undefined && typeof enabled !== "boolean") {
+    return { ok: false, reason: "enabled, when present, must be true or false" };
+  }
+
+  // An absent `enabled` means "on". Normalize it here so the actuator always sees a boolean.
+  let enabledValue = true;
+  if (enabled === false) {
+    enabledValue = false;
+  }
+  // A FRESH object holding only the known keys, so an extra key (a country list, a raw expression)
+  // can never ride along.
+  return { ok: true, params: { zone, enabled: enabledValue } };
+}
+
 // ── cf-tunnel-create ─────────────────────────────────────────────────────────────────
 // Create (idempotently, by name) a per-cell Cloudflare **named tunnel** in the agency's own CF
 // account and return its id + connector token (planning/40 Component A). Actuated with the agency's

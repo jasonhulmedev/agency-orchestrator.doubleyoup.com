@@ -429,6 +429,38 @@ async function probeCacheRulesScope(token: string, zoneId: string | undefined): 
   }
 }
 
+/**
+ * READ-ONLY probe of the WAF scope (the `waf-rule-upsert` op, edge defense): GET the
+ * firewall-custom phase entrypoint of the zone the zone list returned. Returns a short human status
+ * string (never throws) folded into the cfDns detail. A 200 (rules exist) or 404 (no custom rules
+ * yet) proves the token may READ custom rules; Cloudflare cannot tell us whether it may also EDIT
+ * them, so that is exercised on the first waf-rule-upsert. A 401/403 means the scope is missing.
+ *
+ * "Zone WAF Write" is Cloudflare's API permission-group name for this ruleset phase; the dashboard's
+ * token editor lists it under Zone as "WAF", with Edit. Both names are in the message because
+ * Cloudflare labels these by product, not by phase, and the two do not always read the same.
+ */
+async function probeWafRulesScope(token: string, zoneId: string | undefined): Promise<string> {
+  if (!zoneId) {
+    return "WAF rules: could not probe (the zone list returned no zone id).";
+  }
+  try {
+    const response = await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(zoneId)}/rulesets/phases/http_request_firewall_custom/entrypoint`,
+      { headers: { authorization: `Bearer ${token}`, accept: "application/json" } },
+    );
+    if (response.status === 200 || response.status === 404) {
+      return 'WAF rules: read access OK ("Zone WAF Write" is exercised on the first edge-defense rule upsert).';
+    }
+    if (response.status === 401 || response.status === 403) {
+      return 'WAF rules: NOT available — add the "Zone WAF Write" permission (Zone → WAF → Edit in the API-token editor) for edge defense.';
+    }
+    return `WAF rules: check inconclusive (HTTP ${response.status}).`;
+  } catch (err) {
+    return `WAF rules: probe could not be sent (${errorMessage(err)}).`;
+  }
+}
+
 export async function validateCfDns(env: Env): Promise<ValidationResult> {
   if (!env.CF_DNS_API_TOKEN) {
     return {
@@ -459,9 +491,12 @@ export async function validateCfDns(env: Env): Promise<ValidationResult> {
         const tunnelStatus = await probeCfTunnelScope(env.CF_DNS_API_TOKEN);
         // Edge page caching: the same token also drives cache-rule-upsert. Same non-fatal pattern.
         const cacheRulesStatus = await probeCacheRulesScope(env.CF_DNS_API_TOKEN, body.result[0]?.id);
+        // Edge defense: the same token also drives waf-rule-upsert. Same non-fatal pattern — a
+        // missing WAF scope must be visible HERE, not on the first apply against a live zone.
+        const wafRulesStatus = await probeWafRulesScope(env.CF_DNS_API_TOKEN, body.result[0]?.id);
         return {
           ok: true,
-          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch. ${tunnelStatus} ${cacheRulesStatus}`,
+          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch. ${tunnelStatus} ${cacheRulesStatus} ${wafRulesStatus}`,
         };
       }
       return {

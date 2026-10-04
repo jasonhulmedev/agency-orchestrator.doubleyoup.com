@@ -22,6 +22,10 @@
 // idempotent — each treats Google's 409 alreadyExists as success so a half-built cell resumes on
 // re-run (planning/34). `cache-rule-upsert` is idempotent too: it finds the one "edge page cache"
 // rule by its stable description and PATCHes it only on drift, so a re-run converges.
+// `waf-rule-upsert` is idempotent for the same reason, over THREE rules: each standing edge-defense
+// rule is found by its stable description and PATCHed only on drift, so a re-run converges —
+// including after a PARTIAL apply (a zone that ran out of custom-rule budget part-way), which it
+// resumes rather than duplicates.
 //
 // ALL FIVE TEARDOWN ops — `gcp-instance-delete` / `gcp-address-delete` / `gcp-firewall-delete` /
 // `gcp-router-delete` / `gcp-network-delete` — are IDEMPOTENT, the mirror of that: Google's 404
@@ -38,6 +42,7 @@ import {
   type DnsRecordUpsertParams,
   type CachePurgeParams,
   type CacheRuleUpsertParams,
+  type WafRuleUpsertParams,
   type CfTunnelCreateParams,
   type CfTunnelConfigParams,
   type CfTunnelDeleteParams,
@@ -63,6 +68,7 @@ import {
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
   validateCacheRuleUpsertParams,
+  validateWafRuleUpsertParams,
   validateCfTunnelCreateParams,
   validateCfTunnelConfigParams,
   validateCfTunnelDeleteParams,
@@ -91,6 +97,7 @@ import {
   actuateDnsRecordUpsert,
   actuateCachePurge,
   actuateCacheRuleUpsert,
+  actuateWafRuleUpsert,
   actuateCfTunnelCreate,
   actuateCfTunnelConfig,
   actuateCfTunnelDelete,
@@ -154,6 +161,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "cache-rule-upsert": defineOp<CacheRuleUpsertParams>({
     validateParams: validateCacheRuleUpsertParams,
     actuate: (params, env) => actuateCacheRuleUpsert(params, env),
+  }),
+  "waf-rule-upsert": defineOp<WafRuleUpsertParams>({
+    validateParams: validateWafRuleUpsertParams,
+    actuate: (params, env) => actuateWafRuleUpsert(params, env),
   }),
   "cf-tunnel-create": defineOp<CfTunnelCreateParams>({
     validateParams: validateCfTunnelCreateParams,

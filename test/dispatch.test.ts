@@ -50,9 +50,27 @@ import {
   validateGcpNetworkDeleteParams,
   validateProvisionSshKeysParams,
   validateCacheRuleUpsertParams,
+  validateWafRuleUpsertParams,
   edgeCacheZoneFromHostSuffix,
   GCP_FIREWALL_PROTOCOLS,
 } from "../src/dispatch-params.js";
+import {
+  WAF_COUNTRY_BLOCK_DESCRIPTION,
+  WAF_FREE_PLAN_RULE_LIMIT,
+  WAF_LOGIN_GATE_DESCRIPTION,
+  WAF_PHASE,
+  WAF_RULE_BUDGET,
+  WAF_RULE_DESCRIPTIONS,
+  WAF_WPADMIN_GEO_DESCRIPTION,
+  buildEdgeWafRules,
+  edgeWafRulesInOrder,
+  normalizeWafCountryCodes,
+  wafCountryBlockExpression,
+  wafLoginGateExpression,
+  wafRuleDrifted,
+  wafWpAdminGeoExpression,
+  type WafRule,
+} from "../src/edge-waf-rule.js";
 import {
   EDGE_CACHE_BYPASS_RULE_DESCRIPTION,
   EDGE_CACHE_RULE_DESCRIPTION,
@@ -158,6 +176,17 @@ function cacheRuleJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
     op: "cache-rule-upsert",
     params: JSON.stringify(CACHE_RULE_PARAMS),
     nonce: "ab12ab12ab12ab12ab12ab12ab12ab12",
+    ...overrides,
+  });
+}
+
+// A waf-rule-upsert job — the three standing edge-defense rules for an agency zone.
+const WAF_RULE_PARAMS = { zone: "example.com", enabled: true };
+function wafRuleJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "waf-rule-upsert",
+    params: JSON.stringify(WAF_RULE_PARAMS),
+    nonce: "cd34cd34cd34cd34cd34cd34cd34cd34",
     ...overrides,
   });
 }
@@ -886,6 +915,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-router-nat-create",
       "provision-r2",
       "provision-ssh-keys",
+      "waf-rule-upsert",
       "wp-cli",
     ]);
     for (const entry of Object.values(DISPATCH_OP_REGISTRY)) {
@@ -1014,6 +1044,282 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(edgeCacheZoneFromHostSuffix("-production.sbmstudio.com.au")).toBe("sbmstudio.com.au");
     expect(edgeCacheZoneFromHostSuffix("-production.com")).toBeNull();
     expect(edgeCacheZoneFromHostSuffix("x-production.example.com")).toBeNull();
+  });
+
+  // ── waf-rule-upsert (twin of the app's rules) ─────────────────────────────────────
+
+  it("waf-rule-upsert: accepts a zone, defaults enabled to true, and returns only the two known keys", () => {
+    expect(validateWafRuleUpsertParams({ zone: "example.com" })).toEqual({
+      ok: true,
+      params: { zone: "example.com", enabled: true },
+    });
+    expect(validateWafRuleUpsertParams({ zone: "sbmstudio.com.au", enabled: false })).toEqual({
+      ok: true,
+      params: { zone: "sbmstudio.com.au", enabled: false },
+    });
+    // The narrow-authority guarantee: a country list, an expression or an action in the signed
+    // params is DROPPED, never carried into a rule.
+    expect(
+      validateWafRuleUpsertParams({
+        zone: "example.com",
+        enabled: true,
+        blockCountries: ["AU", "US"],
+        adminAllowCountries: ["KP"],
+        expression: "true",
+        action: "block",
+        description: "doubleyoup-country-block",
+      }),
+    ).toEqual({ ok: true, params: { zone: "example.com", enabled: true } });
+  });
+
+  it("waf-rule-upsert: rejects bad input field by field (fails closed)", () => {
+    const bad = (overrides: Record<string, unknown>) => validateWafRuleUpsertParams({ ...WAF_RULE_PARAMS, ...overrides });
+
+    expect(validateWafRuleUpsertParams(null).ok).toBe(false);
+    expect(validateWafRuleUpsertParams([]).ok).toBe(false);
+    expect(validateWafRuleUpsertParams("example.com").ok).toBe(false);
+    expect(bad({ zone: undefined }).ok).toBe(false);
+    expect(bad({ zone: "" }).ok).toBe(false);
+    expect(bad({ zone: "com" }).ok).toBe(false); // single-label
+    expect(bad({ zone: "Example.com" }).ok).toBe(false); // uppercase
+    expect(bad({ zone: "*.example.com" }).ok).toBe(false); // wildcard
+    expect(bad({ zone: " example.com" }).ok).toBe(false); // padded
+    expect(bad({ zone: "example.com." }).ok).toBe(false); // trailing dot
+    expect(bad({ zone: 42 }).ok).toBe(false);
+    expect(bad({ zone: `${"a".repeat(250)}.example.com` }).ok).toBe(false); // over 253 chars
+    expect(bad({ enabled: "false" }).ok).toBe(false);
+    expect(bad({ enabled: 0 }).ok).toBe(false);
+  });
+
+  // ── waf-rule-upsert: the rule BUILDER (byte-identical twin of the orchestrator's) ──
+  // Every expression below is pinned character for character and the orchestrator's
+  // src/edge-waf-rule.test.ts pins the SAME text, so a change on one side of the twin breaks that
+  // side's test. These are also the exact strings the three live PLATFORM rules carry.
+
+  const EXPECTED_COUNTRY_BLOCK_EXPRESSION = 'ip.geoip.country in {"RU" "CN" "KP"}';
+
+  const EXPECTED_WPADMIN_GEO_EXPRESSION =
+    '(http.request.uri.path contains "/wp-admin" or http.request.uri.path eq "/wp-login.php") ' +
+    'and not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE"})';
+
+  const EXPECTED_LOGIN_GATE_EXPRESSION =
+    '(http.request.uri.path eq "/wp-login.php") ' +
+    'or (starts_with(http.request.uri.path, "/wp-admin/") ' +
+    'and not (http.request.uri.path eq "/wp-admin/admin-ajax.php") ' +
+    'and not (http.cookie contains "wordpress_logged_in_"))';
+
+  /** The three rules the Worker must build, or a thrown reason. */
+  function builtWafRules(enabled = true) {
+    const built = buildEdgeWafRules({ enabled });
+    if (!built.ok) throw new Error(built.reason);
+    return built.rules;
+  }
+
+  it("waf-rule-upsert: the exact THREE rule bodies, built from the Worker's OWN constants", () => {
+    const rules = builtWafRules();
+    expect(rules.countryBlock).toEqual({
+      description: "doubleyoup-country-block",
+      expression: EXPECTED_COUNTRY_BLOCK_EXPRESSION,
+      action: "block",
+      enabled: true,
+    });
+    expect(rules.wpAdminGeo).toEqual({
+      description: "doubleyoup-wpadmin-geo",
+      expression: EXPECTED_WPADMIN_GEO_EXPRESSION,
+      action: "block",
+      enabled: true,
+    });
+    expect(rules.loginGate).toEqual({
+      description: "doubleyoup-login-gate",
+      expression: EXPECTED_LOGIN_GATE_EXPRESSION,
+      action: "managed_challenge",
+      enabled: true,
+    });
+    expect(WAF_COUNTRY_BLOCK_DESCRIPTION).toBe("doubleyoup-country-block");
+    expect(WAF_WPADMIN_GEO_DESCRIPTION).toBe("doubleyoup-wpadmin-geo");
+    expect(WAF_LOGIN_GATE_DESCRIPTION).toBe("doubleyoup-login-gate");
+    expect(WAF_PHASE).toBe("http_request_firewall_custom");
+    // enabled:false switches every rule off and rewrites none of them (the rollback).
+    const disabled = builtWafRules(false);
+    for (const rule of edgeWafRulesInOrder(disabled)) {
+      expect(rule.enabled).toBe(false);
+    }
+    expect(disabled.countryBlock.expression).toBe(EXPECTED_COUNTRY_BLOCK_EXPRESSION);
+    expect(disabled.wpAdminGeo.expression).toBe(EXPECTED_WPADMIN_GEO_EXPRESSION);
+    expect(disabled.loginGate.expression).toBe(EXPECTED_LOGIN_GATE_EXPRESSION);
+  });
+
+  it("waf-rule-upsert: the expression helpers normalize codes and REFUSE an empty set", () => {
+    expect(wafCountryBlockExpression(["RU", "CN", "KP"])).toBe(EXPECTED_COUNTRY_BLOCK_EXPRESSION);
+    expect(wafCountryBlockExpression([" ru ", "cn", "RU", "kp"])).toBe(EXPECTED_COUNTRY_BLOCK_EXPRESSION);
+    expect(wafWpAdminGeoExpression(["AU", "US", "GB", "NZ", "FR", "IE"])).toBe(EXPECTED_WPADMIN_GEO_EXPRESSION);
+    expect(wafLoginGateExpression()).toBe(EXPECTED_LOGIN_GATE_EXPRESSION);
+    expect(normalizeWafCountryCodes([" ru ", "cn", "RU", "", "kp"])).toEqual(["RU", "CN", "KP"]);
+    // `block nothing` and `allow nobody` are both silent disasters; CF rejects `{}` anyway.
+    expect(wafCountryBlockExpression([])).toBeNull();
+    expect(wafCountryBlockExpression(["", "  "])).toBeNull();
+    expect(wafWpAdminGeoExpression([])).toBeNull();
+  });
+
+  it("waf-rule-upsert: strictest-first order, distinct descriptions, and the <= 4 rule budget", () => {
+    const ordered = edgeWafRulesInOrder(builtWafRules());
+    expect(ordered.map((rule) => rule.description)).toEqual([
+      "doubleyoup-country-block",
+      "doubleyoup-wpadmin-geo",
+      "doubleyoup-login-gate",
+    ]);
+    expect(ordered.map((rule) => rule.action)).toEqual(["block", "block", "managed_challenge"]);
+    expect([...WAF_RULE_DESCRIPTIONS]).toEqual(ordered.map((rule) => rule.description));
+    // THE BUDGET: a Free Cloudflare zone allows 5 custom rules in this phase, so the op caps itself
+    // at 4 and ships 3 — leaving at least one slot for a rule the agency owns.
+    expect(ordered.length).toBe(3);
+    expect(ordered.length).toBeLessThanOrEqual(WAF_RULE_BUDGET);
+    expect(WAF_RULE_BUDGET).toBe(4);
+    expect(WAF_FREE_PLAN_RULE_LIMIT).toBe(5);
+    expect(WAF_RULE_BUDGET).toBeLessThan(WAF_FREE_PLAN_RULE_LIMIT);
+    expect(new Set(ordered.map((rule) => rule.description)).size).toBe(ordered.length);
+  });
+
+  it("waf-rule-upsert: the drift check covers action, expression and enabled", () => {
+    const loginGate = builtWafRules().loginGate;
+    const echoed = {
+      action: "managed_challenge",
+      expression: EXPECTED_LOGIN_GATE_EXPRESSION,
+      enabled: true,
+    };
+    expect(wafRuleDrifted(echoed, loginGate)).toBe(false);
+    expect(wafRuleDrifted({ ...echoed, enabled: false }, loginGate)).toBe(true);
+    expect(wafRuleDrifted({ ...echoed, action: "block" }, loginGate)).toBe(true);
+    expect(wafRuleDrifted({ ...echoed, expression: "true" }, loginGate)).toBe(true);
+    // A live rule Cloudflare echoes WITHOUT `enabled` is drift against our `enabled:true` — we
+    // would rather PATCH a rule that was already right than leave a disabled one in place.
+    expect(wafRuleDrifted({ action: echoed.action, expression: echoed.expression }, loginGate)).toBe(true);
+  });
+
+  // ── waf-rule-upsert: request-level behaviour ──────────────────────────────────────
+  // A tiny evaluator for EXACTLY the clause grammar these three rules emit, so the policy is pinned
+  // as REQUESTS rather than as strings. The orchestrator's twin test runs the same cases.
+
+  interface SimulatedRequest {
+    country: string;
+    path: string;
+    cookie: string;
+  }
+
+  /** Split `text` on a top-level operator (never inside parentheses). Null when absent. */
+  function splitTopLevel(text: string, operator: " and " | " or "): string[] | null {
+    const parts: string[] = [];
+    let depth = 0;
+    let current = "";
+    for (let index = 0; index < text.length; index += 1) {
+      const char = text[index]!;
+      if (char === "(") depth += 1;
+      if (char === ")") depth -= 1;
+      if (depth === 0 && text.startsWith(operator, index)) {
+        parts.push(current);
+        current = "";
+        index += operator.length - 1;
+        continue;
+      }
+      current += char;
+    }
+    if (parts.length === 0) return null;
+    parts.push(current);
+    return parts;
+  }
+
+  /** True when the whole string is ONE parenthesised group (not "(a) and (b)"). */
+  function isWrappedInParentheses(text: string): boolean {
+    if (!text.startsWith("(") || !text.endsWith(")")) return false;
+    let depth = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      if (text[index] === "(") depth += 1;
+      if (text[index] === ")") depth -= 1;
+      if (depth === 0 && index < text.length - 1) return false;
+    }
+    return true;
+  }
+
+  function evaluateExpression(expression: string, request: SimulatedRequest): boolean {
+    const text = expression.trim();
+
+    const orParts = splitTopLevel(text, " or ");
+    if (orParts) return orParts.some((part) => evaluateExpression(part, request));
+    const andParts = splitTopLevel(text, " and ");
+    if (andParts) return andParts.every((part) => evaluateExpression(part, request));
+    if (text.startsWith("not ")) return !evaluateExpression(text.slice(4), request);
+    if (isWrappedInParentheses(text)) return evaluateExpression(text.slice(1, -1), request);
+
+    let match = /^ip\.geoip\.country in \{(.+)\}$/.exec(text);
+    if (match) return match[1]!.split(" ").map((item) => item.replace(/"/g, "")).includes(request.country);
+    match = /^http\.request\.uri\.path contains "(.+)"$/.exec(text);
+    if (match) return request.path.includes(match[1]!);
+    match = /^http\.request\.uri\.path eq "(.+)"$/.exec(text);
+    if (match) return request.path === match[1]!;
+    match = /^starts_with\(http\.request\.uri\.path, "(.+)"\)$/.exec(text);
+    if (match) return request.path.startsWith(match[1]!);
+    match = /^http\.cookie contains "(.+)"$/.exec(text);
+    if (match) return request.cookie.includes(match[1]!);
+    throw new Error(`evaluator does not understand clause: ${expression}`);
+  }
+
+  /** The action of the FIRST matching rule (all three are terminating), else "reaches-origin". */
+  function edgeVerdict(request: SimulatedRequest): "block" | "managed_challenge" | "reaches-origin" {
+    const ordered: WafRule[] = edgeWafRulesInOrder(builtWafRules());
+    for (const rule of ordered) {
+      if (evaluateExpression(rule.expression, request)) return rule.action;
+    }
+    return "reaches-origin";
+  }
+
+  const ANON_PAGE: SimulatedRequest = { country: "AU", path: "/about-us/", cookie: "_ga=GA1.1" };
+
+  it("waf-rule-upsert: a normal page from an allowed country is UNTOUCHED — it reaches the site", () => {
+    for (const country of ["AU", "US", "GB", "NZ", "FR", "IE"]) {
+      expect(edgeVerdict({ ...ANON_PAGE, country })).toBe("reaches-origin");
+    }
+    expect(edgeVerdict({ ...ANON_PAGE, path: "/" })).toBe("reaches-origin");
+    expect(edgeVerdict({ ...ANON_PAGE, path: "/shop/product/widget/" })).toBe("reaches-origin");
+    // A country that is neither blocked nor admin-allow-listed still reaches the FRONT END.
+    expect(edgeVerdict({ ...ANON_PAGE, country: "DE" })).toBe("reaches-origin");
+  });
+
+  it("waf-rule-upsert: a blocked country does NOT reach the site, on any path", () => {
+    for (const country of ["RU", "CN", "KP"]) {
+      expect(edgeVerdict({ ...ANON_PAGE, country })).toBe("block");
+      // The country block is FIRST, so a blocked country is blocked on the login surface too —
+      // never handed the softer managed challenge, and no exemption rescues it.
+      expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-login.php" })).toBe("block");
+      expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin/" })).toBe("block");
+      expect(
+        edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin/admin-ajax.php", cookie: "wordpress_logged_in_x=a" }),
+      ).toBe("block");
+    }
+  });
+
+  it("waf-rule-upsert: /wp-admin and /wp-login.php from a non-allowed country are BLOCKED", () => {
+    for (const country of ["DE", "IN", "BR", "SG"]) {
+      expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin/" })).toBe("block");
+      expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-login.php" })).toBe("block");
+      expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin/edit.php" })).toBe("block");
+      // The admin-geo rule runs BEFORE the login gate, so neither of the gate's exemptions applies.
+      expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin/admin-ajax.php" })).toBe("block");
+      expect(edgeVerdict({ ...ANON_PAGE, country, path: "/wp-admin/", cookie: "wordpress_logged_in_x=a" })).toBe("block");
+    }
+  });
+
+  it("waf-rule-upsert: the login gate challenges an ALLOWED country's login surface, with its two exemptions", () => {
+    expect(edgeVerdict({ ...ANON_PAGE, path: "/wp-login.php" })).toBe("managed_challenge");
+    // A forged logged-in cookie must NOT bypass the login endpoint itself.
+    expect(edgeVerdict({ ...ANON_PAGE, path: "/wp-login.php", cookie: "wordpress_logged_in_x=a" })).toBe("managed_challenge");
+    expect(edgeVerdict({ ...ANON_PAGE, path: "/wp-admin/" })).toBe("managed_challenge");
+    expect(edgeVerdict({ ...ANON_PAGE, path: "/wp-admin/options-general.php" })).toBe("managed_challenge");
+    // ...except admin-ajax and a genuine logged-in session.
+    expect(edgeVerdict({ ...ANON_PAGE, path: "/wp-admin/admin-ajax.php" })).toBe("reaches-origin");
+    expect(edgeVerdict({ ...ANON_PAGE, path: "/wp-admin/", cookie: "_ga=1; wordpress_logged_in_abc=a%7C1" })).toBe("reaches-origin");
+    // `contains "/wp-admin"` is wider than it looks — the platform's existing text, reproduced.
+    expect(edgeVerdict({ country: "DE", path: "/docs/wp-admin-tips/", cookie: "" })).toBe("block");
+    expect(edgeVerdict({ country: "AU", path: "/docs/wp-admin-tips/", cookie: "" })).toBe("reaches-origin");
   });
 
   // ── wp-cli (twin of the app's rules) ──────────────────────────────────────────────
@@ -3003,6 +3309,390 @@ describe("POST /actuate route", () => {
     expect(response.status).toBe(400);
     const body = (await response.json()) as { reason: string };
     expect(body.reason).toMatch(/hostSuffix/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── waf-rule-upsert through the registry ──────────────────────────────────────────
+
+  /** The three rules the Worker must write for WAF_RULE_PARAMS, in apply order. */
+  function expectedWafRules(enabled = true): WafRule[] {
+    const built = buildEdgeWafRules({ enabled });
+    if (!built.ok) throw new Error(built.reason);
+    return edgeWafRulesInOrder(built.rules);
+  }
+  /** The id the mock assigns a newly written rule, by which of our three it is. */
+  function newWafIdFor(description: unknown): string {
+    if (description === WAF_COUNTRY_BLOCK_DESCRIPTION) return "rule-new-country";
+    if (description === WAF_WPADMIN_GEO_DESCRIPTION) return "rule-new-wpadmin";
+    return "rule-new-login";
+  }
+
+  /**
+   * A routed CF ruleset API mock for the FIREWALL-CUSTOM phase: zone lookup, the entrypoint GET, and
+   * the three writes (create entrypoint / append rule / patch rule). `entrypointRules` = the rules
+   * the zone already has; null => 404 (no custom rules yet). `denyStatus` makes the entrypoint GET
+   * answer 401/403. `refuseWrite` makes a write for that rule description fail as Cloudflare would
+   * when the zone has no custom-rule budget left. Every call must carry the DNS token.
+   */
+  function mockWafRuleApi(
+    entrypointRules: Array<Record<string, unknown>> | null,
+    options: { denyStatus?: number; refuseWriteFor?: string } = {},
+  ) {
+    const calls: Array<{ method: string; path: string; body?: Record<string, unknown> }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = urlOf(input);
+      const method = init?.method ?? "GET";
+      const auth = new Headers(init?.headers).get("authorization");
+      expect(auth).toBe("Bearer cf-dns-token-abc");
+      const parsed = new URL(url);
+      const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined;
+      calls.push({ method, path: parsed.pathname, body });
+
+      if (parsed.pathname === "/client/v4/zones" && method === "GET") {
+        expect(parsed.searchParams.get("name")).toBe("example.com");
+        return jsonResponse({ success: true, result: [{ id: "zone-1", name: "example.com" }] });
+      }
+      if (
+        parsed.pathname === "/client/v4/zones/zone-1/rulesets/phases/http_request_firewall_custom/entrypoint" &&
+        method === "GET"
+      ) {
+        if (options.denyStatus !== undefined) {
+          return jsonResponse({ success: false, errors: [{ code: 10000, message: "Authentication error" }] }, options.denyStatus);
+        }
+        if (entrypointRules === null) {
+          return jsonResponse({ success: false, errors: [{ code: 10003, message: "could not find entrypoint ruleset" }] }, 404);
+        }
+        return jsonResponse({ success: true, result: { id: "rs-1", rules: entrypointRules } });
+      }
+
+      // The budget refusal: Cloudflare rejects the write for one specific rule.
+      const refusedDescription = options.refuseWriteFor;
+      const writtenDescription = (body?.description ?? (body?.rules as Array<Record<string, unknown>> | undefined)?.[0]?.description) as
+        | string
+        | undefined;
+      if (method !== "GET" && refusedDescription !== undefined && writtenDescription === refusedDescription) {
+        return jsonResponse(
+          { success: false, errors: [{ code: 20062, message: "Exceeded maximum number of rules per ruleset" }] },
+          400,
+        );
+      }
+
+      if (parsed.pathname === "/client/v4/zones/zone-1/rulesets" && method === "POST") {
+        const createdRules = (body?.rules as Array<Record<string, unknown>>).map((rule) => ({ ...rule, id: newWafIdFor(rule.description) }));
+        return jsonResponse({ success: true, result: { id: "rs-new", rules: createdRules } });
+      }
+      // Append to ANY ruleset id (rs-1 = the zone's existing entrypoint, rs-new = one this op just
+      // created). Stateless: the reply is the initial rules + this write.
+      const appendMatch = /^\/client\/v4\/zones\/zone-1\/rulesets\/(rs-[a-z0-9-]+)\/rules$/.exec(parsed.pathname);
+      if (appendMatch && method === "POST") {
+        return jsonResponse({
+          success: true,
+          result: { id: appendMatch[1], rules: [...(entrypointRules ?? []), { ...body, id: newWafIdFor(body?.description) }] },
+        });
+      }
+      if (parsed.pathname.startsWith("/client/v4/zones/zone-1/rulesets/rs-1/rules/") && method === "PATCH") {
+        return jsonResponse({ success: true, result: { id: "rs-1", rules: entrypointRules } });
+      }
+      throw new Error(`unexpected fetch ${method} ${url}`);
+    });
+    return calls;
+  }
+
+  it("waf-rule-upsert: no custom rules yet => creates the entrypoint with rule 1, then appends 2 and 3 (one read, no second create)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockWafRuleApi(null);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "waf-rule-upsert",
+      zone: "example.com",
+      enabled: true,
+      rules: [
+        { description: "doubleyoup-country-block", action: "created", ruleId: "rule-new-country" },
+        { description: "doubleyoup-wpadmin-geo", action: "created", ruleId: "rule-new-wpadmin" },
+        { description: "doubleyoup-login-gate", action: "created", ruleId: "rule-new-login" },
+      ],
+      otherWafRules: [],
+    });
+    // Exactly ONE entrypoint read, then three writes: create (rule 1) + two appends to the NEW ruleset.
+    const entrypointReads = calls.filter((call) => call.method === "GET" && call.path.endsWith("/entrypoint"));
+    expect(entrypointReads).toHaveLength(1);
+    const writes = calls.filter((call) => call.method !== "GET");
+    expect(writes).toHaveLength(3);
+    expect(writes[0]?.path).toBe("/client/v4/zones/zone-1/rulesets");
+    expect(writes[0]?.body).toEqual({
+      name: "default",
+      kind: "zone",
+      phase: "http_request_firewall_custom",
+      rules: [expectedWafRules()[0]],
+    });
+    expect(writes[1]?.path).toBe("/client/v4/zones/zone-1/rulesets/rs-new/rules");
+    expect(writes[1]?.body).toEqual(expectedWafRules()[1]);
+    expect(writes[2]?.path).toBe("/client/v4/zones/zone-1/rulesets/rs-new/rules");
+    expect(writes[2]?.body).toEqual(expectedWafRules()[2]);
+  });
+
+  it("waf-rule-upsert: an existing ruleset without our rules => APPENDS all three and never touches the agency's own rule", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const agencyOwnRule = {
+      id: "agency-rule-1",
+      description: "agency: allow the office",
+      expression: "ip.src in {203.0.113.7}",
+      action: "skip",
+      enabled: true,
+    };
+    const calls = mockWafRuleApi([agencyOwnRule]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; rules: Array<{ action: string }>; otherWafRules: string[] };
+    expect(body.ok).toBe(true);
+    expect(body.rules.map((rule) => rule.action)).toEqual(["created", "created", "created"]);
+    const writes = calls.filter((call) => call.method !== "GET");
+    expect(writes).toHaveLength(3);
+    // THREE appends to the EXISTING ruleset — no create, no PUT, nothing that could replace it.
+    expect(writes.map((call) => call.method)).toEqual(["POST", "POST", "POST"]);
+    expect(writes.map((call) => call.path)).toEqual([
+      "/client/v4/zones/zone-1/rulesets/rs-1/rules",
+      "/client/v4/zones/zone-1/rulesets/rs-1/rules",
+      "/client/v4/zones/zone-1/rulesets/rs-1/rules",
+    ]);
+    expect(writes.map((call) => call.body)).toEqual(expectedWafRules());
+    // The agency's own rule is never the target of a write — but it IS reported, with its action,
+    // because a `skip` rule ahead of ours pre-empts the block and it costs a rule-budget slot.
+    expect(writes.some((call) => call.path.includes("agency-rule-1"))).toBe(false);
+    expect(body.otherWafRules).toEqual(["agency: allow the office [agency-rule-1] enabled action=skip"]);
+  });
+
+  it("waf-rule-upsert: an identical rule set (any order in the zone) => NO write at all", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const [countryBlock, wpAdminGeo, loginGate] = expectedWafRules();
+    // Listed in a different order than we apply them, and with Cloudflare's extra fields.
+    const calls = mockWafRuleApi([
+      { ...loginGate, id: "rule-login", ref: "cf-ref-3" },
+      { ...countryBlock, id: "rule-country", ref: "cf-ref-1" },
+      { ...wpAdminGeo, id: "rule-wpadmin", ref: "cf-ref-2" },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "waf-rule-upsert",
+      zone: "example.com",
+      enabled: true,
+      rules: [
+        { description: "doubleyoup-country-block", action: "unchanged", ruleId: "rule-country" },
+        { description: "doubleyoup-wpadmin-geo", action: "unchanged", ruleId: "rule-wpadmin" },
+        { description: "doubleyoup-login-gate", action: "unchanged", ruleId: "rule-login" },
+      ],
+      otherWafRules: [],
+    });
+    expect(calls.every((call) => call.method === "GET")).toBe(true);
+  });
+
+  it("waf-rule-upsert: enabled:false PATCHes all three rules in place (rollback without delete)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob({ params: JSON.stringify({ ...WAF_RULE_PARAMS, enabled: false }) });
+    const signature = await signAsApp(job, privateKey);
+    const [countryBlock, wpAdminGeo, loginGate] = expectedWafRules(true);
+    const calls = mockWafRuleApi([
+      { ...countryBlock, id: "rule-country" },
+      { ...wpAdminGeo, id: "rule-wpadmin" },
+      { ...loginGate, id: "rule-login" },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    const body = (await response.json()) as { ok: boolean; enabled: boolean; rules: Array<{ action: string }> };
+    expect(body.ok).toBe(true);
+    expect(body.enabled).toBe(false);
+    expect(body.rules.map((rule) => rule.action)).toEqual(["updated", "updated", "updated"]);
+    const writes = calls.filter((call) => call.method !== "GET");
+    expect(writes.map((call) => call.method)).toEqual(["PATCH", "PATCH", "PATCH"]);
+    expect(writes.map((call) => call.path)).toEqual([
+      "/client/v4/zones/zone-1/rulesets/rs-1/rules/rule-country",
+      "/client/v4/zones/zone-1/rulesets/rs-1/rules/rule-wpadmin",
+      "/client/v4/zones/zone-1/rulesets/rs-1/rules/rule-login",
+    ]);
+    expect(writes.map((call) => call.body)).toEqual(expectedWafRules(false));
+  });
+
+  it("waf-rule-upsert: a drifted rule (someone softened the country BLOCK to a challenge) is PATCHed back", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const [countryBlock] = expectedWafRules();
+    const calls = mockWafRuleApi([{ ...countryBlock, id: "rule-country", action: "managed_challenge" }]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    const body = (await response.json()) as { ok: boolean; rules: Array<{ description: string; action: string }> };
+    expect(body.ok).toBe(true);
+    expect(body.rules.map((rule) => rule.action)).toEqual(["updated", "created", "created"]);
+    const patch = calls.find((call) => call.method === "PATCH");
+    expect(patch?.path).toBe("/client/v4/zones/zone-1/rulesets/rs-1/rules/rule-country");
+    expect(patch?.body).toEqual(countryBlock);
+  });
+
+  it("waf-rule-upsert: two rules carrying one of our descriptions => fails closed with NO write at all", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const [countryBlock, wpAdminGeo] = expectedWafRules();
+    // The ambiguity is on the SECOND rule we would apply, so this also proves the pre-scan runs
+    // BEFORE any write: rule 1 must not land while rule 2's state is ambiguous.
+    const calls = mockWafRuleApi([
+      { ...countryBlock, id: "rule-country" },
+      { ...wpAdminGeo, id: "rule-wpadmin-a" },
+      { ...wpAdminGeo, id: "rule-wpadmin-b" },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string; wafRulesApplied?: unknown };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/ambiguous/);
+    expect(body.detail).toMatch(/doubleyoup-wpadmin-geo/);
+    expect(body.wafRulesApplied).toBeUndefined();
+    expect(calls.every((call) => call.method === "GET")).toBe(true);
+  });
+
+  it("waf-rule-upsert: a zone with no rule budget left FAILS LOUDLY and names what did and did not land", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    // Three rules of the agency's own + our three = 6, over a Free zone's 5. Cloudflare refuses the
+    // third of ours; the first two have already landed.
+    const agencyRules = [1, 2, 3].map((index) => ({
+      id: `agency-rule-${index}`,
+      description: `agency rule ${index}`,
+      expression: "http.host eq \"shop.example.com\"",
+      action: "block",
+      enabled: true,
+    }));
+    const calls = mockWafRuleApi(agencyRules, { refuseWriteFor: WAF_LOGIN_GATE_DESCRIPTION });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      ok: boolean;
+      detail: string;
+      wafRulesApplied: Array<{ description: string; action: string }>;
+    };
+    // NEVER ok:true with a rule missing.
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/could not apply rule "doubleyoup-login-gate"/);
+    // Cloudflare's own message is kept verbatim...
+    expect(body.detail).toMatch(/Exceeded maximum number of rules per ruleset/);
+    // ...and the budget arithmetic is spelled out for the operator.
+    expect(body.detail).toMatch(/3 custom rule\(s\) that are not ours/);
+    expect(body.detail).toMatch(new RegExp(`allows ${WAF_FREE_PLAN_RULE_LIMIT} custom rules`));
+    expect(body.detail).toMatch(/idempotent and resumes/);
+    // The partial apply is reported, not hidden: these two ARE in force on the zone right now.
+    expect(body.wafRulesApplied).toEqual([
+      { description: "doubleyoup-country-block", action: "created", ruleId: "rule-new-country" },
+      { description: "doubleyoup-wpadmin-geo", action: "created", ruleId: "rule-new-wpadmin" },
+    ]);
+    // The strictest rules are the ones that landed — that is why the apply order is what it is.
+    expect(calls.filter((call) => call.method !== "GET")).toHaveLength(3);
+  });
+
+  it("waf-rule-upsert: a token without the WAF scope gets a clear, actionable denial and no write", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockWafRuleApi([], { denyStatus: 403 });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; zone: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.zone).toBe("example.com");
+    // The exact Cloudflare permission name, not a 403 dump.
+    expect(body.detail).toMatch(/Zone WAF Write/);
+    expect(body.detail).toMatch(/API-token editor/);
+    expect(calls.every((call) => call.method === "GET")).toBe(true);
+  });
+
+  it("waf-rule-upsert: a country list smuggled into the signed params never reaches Cloudflare", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob({
+      params: JSON.stringify({
+        ...WAF_RULE_PARAMS,
+        // The over-broad authority this op exists to refuse: block everyone, allow nobody.
+        blockCountries: ["AU", "US", "GB"],
+        adminAllowCountries: ["KP"],
+        expression: "true",
+        action: "block",
+      }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockWafRuleApi([]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const writes = calls.filter((call) => call.method !== "GET");
+    expect(writes.map((call) => call.body)).toEqual(expectedWafRules());
+    for (const write of writes) {
+      expect(JSON.stringify(write.body)).not.toContain('"AU" "US" "GB"}');
+      expect(JSON.stringify(write.body)).not.toContain('{"KP"}');
+      expect(write.body?.expression).not.toBe("true");
+    }
+  });
+
+  it("waf-rule-upsert: fails cleanly when the token cannot see the zone (no ruleset read or write)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => jsonResponse({ success: true, result: [] }));
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/not visible to CF_DNS_API_TOKEN/);
+    expect(fetchSpy).toHaveBeenCalledTimes(1); // the zone lookup only
+  });
+
+  it("waf-rule-upsert: reports a clean failure and touches NO API when CF_DNS_API_TOKEN is missing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    // R2 + cell tokens ARE present — neither may be used as a substitute.
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ CF_DNS_API_TOKEN: undefined }));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/CF_DNS_API_TOKEN is not configured/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("waf-rule-upsert: a signed job with an invalid zone is 400 with no API call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob({ params: JSON.stringify({ ...WAF_RULE_PARAMS, zone: "*.example.com" }) });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { reason: string };
+    expect(body.reason).toMatch(/zone must be a lowercase DNS zone name/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("waf-rule-upsert: an unsigned or tampered job actuates NOTHING", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const response = await worker.fetch(actuateRequest({ job: wafRuleJob(), signature: "not-a-signature" }), envWith());
+    expect(response.status).toBe(401);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 

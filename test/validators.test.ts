@@ -458,6 +458,13 @@ describe("validateCfDns", () => {
           u === "https://api.cloudflare.com/client/v4/zones/z1/rulesets/phases/http_request_cache_settings/entrypoint",
         respond: () => jsonResponse({ success: false, errors: [{ code: 10003 }] }, 404),
       },
+      // Edge defense: a READ-ONLY probe of the first zone's firewall-custom entrypoint. A zone with
+      // no custom rules yet answers 404, which still proves the token may read them.
+      {
+        match: (u) =>
+          u === "https://api.cloudflare.com/client/v4/zones/z1/rulesets/phases/http_request_firewall_custom/entrypoint",
+        respond: () => jsonResponse({ success: false, errors: [{ code: 10003 }] }, 404),
+      },
     ]);
     vi.stubGlobal("fetch", fetchMock);
     const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
@@ -468,10 +475,12 @@ describe("validateCfDns", () => {
     expect(result.detail).toMatch(/Tunnel management: OK/i);
     // ...and so did the Cache Rules probe.
     expect(result.detail).toMatch(/Cache Rules: read access OK/i);
+    // ...and the WAF probe.
+    expect(result.detail).toMatch(/WAF rules: read access OK/i);
 
-    // Strictly read-only: the zone read, the two tunnel-scope probes and the Cache Rules probe,
-    // all GETs with the bearer.
-    expect(fetchMock.mock.calls.length).toBe(4);
+    // Strictly read-only: the zone read, the two tunnel-scope probes, the Cache Rules probe and the
+    // WAF probe, all GETs with the bearer.
+    expect(fetchMock.mock.calls.length).toBe(5);
     for (const call of fetchMock.mock.calls) {
       const [, init] = call as unknown as [string, RequestInit | undefined];
       expect(init?.method ?? "GET").toBe("GET");
@@ -528,6 +537,41 @@ describe("validateCfDns", () => {
     expect(result.ok).toBe(true);
     expect(result.detail).toMatch(/Cache Rules: NOT available/i);
     expect(result.detail).toMatch(/Cache Rules: Edit/);
+  });
+
+  it("stays green on DNS but flags a MISSING WAF scope (403 on the firewall-custom probe)", async () => {
+    const fetchMock = routedFetch([
+      {
+        match: (u) => u === "https://api.cloudflare.com/client/v4/zones?per_page=1",
+        respond: () => jsonResponse({ success: true, result: [{ id: "z1", name: "jasonhulme.com" }] }),
+      },
+      {
+        match: (u) => u === "https://api.cloudflare.com/client/v4/accounts?per_page=1",
+        respond: () => jsonResponse({ success: true, result: [{ id: "acc1" }] }),
+      },
+      {
+        match: (u) => u.startsWith("https://api.cloudflare.com/client/v4/accounts/acc1/cfd_tunnel"),
+        respond: () => jsonResponse({ success: true, result: [] }),
+      },
+      {
+        match: (u) =>
+          u === "https://api.cloudflare.com/client/v4/zones/z1/rulesets/phases/http_request_cache_settings/entrypoint",
+        respond: () => jsonResponse({ success: true, result: { id: "rs-1", rules: [] } }),
+      },
+      {
+        match: (u) =>
+          u === "https://api.cloudflare.com/client/v4/zones/z1/rulesets/phases/http_request_firewall_custom/entrypoint",
+        respond: () => new Response("", { status: 403 }),
+      },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
+    // Non-fatal, like the other probes: the row stays green and the EXACT permission name is given,
+    // so the agency owner fixes it before the first apply instead of reading a 403 later.
+    expect(result.ok).toBe(true);
+    expect(result.detail).toMatch(/WAF rules: NOT available/i);
+    expect(result.detail).toMatch(/Zone WAF Write/);
+    expect(result.detail).toMatch(/API-token editor/);
   });
 
   it("fails closed when the token authenticates but can list NO zones (wrong scope)", async () => {
