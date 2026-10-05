@@ -29,6 +29,11 @@
 // a re-run of a partly-torn-down cell RESUMES rather than failing on what it already removed
 // (planning/34 teardown). Note the contrast with gcp-instance-delete's CREATE twin — deleting a VM
 // converges, creating one does not.
+//
+// The two in-place UPDATE ops (planning/47) split the same way: `gcp-instance-set-metadata` IS
+// idempotent (a re-run re-reads the fingerprint and writes the same merged values), while
+// `gcp-instance-restart` is NOT — every run reboots the node again, and on the NFS file node every
+// reboot interrupts every site — so it runs exactly once under F1 (see actuate.ts for both).
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -58,6 +63,8 @@ import {
   type GcpFirewallDeleteParams,
   type GcpRouterDeleteParams,
   type GcpNetworkDeleteParams,
+  type GcpInstanceSetMetadataParams,
+  type GcpInstanceRestartParams,
   type ProvisionSshKeysParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
@@ -83,6 +90,8 @@ import {
   validateGcpFirewallDeleteParams,
   validateGcpRouterDeleteParams,
   validateGcpNetworkDeleteParams,
+  validateGcpInstanceSetMetadataParams,
+  validateGcpInstanceRestartParams,
   validateProvisionSshKeysParams,
 } from "./dispatch-params.js";
 import {
@@ -111,6 +120,8 @@ import {
   actuateGcpFirewallDelete,
   actuateGcpRouterDelete,
   actuateGcpNetworkDelete,
+  actuateGcpInstanceSetMetadata,
+  actuateGcpInstanceRestart,
   actuateProvisionSshKeys,
 } from "./actuate.js";
 
@@ -234,6 +245,14 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "gcp-network-delete": defineOp<GcpNetworkDeleteParams>({
     validateParams: validateGcpNetworkDeleteParams,
     actuate: (params, env) => actuateGcpNetworkDelete(params, env),
+  }),
+  "gcp-instance-set-metadata": defineOp<GcpInstanceSetMetadataParams>({
+    validateParams: validateGcpInstanceSetMetadataParams,
+    actuate: (params, env) => actuateGcpInstanceSetMetadata(params, env),
+  }),
+  "gcp-instance-restart": defineOp<GcpInstanceRestartParams>({
+    validateParams: validateGcpInstanceRestartParams,
+    actuate: (params, env) => actuateGcpInstanceRestart(params, env),
   }),
   "provision-ssh-keys": defineOp<ProvisionSshKeysParams>({
     validateParams: validateProvisionSshKeysParams,

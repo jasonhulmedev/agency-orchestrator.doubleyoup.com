@@ -41,7 +41,9 @@ export interface Env {
   // Probed read-only by /validate (validators.ts::validateGCP), and used by the
   // Direction-B `gcp-*` actuators (src/actuate.ts: gcp-instance-create,
   // gcp-network-create, gcp-firewall-create, gcp-address-create,
-  // gcp-router-nat-create) to mint a FULL
+  // gcp-router-nat-create, the gcp-*-get/list reads, the gcp-*-delete teardown
+  // ops, and the planning/47 update ops gcp-instance-set-metadata /
+  // gcp-instance-restart) to mint a FULL
   // cloud-platform-scoped token and create Compute Engine resources in the
   // agency's own project (every op is pinned to the key's own project_id). The
   // key never leaves this Worker; only the short-lived token it mints reaches
@@ -52,6 +54,11 @@ export interface Env {
   // write probe, and used by the Direction-B `db-export` actuator to PRESIGN a
   // single-object PUT URL the agency's cell uploads a DB dump to — the credential
   // itself never leaves this Worker (only the derived, short-lived URL reaches the cell).
+  // ONE deliberate exception (planning/47): `gcp-instance-set-metadata` substitutes
+  // these five values into a cell node's startup script in place of the fixed
+  // `@@DY_T2_S3_*@@` placeholders, so the node's Tier-2 backup runner can write to the
+  // agency's own store. The values go ONLY into that node's instance metadata in the
+  // agency's own GCP project — never back to the platform, which never holds them.
   S3_ACCESS_KEY_ID?: string;
   S3_SECRET_ACCESS_KEY?: string;
   S3_REGION?: string;

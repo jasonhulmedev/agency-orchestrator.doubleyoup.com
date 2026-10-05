@@ -46,6 +46,9 @@ import type {
   GcpFirewallDeleteParams,
   GcpRouterDeleteParams,
   GcpNetworkDeleteParams,
+  GcpInstanceSetMetadataParams,
+  GcpInstanceMetadataItem,
+  GcpInstanceRestartParams,
   ProvisionSshKeysParams,
 } from "./dispatch-params.js";
 import { edgeCacheZoneFromHostSuffix } from "./dispatch-params.js";
@@ -259,6 +262,66 @@ export type GcpNetworkDeleteResult =
     }
   | { ok: false; op: "gcp-network-delete"; networkName: string; subnetName: string; detail: string };
 
+// planning/47 in-place update. `keysSet` names the keys THIS run wrote (the request's keys — never
+// their values, which may carry a substituted secret); `placeholdersSubstituted` names the
+// `@@DY_T2_S3_*@@` placeholders the Worker filled from its own S3_* configuration (names only, see
+// actuateGcpInstanceSetMetadata). The metadata write is WAITED to DONE, so ok:true means the new
+// metadata is in place and a following gcp-instance-restart boots with it.
+//
+// `staleFingerprint` (ok:false ONLY) is set when Google rejected the write with 412 — the instance's
+// metadata changed between this op's read and its write. A DISCRIMINABLE field (never a detail-string
+// match): the caller re-runs DELIBERATELY (a re-run re-reads and re-merges); the Worker never retries
+// it blindly, because a blind re-write is exactly how a concurrent change gets clobbered.
+// `unconfirmed` (ok:false ONLY) is set when Google ACCEPTED the write but its operation did not reach
+// DONE inside the bounded wait — the metadata may well be in place; a re-run converges. Each is absent
+// on every other failure.
+export type GcpInstanceSetMetadataResult =
+  | {
+      ok: true;
+      op: "gcp-instance-set-metadata";
+      instanceName: string;
+      keysSet: string[];
+      placeholdersSubstituted: string[];
+      operationName: string;
+    }
+  | {
+      ok: false;
+      op: "gcp-instance-set-metadata";
+      instanceName: string;
+      detail: string;
+      staleFingerprint?: true;
+      unconfirmed?: true;
+    };
+
+// planning/47: a GRACEFUL stop then start. Each half's Compute operation is WAITED to DONE — Google's
+// confirmation of the TERMINATED / RUNNING transition — so ok:true means the VM is RUNNING again on its
+// (possibly new) startup script. `stopStatus` is "already-stopped" when the VM was TERMINATED before
+// the op touched it (nothing to stop; only the start ran). On ok:false, `phase` names the half that
+// failed and `stopped` says whether the VM had been confirmed TERMINATED by then, so a caller can tell
+// "stop failed, VM untouched" from "stopped, but the start did not confirm" — those need different
+// operator responses. `unconfirmed` is set when Google ACCEPTED the stop/start but its operation did
+// not reach DONE inside the bounded wait (the transition may still complete on its own; re-run once
+// the VM settles — a re-run on a TERMINATED VM only starts it).
+export type GcpInstanceRestartResult =
+  | {
+      ok: true;
+      op: "gcp-instance-restart";
+      instanceName: string;
+      stopStatus: "stopped" | "already-stopped";
+      startStatus: "started";
+      stopOperationName?: string;
+      startOperationName: string;
+    }
+  | {
+      ok: false;
+      op: "gcp-instance-restart";
+      instanceName: string;
+      detail: string;
+      phase: "stop" | "start";
+      stopped: boolean;
+      unconfirmed?: true;
+    };
+
 // Deliberately SMALL: the authorized_keys file lives ON the gateway; nothing sensitive comes back.
 // `count` echoes how many key lines the gateway wrote (0 = the set was revoked), so the caller can
 // confirm the whole desired set landed without the Worker re-reading the file.
@@ -291,6 +354,8 @@ export type ActuateResult =
   | GcpFirewallDeleteResult
   | GcpRouterDeleteResult
   | GcpNetworkDeleteResult
+  | GcpInstanceSetMetadataResult
+  | GcpInstanceRestartResult
   | ProvisionSshKeysResult;
 
 interface CloudflareEnvelope {
@@ -3376,4 +3441,693 @@ export async function actuateGcpNetworkDelete(
     subnetStatus: subnetOutcome.kind,
     networkStatus: networkOutcome.kind,
   };
+}
+
+// ── gcp-instance-set-metadata ────────────────────────────────────────────────────────────────
+// planning/47: MERGE keys into one cell VM's metadata in the agency's own project, so a provisioned
+// cell can be UPDATED (the `startup-script` key is what Google runs as root on every boot; the first
+// consumer re-renders the file node's script with the backup credentials so its timers arm). Four
+// steps, in this fixed order:
+//   1. SUBSTITUTE the `@@DY_T2_S3_*@@` placeholders in every value from this Worker's OWN S3_*
+//      configuration — BEFORE any token is minted or any call is made, so a value this Worker will
+//      not stand behind fails with zero side effects. This is the op's second security boundary (see
+//      substituteMetadataPlaceholders): the platform never holds the agency's object-store credential,
+//      it sends a script with placeholders and the Worker fills them in. The allowlist is FIXED and
+//      SMALL; any other `@@...@@` is refused outright, never passed through — a stray placeholder in a
+//      root boot script is a failure worth refusing loudly, not a value worth guessing at.
+//   2. GET the instance to read its current metadata `fingerprint` + `items`.
+//   3. MERGE: every existing key NOT named in the request survives verbatim (losing an unrelated key
+//      on a live node is a silent, serious regression); a named key is replaced in place; a new key is
+//      appended.
+//   4. POST instances.setMetadata with the fingerprint from step 2 and WAIT (bounded) for the zonal
+//      operation. Google rejects a STALE fingerprint with 412 — that rejection IS the concurrency
+//      guard, and it is surfaced as a discriminable `staleFingerprint` failure for the caller to
+//      re-run deliberately, never retried blindly inside a loop that could clobber a concurrent change.
+//
+// KEY ALLOWLIST (the op's FIRST boundary) is enforced upstream, in dispatch-params.ts
+// validateGcpInstanceSetMetadataParams: every `items[].key` this actuator receives is on
+// GCP_METADATA_KEYS (exactly `startup-script` today), and a request carrying any other key was refused
+// whole as a 400 before this code ran. See that allowlist's comment for what it does and does not
+// constrain — in short, it keeps the op doing only what it says, not less than root-on-the-node.
+//
+// INJECTION SURFACE: `project` / `zone` / `name` are grammar-checked URL path segments (encoded again
+// here); the merged items land ONLY in the JSON.stringify'd body. No substituted secret is ever
+// logged, echoed in a result, or placed in a detail string — results and details carry placeholder
+// NAMES and metadata KEYS only.
+
+/**
+ * The FIXED allowlist of placeholders this Worker will substitute into a metadata value, each named
+ * after the Tier-2 backup variable it feeds (infra/storage-tier/backup-full-daily.sh reads
+ * DY_T2_ACCESS_KEY_ID / DY_T2_SECRET_ACCESS_KEY / DY_T2_ENDPOINT / DY_T2_BUCKET / DY_T2_REGION). Each
+ * maps to the agency's own S3_* Worker secret — see resolveAgencyObjectStoreForBoot for the exact
+ * value each one yields. This is NOT a template engine: no expressions, no nesting, no recursion, and
+ * a substituted value is itself checked to contain no `@@` (BOOT_SAFE_VALUE_RE admits no "@"), so one
+ * substitution can never manufacture another placeholder. Extend this list on purpose, one name at a
+ * time, with the matching twin in the platform's renderer.
+ */
+export const METADATA_PLACEHOLDER_NAMES = [
+  "@@DY_T2_S3_ACCESS_KEY_ID@@",
+  "@@DY_T2_S3_SECRET_ACCESS_KEY@@",
+  "@@DY_T2_S3_ENDPOINT@@",
+  "@@DY_T2_S3_BUCKET@@",
+  "@@DY_T2_S3_REGION@@",
+] as const;
+export type MetadataPlaceholderName = (typeof METADATA_PLACEHOLDER_NAMES)[number];
+
+/** The sigil every placeholder starts and ends with. A value may not contain it anywhere else. */
+const PLACEHOLDER_SIGIL = "@@";
+/** The shape of a well-formed placeholder TOKEN, used only to NAME an unknown one in a detail string. */
+const PLACEHOLDER_TOKEN_RE = /^@@[A-Za-z0-9_]{1,64}@@/;
+
+/**
+ * The charset a substituted value must fit to be spliced into a root boot script: the characters a
+ * real access-key id (uppercase alnum), secret key (base64: +/=), R2/MinIO/AWS endpoint URL (scheme,
+ * dots, hyphens, a port), bucket name or region can legitimately contain — and NOTHING that could
+ * break out of a shell word in either quoting style (no quote, backslash, "$", backtick, whitespace,
+ * newline or other control character) and no "@" (so no `@@`). A value outside this set fails the op
+ * with a message naming the ENV VAR, never the value. Bounded so a junk mega-string fails here.
+ */
+const BOOT_SAFE_VALUE_RE = /^[A-Za-z0-9+/=._:-]{1,512}$/;
+
+/** The agency's object-store configuration as the Worker itself uses it (see the resolver below). */
+interface AgencyObjectStoreConfig {
+  accessKeyId: string;
+  secretAccessKey: string;
+  bucket: string;
+  region: string;
+  /** "" when S3_ENDPOINT is unset — the backup runner's own encoding of "native AWS S3". */
+  endpoint: string;
+}
+
+/**
+ * The region substituted for `@@DY_T2_S3_REGION@@` when S3_REGION is UNSET. This is the Worker's own
+ * effective presign region — validators.ts::validateS3, actuateDbExport and actuateDbImport all apply
+ * `env.S3_REGION || "us-east-1"` — so a node signs exactly the way the Worker (and the green /validate
+ * probe) already does.
+ *
+ * WHY this is explicit and not left to the script: infra/storage-tier/backup-full-daily.sh has its OWN
+ * fallback, `REGION="${DY_T2_REGION:-us-east-2}"` (line 74), which is NOT the Worker's. If this op
+ * substituted "" for an unset S3_REGION, the node would sign for us-east-2 while the Worker's presign
+ * (and the agency's validated configuration) use us-east-1 — two halves of one backup system silently
+ * disagreeing about the region, discovered only from a failed backup. Substituting the Worker's
+ * effective region is what keeps the two from disagreeing. Change this constant ONLY together with the
+ * three inline defaults above.
+ */
+const WORKER_EFFECTIVE_S3_REGION_DEFAULT = "us-east-1";
+
+/**
+ * The endpoint substituted for `@@DY_T2_S3_ENDPOINT@@` when S3_ENDPOINT is UNSET. S3_ENDPOINT is
+ * OPTIONAL by contract (env.ts: unset means real AWS; the Worker's presign then targets AWS with no
+ * custom endpoint). backup-full-daily.sh encodes the SAME meaning as an EMPTY `DY_T2_ENDPOINT`
+ * (line 75: "empty => AWS S3 (native)"), so "" is the one substitution whose empty value is a meaning,
+ * not a missing secret. An R2/MinIO/Wasabi agency always has S3_ENDPOINT set (its /validate probe
+ * would fail otherwise), so an R2 agency never reaches this default.
+ */
+const NATIVE_AWS_ENDPOINT_FOR_BOOT = "";
+
+/**
+ * Resolve the five S3_* values a boot script may receive, by EXACTLY the rule the Worker's own S3
+ * actuators and validator apply (validators.ts::validateS3, actuateDbExport, actuateDbImport):
+ *   - S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY / S3_BUCKET are REQUIRED. An unset one is a hard
+ *     failure naming the variable — NEVER an empty substitution, because an empty credential in a
+ *     boot script produces a node that looks provisioned and silently never backs up, which is
+ *     precisely the failure this op exists to end (hub#52).
+ *   - S3_REGION unset => WORKER_EFFECTIVE_S3_REGION_DEFAULT (see its comment: the Worker presigns with
+ *     us-east-1, the backup script would fall back to us-east-2 — this is what keeps them agreeing).
+ *   - S3_ENDPOINT unset => NATIVE_AWS_ENDPOINT_FOR_BOOT, i.e. "" (see its comment: the script's own
+ *     encoding of native AWS S3).
+ * Every non-empty value must then fit BOOT_SAFE_VALUE_RE (see above). All five are checked whenever
+ * ANY placeholder is present, so a broken S3 configuration fails the whole op rather than half of it.
+ */
+function resolveAgencyObjectStoreForBoot(env: Env): { ok: true; config: AgencyObjectStoreConfig } | { ok: false; detail: string } {
+  const missing: string[] = [];
+  if (!env.S3_ACCESS_KEY_ID) missing.push("S3_ACCESS_KEY_ID");
+  if (!env.S3_SECRET_ACCESS_KEY) missing.push("S3_SECRET_ACCESS_KEY");
+  if (!env.S3_BUCKET) missing.push("S3_BUCKET");
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      detail:
+        `${missing.join(" / ")} ${missing.length === 1 ? "is" : "are"} not configured on this Worker — a @@DY_T2_S3_*@@ ` +
+        "placeholder needs the agency's object-store credential; refusing to write a boot script with an empty one.",
+    };
+  }
+
+  // The two DEFAULTED values, made explicit at the point of use. Region: an unset (or empty) S3_REGION
+  // becomes the Worker's effective presign region, NOT "" — "" would let backup-full-daily.sh fall back
+  // to its own us-east-2 while the Worker presigns with us-east-1 (see WORKER_EFFECTIVE_S3_REGION_DEFAULT).
+  // Endpoint: an unset S3_ENDPOINT becomes "", which the script defines as native AWS S3 (see
+  // NATIVE_AWS_ENDPOINT_FOR_BOOT); a set one is normalized the way the presigners normalize it.
+  let region = WORKER_EFFECTIVE_S3_REGION_DEFAULT;
+  if (env.S3_REGION) {
+    region = env.S3_REGION;
+  }
+  let endpoint = NATIVE_AWS_ENDPOINT_FOR_BOOT;
+  if (env.S3_ENDPOINT) {
+    endpoint = stripTrailingSlash(env.S3_ENDPOINT);
+  }
+  const config: AgencyObjectStoreConfig = {
+    accessKeyId: env.S3_ACCESS_KEY_ID as string,
+    secretAccessKey: env.S3_SECRET_ACCESS_KEY as string,
+    bucket: env.S3_BUCKET as string,
+    region,
+    endpoint,
+  };
+
+  // The charset guard names the ENV VAR only — a substituted value may be a secret.
+  const checks: Array<[string, string]> = [
+    ["S3_ACCESS_KEY_ID", config.accessKeyId],
+    ["S3_SECRET_ACCESS_KEY", config.secretAccessKey],
+    ["S3_BUCKET", config.bucket],
+    ["S3_REGION", config.region],
+    ["S3_ENDPOINT", config.endpoint],
+  ];
+  for (const [envName, value] of checks) {
+    if (envName === "S3_ENDPOINT" && value === "") {
+      continue;
+    }
+    if (!BOOT_SAFE_VALUE_RE.test(value)) {
+      return {
+        ok: false,
+        detail:
+          `${envName} holds a character outside [A-Za-z0-9+/=._:-] (or is over 512 chars) — refusing to splice it ` +
+          "into a boot script.",
+      };
+    }
+  }
+  return { ok: true, config };
+}
+
+/** The resolved value one allowlisted placeholder stands for. */
+function valueForPlaceholder(placeholder: MetadataPlaceholderName, config: AgencyObjectStoreConfig): string {
+  if (placeholder === "@@DY_T2_S3_ACCESS_KEY_ID@@") return config.accessKeyId;
+  if (placeholder === "@@DY_T2_S3_SECRET_ACCESS_KEY@@") return config.secretAccessKey;
+  if (placeholder === "@@DY_T2_S3_ENDPOINT@@") return config.endpoint;
+  if (placeholder === "@@DY_T2_S3_BUCKET@@") return config.bucket;
+  return config.region;
+}
+
+/**
+ * The detail for a `@@` that does not start an allowlisted placeholder. Names the TOKEN when it is
+ * well-formed (`@@NAME@@` — a placeholder name is not a secret) and otherwise only its offset: the
+ * surrounding script text is NEVER echoed, because a rendered boot script legitimately carries real
+ * secrets of its own (the platform's restic repository password, for one).
+ */
+function describeUnknownPlaceholder(value: string, offset: number): string {
+  const allowed = METADATA_PLACEHOLDER_NAMES.join(", ");
+  const token = PLACEHOLDER_TOKEN_RE.exec(value.slice(offset, offset + 80));
+  if (token) {
+    return `the placeholder ${token[0]} is not on this Worker's allowlist (${allowed}) — refusing to write it into instance metadata.`;
+  }
+  return `a "@@" at offset ${offset} does not start an allowlisted placeholder (${allowed}) — refusing to write it into instance metadata.`;
+}
+
+export type PlaceholderSubstitution =
+  | { ok: true; value: string; substituted: MetadataPlaceholderName[] }
+  | { ok: false; detail: string };
+
+/**
+ * Substitute the allowlisted placeholders in ONE metadata value from the Worker's own S3_*
+ * configuration. A single left-to-right scan: at every `@@` exactly one allowlisted placeholder must
+ * begin, or the whole value is refused — so an unknown `@@FOO@@`, a half-formed `@@`, or two
+ * placeholders run together are all hard errors, never passed through and never silently left in
+ * place. Plain string slicing throughout (no regex replacement), so a secret containing "$&"-style
+ * sequences can never be reinterpreted. A value with no `@@` at all is returned untouched without
+ * reading any S3_* variable, so a non-secret metadata key works on a Worker with no object store
+ * configured. Exported for the unit tests; `substituted` lists placeholder NAMES only.
+ */
+export function substituteMetadataPlaceholders(value: string, env: Env): PlaceholderSubstitution {
+  const output: string[] = [];
+  const substituted: MetadataPlaceholderName[] = [];
+  let config: AgencyObjectStoreConfig | null = null;
+  let cursor = 0;
+
+  // Every iteration either breaks (no further sigil) or advances `cursor` past one whole placeholder,
+  // so the loop terminates.
+  while (true) {
+    const sigilAt = value.indexOf(PLACEHOLDER_SIGIL, cursor);
+    if (sigilAt === -1) {
+      output.push(value.slice(cursor));
+      break;
+    }
+    output.push(value.slice(cursor, sigilAt));
+
+    const placeholder = METADATA_PLACEHOLDER_NAMES.find((candidate) => value.startsWith(candidate, sigilAt));
+    if (placeholder === undefined) {
+      return { ok: false, detail: describeUnknownPlaceholder(value, sigilAt) };
+    }
+    // Resolve the S3 configuration lazily, once, and only because a placeholder is really present.
+    if (config === null) {
+      const resolved = resolveAgencyObjectStoreForBoot(env);
+      if (!resolved.ok) {
+        return { ok: false, detail: resolved.detail };
+      }
+      config = resolved.config;
+    }
+    output.push(valueForPlaceholder(placeholder, config));
+    if (!substituted.includes(placeholder)) {
+      substituted.push(placeholder);
+    }
+    cursor = sigilAt + placeholder.length;
+  }
+
+  return { ok: true, value: output.join(""), substituted };
+}
+
+/** What instances.get answers with (the fields these ops read). */
+interface ComputeInstanceResponse {
+  name?: string;
+  /** PROVISIONING | STAGING | RUNNING | STOPPING | SUSPENDING | SUSPENDED | REPAIRING | TERMINATED. */
+  status?: string;
+  metadata?: {
+    /** The optimistic-concurrency token instances.setMetadata must echo back. */
+    fingerprint?: string;
+    items?: Array<{ key?: string; value?: string }>;
+  };
+  error?: ComputeInsertResponse["error"];
+}
+
+/**
+ * GET one instance. A 404 is a FAILURE for both update ops (there is nothing to update or restart —
+ * unlike a delete, "already absent" is not a converged success here). 401/403 names the read
+ * permission; any other non-2xx carries Google's message.
+ */
+async function readComputeInstance(input: {
+  url: string;
+  accessToken: string;
+  what: string;
+  project: string;
+}): Promise<{ ok: true; instance: ComputeInstanceResponse } | { ok: false; detail: string }> {
+  const { url, accessToken, what, project } = input;
+
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: gcpHeaders(accessToken) });
+  } catch (err) {
+    return { ok: false, detail: `could not reach Google Compute Engine to read ${what}: ${errorMessage(err)}` };
+  }
+  const body = (await response.json().catch(() => null)) as ComputeInstanceResponse | null;
+
+  if (response.status === 404) {
+    return { ok: false, detail: `${what} was not found in project "${project}" — nothing to update.` };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return {
+      ok: false,
+      detail:
+        `Google Cloud denied reading ${what} (HTTP ${response.status})${googleErrorMessage(body)} — the service account ` +
+        `needs compute.instances.get (e.g. roles/compute.viewer) on project "${project}".`,
+    };
+  }
+  if (!response.ok || body === null) {
+    return { ok: false, detail: `reading ${what} failed with HTTP ${response.status}${googleErrorMessage(body)}.` };
+  }
+  return { ok: true, instance: body };
+}
+
+/** One metadata entry as Compute Engine stores it — ANY key (the instance's existing keys are not ours). */
+interface ComputeMetadataItem {
+  key: string;
+  value: string;
+}
+
+/**
+ * The merged metadata item list: every EXISTING entry whose key is not in `updates` survives
+ * verbatim and in place; an existing key that IS in `updates` takes the new value in place; any
+ * update key not already present is appended, in request order. A plain list merge over arbitrary
+ * keys — the policy of WHICH keys the platform may set is the validator's (GCP_METADATA_KEYS), not
+ * this function's. Pure and exported for the unit tests — preserving unrelated keys is the invariant
+ * the merge exists for.
+ */
+export function mergeMetadataItems(
+  existing: Array<{ key?: string; value?: string }>,
+  updates: ComputeMetadataItem[],
+): ComputeMetadataItem[] {
+  const updateByKey = new Map<string, string>();
+  for (const update of updates) {
+    updateByKey.set(update.key, update.value);
+  }
+
+  const merged: ComputeMetadataItem[] = [];
+  const replacedKeys = new Set<string>();
+  for (const entry of existing) {
+    // Google never returns a keyless item; one is skipped rather than written back malformed.
+    if (typeof entry.key !== "string" || entry.key.length === 0) {
+      continue;
+    }
+    const replacement = updateByKey.get(entry.key);
+    if (replacement !== undefined) {
+      merged.push({ key: entry.key, value: replacement });
+      replacedKeys.add(entry.key);
+      continue;
+    }
+    merged.push({ key: entry.key, value: entry.value ?? "" });
+  }
+  for (const update of updates) {
+    if (!replacedKeys.has(update.key)) {
+      merged.push({ key: update.key, value: update.value });
+    }
+  }
+  return merged;
+}
+
+// A metadata write completes in seconds; one operations.wait call (up to ~2 minutes) is ample, and
+// like gcp-instance-create this feeds a sync endpoint, so the bound stays at one. An unconfirmed
+// write is reported `unconfirmed` for the caller to re-run (idempotent), never assumed in place.
+const INSTANCE_SET_METADATA_WAIT_ATTEMPTS = 1;
+
+export async function actuateGcpInstanceSetMetadata(
+  params: GcpInstanceSetMetadataParams,
+  env: Env,
+): Promise<GcpInstanceSetMetadataResult> {
+  const { project, zone } = params;
+  const instanceName = params.name;
+  const failure = (detail: string): GcpInstanceSetMetadataResult => ({
+    ok: false,
+    op: "gcp-instance-set-metadata",
+    instanceName,
+    detail,
+  });
+
+  // Step 1 — substitute, before any credential is minted or any call is made. A refusal here has
+  // zero side effects on the agency's project.
+  const renderedItems: GcpInstanceMetadataItem[] = [];
+  const placeholdersSubstituted: MetadataPlaceholderName[] = [];
+  for (const item of params.items) {
+    const rendered = substituteMetadataPlaceholders(item.value, env);
+    if (!rendered.ok) {
+      return failure(`metadata key "${item.key}": ${rendered.detail}`);
+    }
+    renderedItems.push({ key: item.key, value: rendered.value });
+    for (const name of rendered.substituted) {
+      if (!placeholdersSubstituted.includes(name)) {
+        placeholdersSubstituted.push(name);
+      }
+    }
+  }
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const accessToken = token.accessToken;
+  // Path segments are grammar-checked upstream AND URL-encoded here.
+  const zonePath =
+    `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}` +
+    `/zones/${encodeURIComponent(zone)}`;
+  const instanceUrl = `${zonePath}/instances/${encodeURIComponent(instanceName)}`;
+  const what = `instance "${instanceName}"`;
+
+  // Step 2 — read the current fingerprint + items.
+  const current = await readComputeInstance({ url: instanceUrl, accessToken, what, project });
+  if (!current.ok) {
+    return failure(current.detail);
+  }
+  const fingerprint = current.instance.metadata?.fingerprint;
+  if (typeof fingerprint !== "string" || fingerprint.length === 0) {
+    // Without the fingerprint there is no concurrency guard, and an unguarded write is exactly the
+    // clobber this op refuses to risk.
+    return failure(`${what} returned no metadata fingerprint — refusing to write metadata without the concurrency guard.`);
+  }
+  const existingItems = current.instance.metadata?.items ?? [];
+
+  // Step 3 — merge (unrelated keys survive).
+  const mergedItems = mergeMetadataItems(existingItems, renderedItems);
+
+  // Step 4 — write back under the fingerprint we read, then confirm the operation.
+  let response: Response;
+  try {
+    response = await fetch(`${instanceUrl}/setMetadata`, {
+      method: "POST",
+      headers: gcpHeaders(accessToken),
+      body: JSON.stringify({ fingerprint, items: mergedItems }),
+    });
+  } catch (err) {
+    return failure(`could not reach Google Compute Engine to set metadata on ${what}: ${errorMessage(err)}`);
+  }
+  const body = (await response.json().catch(() => null)) as ComputeInsertResponse | null;
+
+  if (response.status === 412) {
+    // Google's conditionNotMet: the metadata changed under us. Surface it discriminably; do NOT
+    // re-read and re-write here — the caller decides whether to re-run against the new state.
+    return {
+      ok: false,
+      op: "gcp-instance-set-metadata",
+      instanceName,
+      detail:
+        `the metadata of ${what} changed between read and write (HTTP 412, stale fingerprint)${googleErrorMessage(body)} — ` +
+        "nothing was written; re-run to merge against the current metadata.",
+      staleFingerprint: true,
+    };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return failure(
+      `Google Cloud denied setting metadata on ${what} (HTTP ${response.status})${googleErrorMessage(body)} — the service account ` +
+        `needs compute.instances.setMetadata (e.g. roles/compute.instanceAdmin.v1) on project "${project}".`,
+    );
+  }
+  if (!response.ok) {
+    return failure(`setting metadata on ${what} failed with HTTP ${response.status}${googleErrorMessage(body)}.`);
+  }
+
+  // A 2xx must carry an Operation. Without one we cannot confirm the write was accepted — but Google
+  // may well have accepted it, so this is `unconfirmed` (re-run converges), not an observed failure.
+  const operationName = body?.name;
+  if (!operationName) {
+    return {
+      ok: false,
+      op: "gcp-instance-set-metadata",
+      instanceName,
+      detail: `Compute Engine returned HTTP ${response.status} but no operation — cannot confirm the metadata write on ${what} was accepted.`,
+      unconfirmed: true,
+    };
+  }
+  const waited = await waitForComputeOperation({
+    waitUrl: `${zonePath}/operations/${encodeURIComponent(operationName)}/wait`,
+    accessToken,
+    what,
+    maxAttempts: INSTANCE_SET_METADATA_WAIT_ATTEMPTS,
+    verb: "metadata write",
+  });
+  if (!waited.ok && waited.completed) {
+    return failure(waited.detail);
+  }
+  if (!waited.ok) {
+    return { ok: false, op: "gcp-instance-set-metadata", instanceName, detail: waited.detail, unconfirmed: true };
+  }
+
+  return {
+    ok: true,
+    op: "gcp-instance-set-metadata",
+    instanceName,
+    keysSet: renderedItems.map((item) => item.key),
+    placeholdersSubstituted,
+    operationName,
+  };
+}
+
+// ── gcp-instance-restart ─────────────────────────────────────────────────────────────────────
+// planning/47: a GRACEFUL restart of one cell VM in the agency's own project — instances.stop (an
+// ACPI shutdown the guest honours: nfs-server stops, filesystems unmount cleanly) and then
+// instances.start — so the VM boots on whatever startup script gcp-instance-set-metadata put in place.
+// NOT instances.reset: that is a hard power cycle, and the first node this restarts is the cell's NFS
+// FILE node. Each half is one Compute operation WAITED to DONE, which is Google's confirmation of the
+// TERMINATED / RUNNING transition; the result reports which transitions were reached so a caller can
+// tell "restarted" from "stopped but the start did not confirm".
+//
+// A VM already TERMINATED is only started (a re-run after an unconfirmed stop converges that way); a
+// VM in any transitional state (STOPPING, STAGING, ...) is refused with "re-run once it settles" rather
+// than raced.
+
+// The stop WAITS for the guest to shut down (Google gives it ~90 s before forcing the stop), so its
+// operation may outlast one ~2-minute wait call on a busy node — two calls bound it at ~4 minutes. A
+// start's operation reaches DONE as soon as the VM is powered on (tens of seconds), so one call is
+// ample. Both small and fixed, like gcp-instance-create's bound: this feeds a sync endpoint.
+const INSTANCE_RESTART_STOP_WAIT_ATTEMPTS = 2;
+const INSTANCE_RESTART_START_WAIT_ATTEMPTS = 1;
+
+/**
+ * POST one instance lifecycle action (stop / start) and WAIT for its zonal operation. The same failure
+ * vocabulary as deleteComputeResource, minus the 404-is-success rule (a vanished VM cannot be
+ * restarted). `unconfirmed` is true ONLY when Google ACCEPTED the action but the wait could not confirm
+ * DONE — the transition may still complete on its own.
+ */
+async function runInstanceLifecycleOperation(input: {
+  url: string;
+  waitUrlBase: string;
+  accessToken: string;
+  what: string;
+  verb: "stop" | "start";
+  maxWaitAttempts: number;
+  project: string;
+  permissionHint: string;
+}): Promise<{ ok: true; operationName: string } | { ok: false; detail: string; unconfirmed: boolean }> {
+  const { url, waitUrlBase, accessToken, what, verb, maxWaitAttempts, project, permissionHint } = input;
+
+  let response: Response;
+  try {
+    response = await fetch(url, { method: "POST", headers: gcpHeaders(accessToken) });
+  } catch (err) {
+    return { ok: false, detail: `could not reach Google Compute Engine to ${verb} ${what}: ${errorMessage(err)}`, unconfirmed: false };
+  }
+  const body = (await response.json().catch(() => null)) as ComputeInsertResponse | null;
+
+  if (response.status === 404) {
+    return { ok: false, detail: `${what} was not found in project "${project}" — nothing to ${verb}.`, unconfirmed: false };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return {
+      ok: false,
+      detail:
+        `Google Cloud denied the ${what} ${verb} (HTTP ${response.status})${googleErrorMessage(body)} — the service account ` +
+        `needs ${permissionHint} on project "${project}".`,
+      unconfirmed: false,
+    };
+  }
+  if (!response.ok) {
+    return { ok: false, detail: `${what} ${verb} failed with HTTP ${response.status}${googleErrorMessage(body)}.`, unconfirmed: false };
+  }
+
+  // A 2xx must carry an Operation; without one the action may still have been accepted, so this is
+  // unconfirmed rather than an observed failure (the same reasoning as deleteComputeResource).
+  const operationName = body?.name;
+  if (!operationName) {
+    return {
+      ok: false,
+      detail: `Compute Engine returned HTTP ${response.status} but no operation — cannot confirm the ${what} ${verb} was accepted.`,
+      unconfirmed: true,
+    };
+  }
+  const operationErrors = body?.error?.errors ?? [];
+  if (operationErrors.length > 0) {
+    return {
+      ok: false,
+      detail: `${what} ${verb} operation ${operationName} failed: ${operationErrorMessages(operationErrors)}.`,
+      unconfirmed: false,
+    };
+  }
+
+  const waited = await waitForComputeOperation({
+    waitUrl: `${waitUrlBase}/${encodeURIComponent(operationName)}/wait`,
+    accessToken,
+    what,
+    maxAttempts: maxWaitAttempts,
+    verb,
+  });
+  if (waited.ok) {
+    return { ok: true, operationName };
+  }
+  return { ok: false, detail: waited.detail, unconfirmed: !waited.completed };
+}
+
+export async function actuateGcpInstanceRestart(
+  params: GcpInstanceRestartParams,
+  env: Env,
+): Promise<GcpInstanceRestartResult> {
+  const { project, zone } = params;
+  const instanceName = params.name;
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return { ok: false, op: "gcp-instance-restart", instanceName, detail: token.detail, phase: "stop", stopped: false };
+  }
+  const accessToken = token.accessToken;
+  // Path segments are grammar-checked upstream AND URL-encoded here.
+  const zonePath =
+    `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}` +
+    `/zones/${encodeURIComponent(zone)}`;
+  const instanceUrl = `${zonePath}/instances/${encodeURIComponent(instanceName)}`;
+  const waitUrlBase = `${zonePath}/operations`;
+  const what = `instance "${instanceName}"`;
+
+  // Read the VM's state first so a TERMINATED VM is only started and a transitional one is refused.
+  const current = await readComputeInstance({ url: instanceUrl, accessToken, what, project });
+  if (!current.ok) {
+    return { ok: false, op: "gcp-instance-restart", instanceName, detail: current.detail, phase: "stop", stopped: false };
+  }
+  const status = current.instance.status;
+
+  let stopStatus: "stopped" | "already-stopped";
+  let stopOperationName: string | undefined;
+  if (status === "RUNNING") {
+    const stop = await runInstanceLifecycleOperation({
+      url: `${instanceUrl}/stop`,
+      waitUrlBase,
+      accessToken,
+      what,
+      verb: "stop",
+      maxWaitAttempts: INSTANCE_RESTART_STOP_WAIT_ATTEMPTS,
+      project,
+      permissionHint: "compute.instances.stop (e.g. roles/compute.instanceAdmin.v1)",
+    });
+    if (!stop.ok) {
+      const stopFailure: GcpInstanceRestartResult = {
+        ok: false,
+        op: "gcp-instance-restart",
+        instanceName,
+        detail: stop.detail,
+        phase: "stop",
+        stopped: false,
+      };
+      if (stop.unconfirmed) {
+        stopFailure.unconfirmed = true;
+      }
+      return stopFailure;
+    }
+    stopStatus = "stopped";
+    stopOperationName = stop.operationName;
+  } else if (status === "TERMINATED") {
+    stopStatus = "already-stopped";
+  } else {
+    return {
+      ok: false,
+      op: "gcp-instance-restart",
+      instanceName,
+      detail:
+        `${what} is ${status ?? "in an unknown state"} — a restart needs it RUNNING (stop then start) or TERMINATED ` +
+        "(start only); re-run once it settles.",
+      phase: "stop",
+      stopped: false,
+    };
+  }
+
+  const start = await runInstanceLifecycleOperation({
+    url: `${instanceUrl}/start`,
+    waitUrlBase,
+    accessToken,
+    what,
+    verb: "start",
+    maxWaitAttempts: INSTANCE_RESTART_START_WAIT_ATTEMPTS,
+    project,
+    permissionHint: "compute.instances.start (e.g. roles/compute.instanceAdmin.v1)",
+  });
+  if (!start.ok) {
+    // The VM IS stopped at this point (confirmed by the stop operation, or already so) — say so, since
+    // "stopped and not coming back" is the state an operator must act on.
+    const startFailure: GcpInstanceRestartResult = {
+      ok: false,
+      op: "gcp-instance-restart",
+      instanceName,
+      detail: start.detail,
+      phase: "start",
+      stopped: true,
+    };
+    if (start.unconfirmed) {
+      startFailure.unconfirmed = true;
+    }
+    return startFailure;
+  }
+
+  const result: GcpInstanceRestartResult = {
+    ok: true,
+    op: "gcp-instance-restart",
+    instanceName,
+    stopStatus,
+    startStatus: "started",
+    startOperationName: start.operationName,
+  };
+  if (stopOperationName !== undefined) {
+    result.stopOperationName = stopOperationName;
+  }
+  return result;
 }

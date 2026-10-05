@@ -48,10 +48,13 @@ import {
   validateGcpFirewallDeleteParams,
   validateGcpRouterDeleteParams,
   validateGcpNetworkDeleteParams,
+  validateGcpInstanceSetMetadataParams,
+  validateGcpInstanceRestartParams,
   validateProvisionSshKeysParams,
   validateCacheRuleUpsertParams,
   edgeCacheZoneFromHostSuffix,
   GCP_FIREWALL_PROTOCOLS,
+  GCP_METADATA_KEYS,
 } from "../src/dispatch-params.js";
 import {
   EDGE_CACHE_BYPASS_RULE_DESCRIPTION,
@@ -63,7 +66,14 @@ import {
   jsonValuesEqual,
 } from "../src/edge-cache-rule.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "../src/ops.js";
-import { actuateCfTunnelConfig, buildDbExportScript, buildDbImportScript } from "../src/actuate.js";
+import {
+  actuateCfTunnelConfig,
+  buildDbExportScript,
+  buildDbImportScript,
+  METADATA_PLACEHOLDER_NAMES,
+  mergeMetadataItems,
+  substituteMetadataPlaceholders,
+} from "../src/actuate.js";
 import { GOOGLE_SCOPE_CLOUD_PLATFORM } from "../src/validators.js";
 
 // ── Web-Crypto helpers (no Node APIs) ───────────────────────────────────────────────
@@ -422,6 +432,58 @@ function gcpNetworkDeleteJob(overrides: Partial<DispatchJob> = {}): DispatchJob 
     op: "gcp-network-delete",
     params: JSON.stringify(GCP_NETWORK_DELETE_PARAMS),
     nonce: "cc33cc33cc33cc33cc33cc33cc33cc33",
+    ...overrides,
+  });
+}
+
+// The two in-place UPDATE ops (planning/47), against the same cell's FILE node. The boot script the
+// platform renders carries PLACEHOLDERS for the agency's object-store values (the Worker fills them
+// from its own S3_* secrets) and may carry real platform secrets of its own (the restic password
+// line below stands in for one — a FIXTURE value, not a credential), which a detail string must
+// never echo.
+const FILE_NODE_BOOT_SCRIPT =
+  "#!/bin/bash\n" +
+  "readonly DY_T2_ACCESS_KEY_ID='@@DY_T2_S3_ACCESS_KEY_ID@@'\n" +
+  "readonly DY_T2_SECRET_ACCESS_KEY='@@DY_T2_S3_SECRET_ACCESS_KEY@@'\n" +
+  "readonly DY_T2_ENDPOINT='@@DY_T2_S3_ENDPOINT@@'\n" +
+  "readonly DY_T2_BUCKET='@@DY_T2_S3_BUCKET@@'\n" +
+  "readonly DY_T2_REGION='@@DY_T2_S3_REGION@@'\n" +
+  "readonly RESTIC_PASSWORD='fixture-restic-password-must-not-echo'\n";
+// What the Worker writes to Google for FILE_NODE_BOOT_SCRIPT under envWith()'s S3_* fixture values.
+const FILE_NODE_BOOT_SCRIPT_RENDERED =
+  "#!/bin/bash\n" +
+  "readonly DY_T2_ACCESS_KEY_ID='s3-akid-example'\n" +
+  "readonly DY_T2_SECRET_ACCESS_KEY='s3-secret-example'\n" +
+  "readonly DY_T2_ENDPOINT='https://acct123.r2.example.test'\n" +
+  "readonly DY_T2_BUCKET='agency-backups'\n" +
+  "readonly DY_T2_REGION='auto'\n" +
+  "readonly RESTIC_PASSWORD='fixture-restic-password-must-not-echo'\n";
+const GCP_SET_METADATA_PARAMS = {
+  project: "dy-agency-proof",
+  zone: "australia-southeast1-a",
+  name: "dy-file-australia-southeast1-1",
+  items: [{ key: "startup-script", value: FILE_NODE_BOOT_SCRIPT }],
+};
+function gcpSetMetadataJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-instance-set-metadata",
+    params: JSON.stringify(GCP_SET_METADATA_PARAMS),
+    nonce: "dd44dd44dd44dd44dd44dd44dd44dd44",
+    ...overrides,
+  });
+}
+
+// A gcp-instance-restart job — graceful stop then start of the file node, so the new script runs.
+const GCP_RESTART_PARAMS = {
+  project: "dy-agency-proof",
+  zone: "australia-southeast1-a",
+  name: "dy-file-australia-southeast1-1",
+};
+function gcpRestartJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-instance-restart",
+    params: JSON.stringify(GCP_RESTART_PARAMS),
+    nonce: "ee55ee55ee55ee55ee55ee55ee55ee55",
     ...overrides,
   });
 }
@@ -878,6 +940,8 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-firewall-get",
       "gcp-instance-create",
       "gcp-instance-delete",
+      "gcp-instance-restart",
+      "gcp-instance-set-metadata",
       "gcp-instances-list",
       "gcp-network-create",
       "gcp-network-delete",
@@ -1460,6 +1524,13 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(bad({ startupScript: 42 }).ok).toBe(false);
     expect(bad({ startupScript: null }).ok).toBe(false);
     expect(bad({ startupScript: "x".repeat(256 * 1024 + 1) }).ok).toBe(false);
+    // Google's cap is BYTES: 100,000 box-drawing characters (3 bytes each) are well UNDER the cap in
+    // characters but 300,000 bytes, so only a byte-counting guard rejects this.
+    const multiByteVerdict = bad({ startupScript: "\u2500".repeat(100_000) });
+    expect(multiByteVerdict.ok).toBe(false);
+    if (!multiByteVerdict.ok) expect(multiByteVerdict.reason).toMatch(/at most 262144 bytes$/);
+    // 87,381 x 3 bytes = 262,143: under the cap in bytes, so accepted.
+    expect(validateGcpInstanceCreateParams({ ...GCP_INSTANCE_PARAMS, startupScript: "\u2500".repeat(87_381) }).ok).toBe(true);
 
     const cases: Array<[Record<string, unknown>, RegExp]> = [
       [{ tags: [] }, /^tags, when present/],
@@ -2110,6 +2181,143 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       [{ region: "australia-southeast1-a" }, /^region must be/],
       [{ networkName: "Bad" }, /^networkName must be/],
       [{ subnetName: "Bad" }, /^subnetName must be/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  // ── gcp-instance-set-metadata / gcp-instance-restart (planning/47, twins of the app's rules) ──
+  // The update ops reuse the instance grammars (project / zone / name are URL path segments). The
+  // metadata `items` list is rebuilt FRESH (known keys only), each key pinned to Google's metadata-key
+  // grammar and unique, each value non-empty and under the 256 KB cap. Placeholders are NOT checked
+  // here — that is the actuator's job (only it holds env) — so a value with `@@` passes validation.
+
+  it("gcp-instance-set-metadata: accepts `startup-script` and returns ONLY the known keys, items rebuilt fresh", () => {
+    const withExtras = {
+      ...GCP_SET_METADATA_PARAMS,
+      extra: "x",
+      items: [{ ...GCP_SET_METADATA_PARAMS.items[0], smuggled: "y" }],
+    };
+    expect(validateGcpInstanceSetMetadataParams(withExtras)).toEqual({
+      ok: true,
+      params: GCP_SET_METADATA_PARAMS,
+    });
+    // A value exactly at the 256 KB cap is admitted.
+    expect(validateGcpInstanceSetMetadataParams({ ...GCP_SET_METADATA_PARAMS, items: [{ key: "startup-script", value: "a".repeat(256 * 1024) }] }).ok).toBe(true);
+    // The allowlist is exactly one key today.
+    expect([...GCP_METADATA_KEYS]).toEqual(["startup-script"]);
+  });
+
+  it("gcp-instance-set-metadata: the KEY allowlist — `ssh-keys` (and every other grammar-valid key) is refused by NAME; a mixed list is refused WHOLE", () => {
+    const bad = (items: unknown) => validateGcpInstanceSetMetadataParams({ ...GCP_SET_METADATA_PARAMS, items });
+
+    // Each of these passes Google's key grammar and would open its own access path — refused.
+    for (const key of ["ssh-keys", "enable-oslogin", "serial-port-enable", "shutdown-script", "startup-script-url", "Startup-Script"]) {
+      const verdict = bad([{ key, value: "v" }]);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) {
+        expect(verdict.reason).toBe(`each items entry's key must be one of the allowlisted metadata keys (startup-script); got "${key}"`);
+      }
+    }
+    // One allowed + one disallowed => the WHOLE request is refused (a verdict is all-or-nothing; the
+    // actuator never sees a partial list, so nothing can be partially applied).
+    const mixed = bad([GCP_SET_METADATA_PARAMS.items[0], { key: "ssh-keys", value: "jason:ssh-ed25519 AAAA" }]);
+    expect(mixed.ok).toBe(false);
+    if (!mixed.ok) expect(mixed.reason).toMatch(/got "ssh-keys"/);
+    const mixedOtherOrder = bad([{ key: "ssh-keys", value: "jason:ssh-ed25519 AAAA" }, GCP_SET_METADATA_PARAMS.items[0]]);
+    expect(mixedOtherOrder.ok).toBe(false);
+  });
+
+  it("gcp-instance-set-metadata: rejects bad input field by field, and names the field", () => {
+    const bad = (overrides: Record<string, unknown>) =>
+      validateGcpInstanceSetMetadataParams({ ...GCP_SET_METADATA_PARAMS, ...overrides });
+    const badItems = (items: unknown) => bad({ items });
+
+    expect(validateGcpInstanceSetMetadataParams(null).ok).toBe(false);
+    expect(validateGcpInstanceSetMetadataParams([]).ok).toBe(false);
+    expect(validateGcpInstanceSetMetadataParams({}).ok).toBe(false);
+    // project / zone / name — the instance grammars
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false);
+    expect(bad({ zone: "australia-southeast1" }).ok).toBe(false); // a region is not a zone
+    expect(bad({ zone: "australia-southeast1-a/../.." }).ok).toBe(false);
+    expect(bad({ name: "Bad-Name" }).ok).toBe(false);
+    expect(bad({ name: "a/b" }).ok).toBe(false);
+    // items — shape + count
+    expect(badItems(undefined).ok).toBe(false);
+    expect(badItems("startup-script=x").ok).toBe(false);
+    expect(badItems([]).ok).toBe(false);
+    expect(badItems(Array.from({ length: 33 }, () => ({ key: "startup-script", value: "v" }))).ok).toBe(false);
+    expect(badItems(["startup-script"]).ok).toBe(false);
+    expect(badItems([null]).ok).toBe(false);
+    // items — key grammar (checked BEFORE the allowlist, so a junk key is never echoed in a reason)
+    expect(badItems([{ key: "", value: "v" }]).ok).toBe(false);
+    expect(badItems([{ key: "has space", value: "v" }]).ok).toBe(false);
+    expect(badItems([{ key: "a/b", value: "v" }]).ok).toBe(false);
+    expect(badItems([{ key: "a.b", value: "v" }]).ok).toBe(false);
+    expect(badItems([{ key: "k".repeat(129), value: "v" }]).ok).toBe(false);
+    expect(badItems([{ key: 42, value: "v" }]).ok).toBe(false);
+    // items — a key named twice is ambiguous
+    expect(badItems([{ key: "startup-script", value: "a" }, { key: "startup-script", value: "b" }]).ok).toBe(false);
+    // items — value: non-empty string under the cap
+    expect(badItems([{ key: "startup-script", value: "" }]).ok).toBe(false);
+    expect(badItems([{ key: "startup-script", value: 42 }]).ok).toBe(false);
+    expect(badItems([{ key: "startup-script" }]).ok).toBe(false);
+    expect(badItems([{ key: "startup-script", value: "a".repeat(256 * 1024 + 1) }]).ok).toBe(false);
+    // Bytes, not characters: 100,000 three-byte characters are under the cap in characters only.
+    const multiByteItems = badItems([{ key: "startup-script", value: "\u2500".repeat(100_000) }]);
+    expect(multiByteItems.ok).toBe(false);
+    if (!multiByteItems.ok) expect(multiByteItems.reason).toMatch(/at most 262144 bytes$/);
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ zone: "australia-southeast1" }, /^zone must be/],
+      [{ name: "Bad" }, /^name must be/],
+      [{ items: [] }, /^items must be an array of 1-32/],
+      [{ items: [{ key: "bad key", value: "v" }] }, /^each items entry's key must be a Compute Engine metadata key/],
+      [{ items: [{ key: "ssh-keys", value: "v" }] }, /^each items entry's key must be one of the allowlisted metadata keys \(startup-script\); got "ssh-keys"$/],
+      [{ items: [{ key: "startup-script", value: "a" }, { key: "startup-script", value: "b" }] }, /names the metadata key "startup-script" more than once/],
+      [{ items: [{ key: "startup-script", value: "" }] }, /value must be a non-empty string/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  it("gcp-instance-restart: accepts valid params and returns ONLY the three known keys", () => {
+    expect(validateGcpInstanceRestartParams({ ...GCP_RESTART_PARAMS, extra: "x" })).toEqual({
+      ok: true,
+      params: GCP_RESTART_PARAMS,
+    });
+  });
+
+  it("gcp-instance-restart: rejects bad input field by field, and names the field", () => {
+    const bad = (overrides: Record<string, unknown>) =>
+      validateGcpInstanceRestartParams({ ...GCP_RESTART_PARAMS, ...overrides });
+
+    expect(validateGcpInstanceRestartParams(null).ok).toBe(false);
+    expect(validateGcpInstanceRestartParams([]).ok).toBe(false);
+    expect(validateGcpInstanceRestartParams({}).ok).toBe(false);
+    expect(bad({ project: undefined }).ok).toBe(false);
+    expect(bad({ project: "Dy-Agency" }).ok).toBe(false);
+    expect(bad({ zone: undefined }).ok).toBe(false);
+    expect(bad({ zone: "australia-southeast1" }).ok).toBe(false); // a region is not a zone
+    expect(bad({ zone: "australia southeast1-a" }).ok).toBe(false);
+    expect(bad({ name: undefined }).ok).toBe(false);
+    expect(bad({ name: "" }).ok).toBe(false);
+    expect(bad({ name: "Bad-Name" }).ok).toBe(false);
+    expect(bad({ name: "dy-file-*" }).ok).toBe(false);
+    expect(bad({ name: 42 }).ok).toBe(false);
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ zone: "australia-southeast1" }, /^zone must be/],
+      [{ name: "Bad" }, /^name must be/],
     ];
     for (const [overrides, expected] of cases) {
       const verdict = bad(overrides);
@@ -5935,6 +6143,558 @@ describe("POST /actuate route", () => {
       vi.restoreAllMocks();
     }
   });
+
+  // ── gcp-instance-set-metadata through the registry (planning/47) ──────────────────────
+  // The in-place update op. Load-bearing assertions: the Worker SUBSTITUTES its own S3_* values for
+  // the allowlisted placeholders BEFORE any Google call (an unknown placeholder or a missing secret
+  // touches NOTHING — not even the token mint); the write goes out under the fingerprint it READ,
+  // with every unrelated existing key preserved IN PLACE; a stale fingerprint (412) surfaces as the
+  // DISCRIMINABLE `staleFingerprint: true`, never a blind retry; and no secret — the agency's S3
+  // secret, the script's own restic line, the access token — ever appears in a result or detail.
+
+  const FILE_NODE_URL = `${GCP_ZONE_URL}/instances/dy-file-australia-southeast1-1`;
+  /** instances.get for the file node with an existing boot script and two UNRELATED keys around it. */
+  function fileNodeInstance(overrides: Record<string, unknown> = {}) {
+    return {
+      body: {
+        name: "dy-file-australia-southeast1-1",
+        status: "RUNNING",
+        metadata: {
+          fingerprint: "fp-abc123",
+          items: [
+            { key: "enable-oslogin", value: "TRUE" },
+            { key: "startup-script", value: "#!/bin/bash\necho old\n" },
+            { key: "dy-cell-bundle", value: "20260916-9c25cfd" },
+          ],
+        },
+        ...overrides,
+      },
+    };
+  }
+  /** Google's 412 for a setMetadata whose fingerprint is stale. */
+  const STALE_FINGERPRINT_412 = {
+    status: 412,
+    body: {
+      error: {
+        code: 412,
+        message: "Supplied fingerprint does not match current metadata fingerprint.",
+        errors: [{ reason: "conditionNotMet", message: "Supplied fingerprint does not match current metadata fingerprint." }],
+      },
+    },
+  };
+
+  it("gcp-instance-set-metadata: substitutes the allowlisted placeholders from the Worker's OWN S3_* secrets, MERGES under the read fingerprint (unrelated keys survive in place), WAITS to DONE — and echoes no secret", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpSetMetadataJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      fileNodeInstance(), // instances.get
+      { body: { name: "operation-setmeta", status: "RUNNING", operationType: "setMetadata" } }, // instances.setMetadata
+      { body: { name: "operation-setmeta", status: "DONE" } }, // zoneOperations.wait
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const resultBody = await response.json();
+    expect(resultBody).toEqual({
+      ok: true,
+      op: "gcp-instance-set-metadata",
+      instanceName: "dy-file-australia-southeast1-1",
+      keysSet: ["startup-script"],
+      placeholdersSubstituted: [
+        "@@DY_T2_S3_ACCESS_KEY_ID@@",
+        "@@DY_T2_S3_SECRET_ACCESS_KEY@@",
+        "@@DY_T2_S3_ENDPOINT@@",
+        "@@DY_T2_S3_BUCKET@@",
+        "@@DY_T2_S3_REGION@@",
+      ],
+      operationName: "operation-setmeta",
+    });
+    // Names only in the result — never the agency's secret, the script's restic line, or the token.
+    const resultText = JSON.stringify(resultBody);
+    expect(resultText).not.toContain("s3-secret-example");
+    expect(resultText).not.toContain("s3-akid-example");
+    expect(resultText).not.toContain("fixture-restic-password");
+    expect(resultText).not.toContain(GCP_ACCESS_TOKEN);
+
+    const [tokenCall] = calls;
+    expect(tokenCall.url).toBe("https://oauth2.googleapis.com/token");
+    expect(jwtClaimsOf(tokenCall.form?.get("assertion") ?? "").scope).toBe(GOOGLE_SCOPE_CLOUD_PLATFORM);
+
+    const [getCall, setCall, waitCall] = computeCalls(calls);
+    expect(getCall.method).toBe("GET");
+    expect(getCall.url).toBe(FILE_NODE_URL);
+    expect(getCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+    expect(setCall.method).toBe("POST");
+    expect(setCall.url).toBe(`${FILE_NODE_URL}/setMetadata`);
+    expect(setCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+    // The fingerprint we READ is the one we WRITE under; the two unrelated keys are untouched and in
+    // their original positions; the named key is replaced in place with the RENDERED script.
+    expect(setCall.body).toEqual({
+      fingerprint: "fp-abc123",
+      items: [
+        { key: "enable-oslogin", value: "TRUE" },
+        { key: "startup-script", value: FILE_NODE_BOOT_SCRIPT_RENDERED },
+        { key: "dy-cell-bundle", value: "20260916-9c25cfd" },
+      ],
+    });
+    // Not a single placeholder sigil survives into the boot script Google receives.
+    expect(setCall.rawBody).not.toContain("@@");
+    expect(waitCall.method).toBe("POST");
+    expect(waitCall.url).toBe(`${GCP_ZONE_URL}/operations/operation-setmeta/wait`);
+    expect(computeCalls(calls)).toHaveLength(3);
+  });
+
+  it("gcp-instance-set-metadata: a VM with no startup-script yet gets it APPENDED after its existing items (nothing else changes); a value with no placeholder needs NO S3_* configured", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const plainScript = "#!/bin/bash\necho 'no placeholders'\n";
+    const job = gcpSetMetadataJob({
+      params: JSON.stringify({ ...GCP_SET_METADATA_PARAMS, items: [{ key: "startup-script", value: plainScript }] }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      fileNodeInstance({
+        metadata: {
+          fingerprint: "fp-abc123",
+          items: [
+            { key: "enable-oslogin", value: "TRUE" },
+            { key: "dy-cell-bundle", value: "20260916-9c25cfd" },
+          ],
+        },
+      }),
+      { body: { name: "operation-setmeta-2", status: "RUNNING" } },
+      { body: { name: "operation-setmeta-2", status: "DONE" } },
+    ]);
+
+    // Every S3_* variable UNSET: a value without a placeholder must not even look at them.
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({
+        GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey,
+        S3_ACCESS_KEY_ID: undefined,
+        S3_SECRET_ACCESS_KEY: undefined,
+        S3_BUCKET: undefined,
+        S3_REGION: undefined,
+        S3_ENDPOINT: undefined,
+      }),
+    );
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-instance-set-metadata",
+      instanceName: "dy-file-australia-southeast1-1",
+      keysSet: ["startup-script"],
+      placeholdersSubstituted: [],
+      operationName: "operation-setmeta-2",
+    });
+    const [, setCall] = computeCalls(calls);
+    expect(setCall.body).toEqual({
+      fingerprint: "fp-abc123",
+      items: [
+        { key: "enable-oslogin", value: "TRUE" },
+        { key: "dy-cell-bundle", value: "20260916-9c25cfd" },
+        { key: "startup-script", value: plainScript },
+      ],
+    });
+  });
+
+  it("gcp-instance-set-metadata: the KEY allowlist through /actuate — `ssh-keys` alone, and a MIXED list of startup-script + ssh-keys, are both refused WHOLE as 400 with NO Google call (no token mint, no read, no write)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const sshKeyItem = { key: "ssh-keys", value: "jason:ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTUREFIXTUREFIXTUREFIXTUREFIXTUREFIXTUREFIXT" };
+    const jobs = [
+      gcpSetMetadataJob({ params: JSON.stringify({ ...GCP_SET_METADATA_PARAMS, items: [sshKeyItem] }) }),
+      // Mixed, allowed key FIRST: the valid startup-script must NOT be applied while ssh-keys is refused.
+      gcpSetMetadataJob({ params: JSON.stringify({ ...GCP_SET_METADATA_PARAMS, items: [GCP_SET_METADATA_PARAMS.items[0], sshKeyItem] }) }),
+      // Mixed, disallowed key FIRST.
+      gcpSetMetadataJob({ params: JSON.stringify({ ...GCP_SET_METADATA_PARAMS, items: [sshKeyItem, GCP_SET_METADATA_PARAMS.items[0]] }) }),
+    ];
+    for (const job of jobs) {
+      const signature = await signAsApp(job, privateKey);
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { ok: boolean; error: string; reason: string };
+      expect(body.ok).toBe(false);
+      expect(body.error).toBe("invalid params");
+      expect(body.reason).toBe('each items entry\'s key must be one of the allowlisted metadata keys (startup-script); got "ssh-keys"');
+      // Nothing was applied, partially or otherwise: not one outbound request.
+      expect(fetchSpy).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("gcp-instance-set-metadata: an UNKNOWN @@PLACEHOLDER@@ is REFUSED — ok:false naming the token, NO Google call at all (not even the token mint), and no script text echoed", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const script =
+      "#!/bin/bash\n" +
+      "readonly DY_T2_BUCKET='@@DY_T2_S3_BUCKET@@'\n" +
+      "readonly RESTIC_PASSWORD='@@DY_RESTIC_PASSWORD@@'\n" +
+      "readonly SENTINEL='script-text-must-not-echo'\n";
+    const job = gcpSetMetadataJob({
+      params: JSON.stringify({ ...GCP_SET_METADATA_PARAMS, items: [{ key: "startup-script", value: script }] }),
+    });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; op: string; instanceName: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-instance-set-metadata");
+    expect(body.instanceName).toBe("dy-file-australia-southeast1-1");
+    expect(body.detail).toMatch(/metadata key "startup-script": the placeholder @@DY_RESTIC_PASSWORD@@ is not on this Worker's allowlist/);
+    expect(body.detail).toMatch(/refusing to write it into instance metadata/);
+    expect(body.detail).not.toContain("script-text-must-not-echo");
+    expect(body.detail).not.toContain("agency-backups");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("gcp-instance-set-metadata: a MISSING required S3 secret FAILS (naming the variable) rather than substituting an empty credential — NO Google call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpSetMetadataJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey, S3_SECRET_ACCESS_KEY: undefined }),
+    );
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/S3_SECRET_ACCESS_KEY is not configured on this Worker/);
+    expect(body.detail).toMatch(/refusing to write a boot script with an empty one/);
+    expect(body.detail).not.toContain("s3-akid-example");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("gcp-instance-set-metadata: an UNSET S3_ENDPOINT substitutes '' (the backup runner's encoding of native AWS) while the credentials still substitute for real", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpSetMetadataJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      fileNodeInstance(),
+      { body: { name: "operation-setmeta-3", status: "RUNNING" } },
+      { body: { name: "operation-setmeta-3", status: "DONE" } },
+    ]);
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey, S3_ENDPOINT: undefined, S3_REGION: "ap-southeast-2" }),
+    );
+    const body = (await response.json()) as { ok: boolean };
+    expect(body.ok).toBe(true);
+    const [, setCall] = computeCalls(calls);
+    const written = (setCall.body as { items: Array<{ key: string; value: string }> }).items[1];
+    expect(written.key).toBe("startup-script");
+    expect(written.value).toContain("readonly DY_T2_ENDPOINT=''\n");
+    expect(written.value).toContain("readonly DY_T2_ACCESS_KEY_ID='s3-akid-example'\n");
+    expect(written.value).toContain("readonly DY_T2_SECRET_ACCESS_KEY='s3-secret-example'\n");
+    expect(written.value).toContain("readonly DY_T2_REGION='ap-southeast-2'\n");
+    expect(written.value).not.toContain("@@");
+  });
+
+  it("gcp-instance-set-metadata: a STALE fingerprint (412) is ok:false with the DISCRIMINABLE staleFingerprint:true — nothing written, NO blind re-read/re-write, NO wait", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpSetMetadataJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([fileNodeInstance(), STALE_FINGERPRINT_412]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string; staleFingerprint?: true; unconfirmed?: true };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-instance-set-metadata");
+    // The FIELD is the contract; the detail is for humans.
+    expect(body.staleFingerprint).toBe(true);
+    expect(body).not.toHaveProperty("unconfirmed");
+    expect(body.detail).toMatch(/changed between read and write \(HTTP 412, stale fingerprint\)/);
+    expect(body.detail).toMatch(/nothing was written; re-run to merge against the current metadata/);
+    // Exactly one GET + one setMetadata — the Worker did NOT loop on a fresh fingerprint.
+    expect(computeCalls(calls)).toHaveLength(2);
+    expect(JSON.stringify(body)).not.toContain("s3-secret-example");
+  });
+
+  it("gcp-instance-set-metadata: an instance that is NOT there is ok:false (nothing to update — a 404 is not a converged success here), NO write", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpSetMetadataJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([notFound404("projects/dy-agency-proof/zones/australia-southeast1-a/instances/dy-file-australia-southeast1-1")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/instance "dy-file-australia-southeast1-1" was not found in project "dy-agency-proof" — nothing to update/);
+    expect(computeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-instance-set-metadata: an instance read WITHOUT a metadata fingerprint is refused — no unguarded write", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpSetMetadataJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([fileNodeInstance({ metadata: { items: [] } })]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/returned no metadata fingerprint — refusing to write metadata without the concurrency guard/);
+    expect(computeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-instance-set-metadata: a write whose operation is still not DONE after the ONE bounded wait is ok:false with unconfirmed:true (re-run converges)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpSetMetadataJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      fileNodeInstance(),
+      { body: { name: "operation-setmeta-slow", status: "RUNNING" } },
+      { body: { name: "operation-setmeta-slow", status: "RUNNING" } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string; unconfirmed?: true; staleFingerprint?: true };
+    expect(body.ok).toBe(false);
+    expect(body.unconfirmed).toBe(true);
+    expect(body).not.toHaveProperty("staleFingerprint");
+    expect(body.detail).toMatch(/metadata write operation was still not DONE after 1 waits/);
+    // 1 GET + 1 setMetadata + exactly 1 wait.
+    expect(computeCalls(calls)).toHaveLength(3);
+  });
+
+  it("gcp-instance-set-metadata: a 403 on the write names compute.instances.setMetadata, token not echoed, NO wait", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpSetMetadataJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([fileNodeInstance(), denied403("compute.instances.setMetadata")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string; staleFingerprint?: true };
+    expect(body.ok).toBe(false);
+    expect(body).not.toHaveProperty("staleFingerprint");
+    expect(body.detail).toMatch(/denied setting metadata on instance "dy-file-australia-southeast1-1" \(HTTP 403\)/);
+    expect(body.detail).toContain("Required 'compute.instances.setMetadata' permission");
+    expect(body.detail).toMatch(/roles\/compute\.instanceAdmin\.v1/);
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+    expect(computeCalls(calls)).toHaveLength(2);
+  });
+
+  // ── gcp-instance-restart through the registry (planning/47) ───────────────────────────
+  // A GRACEFUL stop then start (never reset — the file node is an NFS server). Load-bearing
+  // assertions: a RUNNING VM is stopped (operation WAITED to DONE) and then started (waited again);
+  // a TERMINATED VM is only started ("already-stopped"); a transitional VM is refused, not raced;
+  // and a failure names the PHASE plus whether the VM was confirmed stopped, with `unconfirmed`
+  // only when Google accepted the action but the bounded wait could not see it finish.
+
+  it("gcp-instance-restart: RUNNING -> stop (wait DONE) -> start (wait DONE) is ok:true stopped+started, with both operation names, agency SA only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRestartJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      fileNodeInstance(), // instances.get -> RUNNING
+      { body: { name: "operation-stop", status: "RUNNING", operationType: "stop" } }, // instances.stop
+      { body: { name: "operation-stop", status: "DONE" } }, // wait -> TERMINATED
+      { body: { name: "operation-start", status: "RUNNING", operationType: "start" } }, // instances.start
+      { body: { name: "operation-start", status: "DONE" } }, // wait -> RUNNING
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const resultBody = await response.json();
+    expect(resultBody).toEqual({
+      ok: true,
+      op: "gcp-instance-restart",
+      instanceName: "dy-file-australia-southeast1-1",
+      stopStatus: "stopped",
+      startStatus: "started",
+      stopOperationName: "operation-stop",
+      startOperationName: "operation-start",
+    });
+    expect(JSON.stringify(resultBody)).not.toContain(GCP_ACCESS_TOKEN);
+
+    const [getCall, stopCall, stopWait, startCall, startWait] = computeCalls(calls);
+    expect(getCall.method).toBe("GET");
+    expect(getCall.url).toBe(FILE_NODE_URL);
+    // stop, NOT reset — and an empty body.
+    expect(stopCall.method).toBe("POST");
+    expect(stopCall.url).toBe(`${FILE_NODE_URL}/stop`);
+    expect(stopCall.body).toBeUndefined();
+    expect(stopCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+    expect(stopWait.url).toBe(`${GCP_ZONE_URL}/operations/operation-stop/wait`);
+    expect(startCall.method).toBe("POST");
+    expect(startCall.url).toBe(`${FILE_NODE_URL}/start`);
+    expect(startCall.body).toBeUndefined();
+    expect(startWait.url).toBe(`${GCP_ZONE_URL}/operations/operation-start/wait`);
+    expect(computeCalls(calls)).toHaveLength(5);
+    expect(computeCalls(calls).some((call) => call.url.endsWith("/reset"))).toBe(false);
+  });
+
+  it("gcp-instance-restart: a VM already TERMINATED is only STARTED — stopStatus already-stopped, no stop call, no stopOperationName", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRestartJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      fileNodeInstance({ status: "TERMINATED" }),
+      { body: { name: "operation-start", status: "RUNNING" } },
+      { body: { name: "operation-start", status: "DONE" } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-instance-restart",
+      instanceName: "dy-file-australia-southeast1-1",
+      stopStatus: "already-stopped",
+      startStatus: "started",
+      startOperationName: "operation-start",
+    });
+    const [, startCall] = computeCalls(calls);
+    expect(startCall.url).toBe(`${FILE_NODE_URL}/start`);
+    expect(computeCalls(calls)).toHaveLength(3);
+  });
+
+  it("gcp-instance-restart: a VM in a TRANSITIONAL state (STOPPING) is refused — phase stop, stopped:false, no action issued", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRestartJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([fileNodeInstance({ status: "STOPPING" })]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; phase: string; stopped: boolean; detail: string; unconfirmed?: true };
+    expect(body.ok).toBe(false);
+    expect(body.phase).toBe("stop");
+    expect(body.stopped).toBe(false);
+    expect(body).not.toHaveProperty("unconfirmed");
+    expect(body.detail).toMatch(/is STOPPING — a restart needs it RUNNING .* or TERMINATED .*; re-run once it settles/);
+    expect(computeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-instance-restart: a stop still not DONE after its TWO bounded waits is phase stop, stopped:false, unconfirmed:true — the start is NEVER issued", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRestartJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      fileNodeInstance(),
+      { body: { name: "operation-stop", status: "RUNNING" } },
+      { body: { name: "operation-stop", status: "RUNNING" } },
+      { body: { name: "operation-stop", status: "RUNNING" } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; phase: string; stopped: boolean; detail: string; unconfirmed?: true };
+    expect(body.ok).toBe(false);
+    expect(body.phase).toBe("stop");
+    expect(body.stopped).toBe(false);
+    expect(body.unconfirmed).toBe(true);
+    expect(body.detail).toMatch(/stop operation was still not DONE after 2 waits/);
+    // GET + stop + exactly 2 waits; no start.
+    expect(computeCalls(calls)).toHaveLength(4);
+    expect(computeCalls(calls).some((call) => call.url.endsWith("/start"))).toBe(false);
+  });
+
+  it("gcp-instance-restart: stop confirmed but the start not DONE after its ONE wait is phase start, stopped:TRUE, unconfirmed:true (the operator-visible 'down and not back' case)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRestartJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      fileNodeInstance(),
+      { body: { name: "operation-stop", status: "RUNNING" } },
+      { body: { name: "operation-stop", status: "DONE" } },
+      { body: { name: "operation-start", status: "RUNNING" } },
+      { body: { name: "operation-start", status: "RUNNING" } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; phase: string; stopped: boolean; detail: string; unconfirmed?: true };
+    expect(body.ok).toBe(false);
+    expect(body.phase).toBe("start");
+    expect(body.stopped).toBe(true);
+    expect(body.unconfirmed).toBe(true);
+    expect(body.detail).toMatch(/start operation was still not DONE after 1 waits/);
+    expect(computeCalls(calls)).toHaveLength(5);
+  });
+
+  it("gcp-instance-restart: a stop operation that FINISHES with errors is phase stop WITHOUT unconfirmed (an observed failure), and the start is never issued", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRestartJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      fileNodeInstance(),
+      { body: { name: "operation-stop", status: "RUNNING" } },
+      { body: { name: "operation-stop", status: "DONE", error: { errors: [{ code: "INTERNAL_ERROR", message: "Guest shutdown failed." }] } } },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; phase: string; stopped: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.phase).toBe("stop");
+    expect(body.stopped).toBe(false);
+    expect(body).not.toHaveProperty("unconfirmed");
+    expect(body.detail).toMatch(/instance "dy-file-australia-southeast1-1" stop operation failed: Guest shutdown failed/);
+    expect(computeCalls(calls)).toHaveLength(3);
+  });
+
+  it("gcp-instance-restart: a 403 on the stop names compute.instances.stop (phase stop, token not echoed); a missing instance is phase stop too", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpRestartJob();
+    const signature = await signAsApp(job, privateKey);
+    const deniedCalls = mockGcpApiQueue([fileNodeInstance(), denied403("compute.instances.stop")]);
+
+    const deniedResponse = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const denied = (await deniedResponse.json()) as { ok: boolean; phase: string; stopped: boolean; detail: string };
+    expect(denied.ok).toBe(false);
+    expect(denied.phase).toBe("stop");
+    expect(denied.stopped).toBe(false);
+    expect(denied.detail).toMatch(/denied the instance "dy-file-australia-southeast1-1" stop \(HTTP 403\)/);
+    expect(denied.detail).toContain("Required 'compute.instances.stop' permission");
+    expect(JSON.stringify(denied)).not.toContain(GCP_ACCESS_TOKEN);
+    expect(computeCalls(deniedCalls)).toHaveLength(2);
+    vi.restoreAllMocks();
+
+    const missingCalls = mockGcpApiQueue([notFound404("projects/dy-agency-proof/zones/australia-southeast1-a/instances/dy-file-australia-southeast1-1")]);
+    const missingResponse = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const missing = (await missingResponse.json()) as { ok: boolean; phase: string; stopped: boolean; detail: string };
+    expect(missing.ok).toBe(false);
+    expect(missing.phase).toBe("stop");
+    expect(missing.stopped).toBe(false);
+    expect(missing.detail).toMatch(/was not found in project "dy-agency-proof"/);
+    expect(computeCalls(missingCalls)).toHaveLength(1);
+  });
+
+  it("the two update ops report a clean failure and touch NO API when GCP_SERVICE_ACCOUNT_KEY is missing; are pinned to the key's OWN project; and are 400 on another op's params", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    for (const job of [gcpSetMetadataJob(), gcpRestartJob()]) {
+      const signature = await signAsApp(job, privateKey);
+      // No SA key — every OTHER agency credential is present and none may substitute.
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+      const body = (await response.json()) as { ok: boolean; detail: string };
+      expect(body.ok).toBe(false);
+      expect(body.detail).toMatch(/GCP_SERVICE_ACCOUNT_KEY is not configured/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+
+      // A key for ANOTHER project: refused before any Compute call.
+      const otherProjectKey = await makeServiceAccountKey("some-other-project");
+      const calls = mockGcpApiQueue([{ body: { name: "should-not-happen" } }]);
+      const pinned = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: otherProjectKey }));
+      const pinnedBody = (await pinned.json()) as { ok: boolean; detail: string };
+      expect(pinnedBody.ok).toBe(false);
+      expect(pinnedBody.detail).toMatch(/own project/);
+      expect(calls).toHaveLength(0);
+      vi.restoreAllMocks();
+    }
+
+    // Another op's params (no items / no zone): 400, nothing called.
+    const wrongParamsJobs = [
+      gcpSetMetadataJob({ params: JSON.stringify(GCP_INSTANCE_DELETE_PARAMS) }),
+      gcpRestartJob({ params: JSON.stringify(GCP_ADDRESS_DELETE_PARAMS) }),
+    ];
+    for (const job of wrongParamsJobs) {
+      const signature = await signAsApp(job, privateKey);
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+      expect(response.status).toBe(400);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+    }
+  });
 });
 
 // ── cf-tunnel-config: the appended catch-all rule ──────────────────────────────────────────
@@ -6387,5 +7147,163 @@ describe("edge-cache drift check", () => {
     expect(edgeCacheRuleDrifted({ ...desired, action: "set_config" }, desired)).toBe(true);
     expect(edgeCacheRuleDrifted({ ...desired, action_parameters: { cache: false } }, desired)).toBe(true);
     expect(edgeCacheRuleDrifted({ ...desired, action_parameters: undefined }, desired)).toBe(true);
+  });
+});
+
+// ── gcp-instance-set-metadata: the placeholder substitution (the op's security boundary) ─────
+// Pure-function pins on substituteMetadataPlaceholders + mergeMetadataItems. The substitution is
+// NOT a template engine: a fixed allowlist, a single left-to-right scan, plain string slicing, and
+// every substituted value charset-checked — so an unknown token, a half token, a missing secret or
+// an unsafe value is a hard refusal, and a detail never carries a value (only names / offsets).
+describe("substituteMetadataPlaceholders: fixed allowlist, fail-closed", () => {
+  // Only the S3_* fields matter here; the rest of Env is irrelevant to the function under test.
+  function s3Env(overrides: Partial<Env> = {}): Env {
+    return {
+      S3_ACCESS_KEY_ID: "AKIAFIXTUREEXAMPLE00",
+      S3_SECRET_ACCESS_KEY: "fixture+secret/base64=",
+      S3_BUCKET: "agency-backups",
+      S3_REGION: "auto",
+      S3_ENDPOINT: "https://acct123.r2.example.test/",
+      ...overrides,
+    } as unknown as Env;
+  }
+
+  it("exposes exactly the five backup placeholders", () => {
+    expect([...METADATA_PLACEHOLDER_NAMES]).toEqual([
+      "@@DY_T2_S3_ACCESS_KEY_ID@@",
+      "@@DY_T2_S3_SECRET_ACCESS_KEY@@",
+      "@@DY_T2_S3_ENDPOINT@@",
+      "@@DY_T2_S3_BUCKET@@",
+      "@@DY_T2_S3_REGION@@",
+    ]);
+  });
+
+  it("substitutes every allowlisted placeholder from the Worker's S3_* values (endpoint trailing slash stripped), reporting each NAME once", () => {
+    const script =
+      "A='@@DY_T2_S3_ACCESS_KEY_ID@@' S='@@DY_T2_S3_SECRET_ACCESS_KEY@@' E='@@DY_T2_S3_ENDPOINT@@' " +
+      "B='@@DY_T2_S3_BUCKET@@' R='@@DY_T2_S3_REGION@@' B2='@@DY_T2_S3_BUCKET@@'";
+    expect(substituteMetadataPlaceholders(script, s3Env())).toEqual({
+      ok: true,
+      value:
+        "A='AKIAFIXTUREEXAMPLE00' S='fixture+secret/base64=' E='https://acct123.r2.example.test' " +
+        "B='agency-backups' R='auto' B2='agency-backups'",
+      substituted: [
+        "@@DY_T2_S3_ACCESS_KEY_ID@@",
+        "@@DY_T2_S3_SECRET_ACCESS_KEY@@",
+        "@@DY_T2_S3_ENDPOINT@@",
+        "@@DY_T2_S3_BUCKET@@",
+        "@@DY_T2_S3_REGION@@",
+      ],
+    });
+  });
+
+  it("a value with NO placeholder is returned untouched and reads no S3_* variable at all", () => {
+    const script = "#!/bin/bash\necho 'no placeholders here, even an email like a@b.c is fine'\n";
+    expect(substituteMetadataPlaceholders(script, {} as unknown as Env)).toEqual({ ok: true, value: script, substituted: [] });
+  });
+
+  it("an UNKNOWN @@TOKEN@@ is refused by name — nothing else about the value is echoed", () => {
+    const verdict = substituteMetadataPlaceholders("X='@@DY_T2_S3_BUCKET@@'\nY='@@FOO@@'\nsentinel-must-not-echo\n", s3Env());
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) return;
+    expect(verdict.detail).toMatch(/^the placeholder @@FOO@@ is not on this Worker's allowlist \(@@DY_T2_S3_ACCESS_KEY_ID@@, /);
+    expect(verdict.detail).not.toContain("sentinel-must-not-echo");
+    expect(verdict.detail).not.toContain("agency-backups");
+  });
+
+  it("a half-formed or run-together sigil is refused by OFFSET only (no surrounding text), including a bare trailing @@", () => {
+    // Two placeholders run together: the first substitutes, the leftover "DY_T2_S3_REGION@@" ends in a
+    // bare sigil that starts no placeholder.
+    const runTogether = substituteMetadataPlaceholders("@@DY_T2_S3_BUCKET@@DY_T2_S3_REGION@@", s3Env());
+    expect(runTogether.ok).toBe(false);
+    if (!runTogether.ok) {
+      expect(runTogether.detail).toMatch(/^a "@@" at offset 34 does not start an allowlisted placeholder/);
+    }
+    const halfToken = substituteMetadataPlaceholders("echo '@@DY_T2_S3_BUCKET' secret-text", s3Env());
+    expect(halfToken.ok).toBe(false);
+    if (!halfToken.ok) {
+      expect(halfToken.detail).toMatch(/^a "@@" at offset 6 does not start an allowlisted placeholder/);
+      expect(halfToken.detail).not.toContain("secret-text");
+    }
+    // Case matters: the allowlist is exact.
+    expect(substituteMetadataPlaceholders("@@dy_t2_s3_bucket@@", s3Env()).ok).toBe(false);
+    // The orchestrator's own render marker must never reach a node unrendered.
+    expect(substituteMetadataPlaceholders("# @@DY_INJECTED_VALUES@@\n", s3Env()).ok).toBe(false);
+  });
+
+  it("a MISSING required secret fails naming the variable(s) — never an empty substitution", () => {
+    const one = substituteMetadataPlaceholders("B='@@DY_T2_S3_BUCKET@@'", s3Env({ S3_SECRET_ACCESS_KEY: undefined }));
+    expect(one).toEqual({
+      ok: false,
+      detail:
+        "S3_SECRET_ACCESS_KEY is not configured on this Worker — a @@DY_T2_S3_*@@ placeholder needs the agency's " +
+        "object-store credential; refusing to write a boot script with an empty one.",
+    });
+    const all = substituteMetadataPlaceholders("B='@@DY_T2_S3_BUCKET@@'", {} as unknown as Env);
+    expect(all.ok).toBe(false);
+    if (!all.ok) expect(all.detail).toMatch(/^S3_ACCESS_KEY_ID \/ S3_SECRET_ACCESS_KEY \/ S3_BUCKET are not configured/);
+    const empty = substituteMetadataPlaceholders("B='@@DY_T2_S3_BUCKET@@'", s3Env({ S3_ACCESS_KEY_ID: "" }));
+    expect(empty.ok).toBe(false);
+    if (!empty.ok) expect(empty.detail).toMatch(/^S3_ACCESS_KEY_ID is not configured/);
+  });
+
+  it("S3_ENDPOINT unset yields '' (native AWS per the backup runner) and S3_REGION unset yields us-east-1 (the Worker's own presign default)", () => {
+    expect(
+      substituteMetadataPlaceholders("E='@@DY_T2_S3_ENDPOINT@@' R='@@DY_T2_S3_REGION@@'", s3Env({ S3_ENDPOINT: undefined, S3_REGION: undefined })),
+    ).toEqual({
+      ok: true,
+      value: "E='' R='us-east-1'",
+      substituted: ["@@DY_T2_S3_ENDPOINT@@", "@@DY_T2_S3_REGION@@"],
+    });
+  });
+
+  it("an S3_* value outside the boot-safe charset is refused naming the ENV VAR only (never the value) — and all five are checked whenever any placeholder is present", () => {
+    const unsafeCases: Array<[Partial<Env>, string]> = [
+      [{ S3_BUCKET: "agency@@backups" }, "S3_BUCKET"], // a value may never carry the sigil
+      [{ S3_SECRET_ACCESS_KEY: "line1\nline2" }, "S3_SECRET_ACCESS_KEY"], // newline = a second script line
+      [{ S3_SECRET_ACCESS_KEY: "it's" }, "S3_SECRET_ACCESS_KEY"], // breaks out of a single-quoted word
+      [{ S3_ACCESS_KEY_ID: "$HOME" }, "S3_ACCESS_KEY_ID"], // shell expansion
+      [{ S3_ENDPOINT: "https://x.example.test/`id`" }, "S3_ENDPOINT"], // command substitution
+      [{ S3_REGION: "a".repeat(513) }, "S3_REGION"], // over the length cap
+    ];
+    for (const [overrides, envName] of unsafeCases) {
+      // Only the BUCKET placeholder is referenced; the unsafe value is elsewhere — still refused.
+      const verdict = substituteMetadataPlaceholders("B='@@DY_T2_S3_BUCKET@@'", s3Env(overrides));
+      expect(verdict.ok, JSON.stringify(Object.keys(overrides))).toBe(false);
+      if (verdict.ok) continue;
+      expect(verdict.detail).toMatch(new RegExp(`^${envName} holds a character outside`));
+      for (const value of Object.values(overrides)) {
+        expect(verdict.detail).not.toContain(String(value));
+      }
+    }
+  });
+});
+
+describe("mergeMetadataItems: unrelated keys survive, in place", () => {
+  it("replaces a named key in place, keeps every other key verbatim, and appends new keys in request order", () => {
+    const existing = [
+      { key: "enable-oslogin", value: "TRUE" },
+      { key: "startup-script", value: "old" },
+      { key: "dy-cell-bundle", value: "20260916-9c25cfd" },
+    ];
+    expect(
+      mergeMetadataItems(existing, [
+        { key: "dy-backup-epoch", value: "2026-10-05" },
+        { key: "startup-script", value: "new" },
+      ]),
+    ).toEqual([
+      { key: "enable-oslogin", value: "TRUE" },
+      { key: "startup-script", value: "new" },
+      { key: "dy-cell-bundle", value: "20260916-9c25cfd" },
+      { key: "dy-backup-epoch", value: "2026-10-05" },
+    ]);
+  });
+
+  it("an instance with no items yet gets exactly the updates; an existing empty-valued key is kept as ''", () => {
+    expect(mergeMetadataItems([], [{ key: "startup-script", value: "new" }])).toEqual([{ key: "startup-script", value: "new" }]);
+    expect(mergeMetadataItems([{ key: "serial-port-enable" }], [{ key: "startup-script", value: "new" }])).toEqual([
+      { key: "serial-port-enable", value: "" },
+      { key: "startup-script", value: "new" },
+    ]);
   });
 });

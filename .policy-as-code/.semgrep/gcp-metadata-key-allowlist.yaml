@@ -1,0 +1,53 @@
+# The gcp-instance-set-metadata KEY allowlist, pinned to its approved value.
+#
+# WHAT THE OP IS. planning/47 added `gcp-instance-set-metadata` so that a provisioned agency
+# cell can be updated at all. Google runs an instance's `startup-script` metadata key AS ROOT
+# on every boot, so setting that key is how the platform ships a new boot script — and, as its
+# first consumer, how a backup credential reaches a file node that no other path can write to.
+#
+# WHY THE ALLOWLIST IS THE BOUNDARY. Without it the op is a general-purpose remote-configuration
+# channel on the agency's own VM. `ssh-keys` grants a persistent interactive login,
+# `enable-oslogin` and `serial-port-enable` each open an access path of their own. Those are
+# categorically different from updating the boot script the provisioning model already authors
+# (gcp-instance-create's `startupScript`). planning/47 "The rule that settles this": platform
+# identities never hold accounts on an agency cell. A standing login acquired by widening this
+# list is exactly that, acquired quietly.
+#
+# WHAT THE ALLOWLIST DOES NOT DO, so nobody argues the rule away: it does not reduce the op's
+# ultimate capability. A startup script runs as root and could add an SSH key itself. The
+# allowlist keeps the op's STATED purpose aligned with its ACTUAL capability, so that widening
+# it is a reviewed decision rather than an accident of "any key passes the grammar".
+#
+# WHY THIS IS A PINNED LITERAL AND NOT A SHAPE CHECK. There is no property of a metadata key a
+# matcher can test. The approved value IS the policy, so the rule carries a copy of it and
+# flags every other value. Editing the constant then requires editing this rule in the same
+# change, which is the review signal the rule exists to produce.
+#
+# THREE TWINS, ONE VALUE. The same constant lives in app (src/server/services/
+# agency-dispatch-params.ts), orchestrator (src/agency-dispatch.ts) and the agency Worker
+# (src/dispatch-params.ts), and each repo carries its own copy of this rule. They are extended
+# together or not at all.
+rules:
+  - id: dy-gcp-metadata-key-allowlist-pinned
+    message: >-
+      The gcp-instance-set-metadata key allowlist is no longer exactly ["startup-script"]. Every
+      extra key is a new capability on the AGENCY's own VM — `ssh-keys` is a persistent
+      interactive login, `enable-oslogin` and `serial-port-enable` are each an access path —
+      and platform identities are not supposed to hold accounts on an agency cell at all
+      (planning/47, "The rule that settles this"). Widening this list is a deliberate decision:
+      say why in the change, and update the twin constants in app, orchestrator and the agency
+      Worker together.
+    # WARNING, not ERROR, per the planning/45 rollout convention: a new rule lands reporting,
+    # not gating, so CI is not red on day one. The CI gate is on the rule TESTS passing; the
+    # full scan is reported under continue-on-error.
+    severity: WARNING
+    languages: [typescript]
+    paths:
+      exclude:
+        - "*.test.ts"
+        - "*.test.tsx"
+    patterns:
+      # Matches the declaration with or without a type annotation; $LIST binds whatever it is
+      # initialised to, so a renamed value, a reordering and an added key all land here.
+      - pattern: const GCP_METADATA_KEYS = $LIST;
+      - pattern-not: const GCP_METADATA_KEYS = ["startup-script"] as const;

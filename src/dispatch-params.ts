@@ -970,11 +970,11 @@ export function validateGcpInstanceCreateParams(raw: unknown): ParamsVerdict<Gcp
   // and within Google's metadata-value limit.
   if (
     startupScript !== undefined &&
-    (typeof startupScript !== "string" || startupScript.length === 0 || startupScript.length > GCP_STARTUP_SCRIPT_MAX_LENGTH)
+    (typeof startupScript !== "string" || startupScript.length === 0 || new TextEncoder().encode(startupScript).length > GCP_STARTUP_SCRIPT_MAX_LENGTH)
   ) {
     return {
       ok: false,
-      reason: `startupScript, when present, must be a non-empty string of at most ${GCP_STARTUP_SCRIPT_MAX_LENGTH} characters`,
+      reason: `startupScript, when present, must be a non-empty string of at most ${GCP_STARTUP_SCRIPT_MAX_LENGTH} bytes`,
     };
   }
 
@@ -1625,6 +1625,205 @@ export function validateGcpNetworkDeleteParams(raw: unknown): ParamsVerdict<GcpN
 
   // A FRESH object of only the known keys — never the caller's object.
   return { ok: true, params: { project, region, networkName, subnetName } };
+}
+
+// ── GCP in-place UPDATE ops: gcp-instance-set-metadata / gcp-instance-restart ────────
+// planning/47: a provisioned agency cell could not be CHANGED after creation — no op reached a
+// node's startup script, and the cell-agent's /exec cannot write a root-owned credential file. These
+// two ops close that gap: `gcp-instance-set-metadata` merges keys into a VM's metadata (the
+// `startup-script` Google runs AS ROOT on every boot is one such key), and `gcp-instance-restart`
+// reboots the VM gracefully so the new script runs. Together they are "update a cell node"; the
+// first consumer arms the file node's backup timers (hub#52).
+//
+// TWO boundaries bound the set-metadata op:
+//   1. WHICH KEYS may be set — the fixed GCP_METADATA_KEYS allowlist below (exactly `startup-script`
+//      today), enforced HERE in the validator, so a disallowed key is a 400 with no token minted and
+//      no GCP call made, and a request mixing an allowed key with a disallowed one is refused WHOLE
+//      (nothing partially applied). Read the allowlist's own comment for why it exists and what it
+//      does — and does not — constrain.
+//   2. WHAT is substituted into a value — the Worker-side PLACEHOLDER substitution in actuate.ts (a
+//      fixed allowlist of `@@DY_T2_S3_*@@` names mapped to the agency's own S3_* secrets; any other
+//      `@@...@@` is refused). That runs in the actuator because only the actuator holds `env`.
+
+// ── gcp-instance-set-metadata ────────────────────────────────────────────────────────
+// MERGE keys into ONE VM's metadata in the AGENCY's own project. Four REQUIRED params:
+//   1. `project` — the project id (pinned to the SA key's own project by the actuator).
+//   2. `zone`    — the Compute zone the VM lives in (a URL path segment).
+//   3. `name`    — the instance's resource name (a URL path segment).
+//   4. `items`   — 1-32 { key, value } entries to set. `key` must pass Google's metadata-key grammar
+//                  ([a-zA-Z0-9_-], 1-128 chars) AND be on the fixed GCP_METADATA_KEYS allowlist
+//                  (exactly `startup-script` today — see its comment), and must be unique within the
+//                  request (two values for one key would be ambiguous). `value` is the ONE opaque
+//                  field — a shell script legitimately contains any character — so it is
+//                  length-capped at Google's 256 KB per-value limit and must be non-empty (an empty
+//                  startup script is always a caller bug, never a desired state). It reaches Google
+//                  only as a JSON.stringify'd body field, never a URL segment.
+// Keys NOT named in `items` are PRESERVED: the actuator reads the instance, merges, and writes back
+// with the instance's current metadata FINGERPRINT, which Google rejects when stale (HTTP 412) — the
+// concurrency guard against clobbering a change made between the read and the write.
+//
+// IDEMPOTENT: setting a key to a value converges — a re-run re-reads the fingerprint and writes the
+// same values. Registered `true` in AGENCY_OP_IDEMPOTENT.
+
+/**
+ * The FIXED allowlist of instance-metadata KEYS this op may set. Exactly `startup-script` for now.
+ *
+ * WHY an allowlist at all: without one, this op is a general-purpose remote-configuration channel on
+ * the agency's VM. `ssh-keys` grants a persistent interactive login; `enable-oslogin`,
+ * `serial-port-enable` and their relatives each open an access path of their own. Those are
+ * categorically different from "update the boot script the platform already authors": the boot-script
+ * capability is one the provisioning model already has and already documents (gcp-instance-create's
+ * `startupScript`), whereas silently acquiring SSH into an agency's VM would be a NEW capability — and
+ * acquiring new capabilities unannounced is precisely what the Direction-B boundary exists to prevent.
+ * The allowlist also bounds a plain bug: a mis-targeted call with the wrong `items` cannot clobber
+ * unrelated VM configuration.
+ *
+ * WHAT it does NOT do: it does NOT reduce the op's ultimate capability. A startup script runs as root
+ * on every boot, so a caller who can set it can do anything on the node — including adding an SSH key
+ * from inside the script. The allowlist is here to keep the op's STATED purpose and its ACTUAL
+ * capability aligned, so that widening it (say, to `shutdown-script` or `ssh-keys`) is a deliberate,
+ * reviewed decision rather than an accident of "any key passes the grammar". Do not read it as the op
+ * being more constrained than root-on-the-node; read it as the op doing only what it says it does.
+ *
+ * Twin of the orchestrator's GCP_METADATA_KEYS (agency-dispatch.ts); the app's validator should carry
+ * the same list. Extend all three together.
+ */
+export const GCP_METADATA_KEYS = ["startup-script"] as const;
+export type GcpMetadataKey = (typeof GCP_METADATA_KEYS)[number];
+
+export interface GcpInstanceMetadataItem {
+  /** The metadata key — one of GCP_METADATA_KEYS (exactly "startup-script" today). */
+  key: GcpMetadataKey;
+  /** The value — opaque, non-empty, at most 256 KB. May carry `@@DY_T2_S3_*@@` placeholders. */
+  value: string;
+}
+
+/** True when `key` is on the fixed GCP_METADATA_KEYS allowlist (narrows the type). */
+function isAllowlistedMetadataKey(key: string): key is GcpMetadataKey {
+  return (GCP_METADATA_KEYS as readonly string[]).includes(key);
+}
+
+export interface GcpInstanceSetMetadataParams {
+  /** The agency's GCP project id the VM lives in. */
+  project: string;
+  /** The Compute Engine zone of the VM, e.g. "australia-southeast1-a". */
+  zone: string;
+  /** The instance's resource name. */
+  name: string;
+  /** The entries to set (merged into the instance's existing metadata; other keys survive). */
+  items: GcpInstanceMetadataItem[];
+}
+
+// Google's metadata KEY grammar: letters, digits, hyphen, underscore; 1-128 chars. Anchored, so a key
+// can carry no whitespace, "/" or other JSON/URL metacharacter.
+const GCP_METADATA_KEY_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+const GCP_METADATA_KEY_RULE =
+  "each items entry's key must be a Compute Engine metadata key (1-128 chars of letters, digits, hyphens, underscores)";
+// Google caps ONE metadata value at 256 KB — the same cap gcp-instance-create's startupScript uses.
+const GCP_METADATA_VALUE_MAX_LENGTH = GCP_STARTUP_SCRIPT_MAX_LENGTH;
+// A cell-node update sets a handful of keys; 32 is generous and stops a junk mega-list.
+const GCP_METADATA_ITEMS_MAX = 32;
+
+export function validateGcpInstanceSetMetadataParams(raw: unknown): ParamsVerdict<GcpInstanceSetMetadataParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, zone, name, items } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof zone !== "string" || zone.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a Compute Engine zone name (e.g. australia-southeast1-a)" };
+  }
+  if (typeof name !== "string" || !GCP_RESOURCE_NAME_RE.test(name)) {
+    return { ok: false, reason: `name ${GCP_RESOURCE_NAME_RULE}` };
+  }
+  if (!Array.isArray(items) || items.length < 1 || items.length > GCP_METADATA_ITEMS_MAX) {
+    return { ok: false, reason: `items must be an array of 1-${GCP_METADATA_ITEMS_MAX} { key, value } entries` };
+  }
+
+  // Build a FRESH array of fresh { key, value } objects — never the caller's objects — so an extra
+  // property on an entry can never ride along into the metadata body the actuator writes. The WHOLE
+  // request is refused on the first bad entry (no partial list is ever returned, so nothing is ever
+  // partially applied). A key named twice is refused: the merge would have to pick one, and guessing
+  // is how a wrong boot script lands on a node.
+  const cleanItems: GcpInstanceMetadataItem[] = [];
+  const seenKeys = new Set<string>();
+  for (const entry of items) {
+    if (!isPlainObject(entry)) {
+      return { ok: false, reason: "each items entry must be an object { key, value }" };
+    }
+    const { key, value } = entry;
+    // Grammar FIRST (bounds what the allowlist reason below may echo to 128 safe chars), then the
+    // allowlist — the reason NAMES the offending key so a mis-targeted call is diagnosable.
+    if (typeof key !== "string" || !GCP_METADATA_KEY_RE.test(key)) {
+      return { ok: false, reason: GCP_METADATA_KEY_RULE };
+    }
+    if (!isAllowlistedMetadataKey(key)) {
+      return {
+        ok: false,
+        reason: `each items entry's key must be one of the allowlisted metadata keys (${GCP_METADATA_KEYS.join(", ")}); got "${key}"`,
+      };
+    }
+    if (seenKeys.has(key)) {
+      return { ok: false, reason: `items names the metadata key "${key}" more than once` };
+    }
+    if (typeof value !== "string" || value.length === 0 || new TextEncoder().encode(value).length > GCP_METADATA_VALUE_MAX_LENGTH) {
+      return {
+        ok: false,
+        reason: `each items entry's value must be a non-empty string of at most ${GCP_METADATA_VALUE_MAX_LENGTH} bytes`,
+      };
+    }
+    seenKeys.add(key);
+    cleanItems.push({ key, value });
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, zone, name, items: cleanItems } };
+}
+
+// ── gcp-instance-restart ─────────────────────────────────────────────────────────────
+// GRACEFULLY restart ONE VM in the AGENCY's own project: instances.stop (an ACPI shutdown the guest
+// OS honours — nfs-server stops, filesystems unmount), then instances.start. Deliberately NOT
+// instances.reset, which is a hard power cycle: the first node this restarts is the cell's NFS file
+// node, which deserves a clean shutdown. Three REQUIRED strings, the same three gcp-instance-delete
+// takes: `project` (pinned to the SA key's own project by the actuator), `zone` and `name` (both URL
+// path segments).
+//
+// NON-IDEMPOTENT: every run reboots the VM again, and for the file node every reboot interrupts every
+// site on the cell for about a minute while the web node's NFS mounts recover. A re-dispatch after a
+// lost response could therefore reboot a node that had already come back — so the orchestrator
+// registers it `false` in AGENCY_OP_IDEMPOTENT and runs it exactly once (like gcp-instance-create),
+// leaving "did it come back?" to the caller's own health probe.
+
+export interface GcpInstanceRestartParams {
+  /** The agency's GCP project id the VM lives in. */
+  project: string;
+  /** The Compute Engine zone of the VM, e.g. "australia-southeast1-a". */
+  zone: string;
+  /** The instance's resource name. */
+  name: string;
+}
+
+export function validateGcpInstanceRestartParams(raw: unknown): ParamsVerdict<GcpInstanceRestartParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, zone, name } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof zone !== "string" || zone.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a Compute Engine zone name (e.g. australia-southeast1-a)" };
+  }
+  if (typeof name !== "string" || !GCP_RESOURCE_NAME_RE.test(name)) {
+    return { ok: false, reason: `name ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, zone, name } };
 }
 
 // ── provision-ssh-keys ───────────────────────────────────────────────────────────────

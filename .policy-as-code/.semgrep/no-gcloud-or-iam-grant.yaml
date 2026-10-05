@@ -1,0 +1,84 @@
+# No gcloud, no VM SSH, no IAM granting from service code.
+#
+# THE BOUNDARY. planning/47 "The rule that settles this": platform identities never hold accounts
+# on an agency cell, and all access runs through the orchestrator → the agency's own Cloudflare
+# Worker → the agency's own GCP service-account key. That is what makes "the agency owns their
+# infrastructure" a true statement rather than a marketing one. A service that can run `gcloud`,
+# open an SSH session to a VM, or grant itself a role has stepped outside that path by
+# definition, whatever the surrounding code says it is doing.
+#
+# THE SPECIFIC FAILURE MODE THIS RULE NAMES. planning/47 again: "granting
+# roles/compute.instanceAdmin.v1 / roles/iap.tunnelResourceAccessor on the agency project is not
+# a shortcut to be taken under time pressure. It is the failure mode." It is attractive precisely
+# because it works, and because syd — a platform-owned cell in the platform's own project — has
+# always been reachable that way. The 2026-10-05 decision closed that off: syd goes through its
+# Worker too, so one mechanism covers every cell and the "just do it the syd way" shortcut has
+# nowhere left to be correct.
+#
+# WHY THIS SHOULD BE NEAR-SILENT. Service code has no business invoking gcloud at all — every GCP
+# action is a Worker op (gcp-instance-create / -delete / -set-metadata / -restart, gcp-firewall-*,
+# gcp-router-*, gcp-network-*, gcp-address-*). On the 2026-10-05 tree this rule has ONE finding
+# across app, orchestrator and the agency Worker: src/scripts/agency-gcp-instance-proof.ts prints
+# a `gcloud compute instances delete` line as manual cleanup advice for the billed VM it just
+# created. That is console text, not an exec — but the Worker already has a gcp-instance-delete
+# op, so the advice points a human down the retired path, which is the thing the rule is for.
+#
+# WHAT IS DELIBERATELY NOT MATCHED, and why the rule is quiet rather than narrow:
+#
+#   1. COMMENTS. `"=~/…/"` matches string and template literals only. orchestrator's cell-run.ts,
+#      cells.ts and cell-provision.ts each mention `gcloud compute ssh` and
+#      `--tunnel-through-iap` in prose — all of it recording the migration AWAY from those paths
+#      (planning/31 mechanism-B). Flagging a comment that says "NO gcloud compute ssh" would be
+#      the rule arguing with its own documentation.
+#
+#   2. A BARE ROLE NAME. `roles/compute.*` and `roles/iap.*` are flagged only when the SAME
+#      literal also carries a granting token — setIamPolicy, add-iam-policy-binding, --member or
+#      --role. The reason is specific and was measured, not assumed: the agency Worker names
+#      roles in 20 diagnostic strings (actuate.ts permissionHint fields, validators.ts:842) whose
+#      entire job is to tell the AGENCY which role to grant to the AGENCY's OWN service account.
+#      That is the opposite of the defect — it is the platform declining to hold the role and
+#      asking the owner to grant it in their own project. Twenty standing findings of that shape
+#      would train everyone to ignore the rule, which planning/45 calls out as worse than having
+#      no rule. THE COST: a role name assigned to a variable and passed to a grant call built
+#      elsewhere is not caught. Nothing in any repo does that today; if one ever does, drop the
+#      second pattern in the `roles/` clause and accept the diagnostics as a baseline instead.
+#
+# SCOPE. src/ only. Deploy scripts and infra recipes legitimately run gcloud; the companion rule
+# for those lives in infra/.policy-as-code/.semgrep/no-cell-node-ssh.yaml and draws the line at
+# cell node vs control-plane VM rather than at gcloud itself.
+rules:
+  - id: dy-no-gcloud-or-iam-grant-in-service-code
+    message: >-
+      Service code is shelling out to gcloud, opening an SSH session to a VM, or granting IAM.
+      Every GCP action on a cell runs through the agency's own Cloudflare Worker on the agency's
+      own service-account key — a platform identity holds no account on a cell and no IAM in an
+      agency's project (planning/47, "The rule that settles this"). Granting roles/compute.* or
+      roles/iap.* to a platform identity is the documented failure mode, not a shortcut under
+      time pressure. Add or use a Worker GCP op instead. If this literal is operator-facing text
+      rather than something the service runs, it is still pointing a human down the retired path
+      — point them at the Worker op.
+    # WARNING, not ERROR, per the planning/45 rollout convention: a new rule lands reporting, not
+    # gating, so CI is not red on day one. This one is ERROR-worthy in principle — there is no
+    # legitimate gcloud call in a service — and should be raised once the single standing finding
+    # in orchestrator's agency-gcp-instance-proof.ts is resolved.
+    severity: WARNING
+    languages: [typescript]
+    paths:
+      include:
+        - "src/**"
+      exclude:
+        - "*.test.ts"
+        - "*.test.tsx"
+    pattern-either:
+      # The shell-out half: the CLI itself, an SSH session, and the IAP tunnel that reaches a
+      # private cell node.
+      - pattern: '"=~/\bgcloud\b/"'
+      - pattern: '"=~/\bcompute\s+ssh\b/"'
+      - pattern: '"=~/--tunnel-through-iap\b/"'
+      # The IAM half: the gcloud grant verb is unambiguous on its own.
+      - pattern: '"=~/\badd-iam-policy-binding\b/"'
+      # A cell-relevant role name, but only where the same literal also performs a grant. See
+      # "WHAT IS DELIBERATELY NOT MATCHED" §2 above before widening this.
+      - patterns:
+          - pattern: '"=~/\broles\/(compute|iap)\./"'
+          - pattern: '"=~/(setIamPolicy|add-iam-policy-binding|--member\b|--role[ =])/"'
