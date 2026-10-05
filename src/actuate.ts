@@ -998,8 +998,11 @@ export async function actuateCachePurge(params: CachePurgeParams, env: Env): Pro
 //        drifted => PATCH /zones/:zid/rulesets/:rid/rules/:ruleId   (in place)
 //        equal   => nothing
 // The zone is DERIVED from the validated suffix ("-production.<zone>"), so the rule can only ever
-// land in a zone the agency's own token can see, matching only that zone's production hosts. The
-// rule body is built HERE (edge-cache-rule.ts) — the job never carries an expression.
+// land in a zone the agency's own token can see, matching only that zone's WordPress sites — its
+// `-production.<zone>` routing hosts plus the customer domains onboarded onto it as
+// Cloudflare-for-SaaS custom hostnames, and NOT the zone apex, the agency's own in-zone hosts or a
+// branded media host (edge-cache-rule.ts "WHICH HOSTS"). The rule body is built HERE — the job
+// never carries an expression, so it cannot widen that host set.
 //
 // Creating the entrypoint with POST (not PUT on the entrypoint path) is deliberate: Cloudflare
 // allows ONE entrypoint per phase per zone, so if one appeared between our GET and our write, the

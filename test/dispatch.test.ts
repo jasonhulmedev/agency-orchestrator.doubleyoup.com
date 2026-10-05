@@ -5992,11 +5992,22 @@ describe("actuateCfTunnelConfig: the catch-all rule", () => {
 // ── edge page-cache rule builder (Worker copy — TWIN of the orchestrator's) ─────────────
 
 describe("buildEdgeCacheRules: the Worker builds BOTH rules from three narrow inputs", () => {
-  // Pinned line by line. The orchestrator's src/edge-cache-rule.test.ts pins the SAME text, so a
-  // change on only one side of the twin breaks that side's test.
+  // ── THE TWIN PROOF ───────────────────────────────────────────────────────────────────
+  // The two blocks below are the literal text BOTH repos must emit for the SAME zone. They are
+  // duplicated VERBATIM in orchestrator.doubleyoup.com/src/edge-cache-rule.test.ts (there as
+  // TWIN_CACHE_EXPRESSION / TWIN_BYPASS_EXPRESSION), and both repos assert against them — so a
+  // change made on only one side of the twin fails that side's test.
+  // The host clause, pinned on its own as well: the internal `<slug>-production.<zone>` routing
+  // hosts OR a foreign domain on the zone (a Cloudflare-for-SaaS custom hostname = a CUSTOMER
+  // DOMAIN), minus the zone apex and the branded media hosts. See edge-cache-rule.ts's
+  // "WHICH HOSTS" header for why each exclusion is there and why `contains` rather than `ends_with`.
+  const EXPECTED_HOST_CLAUSE =
+    '(ends_with(http.host, "-production.example.com") or (not http.host contains ".example.com" ' +
+    'and http.host ne "example.com" and not starts_with(http.host, "media.")))';
+
   const EXPECTED_EXPRESSION = [
     '(http.request.method in {"GET" "HEAD"})',
-    'and ends_with(http.host, "-production.example.com")',
+    'and (ends_with(http.host, "-production.example.com") or (not http.host contains ".example.com" and http.host ne "example.com" and not starts_with(http.host, "media.")))',
     'and (http.request.uri.path.extension in {"" "php" "html"})',
     'and not starts_with(http.request.uri.path, "/wp-admin")',
     'and not starts_with(http.request.uri.path, "/wp-login.php")',
@@ -6022,7 +6033,7 @@ describe("buildEdgeCacheRules: the Worker builds BOTH rules from three narrow in
   // The BYPASS rule: the same host + HTML-page clauses, then the personal cookies ORed. Byte-identical
   // to the orchestrator's pin.
   const EXPECTED_BYPASS_EXPRESSION = [
-    'ends_with(http.host, "-production.example.com")',
+    '(ends_with(http.host, "-production.example.com") or (not http.host contains ".example.com" and http.host ne "example.com" and not starts_with(http.host, "media.")))',
     'and (http.request.uri.path.extension in {"" "php" "html"})',
     'and (http.cookie contains "wordpress_logged_in_"',
     'or http.cookie contains "wp-postpass_"',
@@ -6102,9 +6113,9 @@ describe("buildEdgeCacheRules: the Worker builds BOTH rules from three narrow in
       // ... and the cache rule NEGATES the same fragment, so the two can never both match one request.
       expect(built.rules.cache.expression).toContain(`and not http.cookie contains "${cookieFragment}"`);
     }
-    // Both rules are scoped to HTML-ish pages on the host, so a logged-in admin's static assets are
-    // left to Cloudflare's default (not bypassed).
-    expect(built.rules.bypass.expression).toContain('ends_with(http.host, "-production.example.com") and (http.request.uri.path.extension in {"" "php" "html"})');
+    // Both rules are scoped to HTML-ish pages on one of our hosts, so a logged-in admin's static
+    // assets are left to Cloudflare's default (not bypassed).
+    expect(built.rules.bypass.expression).toContain(`${EXPECTED_HOST_CLAUSE} and (http.request.uri.path.extension in {"" "php" "html"})`);
   });
 
   it("enabled:false produces two disabled rules; absent means enabled", () => {
@@ -6146,6 +6157,210 @@ describe("buildEdgeCacheRules: the Worker builds BOTH rules from three narrow in
     ]) {
       expect(buildEdgeCacheRules({ hostSuffix, edgeTtlSeconds: 600 }).ok).toBe(false);
     }
+  });
+
+  it("the host clause is the exact twin text, for a .com zone and for a multi-label agency zone", () => {
+    const built = buildEdgeCacheRules({ hostSuffix: "-production.example.com", edgeTtlSeconds: 600 });
+    if (!built.ok) throw new Error(built.reason);
+    expect(built.rules.cache.expression).toContain(EXPECTED_HOST_CLAUSE);
+    expect(built.rules.bypass.expression).toContain(EXPECTED_HOST_CLAUSE);
+    // A real agency zone has a multi-label public suffix; the zone name lands in the clause four
+    // times, so pin that shape too.
+    const agency = buildEdgeCacheRules({ hostSuffix: "-production.sbmstudio.com.au", edgeTtlSeconds: 600 });
+    if (!agency.ok) throw new Error(agency.reason);
+    expect(agency.rules.bypass.expression).toContain(
+      '(ends_with(http.host, "-production.sbmstudio.com.au") or (not http.host contains ".sbmstudio.com.au" ' +
+        'and http.host ne "sbmstudio.com.au" and not starts_with(http.host, "media.")))',
+    );
+    // Cloudflare caps a rule expression at 4096 characters; the host clause must not push us near it.
+    expect(agency.rules.cache.expression.length).toBeLessThan(2000);
+  });
+});
+
+// ── WHICH HOSTS the rules claim (agency zone) ──────────────────────────────────────────
+// The same request-level proof the orchestrator's twin test runs, against the text THIS Worker
+// emits. The evaluator below understands exactly the clause grammar the builder produces — it is
+// not a Rules-language engine, it exists so "a customer domain is cached, the agency's own hosts
+// are not" is pinned as a REQUEST and not only as a string.
+
+interface SimulatedRequest {
+  method: string;
+  host: string;
+  path: string;
+  query: string;
+  cookie: string;
+}
+
+function pathExtension(path: string): string {
+  const lastSegment = path.slice(path.lastIndexOf("/") + 1);
+  const dot = lastSegment.lastIndexOf(".");
+  if (dot < 0) {
+    return "";
+  }
+  return lastSegment.slice(dot + 1);
+}
+
+/**
+ * Split `text` on every top-level occurrence of `separator` (never inside a parenthesised group).
+ * Returns a single-element array when the separator appears only inside groups.
+ */
+function splitTopLevel(text: string, separator: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]!;
+    if (char === "(") depth += 1;
+    if (char === ")") depth -= 1;
+    if (depth === 0 && text.startsWith(separator, index)) {
+      parts.push(current);
+      current = "";
+      index += separator.length - 1;
+      continue;
+    }
+    current += char;
+  }
+  parts.push(current);
+  return parts;
+}
+
+/**
+ * Drop the parentheses that wrap the WHOLE text, repeatedly. A naive slice(1, -1) would corrupt
+ * `(a) or (b)` — whose first and last characters are also parens but which is not one group — so
+ * each round first checks that the opening paren's partner is the final character.
+ */
+function stripOuterParens(text: string): string {
+  let current = text.trim();
+  while (current.startsWith("(") && current.endsWith(")")) {
+    let depth = 0;
+    let closesAtTheEnd = true;
+    for (let index = 0; index < current.length; index += 1) {
+      if (current[index] === "(") depth += 1;
+      if (current[index] === ")") {
+        depth -= 1;
+        if (depth === 0 && index < current.length - 1) {
+          closesAtTheEnd = false;
+          break;
+        }
+      }
+    }
+    if (!closesAtTheEnd) {
+      return current;
+    }
+    current = current.slice(1, -1).trim();
+  }
+  return current;
+}
+
+function evaluateClause(clause: string, request: SimulatedRequest): boolean {
+  const text = stripOuterParens(clause);
+  // Cloudflare's precedence: `not` binds tighter than `and`, which binds tighter than `or`. Split in
+  // the same order, so the host clause's `A or (B and C and D)` is read the way Cloudflare reads it.
+  const orParts = splitTopLevel(text, " or ");
+  if (orParts.length > 1) {
+    return orParts.some((part) => evaluateClause(part, request));
+  }
+  const andParts = splitTopLevel(text, " and ");
+  if (andParts.length > 1) {
+    return andParts.every((part) => evaluateClause(part, request));
+  }
+  if (text.startsWith("not ")) {
+    return !evaluateClause(text.slice(4), request);
+  }
+  let match = /^http\.request\.method in \{(.+)\}$/.exec(text);
+  if (match) {
+    return match[1]!.split(" ").map((item) => item.replace(/"/g, "")).includes(request.method);
+  }
+  match = /^http\.request\.uri\.path\.extension in \{(.+)\}$/.exec(text);
+  if (match) {
+    return match[1]!.split(" ").map((item) => item.replace(/"/g, "")).includes(pathExtension(request.path));
+  }
+  match = /^ends_with\(http\.host, "(.+)"\)$/.exec(text);
+  if (match) {
+    return request.host.endsWith(match[1]!);
+  }
+  match = /^starts_with\(http\.host, "(.+)"\)$/.exec(text);
+  if (match) {
+    return request.host.startsWith(match[1]!);
+  }
+  match = /^http\.host contains "(.+)"$/.exec(text);
+  if (match) {
+    return request.host.includes(match[1]!);
+  }
+  match = /^http\.host ne "(.+)"$/.exec(text);
+  if (match) {
+    return request.host !== match[1]!;
+  }
+  match = /^starts_with\(http\.request\.uri\.path, "(.+)"\)$/.exec(text);
+  if (match) {
+    return request.path.startsWith(match[1]!);
+  }
+  match = /^http\.request\.uri\.query contains "(.+)"$/.exec(text);
+  if (match) {
+    return request.query.includes(match[1]!);
+  }
+  match = /^http\.cookie contains "(.+)"$/.exec(text);
+  if (match) {
+    return request.cookie.includes(match[1]!);
+  }
+  throw new Error(`evaluator does not understand clause: ${clause}`);
+}
+
+describe("the edge-cache host predicate, as requests against an agency zone", () => {
+  const built = buildEdgeCacheRules({ hostSuffix: "-production.sbmstudio.com.au", edgeTtlSeconds: 600 });
+  if (!built.ok) throw new Error(built.reason);
+  const rules = built.rules;
+
+  const ANON_PAGE: SimulatedRequest = { method: "GET", host: "", path: "/shop/", query: "", cookie: "_ga=GA1.1" };
+
+  /** The cache setting the matching rule applies: "cache" / "bypass" / "none" (Cloudflare default). */
+  function selectedAction(request: SimulatedRequest): "cache" | "bypass" | "none" {
+    const bypassMatches = evaluateClause(rules.bypass.expression, request);
+    const cacheMatches = evaluateClause(rules.cache.expression, request);
+    expect(bypassMatches && cacheMatches).toBe(false);
+    if (bypassMatches) return "bypass";
+    if (cacheMatches) return "cache";
+    return "none";
+  }
+
+  it("CACHES a customer domain onboarded as a custom hostname, and the internal -production hosts", () => {
+    for (const host of ["bsodigital.com.au", "www.bsodigital.com.au", "shop.example.net"]) {
+      expect(selectedAction({ ...ANON_PAGE, host })).toBe("cache");
+      expect(selectedAction({ ...ANON_PAGE, host, cookie: "woocommerce_cart_hash=deadbeef" })).toBe("bypass");
+      expect(selectedAction({ ...ANON_PAGE, host, path: "/wp-admin/" })).toBe("none");
+      expect(selectedAction({ ...ANON_PAGE, host, path: "/style.css" })).toBe("none");
+    }
+    expect(selectedAction({ ...ANON_PAGE, host: "crownbedding-production.sbmstudio.com.au" })).toBe("cache");
+  });
+
+  it("CACHES NOTHING on the agency's own zone — apex, www, the fallback origin and the cell origin", () => {
+    // Caching the fallback origin or a cell origin would be a genuinely bad failure mode: those
+    // hosts are how Cloudflare reaches the cell, so a cached copy there poisons every custom
+    // hostname riding on it.
+    for (const host of [
+      "sbmstudio.com.au",
+      "www.sbmstudio.com.au",
+      "host.sbmstudio.com.au",
+      "cell-australia-southeast2-origin.sbmstudio.com.au",
+      "sftp.sbmstudio.com.au",
+      "staging-crownbedding.sbmstudio.com.au",
+      "pma-crownbedding.sbmstudio.com.au",
+      // A decorated form of an in-zone host still fails closed — that is why the clause is
+      // `contains ".<zone>"` rather than `ends_with`.
+      "host.sbmstudio.com.au.",
+    ]) {
+      expect(selectedAction({ ...ANON_PAGE, host })).toBe("none");
+      expect(selectedAction({ ...ANON_PAGE, host, cookie: "wordpress_logged_in_x=admin" })).toBe("none");
+    }
+  });
+
+  it("CACHES NOTHING on a branded media host (served by the media Worker from R2, not our WordPress origin)", () => {
+    expect(selectedAction({ ...ANON_PAGE, host: "media.bsodigital.com.au", path: "/crownbedding/2026/07/" })).toBe("none");
+    expect(selectedAction({ ...ANON_PAGE, host: "media.bsodigital.com.au", path: "/crownbedding/a.jpg" })).toBe("none");
+    // The exclusion is the literal `media.` label, so a customer domain merely CONTAINING "media"
+    // is unaffected.
+    expect(selectedAction({ ...ANON_PAGE, host: "mediacompany.com.au" })).toBe("cache");
+    expect(selectedAction({ ...ANON_PAGE, host: "social-media.example.net" })).toBe("cache");
   });
 });
 

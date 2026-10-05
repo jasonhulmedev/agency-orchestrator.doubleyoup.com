@@ -289,14 +289,17 @@ export function validateCachePurgeParams(raw: unknown): ParamsVerdict<CachePurge
 
 // ── cache-rule-upsert ────────────────────────────────────────────────────────────────
 // Upsert the ONE standing "edge page cache" Cache Rule (phase http_request_cache_settings) in an
-// agency zone, so anonymous visitors to the agency's WordPress production hosts are served from
-// Cloudflare's edge. Actuated with the agency's own CF_DNS_API_TOKEN, which now also carries
+// agency zone, so anonymous visitors to the agency's WordPress sites are served from Cloudflare's
+// edge. Actuated with the agency's own CF_DNS_API_TOKEN, which now also carries
 // Zone → Cache Rules: Edit (a deploy-time scope add, not a new secret).
 //
 // NARROW AUTHORITY (Direction-B principle, fail-closed): the job carries only a host SUFFIX, a TTL
 // and an on/off switch — NEVER a raw expression or raw action_parameters. The Worker builds the
 // whole rule itself (edge-cache-rule.ts) from these three values, so the platform can at most turn
-// a fixed, WordPress-safe cache rule on or off for `*-production.<zone>` hosts. The suffix must be
+// a fixed, WordPress-safe cache rule on or off for the zone's WordPress sites: its
+// `-production.<zone>` routing hosts plus the customer domains onboarded onto the zone as
+// Cloudflare-for-SaaS custom hostnames, and never the zone apex, the agency's other in-zone hosts
+// or a branded media host (edge-cache-rule.ts "WHICH HOSTS"). The suffix must be
 // EXACTLY "-production." + a zone name; the actuator then resolves that zone with the agency's own
 // token and fails closed when the token cannot see it — the same "restricted to its own zone" rule
 // dns-record-upsert follows. Unlike the older all-strings ops, the TTL is a real number and

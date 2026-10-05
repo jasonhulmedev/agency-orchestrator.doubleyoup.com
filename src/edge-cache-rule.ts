@@ -4,7 +4,9 @@
 // suffix, a TTL and an on/off switch (dispatch-params.ts::validateCacheRuleUpsertParams), and THIS
 // module turns them into the full rules. That keeps the platform's authority narrow (Direction-B,
 // fail-closed): the most a signed job can do is switch a fixed, WordPress-safe pair of page-cache
-// rules on or off for `*-production.<zone>` hosts.
+// rules on or off for the zone's WordPress sites — its `*-production.<zone>` routing hosts and the
+// customer domains onboarded onto the zone as Cloudflare-for-SaaS custom hostnames (see
+// "WHICH HOSTS" below). The host set is derived HERE from the suffix; the job cannot widen it.
 //
 // ── TWIN of the orchestrator's src/edge-cache-rule.ts ──────────────────────────────────
 // The orchestrator applies the SAME rules to the platform zone (doubleyoup.com). Keep both
@@ -31,6 +33,52 @@
 //
 // The cache rule's path/query/cookie exclusions are DEFENSE IN DEPTH for STORING only; serving an
 // already-stored copy is the bypass rule's job (above). The browser TTL follows the origin.
+//
+// ── WHICH HOSTS (edgeCacheHostClause) ──────────────────────────────────────────────────
+//
+// A customer domain (`bsodigital.com.au`) is onboarded as a Cloudflare-for-SaaS CUSTOM HOSTNAME on
+// the agency's zone, NOT as a DNS record in it. For a non-O2O custom hostname Cloudflare applies the
+// SaaS PROVIDER's zone settings to the traffic, so a Cache Rule on THIS zone is what governs
+// customer-domain traffic — one rule covers every custom hostname the zone will ever carry, with no
+// per-domain re-apply. (Under O2O the customer's own zone settings win instead, so our rule simply
+// does not take effect there: no cache, no risk.) The host clause is therefore a two-arm OR:
+//
+//   ends_with(http.host, "-production.<zone>")        <- the internal routing hosts, and
+//   or ( not http.host contains ".<zone>"             <- a FOREIGN domain: a custom hostname
+//        and http.host ne "<zone>"                    <- ...but not the zone apex
+//        and not starts_with(http.host, "media.") )   <- ...and not a branded media host
+//
+// WHY "NOT IN THIS ZONE" IS A SAFE STAND-IN FOR "IS A CUSTOM HOSTNAME". Only two kinds of hostname
+// ever reach a zone's rulesets: a (proxied) DNS record IN the zone, and a custom hostname ON the
+// zone. The first arm's exclusions remove the first kind, so what is left is the second kind — the
+// customer domains the platform onboarded. A stranger cannot register a custom hostname on the
+// agency's zone, and a bare CNAME to its fallback origin without one is refused by Cloudflare
+// (error 1014) before any ruleset runs.
+//
+// THE THREE EXCLUSIONS, each load-bearing:
+//   - `not http.host contains ".<zone>"` removes every in-zone host — the agency's own tooling and,
+//     importantly, its CF-for-SaaS fallback-origin and cell-origin hosts. Deliberately `contains`
+//     and not `ends_with`: a decorated form of an in-zone host (a trailing-dot FQDN) still contains
+//     ".<zone>" and so still fails CLOSED, where `ends_with` would let it through. The cost is that
+//     a foreign domain embedding ".<zone>" as a substring is never cached; the failure direction is
+//     "not cached", not "wrongly cached".
+//   - `http.host ne "<zone>"` is the APEX TRAP: `example.com` does not contain ".example.com", so
+//     without this clause the zone apex — the AGENCY's own marketing site, which the platform may
+//     not even host — would start being cached.
+//   - `not starts_with(http.host, "media.")` keeps BRANDED MEDIA hosts out. `media.<domain>` is an
+//     exact platform convention, and those hosts are served by the media Worker out of R2 — a
+//     different origin that never signs up to this rule's Cache-Control contract. There is nothing
+//     to win: media objects carry real file extensions, so the extension clause already skips them.
+//
+// WHAT STOPS A MISTAKE HERE FROM CACHING SOMETHING PERSONAL: `bypass_by_default` + the origin. Even
+// if some host did slip past these exclusions, Cloudflare stores NOTHING unless that host's origin
+// answered with a cacheable Cache-Control. The host clause is scoping; the origin is the guarantee.
+//
+// CASE: Cloudflare does NOT lowercase `http.host` (its docs recommend `lower(http.host)` for
+// case-insensitive matching), and every clause here is case-sensitive. A mixed-case Host on an
+// in-zone host would therefore escape the exclusions. `lower()` is not used because it is unproven
+// in this phase on these zones and a rejected expression blocks the whole apply; the origin veto
+// above bounds the consequence to "a public page gets cached", not "a personal page gets cached".
 //
 // `edgeTtlSeconds` still arrives in the signed op (validated 60..3600) for wire compatibility, but
 // it no longer lands in a rule: the edge TTL is the origin's s-maxage.
@@ -225,14 +273,32 @@ export function clampEdgeCacheTtl(seconds: number): number | null {
   return wholeSeconds;
 }
 
-/** The clauses both rules share: an HTML-ish page (no extension, .php, .html) on a production host. */
-function edgeCachePageOnHostClauses(hostSuffix: string): string[] {
-  return [`ends_with(http.host, "${hostSuffix}")`, '(http.request.uri.path.extension in {"" "php" "html"})'];
+/**
+ * The host clause both rules share: an internal `<slug>-production.<zone>` routing host, OR a
+ * foreign domain on the zone (a Cloudflare-for-SaaS custom hostname = a customer domain), with the
+ * zone apex and the branded media hosts carved back out. See "WHICH HOSTS" in the header for why
+ * each exclusion is there and why `contains` rather than `ends_with`.
+ *
+ * Both `hostSuffix` and `zone` must already be validated (they land inside quoted Rules-language
+ * strings).
+ */
+function edgeCacheHostClause(hostSuffix: string, zone: string): string {
+  const internalProductionHost = `ends_with(http.host, "${hostSuffix}")`;
+  const notInThisZone = `not http.host contains ".${zone}"`;
+  const notTheZoneApex = `http.host ne "${zone}"`;
+  const notABrandedMediaHost = 'not starts_with(http.host, "media.")';
+  const customHostname = `(${notInThisZone} and ${notTheZoneApex} and ${notABrandedMediaHost})`;
+  return `(${internalProductionHost} or ${customHostname})`;
 }
 
-/** The CACHE rule's expression. `hostSuffix` must already be validated (safe to quote). */
-function edgeCacheExpression(hostSuffix: string): string {
-  const clauses: string[] = ['(http.request.method in {"GET" "HEAD"})', ...edgeCachePageOnHostClauses(hostSuffix)];
+/** The clauses both rules share: an HTML-ish page (no extension, .php, .html) on one of our hosts. */
+function edgeCachePageOnHostClauses(hostSuffix: string, zone: string): string[] {
+  return [edgeCacheHostClause(hostSuffix, zone), '(http.request.uri.path.extension in {"" "php" "html"})'];
+}
+
+/** The CACHE rule's expression. `hostSuffix` / `zone` must already be validated (safe to quote). */
+function edgeCacheExpression(hostSuffix: string, zone: string): string {
+  const clauses: string[] = ['(http.request.method in {"GET" "HEAD"})', ...edgeCachePageOnHostClauses(hostSuffix, zone)];
   for (const pathPrefix of EDGE_CACHE_EXCLUDED_PATH_PREFIXES) {
     clauses.push(`not starts_with(http.request.uri.path, "${pathPrefix}")`);
   }
@@ -251,16 +317,19 @@ function edgeCacheExpression(hostSuffix: string): string {
  * no path/query clauses (a bypass can never be too wide). The extension clause matters: without it a
  * logged-in admin's CSS/JS/images would also bypass the cache, which would be a real slowdown.
  */
-function edgeCacheBypassExpression(hostSuffix: string): string {
+function edgeCacheBypassExpression(hostSuffix: string, zone: string): string {
   const cookieClauses = EDGE_CACHE_PERSONAL_COOKIE_FRAGMENTS.map((fragment) => `http.cookie contains "${fragment}"`);
-  return [...edgeCachePageOnHostClauses(hostSuffix), `(${cookieClauses.join(" or ")})`].join(" and ");
+  return [...edgeCachePageOnHostClauses(hostSuffix, zone), `(${cookieClauses.join(" or ")})`].join(" and ");
 }
 
 /** Build both rule bodies from the three narrow inputs. */
 export function buildEdgeCacheRules(input: EdgeCacheRuleInput): EdgeCacheRulesVerdict {
   // The suffix is embedded inside a quoted Rules-language string, so it must pass the strict
-  // "-production.<zone>" grammar first (only [a-z0-9_.-] can reach the expression).
-  if (edgeCacheZoneFromHostSuffix(input.hostSuffix) === null) {
+  // "-production.<zone>" grammar first (only [a-z0-9_.-] can reach the expression). The validated
+  // ZONE is kept, not discarded: the host clause needs it for the custom-hostname arm, and it
+  // carries exactly the same guarantee as the suffix.
+  const zone = edgeCacheZoneFromHostSuffix(input.hostSuffix);
+  if (zone === null) {
     return { ok: false, reason: `hostSuffix "${input.hostSuffix}" is not "-production." + a lowercase zone name` };
   }
   // The clamp still runs so a non-finite TTL is refused the same way on both twins, even though the
@@ -277,7 +346,7 @@ export function buildEdgeCacheRules(input: EdgeCacheRuleInput): EdgeCacheRulesVe
   const rules: EdgeCacheRuleSet = {
     bypass: {
       description: EDGE_CACHE_BYPASS_RULE_DESCRIPTION,
-      expression: edgeCacheBypassExpression(input.hostSuffix),
+      expression: edgeCacheBypassExpression(input.hostSuffix, zone),
       action: "set_cache_settings",
       // Bypass: never serve this request from the cache, never store its response.
       action_parameters: { cache: false },
@@ -285,7 +354,7 @@ export function buildEdgeCacheRules(input: EdgeCacheRuleInput): EdgeCacheRulesVe
     },
     cache: {
       description: EDGE_CACHE_RULE_DESCRIPTION,
-      expression: edgeCacheExpression(input.hostSuffix),
+      expression: edgeCacheExpression(input.hostSuffix, zone),
       action: "set_cache_settings",
       action_parameters: {
         // Eligible for cache — but `bypass_by_default` means Cloudflare stores a response ONLY when
