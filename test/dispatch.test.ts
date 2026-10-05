@@ -6013,7 +6013,6 @@ describe("buildEdgeCacheRules: the Worker builds BOTH rules from three narrow in
     'and not http.cookie contains "wordpress_logged_in_"',
     'and not http.cookie contains "wp-postpass_"',
     'and not http.cookie contains "comment_author_"',
-    'and not http.cookie contains "woocommerce_items_in_cart"',
     'and not http.cookie contains "wp_woocommerce_session_"',
     'and not http.cookie contains "woocommerce_cart_hash"',
     'and not http.cookie contains "woocommerce_recently_viewed"',
@@ -6028,7 +6027,6 @@ describe("buildEdgeCacheRules: the Worker builds BOTH rules from three narrow in
     'and (http.cookie contains "wordpress_logged_in_"',
     'or http.cookie contains "wp-postpass_"',
     'or http.cookie contains "comment_author_"',
-    'or http.cookie contains "woocommerce_items_in_cart"',
     'or http.cookie contains "wp_woocommerce_session_"',
     'or http.cookie contains "woocommerce_cart_hash"',
     'or http.cookie contains "woocommerce_recently_viewed"',
@@ -6070,11 +6068,27 @@ describe("buildEdgeCacheRules: the Worker builds BOTH rules from three narrow in
     expect(EDGE_CACHE_BYPASS_RULE_DESCRIPTION).toBe("doubleyoup: edge page cache (bypass personal cookies)");
   });
 
-  it("a personal-cookie request (woocommerce_items_in_cart, wordpress_logged_in_) is claimed by the BYPASS rule and refused by the CACHE rule", () => {
+  // THE EMPTY CART. `woocommerce_items_in_cart` is deliberately absent from BOTH expressions: WP
+  // Engine value-matches `=[1-9]+` so an empty cart keeps its cache, and Cloudflare cannot read a
+  // cookie's VALUE below a Business plan (`matches` is Business+). The origin makes the precise
+  // call instead — the cell's nginx map and the mu-plugin both test `=[1-9]`. The BYPASS rule
+  // loses nothing by it: WooCommerce writes and clears the counter and `woocommerce_cart_hash`
+  // in the same call, so a real cart always carries the hash, which IS still a bypass cookie.
+  it("neither rule mentions woocommerce_items_in_cart (an empty cart keeps its cache; the origin decides)", () => {
+    const built = buildEdgeCacheRules({ hostSuffix: "-production.example.com", edgeTtlSeconds: 600 });
+    if (!built.ok) throw new Error(built.reason);
+    expect(built.rules.cache.expression).not.toContain("woocommerce_items_in_cart");
+    expect(built.rules.bypass.expression).not.toContain("woocommerce_items_in_cart");
+    // The cookie a filled cart always carries alongside it is still on both sides.
+    expect(built.rules.bypass.expression).toContain('http.cookie contains "woocommerce_cart_hash"');
+    expect(built.rules.cache.expression).toContain('and not http.cookie contains "woocommerce_cart_hash"');
+  });
+
+  it("a personal-cookie request (woocommerce_cart_hash, wordpress_logged_in_) is claimed by the BYPASS rule and refused by the CACHE rule", () => {
     const built = buildEdgeCacheRules({ hostSuffix: "-production.example.com", edgeTtlSeconds: 600 });
     if (!built.ok) throw new Error(built.reason);
     for (const cookieFragment of [
-      "woocommerce_items_in_cart",
+      "woocommerce_cart_hash",
       "wordpress_logged_in_",
       "wp_woocommerce_session_",
       "comment_author_",

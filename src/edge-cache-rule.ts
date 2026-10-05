@@ -85,6 +85,59 @@ const EDGE_CACHE_EXCLUDED_PATH_PREFIXES = [
 // Query fragments that mark a preview or a cart action: never cache them.
 const EDGE_CACHE_EXCLUDED_QUERY_FRAGMENTS = ["preview=", "add-to-cart", "wc-ajax"];
 
+// ── MARKETING QUERY PARAMETERS (utm_*, gclid, fbclid) — INVESTIGATED 2026-10-05, NOT SHIPPED ──
+//
+// THE PROBLEM, and it is the big one. Cloudflare's default cache key is the FULL URL including the
+// query string, so `/post/` reached from twelve ad creatives is twelve cache objects, each of which
+// has to be filled from PHP once. WP Engine does not strip these either — their Edge Full Page
+// Cache caches each unique query string as its own object — which is a large part of why a real
+// 30-day report for one of their sites shows 233,676 MISSes against 1.9M hits. Normalising these
+// params OUT OF THE CACHE KEY turns most of that column into hits. It is the biggest honest win
+// available, and it is NOT taken here. What was checked, against Cloudflare's current docs:
+//
+//   1. Cache Rules -> Cache Key -> Query String (include/exclude named params).
+//      THE CLEAN FIX, and ENTERPRISE ONLY. developers.cloudflare.com/cache/how-to/cache-keys/
+//      publishes a per-plan table whose "Query string" row reads Free: No, Pro: No, Business: No,
+//      Enterprise: Yes. It is the only mechanism that changes the CACHE KEY while leaving the
+//      ORIGIN request untouched. An agency zone on anything below Enterprise is out.
+//
+//   2. A Transform Rule (URL rewrite) stripping the params before the cache lookup.
+//      EXPRESSIBLE ON PRO, but unproven and not free of consequences.
+//      - Transform Rules are available on every plan (Free 10, Pro 25 active rules). Regular
+//        expressions are Business+, both for the `matches` operator and for `regex_replace()`, so
+//        the usual regex recipe is out below Business. BUT `remove_query_args(
+//        http.request.uri.query, "utm_source", ...)` is a plain function, not a regex, and the
+//        match side needs only `contains` — so the whole rule IS writable on Pro.
+//      - URL rewrites run in `http_request_transform`, ahead of Cache Rules
+//        (`http_request_cache_settings`) and ahead of the cache lookup. COULD NOT VERIFY from
+//        Cloudflare's own documentation that the cache key is then built from the REWRITTEN URL;
+//        their URL-rewrite page says nothing about caching. Every third-party guide asserts it,
+//        and the execution order makes it very likely, but it is the load-bearing fact and it
+//        needs one live proof (two requests differing only in `utm_source`, same `cf-cache-status`
+//        object) on a throwaway host before it goes anywhere near customer traffic.
+//      - THE TRAP: a URL rewrite strips the params from what the ORIGIN sees as well. On Pro there
+//        is no way to decouple those — decoupling is exactly the Enterprise cache-key feature
+//        above. Client-side analytics are unaffected (a rewrite never changes the browser's URL,
+//        so GA/GTM still read them from window.location), but anything reading them SERVER-side
+//        stops seeing them: Gravity Forms dynamic population from a query string, any plugin that
+//        stamps a UTM onto an order or a form submission, some affiliate plugins. That is a
+//        per-site question, not a platform-wide one, so a zone-wide rule is the wrong shape for it.
+//        It is also exactly the kind of judgement an agency must make for its own zone, which is a
+//        second reason this Worker does not grow an op for it.
+//
+//   3. nginx. It cannot do this. nginx is the ORIGIN here; the cache key is built at the Cloudflare
+//      edge before the request is ever sent to us, so nothing nginx emits can collapse two cache
+//      entries into one. Honest answer: not at this layer.
+//
+//   4. Cache Rules -> Cache Key -> "Sort query string" (`cache_key.ignore_query_strings_order`).
+//      Available on ALL plans, and DELIBERATELY NOT TAKEN. It only merges URLs that differ in
+//      param ORDER, and ad platforms emit a fixed order, so the real gain is near zero — while it
+//      would merge `?a=1&a=2` with `?a=2&a=1`, which PHP resolves to DIFFERENT values of $_GET['a'].
+//      A near-zero win is not worth any chance of serving one page's HTML for another's URL.
+//
+// So: the real fix needs an Enterprise zone, or a proven-then-opt-in Transform Rule per zone whose
+// origin-visibility cost each site has accepted. Neither belongs in this builder today.
+
 // Cookies that mark a visitor whose pages are personal (logged in, unlocked a password post, left
 // a comment, or has a WooCommerce cart/session). The cache rule REFUSES these requests (never store
 // for them) and the bypass rule CLAIMS them (never serve them a stored copy) — the same list on both
@@ -96,11 +149,26 @@ const EDGE_CACHE_EXCLUDED_QUERY_FRAGMENTS = ["preview=", "add-to-cart", "wc-ajax
 // It is safe to leave out because the STORE side already refuses the leak: the response that starts
 // a PHP session carries a Set-Cookie, so the origin marks it `private, no-store` and nothing is stored.
 // `wordpress_sec_` is also absent: a logged-in visitor always carries `wordpress_logged_in_` too.
+//
+// DECIDED 2026-10-05 — `woocommerce_items_in_cart` is deliberately NOT here any more, so that an
+// EMPTY cart keeps its cache. WP Engine value-matches `woocommerce_items_in_cart=[1-9]+`: a visitor
+// whose cart is empty still gets cached pages. Cloudflare's `contains` cannot look at a cookie's
+// value, and the `matches` operator that could needs a Business plan (the platform zone is Pro), so
+// the choice at the edge is "bypass every value, including 0" or "do not look at this cookie at
+// all". Neither edge rule needs to look at it:
+//   - SERVING: WooCommerce writes `woocommerce_items_in_cart` and `woocommerce_cart_hash` in the
+//     SAME call (WC_Cart_Session::set_cart_cookies) and clears both in the same call, so a visitor
+//     who has anything in their cart always carries the cart hash too — which is still in this
+//     list. Dropping the counter costs the bypass rule nothing.
+//   - STORING: the origin makes the precise decision. The cell's nginx map value-matches
+//     `(^|;\s*)woocommerce_items_in_cart=[1-9]` and the `doubleyoup-edge-cache` mu-plugin applies
+//     the same test in PHP, so a real cart is still never marked public.
+// Keeping it here would have meant the edge bypassed an empty-cart visitor the origin was happy to
+// serve from cache — i.e. the WP Engine behaviour we are trying to beat.
 const EDGE_CACHE_PERSONAL_COOKIE_FRAGMENTS = [
   "wordpress_logged_in_",
   "wp-postpass_",
   "comment_author_",
-  "woocommerce_items_in_cart",
   "wp_woocommerce_session_",
   "woocommerce_cart_hash",
   // WP Engine parity for WooCommerce: both are Woo-only, so a non-Woo site never carries them and
