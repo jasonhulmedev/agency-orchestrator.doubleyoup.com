@@ -75,6 +75,9 @@ export interface Env {
   // which is the pre-hub#64 behaviour (both tiers in one bucket); set it to an UNLOCKED
   // bucket to split them. Same credential either way: S3_ACCESS_KEY_ID /
   // S3_SECRET_ACCESS_KEY / S3_REGION / S3_ENDPOINT cover both buckets.
+  // It is the bucket NAME, not a URL. Setting it to the "S3 API" URL the R2 dashboard
+  // shows has happened on a live Worker; gcp-instance-set-metadata now refuses that
+  // shape rather than splicing a URL into the node's backup repository path.
   S3_BACKUP_BUCKET?: string;
 
   // Stripe secret key (the agency's own account — used for the subscription).

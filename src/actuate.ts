@@ -268,6 +268,14 @@ export type GcpNetworkDeleteResult =
 // actuateGcpInstanceSetMetadata). The metadata write is WAITED to DONE, so ok:true means the new
 // metadata is in place and a following gcp-instance-restart boots with it.
 //
+// `placeholderValues` carries the RESOLVED value of the substituted placeholders that are NOT
+// secrets — and only those, by the hardcoded PLACEHOLDER_VALUES_SAFE_TO_ECHO allowlist. It exists
+// because reporting that a placeholder was "substituted" says nothing about WHAT it resolved to:
+// `@@DY_T1_S3_BUCKET@@` falls back to S3_BUCKET when the optional S3_BACKUP_BUCKET secret is unset,
+// and on 2026-10-06 that fallback was reported as a clean substitution while Tier-1 kept writing to
+// the wrong bucket. A placeholder the allowlist does not name is ABSENT from this map — not masked,
+// not truncated.
+//
 // `staleFingerprint` (ok:false ONLY) is set when Google rejected the write with 412 — the instance's
 // metadata changed between this op's read and its write. A DISCRIMINABLE field (never a detail-string
 // match): the caller re-runs DELIBERATELY (a re-run re-reads and re-merges); the Worker never retries
@@ -282,6 +290,8 @@ export type GcpInstanceSetMetadataResult =
       instanceName: string;
       keysSet: string[];
       placeholdersSubstituted: string[];
+      /** Non-secret resolved values only, keyed by placeholder name. See the comment above. */
+      placeholderValues: Record<string, string>;
       operationName: string;
     }
   | {
@@ -3473,8 +3483,11 @@ export async function actuateGcpNetworkDelete(
 //
 // INJECTION SURFACE: `project` / `zone` / `name` are grammar-checked URL path segments (encoded again
 // here); the merged items land ONLY in the JSON.stringify'd body. No substituted secret is ever
-// logged, echoed in a result, or placed in a detail string — results and details carry placeholder
-// NAMES and metadata KEYS only.
+// logged, echoed in a result, or placed in a detail string. A DETAIL carries placeholder NAMES, env
+// var names and metadata KEYS only, never a value of any kind. A SUCCESSFUL RESULT additionally
+// carries the resolved values of the placeholders PLACEHOLDER_VALUES_SAFE_TO_ECHO names — the two
+// buckets, the endpoint and the region — and of nothing else; see that allowlist for why the two
+// credential placeholders are absent from it and must stay absent.
 
 /**
  * The FIXED allowlist of placeholders this Worker will substitute into a metadata value, each named
@@ -3499,6 +3512,37 @@ export const METADATA_PLACEHOLDER_NAMES = [
 ] as const;
 export type MetadataPlaceholderName = (typeof METADATA_PLACEHOLDER_NAMES)[number];
 
+/**
+ * THE ALLOWLIST OF PLACEHOLDERS WHOSE RESOLVED VALUE MAY BE ECHOED BACK IN THE RESULT. Adding a name
+ * to this list is how a secret would leak out of this Worker, so treat an edit here as a security
+ * change and not a reporting tweak.
+ *
+ * These four are not credentials: two bucket names, an object-store endpoint host and an AWS region.
+ * They are reported because "the placeholder was substituted" says nothing about WHAT it resolved to,
+ * and that gap produced a real silent failure — `@@DY_T1_S3_BUCKET@@` falls back to S3_BUCKET when
+ * the optional S3_BACKUP_BUCKET secret is unset, so a Tier-1 bucket that never changed was reported
+ * as a clean substitution and an `ok` run, while restic kept writing into the locked Tier-2 bucket
+ * (hub#64). Echoing the value is what makes that visible from the control plane instead of from an
+ * SSH session and an mtime comparison.
+ *
+ * `@@DY_T2_S3_ACCESS_KEY_ID@@` and `@@DY_T2_S3_SECRET_ACCESS_KEY@@` are DELIBERATELY ABSENT and must
+ * stay absent. A secret key is obvious; an access key id is half of a credential and is a
+ * long-lived identifier of the agency's object store, and Direction-B's whole point is that the
+ * platform never holds either half. Anything not named here is omitted from the result entirely —
+ * not masked, not truncated, absent.
+ */
+export const PLACEHOLDER_VALUES_SAFE_TO_ECHO = [
+  "@@DY_T1_S3_BUCKET@@",
+  "@@DY_T2_S3_BUCKET@@",
+  "@@DY_T2_S3_ENDPOINT@@",
+  "@@DY_T2_S3_REGION@@",
+] as const;
+
+/** Whether one substituted placeholder's resolved value may appear in the op's result. */
+function mayEchoPlaceholderValue(placeholder: MetadataPlaceholderName): boolean {
+  return (PLACEHOLDER_VALUES_SAFE_TO_ECHO as readonly string[]).includes(placeholder);
+}
+
 /** The sigil every placeholder starts and ends with. A value may not contain it anywhere else. */
 const PLACEHOLDER_SIGIL = "@@";
 /** The shape of a well-formed placeholder TOKEN, used only to NAME an unknown one in a detail string. */
@@ -3513,6 +3557,85 @@ const PLACEHOLDER_TOKEN_RE = /^@@[A-Za-z0-9_]{1,64}@@/;
  * with a message naming the ENV VAR, never the value. Bounded so a junk mega-string fails here.
  */
 const BOOT_SAFE_VALUE_RE = /^[A-Za-z0-9+/=._:-]{1,512}$/;
+
+// ── Shape guards for the values whose shape is actually known ────────────────────────────────
+//
+// WHY THESE EXIST ON TOP OF THE CHARSET GUARD, and why they are this specific. On 2026-10-06 an
+// agency's optional S3_BACKUP_BUCKET secret was set to the agency's S3 API URL instead of the bucket
+// NAME, and BOOT_SAFE_VALUE_RE passed it: ":", "/", "." and "-" are all inside that charset, so a
+// whole URL sits comfortably in a guard meant to stop junk from reaching a root-run boot script. The
+// published metadata read `DY_T1_S3_BUCKET='https://<acct>.r2.cloudflarestorage.com'`, and because
+// file.sh composes the restic repository as `s3:<endpoint>/<bucket>/<slug>`, the next boot would have
+// produced `s3:https://host/https://host/dy-backups-tier1/<slug>`.
+//
+// IT IS THE NATURAL MISTAKE, NOT A CARELESS ONE. Cloudflare's R2 dashboard labels the
+// endpoint-plus-bucket URL "the S3 API", so that URL is what is on the clipboard when someone goes
+// looking for the bucket. People will keep making it, which is why the refusal below names the
+// variable and says the value looks like a URL rather than leaving them to compare two charsets.
+//
+// The charset guard STAYS and still runs first. These are narrower, additional checks on the three
+// values whose shape this Worker actually knows — the two buckets and the endpoint. Like every other
+// guard here, a refusal names the ENV VAR and the shape expected, and NEVER echoes the value: a
+// bucket name is not a credential, but keeping the no-echo discipline uniform is worth more than the
+// convenience of seeing the bad value in the error.
+
+/**
+ * An S3 bucket name, by S3's own naming rules: 3-63 characters, lowercase letters / digits / dots /
+ * hyphens, beginning and ending with a letter or digit. R2 is stricter still (no dots), so a name
+ * that passes here is accepted by both.
+ *
+ * Two of S3's rules are checked separately below because a regex states them badly: no two adjacent
+ * dots, and not formatted as an IPv4 address.
+ *
+ * S3's reserved prefixes and suffixes (`xn--`, `sthree-`, `amzn-s3-demo-`, `-s3alias`, `--ol-s3`,
+ * `.mrap`, `--x-s3`) are DELIBERATELY NOT enforced. S3 refuses those at bucket CREATION, so no
+ * existing bucket carries one, and rejecting a name the agency's store actually accepts would break a
+ * working configuration to catch a case that cannot occur.
+ */
+const S3_BUCKET_NAME_RE = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
+
+/** S3 refuses a bucket name formatted as an IPv4 address; the digits-and-dots shape is enough here. */
+const IPV4_SHAPED_RE = /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/;
+
+/** What a pasted URL carries and a bucket name never does. Named so the refusal can be specific. */
+const URL_SCHEME_SEPARATOR = "://";
+
+/**
+ * A bare object-store endpoint: scheme, host, optional port, and NOTHING after it. The opposite
+ * mistake to the bucket one — an endpoint SHOULD be a URL, but one carrying a path segment (e.g.
+ * `https://<acct>.r2.cloudflarestorage.com/<bucket>`) is concatenated with the bucket name by
+ * file.sh, so that segment ends up in the repository path twice.
+ */
+const S3_ENDPOINT_URL_RE = /^https?:\/\/[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$/;
+
+/**
+ * Why `value` is not a usable bucket name, or null when it is one. Guard clauses in the order an
+ * operator would want to read them: the mistake that actually happens first, then the general shape,
+ * then the two rules the regex cannot state.
+ */
+function describeBucketNameFault(envName: string, value: string): string | null {
+  if (value.includes(URL_SCHEME_SEPARATOR)) {
+    return (
+      `${envName} looks like an endpoint URL, not a bucket name (it contains "${URL_SCHEME_SEPARATOR}") — refusing to ` +
+      `splice it into a boot script, where it would become part of the backup repository path. Cloudflare's R2 ` +
+      `dashboard labels the endpoint-plus-bucket URL "the S3 API", which is the usual source of this: set ` +
+      `${envName} to the bucket NAME alone and leave the URL in S3_ENDPOINT.`
+    );
+  }
+  if (!S3_BUCKET_NAME_RE.test(value)) {
+    return (
+      `${envName} is not a valid S3/R2 bucket name — it must be 3 to 63 characters of lowercase letters, digits, ` +
+      `dots and hyphens, beginning and ending with a letter or digit.`
+    );
+  }
+  if (value.includes("..")) {
+    return `${envName} is not a valid S3/R2 bucket name — a bucket name may not contain two adjacent dots.`;
+  }
+  if (IPV4_SHAPED_RE.test(value)) {
+    return `${envName} is not a valid S3/R2 bucket name — a bucket name may not be formatted as an IPv4 address.`;
+  }
+  return null;
+}
 
 /** The agency's object-store configuration as the Worker itself uses it (see the resolver below). */
 interface AgencyObjectStoreConfig {
@@ -3565,8 +3688,11 @@ const NATIVE_AWS_ENDPOINT_FOR_BOOT = "";
  *     encoding of native AWS S3).
  *   - S3_BACKUP_BUCKET unset => S3_BUCKET (see the comment at the point of use: the fallback is what
  *     keeps every existing agency on its current behaviour with no action).
- * Every non-empty value must then fit BOOT_SAFE_VALUE_RE (see above). All of them are checked whenever
- * ANY placeholder is present, so a broken S3 configuration fails the whole op rather than half of it.
+ * Every non-empty value must then fit BOOT_SAFE_VALUE_RE (see above), and the three values whose shape
+ * this Worker knows — both buckets and the endpoint — must additionally fit that shape (see the block
+ * comment above S3_BUCKET_NAME_RE: a URL passes the charset guard, and one reached a live node). All of
+ * them are checked whenever ANY placeholder is present, so a broken S3 configuration fails the whole op
+ * rather than half of it.
  */
 function resolveAgencyObjectStoreForBoot(env: Env): { ok: true; config: AgencyObjectStoreConfig } | { ok: false; detail: string } {
   const missing: string[] = [];
@@ -3651,6 +3777,33 @@ function resolveAgencyObjectStoreForBoot(env: Env): { ok: true; config: AgencyOb
       };
     }
   }
+
+  // The narrower SHAPE checks, after the charset guard so a value that is junk in both ways is
+  // reported under the simpler rule. See the block comment above S3_BUCKET_NAME_RE for why a URL in
+  // a bucket variable is the specific mistake these catch.
+  const bucketChecks: Array<[string, string]> = [["S3_BUCKET", config.bucket]];
+  if (tier1BucketEnvName === "S3_BACKUP_BUCKET") {
+    bucketChecks.push(["S3_BACKUP_BUCKET", config.tier1Bucket]);
+  }
+  for (const [envName, value] of bucketChecks) {
+    const fault = describeBucketNameFault(envName, value);
+    if (fault !== null) {
+      return { ok: false, detail: fault };
+    }
+  }
+
+  // "" is the script's own encoding of native AWS S3 (see NATIVE_AWS_ENDPOINT_FOR_BOOT), so only a
+  // configured endpoint has a shape to check.
+  if (config.endpoint !== "" && !S3_ENDPOINT_URL_RE.test(config.endpoint)) {
+    return {
+      ok: false,
+      detail:
+        "S3_ENDPOINT is not a bare endpoint URL — it must be scheme://host with an optional port and NOTHING after " +
+        "it. An endpoint carrying a path segment (the bucket name, typically) is joined to the bucket name on the " +
+        "node, so that segment lands in the backup repository path twice.",
+    };
+  }
+
   return { ok: true, config };
 }
 
@@ -3680,7 +3833,16 @@ function describeUnknownPlaceholder(value: string, offset: number): string {
 }
 
 export type PlaceholderSubstitution =
-  | { ok: true; value: string; substituted: MetadataPlaceholderName[] }
+  | {
+      ok: true;
+      value: string;
+      substituted: MetadataPlaceholderName[];
+      /**
+       * The RESOLVED value of each substituted placeholder that PLACEHOLDER_VALUES_SAFE_TO_ECHO
+       * names, keyed by placeholder name. Anything else — both credential halves — is absent.
+       */
+      placeholderValues: Record<string, string>;
+    }
   | { ok: false; detail: string };
 
 /**
@@ -3691,11 +3853,13 @@ export type PlaceholderSubstitution =
  * place. Plain string slicing throughout (no regex replacement), so a secret containing "$&"-style
  * sequences can never be reinterpreted. A value with no `@@` at all is returned untouched without
  * reading any S3_* variable, so a non-secret metadata key works on a Worker with no object store
- * configured. Exported for the unit tests; `substituted` lists placeholder NAMES only.
+ * configured. Exported for the unit tests; `substituted` lists placeholder NAMES only, and
+ * `placeholderValues` carries the resolved value of the non-secret ones (PLACEHOLDER_VALUES_SAFE_TO_ECHO).
  */
 export function substituteMetadataPlaceholders(value: string, env: Env): PlaceholderSubstitution {
   const output: string[] = [];
   const substituted: MetadataPlaceholderName[] = [];
+  const placeholderValues: Record<string, string> = {};
   let config: AgencyObjectStoreConfig | null = null;
   let cursor = 0;
 
@@ -3721,14 +3885,20 @@ export function substituteMetadataPlaceholders(value: string, env: Env): Placeho
       }
       config = resolved.config;
     }
-    output.push(valueForPlaceholder(placeholder, config));
+    const resolvedValue = valueForPlaceholder(placeholder, config);
+    output.push(resolvedValue);
     if (!substituted.includes(placeholder)) {
       substituted.push(placeholder);
+    }
+    // The ONE place a resolved value is kept for reporting. The allowlist is consulted here, on the
+    // value itself, so a placeholder it does not name can never reach the result by any path.
+    if (mayEchoPlaceholderValue(placeholder)) {
+      placeholderValues[placeholder] = resolvedValue;
     }
     cursor = sigilAt + placeholder.length;
   }
 
-  return { ok: true, value: output.join(""), substituted };
+  return { ok: true, value: output.join(""), substituted, placeholderValues };
 }
 
 /** What instances.get answers with (the fields these ops read). */
@@ -3850,6 +4020,7 @@ export async function actuateGcpInstanceSetMetadata(
   // zero side effects on the agency's project.
   const renderedItems: GcpInstanceMetadataItem[] = [];
   const placeholdersSubstituted: MetadataPlaceholderName[] = [];
+  const placeholderValues: Record<string, string> = {};
   for (const item of params.items) {
     const rendered = substituteMetadataPlaceholders(item.value, env);
     if (!rendered.ok) {
@@ -3861,6 +4032,10 @@ export async function actuateGcpInstanceSetMetadata(
         placeholdersSubstituted.push(name);
       }
     }
+    // Every item resolves from the SAME env, so two items naming one placeholder agree on its value
+    // and a later item cannot change what an earlier one reported. Non-secret values only — the
+    // PLACEHOLDER_VALUES_SAFE_TO_ECHO allowlist is applied inside substituteMetadataPlaceholders.
+    Object.assign(placeholderValues, rendered.placeholderValues);
   }
 
   const token = await mintPinnedGcpAccessToken(env, project);
@@ -3959,6 +4134,7 @@ export async function actuateGcpInstanceSetMetadata(
     instanceName,
     keysSet: renderedItems.map((item) => item.key),
     placeholdersSubstituted,
+    placeholderValues,
     operationName,
   };
 }

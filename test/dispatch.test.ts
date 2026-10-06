@@ -71,6 +71,7 @@ import {
   buildDbExportScript,
   buildDbImportScript,
   METADATA_PLACEHOLDER_NAMES,
+  PLACEHOLDER_VALUES_SAFE_TO_ECHO,
   mergeMetadataItems,
   substituteMetadataPlaceholders,
 } from "../src/actuate.js";
@@ -6213,6 +6214,15 @@ describe("POST /actuate route", () => {
         "@@DY_T2_S3_REGION@@",
         "@@DY_T1_S3_BUCKET@@",
       ],
+      // hub#64: the RESOLVED values of the four non-secret placeholders, so the operator sees WHICH
+      // bucket Tier-1 landed on rather than only that a substitution happened. envWith() leaves
+      // S3_BACKUP_BUCKET unset, so Tier-1 falls back to S3_BUCKET and the two buckets are equal.
+      placeholderValues: {
+        "@@DY_T2_S3_ENDPOINT@@": "https://acct123.r2.example.test",
+        "@@DY_T2_S3_BUCKET@@": "agency-backups",
+        "@@DY_T2_S3_REGION@@": "auto",
+        "@@DY_T1_S3_BUCKET@@": "agency-backups",
+      },
       operationName: "operation-setmeta",
     });
     // Names only in the result — never the agency's secret, the script's restic line, or the token.
@@ -6221,6 +6231,10 @@ describe("POST /actuate route", () => {
     expect(resultText).not.toContain("s3-akid-example");
     expect(resultText).not.toContain("fixture-restic-password");
     expect(resultText).not.toContain(GCP_ACCESS_TOKEN);
+    // The two CREDENTIAL placeholders are ABSENT from the value map — not masked, not truncated.
+    const reported = (resultBody as { placeholderValues: Record<string, string> }).placeholderValues;
+    expect(Object.keys(reported)).not.toContain("@@DY_T2_S3_ACCESS_KEY_ID@@");
+    expect(Object.keys(reported)).not.toContain("@@DY_T2_S3_SECRET_ACCESS_KEY@@");
 
     const [tokenCall] = calls;
     expect(tokenCall.url).toBe("https://oauth2.googleapis.com/token");
@@ -6289,6 +6303,8 @@ describe("POST /actuate route", () => {
       instanceName: "dy-file-australia-southeast1-1",
       keysSet: ["startup-script"],
       placeholdersSubstituted: [],
+      // Nothing was substituted, so there is nothing to report a value for.
+      placeholderValues: {},
       operationName: "operation-setmeta-2",
     });
     const [, setCall] = computeCalls(calls);
@@ -6369,6 +6385,61 @@ describe("POST /actuate route", () => {
     expect(body.detail).toMatch(/refusing to write a boot script with an empty one/);
     expect(body.detail).not.toContain("s3-akid-example");
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("gcp-instance-set-metadata: hub#64 — an S3_BACKUP_BUCKET holding a URL is refused BEFORE the token mint and any Google call, naming the variable", async () => {
+    // The live 2026-10-06 mistake, through the whole route: the agency's S3 API URL in the optional
+    // Tier-1 bucket secret. The refusal must cost nothing — no minted credential, no instance read,
+    // certainly no metadata write — exactly like the unknown-placeholder and missing-secret refusals.
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpSetMetadataJob();
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey, S3_BACKUP_BUCKET: "https://acct123.r2.example.test" }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; op: string; instanceName: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-instance-set-metadata");
+    expect(body.detail).toMatch(/metadata key "startup-script": S3_BACKUP_BUCKET looks like an endpoint URL, not a bucket name/);
+    expect(body.detail).not.toContain("acct123");
+    expect(body.detail).not.toContain("fixture-restic-password");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("gcp-instance-set-metadata: hub#64 — a SET S3_BACKUP_BUCKET is reported as Tier-1's own bucket, DIFFERENT from Tier-2's", async () => {
+    // The whole point of the value report: the two buckets differ, visibly, from the control plane.
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpSetMetadataJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      fileNodeInstance(),
+      { body: { name: "operation-setmeta-t1", status: "RUNNING" } },
+      { body: { name: "operation-setmeta-t1", status: "DONE" } },
+    ]);
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey, S3_BACKUP_BUCKET: "agency-backups-tier1" }),
+    );
+    const body = (await response.json()) as { ok: boolean; placeholderValues: Record<string, string> };
+    expect(body.ok).toBe(true);
+    expect(body.placeholderValues["@@DY_T1_S3_BUCKET@@"]).toBe("agency-backups-tier1");
+    expect(body.placeholderValues["@@DY_T2_S3_BUCKET@@"]).toBe("agency-backups");
+    expect(Object.keys(body.placeholderValues).sort()).toEqual([
+      "@@DY_T1_S3_BUCKET@@",
+      "@@DY_T2_S3_BUCKET@@",
+      "@@DY_T2_S3_ENDPOINT@@",
+      "@@DY_T2_S3_REGION@@",
+    ]);
+    // The published script really carries the split, not just the report.
+    const [, setCall] = computeCalls(calls);
+    const written = (setCall.body as { items: Array<{ key: string; value: string }> }).items[1];
+    expect(written.value).toContain("readonly DY_T1_BUCKET='agency-backups-tier1'\n");
+    expect(written.value).toContain("readonly DY_T2_BUCKET='agency-backups'\n");
   });
 
   it("gcp-instance-set-metadata: an UNSET S3_ENDPOINT substitutes '' (the backup runner's encoding of native AWS) while the credentials still substitute for real", async () => {
@@ -7194,6 +7265,9 @@ describe("substituteMetadataPlaceholders: fixed allowlist, fail-closed", () => {
       ok: true,
       value: "T1='agency-backups' T2='agency-backups'",
       substituted: ["@@DY_T1_S3_BUCKET@@", "@@DY_T2_S3_BUCKET@@"],
+      // EQUAL reported values are what the fallback looks like from the control plane, and the only
+      // way to see it without an SSH session: the orchestrator says so in the provisioning summary.
+      placeholderValues: { "@@DY_T1_S3_BUCKET@@": "agency-backups", "@@DY_T2_S3_BUCKET@@": "agency-backups" },
     });
     // An EMPTY string is "unset" too — an empty bucket name would produce a node that looks
     // provisioned and never backs up, which is the failure the whole op exists to end.
@@ -7201,6 +7275,7 @@ describe("substituteMetadataPlaceholders: fixed allowlist, fail-closed", () => {
       ok: true,
       value: "T1='agency-backups'",
       substituted: ["@@DY_T1_S3_BUCKET@@"],
+      placeholderValues: { "@@DY_T1_S3_BUCKET@@": "agency-backups" },
     });
   });
 
@@ -7216,7 +7291,142 @@ describe("substituteMetadataPlaceholders: fixed allowlist, fail-closed", () => {
       value:
         "T1='agency-backups-tier1' T2='agency-backups' E='https://acct123.r2.example.test' A='AKIAFIXTUREEXAMPLE00'",
       substituted: ["@@DY_T1_S3_BUCKET@@", "@@DY_T2_S3_BUCKET@@", "@@DY_T2_S3_ENDPOINT@@", "@@DY_T2_S3_ACCESS_KEY_ID@@"],
+      // The two buckets DIFFER, which is how a set S3_BACKUP_BUCKET reads from the control plane.
+      // The access key id was substituted but is NOT reported — it is half of a credential.
+      placeholderValues: {
+        "@@DY_T1_S3_BUCKET@@": "agency-backups-tier1",
+        "@@DY_T2_S3_BUCKET@@": "agency-backups",
+        "@@DY_T2_S3_ENDPOINT@@": "https://acct123.r2.example.test",
+      },
     });
+  });
+
+  // ── which resolved VALUES may be reported (hub#64) ─────────────────────────────────────
+  // The allowlist is the boundary. A placeholder it does not name must be ABSENT from the reported
+  // map — not masked, not truncated — and the DEFAULT for any name must be "not reported", so that a
+  // seventh placeholder added to METADATA_PLACEHOLDER_NAMES cannot start echoing a secret by itself.
+
+  it("PLACEHOLDER_VALUES_SAFE_TO_ECHO is exactly the four NON-SECRET names — neither credential half is on it", () => {
+    expect([...PLACEHOLDER_VALUES_SAFE_TO_ECHO]).toEqual([
+      "@@DY_T1_S3_BUCKET@@",
+      "@@DY_T2_S3_BUCKET@@",
+      "@@DY_T2_S3_ENDPOINT@@",
+      "@@DY_T2_S3_REGION@@",
+    ]);
+    // Stated as an absence, deliberately: an access key id is half of a credential, not a label.
+    expect(PLACEHOLDER_VALUES_SAFE_TO_ECHO).not.toContain("@@DY_T2_S3_ACCESS_KEY_ID@@");
+    expect(PLACEHOLDER_VALUES_SAFE_TO_ECHO).not.toContain("@@DY_T2_S3_SECRET_ACCESS_KEY@@");
+  });
+
+  it("every placeholder NOT on the echo allowlist is ABSENT from placeholderValues — so a new one is silent by default", () => {
+    // Swept over METADATA_PLACEHOLDER_NAMES rather than written out, so a SEVENTH placeholder added
+    // later is covered by this test the day it is added: unless it is also put on the echo
+    // allowlist, its value must not appear. That is the "a hypothetical new secret placeholder is
+    // not echoed by default" property, as a test rather than a reading of the code.
+    for (const placeholder of METADATA_PLACEHOLDER_NAMES) {
+      const verdict = substituteMetadataPlaceholders(`X='${placeholder}'`, s3Env({ S3_BACKUP_BUCKET: "agency-backups-tier1" }));
+      expect(verdict.ok).toBe(true);
+      if (!verdict.ok) continue;
+
+      const mayEcho = (PLACEHOLDER_VALUES_SAFE_TO_ECHO as readonly string[]).includes(placeholder);
+      expect(Object.keys(verdict.placeholderValues), placeholder).toEqual(mayEcho ? [placeholder] : []);
+    }
+  });
+
+  it("a script carrying ALL SIX placeholders reports the four non-secret values and NEITHER credential, by key or by value", () => {
+    const script =
+      "A='@@DY_T2_S3_ACCESS_KEY_ID@@' S='@@DY_T2_S3_SECRET_ACCESS_KEY@@' E='@@DY_T2_S3_ENDPOINT@@' " +
+      "B='@@DY_T2_S3_BUCKET@@' R='@@DY_T2_S3_REGION@@' T1='@@DY_T1_S3_BUCKET@@'";
+    const verdict = substituteMetadataPlaceholders(script, s3Env({ S3_BACKUP_BUCKET: "agency-backups-tier1" }));
+    expect(verdict.ok).toBe(true);
+    if (!verdict.ok) return;
+
+    expect(verdict.placeholderValues).toEqual({
+      "@@DY_T2_S3_ENDPOINT@@": "https://acct123.r2.example.test",
+      "@@DY_T2_S3_BUCKET@@": "agency-backups",
+      "@@DY_T2_S3_REGION@@": "auto",
+      "@@DY_T1_S3_BUCKET@@": "agency-backups-tier1",
+    });
+    // Absence by KEY and by VALUE: the credential is in `value` (it has to be — that is the point of
+    // the substitution) and must not have leaked into the reported map by any route.
+    const reportedText = JSON.stringify(verdict.placeholderValues);
+    expect(reportedText).not.toContain("AKIAFIXTUREEXAMPLE00");
+    expect(reportedText).not.toContain("fixture+secret/base64=");
+    expect(verdict.value).toContain("AKIAFIXTUREEXAMPLE00");
+  });
+
+  // ── the two bucket placeholders must hold a BUCKET NAME, not a URL (hub#64) ─────────────
+
+  it("hub#64: an endpoint URL in S3_BACKUP_BUCKET is REFUSED naming that variable and saying it looks like a URL", () => {
+    // The real mistake, 2026-10-06: the agency's S3 API URL was pasted into S3_BACKUP_BUCKET. Every
+    // character of it is inside BOOT_SAFE_VALUE_RE, so only a shape check catches it — and without
+    // one the node would have been published with
+    // DY_T1_S3_BUCKET='https://<acct>.r2.cloudflarestorage.com'.
+    const url = "https://043e3bdaf4a6849a2d745269084c0e5f.r2.cloudflarestorage.com";
+    const verdict = substituteMetadataPlaceholders("T1='@@DY_T1_S3_BUCKET@@'", s3Env({ S3_BACKUP_BUCKET: url }));
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) return;
+    expect(verdict.detail).toMatch(/^S3_BACKUP_BUCKET looks like an endpoint URL, not a bucket name/);
+    expect(verdict.detail).toMatch(/Cloudflare's R2 dashboard labels the endpoint-plus-bucket URL "the S3 API"/);
+    expect(verdict.detail).toMatch(/leave the URL in S3_ENDPOINT/);
+    // The offending value is named by VARIABLE, never echoed — the same discipline as every other
+    // guard here, even though a bucket name is not a credential.
+    expect(verdict.detail).not.toContain(url);
+    expect(verdict.detail).not.toContain("043e3bdaf4a6849a2d745269084c0e5f");
+  });
+
+  it("hub#64: a URL in S3_BUCKET is refused under S3_BUCKET's own name — Tier-2's bucket gets the same check", () => {
+    const verdict = substituteMetadataPlaceholders("T2='@@DY_T2_S3_BUCKET@@'", s3Env({ S3_BUCKET: "https://acct123.r2.example.test" }));
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) return;
+    expect(verdict.detail).toMatch(/^S3_BUCKET looks like an endpoint URL, not a bucket name/);
+    expect(verdict.detail).not.toContain("acct123");
+  });
+
+  it("hub#64: a bucket value that is not a URL but is not a bucket name either is refused by SHAPE, naming the variable only", () => {
+    const notBucketNames: Array<[string, RegExp]> = [
+      ["ab", /^S3_BACKUP_BUCKET is not a valid S3\/R2 bucket name — it must be 3 to 63 characters/],
+      ["a".repeat(64), /^S3_BACKUP_BUCKET is not a valid S3\/R2 bucket name — it must be 3 to 63 characters/],
+      ["Agency-Backups", /it must be 3 to 63 characters of lowercase letters/], // uppercase
+      ["-agency-backups", /beginning and ending with a letter or digit/],
+      ["agency-backups-", /beginning and ending with a letter or digit/],
+      [".agency.backups", /beginning and ending with a letter or digit/],
+      ["agency..backups", /may not contain two adjacent dots/],
+      ["192.168.5.4", /may not be formatted as an IPv4 address/],
+    ];
+    for (const [value, expected] of notBucketNames) {
+      const verdict = substituteMetadataPlaceholders("T1='@@DY_T1_S3_BUCKET@@'", s3Env({ S3_BACKUP_BUCKET: value }));
+      expect(verdict.ok, value).toBe(false);
+      if (verdict.ok) continue;
+      expect(verdict.detail, value).toMatch(expected);
+      expect(verdict.detail, value).not.toContain(value);
+    }
+  });
+
+  it("hub#64: real bucket names PASS — dotted, hyphenated, digits, and the minimum length", () => {
+    const realBucketNames = ["sbmstudio", "sbmstudio-backups-tier1", "doubleyoup-agency-backups", "my.bucket.name", "a1b", "123bucket"];
+    for (const value of realBucketNames) {
+      const verdict = substituteMetadataPlaceholders("T1='@@DY_T1_S3_BUCKET@@'", s3Env({ S3_BACKUP_BUCKET: value }));
+      expect(verdict.ok, value).toBe(true);
+      if (!verdict.ok) continue;
+      expect(verdict.value).toBe(`T1='${value}'`);
+      expect(verdict.placeholderValues["@@DY_T1_S3_BUCKET@@"]).toBe(value);
+    }
+  });
+
+  it("hub#64: an S3_ENDPOINT carrying a PATH is refused — the node joins it to the bucket name", () => {
+    // The opposite-direction mistake: an endpoint SHOULD be a URL, but `https://host/<bucket>` makes
+    // the bucket appear twice in the repository path file.sh composes.
+    const verdict = substituteMetadataPlaceholders("E='@@DY_T2_S3_ENDPOINT@@'", s3Env({ S3_ENDPOINT: "https://acct123.r2.example.test/sbmstudio" }));
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) return;
+    expect(verdict.detail).toMatch(/^S3_ENDPOINT is not a bare endpoint URL/);
+    expect(verdict.detail).toMatch(/scheme:\/\/host with an optional port and NOTHING after it/);
+    expect(verdict.detail).not.toContain("sbmstudio");
+    // A bare host, a host with a port, and the trailing-slash form all still pass.
+    for (const endpoint of ["https://acct123.r2.example.test", "https://acct123.r2.example.test/", "http://minio.internal:9000"]) {
+      expect(substituteMetadataPlaceholders("E='@@DY_T2_S3_ENDPOINT@@'", s3Env({ S3_ENDPOINT: endpoint })).ok, endpoint).toBe(true);
+    }
   });
 
   it("hub#64: an unsafe S3_BACKUP_BUCKET is refused under ITS OWN name, never S3_BUCKET's", () => {
@@ -7245,12 +7455,23 @@ describe("substituteMetadataPlaceholders: fixed allowlist, fail-closed", () => {
         "@@DY_T2_S3_BUCKET@@",
         "@@DY_T2_S3_REGION@@",
       ],
+      // Both credentials were substituted into the value; NEITHER is reported.
+      placeholderValues: {
+        "@@DY_T2_S3_ENDPOINT@@": "https://acct123.r2.example.test",
+        "@@DY_T2_S3_BUCKET@@": "agency-backups",
+        "@@DY_T2_S3_REGION@@": "auto",
+      },
     });
   });
 
   it("a value with NO placeholder is returned untouched and reads no S3_* variable at all", () => {
     const script = "#!/bin/bash\necho 'no placeholders here, even an email like a@b.c is fine'\n";
-    expect(substituteMetadataPlaceholders(script, {} as unknown as Env)).toEqual({ ok: true, value: script, substituted: [] });
+    expect(substituteMetadataPlaceholders(script, {} as unknown as Env)).toEqual({
+      ok: true,
+      value: script,
+      substituted: [],
+      placeholderValues: {},
+    });
   });
 
   it("an UNKNOWN @@TOKEN@@ is refused by name — nothing else about the value is echoed", () => {
@@ -7305,6 +7526,8 @@ describe("substituteMetadataPlaceholders: fixed allowlist, fail-closed", () => {
       ok: true,
       value: "E='' R='us-east-1'",
       substituted: ["@@DY_T2_S3_ENDPOINT@@", "@@DY_T2_S3_REGION@@"],
+      // "" is a MEANING here (native AWS S3), not a missing value, so it is reported as it stands.
+      placeholderValues: { "@@DY_T2_S3_ENDPOINT@@": "", "@@DY_T2_S3_REGION@@": "us-east-1" },
     });
   });
 
