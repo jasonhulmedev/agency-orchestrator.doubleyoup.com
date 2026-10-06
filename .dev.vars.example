@@ -15,6 +15,9 @@ S3_SECRET_ACCESS_KEY=""
 S3_REGION="us-east-1"
 S3_BUCKET=""
 S3_ENDPOINT=""
+# Optional: Tier-1 (restic) writes here instead of S3_BUCKET. Leave empty unless S3_BUCKET has an
+# object-lock/retention policy — restic needs delete, so Tier-1's bucket must be UNLOCKED (hub#64).
+S3_BACKUP_BUCKET=""
 
 # Stripe (the agency's own account)
 STRIPE_SECRET_KEY=""

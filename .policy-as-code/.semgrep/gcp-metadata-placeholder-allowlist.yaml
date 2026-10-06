@@ -1,19 +1,29 @@
-# The metadata placeholder allowlist, pinned to its approved five names.
+# The metadata placeholder allowlist, pinned to its approved six names.
 #
 # WHAT THE LIST IS. It is the security boundary of the whole Direction-B credential path. The
-# orchestrator renders an agency cell's root boot script with `@@DY_T2_S3_*@@` tokens in place of
-# the agency's object-store credential; the agency Worker substitutes its OWN S3_* secrets for
-# exactly these names before calling GCP setMetadata, and REFUSES any other `@@...@@` rather than
-# passing it through. That refusal is why the platform never holds the agency's R2 key — the
-# point of Direction-B and the reason the op is shaped this awkward way instead of the simple one
-# (planning/47, "Decisions taken" and §1).
+# orchestrator renders an agency cell's root boot script with `@@DY_T1_S3_BUCKET@@` /
+# `@@DY_T2_S3_*@@` tokens in place of the agency's object-store values; the agency Worker
+# substitutes its OWN S3_* secrets for exactly these names before calling GCP setMetadata, and
+# REFUSES any other `@@...@@` rather than passing it through. That refusal is why the platform
+# never holds the agency's R2 key — the point of Direction-B and the reason the op is shaped this
+# awkward way instead of the simple one (planning/47, "Decisions taken" and §1).
 #
-# WHAT A SIXTH NAME COSTS. Each entry is one more agency secret the Worker will splice into a
+# WHAT A SEVENTH NAME COSTS. Each entry is one more agency value the Worker will splice into a
 # script Google runs AS ROOT on every boot. planning/47 §1 is explicit that substitution "must be
 # allowlisted to a fixed set of known names, and must not be a general template engine — a Worker
 # that substitutes arbitrary tokens into a root-run boot script is a far larger surface than the
 # one we need." Adding to the list is the one-line edit that turns the first sentence into the
 # second, so it should not be able to pass review unnoticed.
+#
+# WHY THE SIXTH NAME WAS ADDED (hub#64, 2026-10-06). `@@DY_T1_S3_BUCKET@@` is Tier-1's own bucket
+# name, separate from Tier-2's `@@DY_T2_S3_BUCKET@@`. The two tiers want opposite things from a
+# bucket: Tier-1 is restic, which REQUIRES delete — it writes a lock object per run and removes it,
+# and `forget`/`prune` retention is implemented entirely by deleting — while Tier-2 is a write-once
+# full whose purpose is to survive a compromised credential and therefore wants a retention/lock
+# policy. Sharing one locked bucket was proven in a live run to leave Tier-1 with an unremovable
+# lock and retention that silently never runs. It is a BUCKET NAME, not a credential, and the
+# Worker's OPTIONAL S3_BACKUP_BUCKET secret falls back to S3_BUCKET when unset, so no existing
+# agency changes behaviour.
 #
 # WHY A PINNED LITERAL. The names carry no property a matcher can test — the approved list IS the
 # policy. The rule holds a copy and flags every other value, so changing the constant forces a
@@ -28,10 +38,10 @@ rules:
   - id: dy-gcp-metadata-placeholder-allowlist-pinned
     message: >-
       The agency Worker's metadata placeholder allowlist is no longer exactly the five
-      @@DY_T2_S3_*@@ names. This list is the security boundary of the Direction-B credential
-      path: the Worker substitutes its OWN secrets for exactly these tokens and refuses every
-      other @@...@@, which is what keeps the platform from ever holding the agency's
-      object-store credential. Another name is another agency secret spliced into a script
+      @@DY_T2_S3_*@@ names plus @@DY_T1_S3_BUCKET@@. This list is the security boundary of the
+      Direction-B credential path: the Worker substitutes its OWN secrets for exactly these tokens
+      and refuses every other @@...@@, which is what keeps the platform from ever holding the
+      agency's object-store credential. Another name is another agency value spliced into a script
       Google runs as root on every boot — a decision, not a one-line edit (planning/47 §1).
       Change the Worker's METADATA_PLACEHOLDER_NAMES and the orchestrator's
       GCP_METADATA_PLACEHOLDERS together, and say why.
@@ -57,6 +67,7 @@ rules:
             "@@DY_T2_S3_ENDPOINT@@",
             "@@DY_T2_S3_BUCKET@@",
             "@@DY_T2_S3_REGION@@",
+            "@@DY_T1_S3_BUCKET@@",
           ] as const;
       - pattern-not: |
           const GCP_METADATA_PLACEHOLDERS = [
@@ -65,4 +76,5 @@ rules:
             "@@DY_T2_S3_ENDPOINT@@",
             "@@DY_T2_S3_BUCKET@@",
             "@@DY_T2_S3_REGION@@",
+            "@@DY_T1_S3_BUCKET@@",
           ] as const;

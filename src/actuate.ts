@@ -3448,13 +3448,14 @@ export async function actuateGcpNetworkDelete(
 // cell can be UPDATED (the `startup-script` key is what Google runs as root on every boot; the first
 // consumer re-renders the file node's script with the backup credentials so its timers arm). Four
 // steps, in this fixed order:
-//   1. SUBSTITUTE the `@@DY_T2_S3_*@@` placeholders in every value from this Worker's OWN S3_*
-//      configuration — BEFORE any token is minted or any call is made, so a value this Worker will
-//      not stand behind fails with zero side effects. This is the op's second security boundary (see
-//      substituteMetadataPlaceholders): the platform never holds the agency's object-store credential,
-//      it sends a script with placeholders and the Worker fills them in. The allowlist is FIXED and
-//      SMALL; any other `@@...@@` is refused outright, never passed through — a stray placeholder in a
-//      root boot script is a failure worth refusing loudly, not a value worth guessing at.
+//   1. SUBSTITUTE the `@@DY_T1_S3_BUCKET@@` / `@@DY_T2_S3_*@@` placeholders in every value from this
+//      Worker's OWN S3_* configuration — BEFORE any token is minted or any call is made, so a value
+//      this Worker will not stand behind fails with zero side effects. This is the op's second
+//      security boundary (see substituteMetadataPlaceholders): the platform never holds the agency's
+//      object-store credential, it sends a script with placeholders and the Worker fills them in.
+//      The allowlist is FIXED and SMALL; any other `@@...@@` is refused outright, never passed
+//      through — a stray placeholder in a root boot script is a failure worth refusing loudly, not a
+//      value worth guessing at.
 //   2. GET the instance to read its current metadata `fingerprint` + `items`.
 //   3. MERGE: every existing key NOT named in the request survives verbatim (losing an unrelated key
 //      on a live node is a silent, serious regression); a named key is replaced in place; a new key is
@@ -3477,13 +3478,16 @@ export async function actuateGcpNetworkDelete(
 
 /**
  * The FIXED allowlist of placeholders this Worker will substitute into a metadata value, each named
- * after the Tier-2 backup variable it feeds (infra/storage-tier/backup-full-daily.sh reads
- * DY_T2_ACCESS_KEY_ID / DY_T2_SECRET_ACCESS_KEY / DY_T2_ENDPOINT / DY_T2_BUCKET / DY_T2_REGION). Each
- * maps to the agency's own S3_* Worker secret — see resolveAgencyObjectStoreForBoot for the exact
- * value each one yields. This is NOT a template engine: no expressions, no nesting, no recursion, and
- * a substituted value is itself checked to contain no `@@` (BOOT_SAFE_VALUE_RE admits no "@"), so one
- * substitution can never manufacture another placeholder. Extend this list on purpose, one name at a
- * time, with the matching twin in the platform's renderer.
+ * after the backup variable it feeds. The five `DY_T2_*` names feed Tier-2
+ * (infra/storage-tier/backup-full-daily.sh reads DY_T2_ACCESS_KEY_ID / DY_T2_SECRET_ACCESS_KEY /
+ * DY_T2_ENDPOINT / DY_T2_BUCKET / DY_T2_REGION); `@@DY_T1_S3_BUCKET@@` is Tier-1's own bucket name
+ * (hub#64 — restic cannot operate in a bucket that refuses DELETE, so it must be able to live
+ * somewhere other than Tier-2's deliberately locked bucket). Each maps to the agency's own S3_*
+ * Worker secret — see resolveAgencyObjectStoreForBoot for the exact value each one yields. This is
+ * NOT a template engine: no expressions, no nesting, no recursion, and a substituted value is itself
+ * checked to contain no `@@` (BOOT_SAFE_VALUE_RE admits no "@"), so one substitution can never
+ * manufacture another placeholder. Extend this list on purpose, one name at a time, with the matching
+ * twin in the platform's renderer.
  */
 export const METADATA_PLACEHOLDER_NAMES = [
   "@@DY_T2_S3_ACCESS_KEY_ID@@",
@@ -3491,6 +3495,7 @@ export const METADATA_PLACEHOLDER_NAMES = [
   "@@DY_T2_S3_ENDPOINT@@",
   "@@DY_T2_S3_BUCKET@@",
   "@@DY_T2_S3_REGION@@",
+  "@@DY_T1_S3_BUCKET@@",
 ] as const;
 export type MetadataPlaceholderName = (typeof METADATA_PLACEHOLDER_NAMES)[number];
 
@@ -3517,6 +3522,8 @@ interface AgencyObjectStoreConfig {
   region: string;
   /** "" when S3_ENDPOINT is unset — the backup runner's own encoding of "native AWS S3". */
   endpoint: string;
+  /** Tier-1's bucket: S3_BACKUP_BUCKET when set, otherwise `bucket` (see the resolver). */
+  tier1Bucket: string;
 }
 
 /**
@@ -3546,7 +3553,7 @@ const WORKER_EFFECTIVE_S3_REGION_DEFAULT = "us-east-1";
 const NATIVE_AWS_ENDPOINT_FOR_BOOT = "";
 
 /**
- * Resolve the five S3_* values a boot script may receive, by EXACTLY the rule the Worker's own S3
+ * Resolve the S3_* values a boot script may receive, by EXACTLY the rule the Worker's own S3
  * actuators and validator apply (validators.ts::validateS3, actuateDbExport, actuateDbImport):
  *   - S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY / S3_BUCKET are REQUIRED. An unset one is a hard
  *     failure naming the variable — NEVER an empty substitution, because an empty credential in a
@@ -3556,7 +3563,9 @@ const NATIVE_AWS_ENDPOINT_FOR_BOOT = "";
  *     us-east-1, the backup script would fall back to us-east-2 — this is what keeps them agreeing).
  *   - S3_ENDPOINT unset => NATIVE_AWS_ENDPOINT_FOR_BOOT, i.e. "" (see its comment: the script's own
  *     encoding of native AWS S3).
- * Every non-empty value must then fit BOOT_SAFE_VALUE_RE (see above). All five are checked whenever
+ *   - S3_BACKUP_BUCKET unset => S3_BUCKET (see the comment at the point of use: the fallback is what
+ *     keeps every existing agency on its current behaviour with no action).
+ * Every non-empty value must then fit BOOT_SAFE_VALUE_RE (see above). All of them are checked whenever
  * ANY placeholder is present, so a broken S3 configuration fails the whole op rather than half of it.
  */
 function resolveAgencyObjectStoreForBoot(env: Env): { ok: true; config: AgencyObjectStoreConfig } | { ok: false; detail: string } {
@@ -3586,12 +3595,33 @@ function resolveAgencyObjectStoreForBoot(env: Env): { ok: true; config: AgencyOb
   if (env.S3_ENDPOINT) {
     endpoint = stripTrailingSlash(env.S3_ENDPOINT);
   }
+
+  // The THIRD defaulted value, and the one with a hard reason behind it (hub#64). The two tiers want
+  // OPPOSITE things from a bucket: Tier-1 is restic, which REQUIRES delete (it writes a lock object
+  // per run and removes it at the end, and `forget`/`prune` retention is implemented entirely by
+  // deleting), while Tier-2 is a write-once full whose whole purpose is to survive a compromised
+  // credential and therefore wants a retention/lock policy. On the first live Tier-1 run against an
+  // agency bucket that had one, the snapshot was written, the lock could not be removed and retention
+  // became permanently inert — so the two tiers must be able to sit in different buckets.
+  //
+  // UNSET FALLS BACK TO S3_BUCKET, and that fallback is load-bearing: every agency that does nothing
+  // keeps exactly the behaviour it has today (both tiers in the one bucket), and only an agency that
+  // deliberately creates an UNLOCKED Tier-1 bucket and sets S3_BACKUP_BUCKET gets the split. One
+  // credential covers both buckets, so nothing else about the configuration changes.
+  let tier1Bucket = env.S3_BUCKET as string;
+  let tier1BucketEnvName = "S3_BUCKET";
+  if (env.S3_BACKUP_BUCKET) {
+    tier1Bucket = env.S3_BACKUP_BUCKET;
+    tier1BucketEnvName = "S3_BACKUP_BUCKET";
+  }
+
   const config: AgencyObjectStoreConfig = {
     accessKeyId: env.S3_ACCESS_KEY_ID as string,
     secretAccessKey: env.S3_SECRET_ACCESS_KEY as string,
     bucket: env.S3_BUCKET as string,
     region,
     endpoint,
+    tier1Bucket,
   };
 
   // The charset guard names the ENV VAR only — a substituted value may be a secret.
@@ -3602,6 +3632,12 @@ function resolveAgencyObjectStoreForBoot(env: Env): { ok: true; config: AgencyOb
     ["S3_REGION", config.region],
     ["S3_ENDPOINT", config.endpoint],
   ];
+  // Only when S3_BACKUP_BUCKET is really set: on the fallback path tier1Bucket IS the S3_BUCKET value
+  // already checked above, and checking it twice would let a bad value be reported under the wrong
+  // variable name.
+  if (tier1BucketEnvName === "S3_BACKUP_BUCKET") {
+    checks.push(["S3_BACKUP_BUCKET", config.tier1Bucket]);
+  }
   for (const [envName, value] of checks) {
     if (envName === "S3_ENDPOINT" && value === "") {
       continue;
@@ -3624,6 +3660,7 @@ function valueForPlaceholder(placeholder: MetadataPlaceholderName, config: Agenc
   if (placeholder === "@@DY_T2_S3_SECRET_ACCESS_KEY@@") return config.secretAccessKey;
   if (placeholder === "@@DY_T2_S3_ENDPOINT@@") return config.endpoint;
   if (placeholder === "@@DY_T2_S3_BUCKET@@") return config.bucket;
+  if (placeholder === "@@DY_T1_S3_BUCKET@@") return config.tier1Bucket;
   return config.region;
 }
 

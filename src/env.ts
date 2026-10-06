@@ -55,10 +55,11 @@ export interface Env {
   // single-object PUT URL the agency's cell uploads a DB dump to — the credential
   // itself never leaves this Worker (only the derived, short-lived URL reaches the cell).
   // ONE deliberate exception (planning/47): `gcp-instance-set-metadata` substitutes
-  // these five values into a cell node's startup script in place of the fixed
-  // `@@DY_T2_S3_*@@` placeholders, so the node's Tier-2 backup runner can write to the
-  // agency's own store. The values go ONLY into that node's instance metadata in the
-  // agency's own GCP project — never back to the platform, which never holds them.
+  // these values into a cell node's startup script in place of the fixed
+  // `@@DY_T1_S3_BUCKET@@` / `@@DY_T2_S3_*@@` placeholders, so the node's backup runners
+  // can write to the agency's own store. The values go ONLY into that node's instance
+  // metadata in the agency's own GCP project — never back to the platform, which never
+  // holds them.
   S3_ACCESS_KEY_ID?: string;
   S3_SECRET_ACCESS_KEY?: string;
   S3_REGION?: string;
@@ -66,6 +67,15 @@ export interface Env {
   // Optional: a custom S3 endpoint (R2 / MinIO / Wasabi …). When set the
   // validator uses path-style addressing against it; when unset it targets AWS.
   S3_ENDPOINT?: string;
+  // Optional (hub#64): a SECOND bucket, used by Tier-1 (restic) only. Tier-1 and Tier-2
+  // want opposite things from a bucket — restic needs DELETE (it removes its own per-run
+  // lock object, and `forget`/`prune` retention is implemented entirely by deleting),
+  // while Tier-2 is a write-once full whose whole purpose is to survive a compromised
+  // credential and therefore wants a retention/lock policy. UNSET falls back to S3_BUCKET,
+  // which is the pre-hub#64 behaviour (both tiers in one bucket); set it to an UNLOCKED
+  // bucket to split them. Same credential either way: S3_ACCESS_KEY_ID /
+  // S3_SECRET_ACCESS_KEY / S3_REGION / S3_ENDPOINT cover both buckets.
+  S3_BACKUP_BUCKET?: string;
 
   // Stripe secret key (the agency's own account — used for the subscription).
   STRIPE_SECRET_KEY?: string;

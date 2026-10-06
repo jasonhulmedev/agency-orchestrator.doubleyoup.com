@@ -36,6 +36,7 @@ Worker never persists them anywhere else and we never hold them. See
 | `DY_CLIENT_ID` / `DY_CLIENT_SECRET` | secrets | Direction-A OAuth2 client credentials issued by our app at onboarding |
 | `GCP_SERVICE_ACCOUNT_KEY` | secret | the entire Google Cloud service-account JSON |
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_REGION` / `S3_BUCKET` | secrets | object-store (backup) credentials — **Cloudflare R2 recommended**, or AWS S3 (region defaults to `us-east-1`; use `auto` for R2) |
+| `S3_BACKUP_BUCKET` | secret (optional) | a SECOND bucket, used by **Tier-1 (restic) only**. Leave it unset and both backup tiers share `S3_BUCKET` (the existing behaviour). Set it when `S3_BUCKET` carries an object-lock / retention policy: restic needs **delete** (it removes its own per-run lock object, and `forget`/`prune` retention is implemented entirely by deleting), so point this at an **unlocked** bucket. Same credential covers both buckets |
 | `S3_ENDPOINT` | secret (optional) | set for Cloudflare R2 (recommended) or another S3-compatible store (MinIO/Wasabi); uses path-style addressing. When set, `/validate` proves the credential can actually **write** the bucket with an object **PUT** probe (no bucket list, best-effort deleted after), so a normally-scoped R2 Object Read&Write key — which is denied bucket-level `ListObjectsV2` — still validates green, while a read-only key or a non-S3 endpoint is correctly caught |
 | `STRIPE_SECRET_KEY` | secret | the agency's Stripe secret key |
 | `R2_PROVISION_API_TOKEN` | secret | Cloudflare **account-owned** token (Manage Account → Account API Tokens in their account) with Workers R2 Storage: Edit + Account API Tokens: Edit — creates per-site media buckets + mints per-site keys. Must NOT be a My Profile → API Tokens (user) token — those fail the account-scoped check |
@@ -112,6 +113,7 @@ wrangler secret put S3_ACCESS_KEY_ID
 wrangler secret put S3_SECRET_ACCESS_KEY
 wrangler secret put S3_REGION                 # e.g. us-east-1 (or "auto" for R2)
 wrangler secret put S3_BUCKET
+wrangler secret put S3_BACKUP_BUCKET          # optional — Tier-1's own UNLOCKED bucket; unset = same as S3_BUCKET
 wrangler secret put S3_ENDPOINT               # optional — only for R2/MinIO/Wasabi
 wrangler secret put STRIPE_SECRET_KEY
 wrangler secret put R2_PROVISION_API_TOKEN  # ACCOUNT-owned token (Manage Account -> Account API Tokens): Workers R2 Storage: Edit + Account API Tokens: Edit

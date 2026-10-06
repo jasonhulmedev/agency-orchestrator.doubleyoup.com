@@ -448,6 +448,9 @@ const FILE_NODE_BOOT_SCRIPT =
   "readonly DY_T2_ENDPOINT='@@DY_T2_S3_ENDPOINT@@'\n" +
   "readonly DY_T2_BUCKET='@@DY_T2_S3_BUCKET@@'\n" +
   "readonly DY_T2_REGION='@@DY_T2_S3_REGION@@'\n" +
+  // hub#64: Tier-1's bucket is its own placeholder. envWith() leaves S3_BACKUP_BUCKET unset, so this
+  // one renders to the SAME bucket as Tier-2 — the fallback every existing agency stays on.
+  "readonly DY_T1_BUCKET='@@DY_T1_S3_BUCKET@@'\n" +
   "readonly RESTIC_PASSWORD='fixture-restic-password-must-not-echo'\n";
 // What the Worker writes to Google for FILE_NODE_BOOT_SCRIPT under envWith()'s S3_* fixture values.
 const FILE_NODE_BOOT_SCRIPT_RENDERED =
@@ -457,6 +460,7 @@ const FILE_NODE_BOOT_SCRIPT_RENDERED =
   "readonly DY_T2_ENDPOINT='https://acct123.r2.example.test'\n" +
   "readonly DY_T2_BUCKET='agency-backups'\n" +
   "readonly DY_T2_REGION='auto'\n" +
+  "readonly DY_T1_BUCKET='agency-backups'\n" +
   "readonly RESTIC_PASSWORD='fixture-restic-password-must-not-echo'\n";
 const GCP_SET_METADATA_PARAMS = {
   project: "dy-agency-proof",
@@ -6207,6 +6211,7 @@ describe("POST /actuate route", () => {
         "@@DY_T2_S3_ENDPOINT@@",
         "@@DY_T2_S3_BUCKET@@",
         "@@DY_T2_S3_REGION@@",
+        "@@DY_T1_S3_BUCKET@@",
       ],
       operationName: "operation-setmeta",
     });
@@ -7168,14 +7173,60 @@ describe("substituteMetadataPlaceholders: fixed allowlist, fail-closed", () => {
     } as unknown as Env;
   }
 
-  it("exposes exactly the five backup placeholders", () => {
+  it("exposes exactly the six backup placeholders — the five Tier-2 values plus Tier-1's own bucket", () => {
     expect([...METADATA_PLACEHOLDER_NAMES]).toEqual([
       "@@DY_T2_S3_ACCESS_KEY_ID@@",
       "@@DY_T2_S3_SECRET_ACCESS_KEY@@",
       "@@DY_T2_S3_ENDPOINT@@",
       "@@DY_T2_S3_BUCKET@@",
       "@@DY_T2_S3_REGION@@",
+      // hub#64: restic REQUIRES delete (its per-run lock object, and forget/prune retention, are
+      // both implemented by deleting), so Tier-1 cannot share Tier-2's deliberately locked bucket.
+      "@@DY_T1_S3_BUCKET@@",
     ]);
+    expect(METADATA_PLACEHOLDER_NAMES).toHaveLength(6);
+  });
+
+  it("hub#64: S3_BACKUP_BUCKET UNSET falls back to S3_BUCKET, so both tiers keep sharing one bucket", () => {
+    // The fallback is load-bearing: every agency that does nothing must keep exactly the behaviour
+    // it has today. Both placeholders therefore resolve to the same value.
+    expect(substituteMetadataPlaceholders("T1='@@DY_T1_S3_BUCKET@@' T2='@@DY_T2_S3_BUCKET@@'", s3Env())).toEqual({
+      ok: true,
+      value: "T1='agency-backups' T2='agency-backups'",
+      substituted: ["@@DY_T1_S3_BUCKET@@", "@@DY_T2_S3_BUCKET@@"],
+    });
+    // An EMPTY string is "unset" too — an empty bucket name would produce a node that looks
+    // provisioned and never backs up, which is the failure the whole op exists to end.
+    expect(substituteMetadataPlaceholders("T1='@@DY_T1_S3_BUCKET@@'", s3Env({ S3_BACKUP_BUCKET: "" }))).toEqual({
+      ok: true,
+      value: "T1='agency-backups'",
+      substituted: ["@@DY_T1_S3_BUCKET@@"],
+    });
+  });
+
+  it("hub#64: S3_BACKUP_BUCKET SET is used for Tier-1 only — Tier-2 still gets S3_BUCKET", () => {
+    const verdict = substituteMetadataPlaceholders(
+      "T1='@@DY_T1_S3_BUCKET@@' T2='@@DY_T2_S3_BUCKET@@' E='@@DY_T2_S3_ENDPOINT@@' A='@@DY_T2_S3_ACCESS_KEY_ID@@'",
+      s3Env({ S3_BACKUP_BUCKET: "agency-backups-tier1" }),
+    );
+    expect(verdict).toEqual({
+      ok: true,
+      // The two buckets differ; the credential and the endpoint are shared, which is the whole
+      // design — one object-store credential, two buckets with opposite retention policies.
+      value:
+        "T1='agency-backups-tier1' T2='agency-backups' E='https://acct123.r2.example.test' A='AKIAFIXTUREEXAMPLE00'",
+      substituted: ["@@DY_T1_S3_BUCKET@@", "@@DY_T2_S3_BUCKET@@", "@@DY_T2_S3_ENDPOINT@@", "@@DY_T2_S3_ACCESS_KEY_ID@@"],
+    });
+  });
+
+  it("hub#64: an unsafe S3_BACKUP_BUCKET is refused under ITS OWN name, never S3_BUCKET's", () => {
+    // The charset guard must name the variable the operator has to fix. Reporting a bad
+    // S3_BACKUP_BUCKET as "S3_BUCKET" would send them to the wrong secret.
+    const verdict = substituteMetadataPlaceholders("T1='@@DY_T1_S3_BUCKET@@'", s3Env({ S3_BACKUP_BUCKET: "bucket with a space" }));
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) return;
+    expect(verdict.detail).toMatch(/^S3_BACKUP_BUCKET holds a character outside/);
+    expect(verdict.detail).not.toContain("bucket with a space");
   });
 
   it("substitutes every allowlisted placeholder from the Worker's S3_* values (endpoint trailing slash stripped), reporting each NAME once", () => {
@@ -7257,7 +7308,7 @@ describe("substituteMetadataPlaceholders: fixed allowlist, fail-closed", () => {
     });
   });
 
-  it("an S3_* value outside the boot-safe charset is refused naming the ENV VAR only (never the value) — and all five are checked whenever any placeholder is present", () => {
+  it("an S3_* value outside the boot-safe charset is refused naming the ENV VAR only (never the value) — and all of them are checked whenever any placeholder is present", () => {
     const unsafeCases: Array<[Partial<Env>, string]> = [
       [{ S3_BUCKET: "agency@@backups" }, "S3_BUCKET"], // a value may never carry the sigil
       [{ S3_SECRET_ACCESS_KEY: "line1\nline2" }, "S3_SECRET_ACCESS_KEY"], // newline = a second script line

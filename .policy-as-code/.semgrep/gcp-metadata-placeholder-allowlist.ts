@@ -5,7 +5,7 @@
 
 // The approved value, as it stands in the orchestrator's src/agency-dispatch.ts. This is the
 // only form the rule accepts, and the agency Worker's twin list in src/actuate.ts
-// (METADATA_PLACEHOLDER_NAMES) carries the same five names.
+// (METADATA_PLACEHOLDER_NAMES) carries the same six names.
 // ok: dy-gcp-metadata-placeholder-allowlist-pinned
 export const GCP_METADATA_PLACEHOLDERS = [
   "@@DY_T2_S3_ACCESS_KEY_ID@@",
@@ -13,6 +13,7 @@ export const GCP_METADATA_PLACEHOLDERS = [
   "@@DY_T2_S3_ENDPOINT@@",
   "@@DY_T2_S3_BUCKET@@",
   "@@DY_T2_S3_REGION@@",
+  "@@DY_T1_S3_BUCKET@@",
 ] as const;
 
 {
@@ -24,11 +25,12 @@ export const GCP_METADATA_PLACEHOLDERS = [
     "@@DY_T2_S3_ENDPOINT@@",
     "@@DY_T2_S3_BUCKET@@",
     "@@DY_T2_S3_REGION@@",
+    "@@DY_T1_S3_BUCKET@@",
   ] as const;
 }
 
 {
-  // A sixth agency secret spliced into a root-run boot script.
+  // A seventh agency secret spliced into a root-run boot script.
   // ruleid: dy-gcp-metadata-placeholder-allowlist-pinned
   const GCP_METADATA_PLACEHOLDERS = [
     "@@DY_T2_S3_ACCESS_KEY_ID@@",
@@ -36,6 +38,7 @@ export const GCP_METADATA_PLACEHOLDERS = [
     "@@DY_T2_S3_ENDPOINT@@",
     "@@DY_T2_S3_BUCKET@@",
     "@@DY_T2_S3_REGION@@",
+    "@@DY_T1_S3_BUCKET@@",
     "@@DY_CF_API_TOKEN@@",
   ] as const;
 }
@@ -49,7 +52,21 @@ export const GCP_METADATA_PLACEHOLDERS = [
     "@@DY_T2_S3_ENDPOINT@@",
     "@@DY_T2_S3_BUCKET@@",
     "@@DY_T2_S3_REGION@@",
+    "@@DY_T1_S3_BUCKET@@",
     "@@DY_RESTIC_PASSWORD@@",
+  ] as const;
+}
+
+{
+  // The pre-hub#64 five: dropping Tier-1's own bucket would send restic back into Tier-2's locked
+  // bucket, where its lock object cannot be removed and retention silently never runs.
+  // ruleid: dy-gcp-metadata-placeholder-allowlist-pinned
+  const GCP_METADATA_PLACEHOLDERS = [
+    "@@DY_T2_S3_ACCESS_KEY_ID@@",
+    "@@DY_T2_S3_SECRET_ACCESS_KEY@@",
+    "@@DY_T2_S3_ENDPOINT@@",
+    "@@DY_T2_S3_BUCKET@@",
+    "@@DY_T2_S3_REGION@@",
   ] as const;
 }
 
@@ -71,6 +88,7 @@ export const GCP_METADATA_PLACEHOLDERS = [
     "@@DY_T2_S3_ENDPOINT@@",
     "@@DY_T2_S3_BUCKET@@",
     "@@DY_T2_S3_REGION@@",
+    "@@DY_T1_S3_BUCKET@@",
   ] as const;
 }
 

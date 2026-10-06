@@ -21,6 +21,7 @@
 #       wrangler secret put S3_SECRET_ACCESS_KEY
 #       wrangler secret put S3_REGION                 # e.g. us-east-1 (or "auto" for R2)
 #       wrangler secret put S3_BUCKET
+#       wrangler secret put S3_BACKUP_BUCKET          # optional — Tier-1's own UNLOCKED bucket (unset = S3_BUCKET)
 #       wrangler secret put S3_ENDPOINT               # optional — set for R2/MinIO/Wasabi
 #       wrangler secret put STRIPE_SECRET_KEY
 #       wrangler secret put CF_DNS_API_TOKEN           # Zone:DNS:Edit + Zone:Read (Direction-B dns-record-upsert) + Zone:Cache Purge (cache-purge) + Zone:Cache Rules:Edit (cache-rule-upsert)
