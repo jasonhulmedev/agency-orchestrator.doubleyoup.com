@@ -1,48 +1,68 @@
-// The standing EDGE-DEFENSE WAF custom rules — the Worker's OWN builder for the `waf-rule-upsert` op.
+// The EDGE-DEFENSE baseline — the Worker's OWN builder for the `waf-rule-upsert` op: five WAF custom
+// rules plus the Cloudflare Managed Ruleset.
 //
-// The platform never sends this Worker an expression, an action, a country list or a rule body: it
-// sends only a zone name and an on/off switch (dispatch-params.ts::validateWafRuleUpsertParams), and
-// THIS module turns them into the full rules from its own constants. That keeps the platform's
-// authority as narrow as it can be (Direction-B, fail-closed): the most a signed job can do is switch
-// a fixed, known-safe set of three WordPress-defense rules on or off for one zone. A signed job can
-// NEVER widen the blocked-country list, narrow the admin allow-list, or change an action — which
-// matters here more than for any other op, because all three of those would be a self-inflicted
-// outage of every site on the agency's zone.
+// The platform never sends this Worker an expression, an action, a path or a country list. It sends a
+// zone name, an on/off switch, two lists of HOSTS inside that zone and a switch for the Managed
+// Ruleset (dispatch-params.ts::validateWafRuleUpsertParams). THIS module turns them into the rules
+// from its own templates and constants. The country lists stay CONSTANTS on purpose: a signed country
+// list could block AU or allow only KP and take every site on the agency's zone offline. A host list
+// cannot do that — the worst a bad one does is exempt an in-zone host from the front-end challenge.
 //
-// WHAT THE THREE RULES DO:
+// WHAT THE FIVE RULES DO, in APPLY order:
 //   1. doubleyoup-country-block  BLOCK traffic from a small set of high-abuse countries (RU/CN/KP).
 //   2. doubleyoup-wpadmin-geo    BLOCK the WordPress admin/login surface (/wp-admin + /wp-login.php)
 //                                for everyone outside the allow-list (AU/US/GB/NZ/FR/IE).
 //   3. doubleyoup-login-gate     MANAGED-CHALLENGE what is left of the login surface, so brute force
 //                                dies at the edge: /wp-login.php unconditionally, and /wp-admin/
 //                                except admin-ajax.php and an already-logged-in session.
+//   4. doubleyoup-frontend-geo   MANAGED-CHALLENGE everything else from outside the allow-list, except
+//                                verified search-engine crawlers, the zone's infrastructure hosts
+//                                (`excludedHosts`) and its per-site media hosts (`*-media.<zone>`).
+//   5. the /exec skip            SKIP the Managed Ruleset for the cell-agent's /exec on `agentHosts`.
+//                                The agent is a bearer-authenticated machine API whose request bodies
+//                                carry shell commands and presigned URLs, and the Managed Ruleset
+//                                blocks those bodies (measured on syd: a db-export 403'd at the edge
+//                                until this rule existed). It is NOT a protection, so `enabled:false`
+//                                (the rollback) leaves it ON — switching it off would break the agent.
+// Plus the Cloudflare Managed Ruleset in http_request_firewall_managed, deployed by the actuator AFTER
+// rule 5 is in force, never before (the same 403 would otherwise hit every /exec in between).
 //
 // ORDER IS THE POLICY. Cloudflare evaluates a ruleset top-down and the first terminating action wins,
-// so the rules are applied STRICTEST FIRST (country block -> admin geo -> login gate):
+// so the rules are applied STRICTEST FIRST (country block -> admin geo -> login gate -> front end):
 //   - a request from a blocked country to /wp-login.php is BLOCKED, not challenged;
 //   - a request from a non-allow-listed country to /wp-admin is BLOCKED, not challenged;
 //   - a request from an allow-listed country to /wp-login.php is CHALLENGED.
-// Applying in this order also means a PARTIAL apply (a zone out of custom-rule budget) leaves the
-// most protective rules in force rather than the least.
+// The order only decides where a NEW rule lands. A rule that already exists is PATCHed where it is, so
+// a zone whose rules were created in another order (syd's: login gate first) keeps that order.
 //
-// NO HOST CLAUSE — deliberate, and the whole point. A WAF custom rule is evaluated per ZONE across
-// ALL of that zone's traffic, which is what makes it cover a site served on its own customer domain
-// (a Cloudflare-for-SaaS custom hostname on this zone). A rule scoped to `<slug>-production.<zone>`
-// would protect the platform hostname and leave the real customer domain open. The blast radius is
-// the whole zone, including the agency's own site — exactly as these rules already behave on the
-// platform's own zone.
+// NO PER-SITE HOST CLAUSE — deliberate, and the whole point. A WAF custom rule is evaluated per ZONE
+// across ALL of that zone's traffic, which is what makes it cover a site served on its own customer
+// domain (a Cloudflare-for-SaaS custom hostname on this zone). The host lists only EXEMPT the zone's
+// own infrastructure. The blast radius is the whole zone, including the agency's own site.
+//
+// THE LIVE syd RULES. doubleyoup.com carries these five rules today (applied with the orchestrator's
+// own token). The descriptions here are IDENTICAL, so this op finds them and PATCHes them in place.
+// For syd-equivalent hosts the rendered text is byte-identical to the live rules EXCEPT two deliberate
+// changes, so the first run against syd updates exactly two rules:
+//   - wp-admin geo: `starts_with` + the admin-ajax.php exemption (the 2026-10-04 fix, see below);
+//   - front-end geo: one clause APPENDED, `and not ends_with(http.host, "-media.<zone>")` (the media
+//     hosts, Jason 2026-10-07). The live text is an exact prefix of the new text.
+// test/dispatch.test.ts pins all five live strings and both differences.
+//
+// CASE. Cloudflare does not lowercase `http.host`, and the host clauses are case-sensitive (as the
+// live rules are). Both fail SAFE on a mixed-case Host: the front-end exemption does not match, so
+// the request is challenged rather than exempted; the /exec skip does not match, so the Managed
+// Ruleset still runs rather than being skipped.
 //
 // ── TWIN of the orchestrator's src/edge-waf-rule.ts ────────────────────────────────────
-// The orchestrator applies the SAME three rules to the platform zone (doubleyoup.com). Keep every
-// expression byte-identical across the two copies, or platform sites and agency sites get different
-// protection. Both test files pin the same text.
+// The orchestrator keeps a byte-identical copy to print, in a dry run, exactly what this Worker will
+// build. Both test files pin the same text.
 //
-// ONE ASYMMETRY, on purpose: the orchestrator's copy lets the PLATFORM override the two country
-// lists from its own env (COUNTRY_BLOCK_LIST / GEO_ALLOW_COUNTRIES). This copy takes no override at
-// all — an agency zone always gets the default policy, because the only other way to vary it would
-// be to let a signed job carry a country list.
-//
-// PURE: no fetch, no Node APIs — unit-tested in test/dispatch.test.ts.
+// PURE: no fetch, no Node APIs — unit-tested in test/dispatch.test.ts. The inputs MUST already have
+// passed validateWafRuleUpsertParams: hosts are lowercase DNS names, so nothing here can break out of a
+// quoted Rules-language string (escapeRulesString is defense in depth).
+
+import { jsonValuesEqual } from "./edge-cache-rule.js";
 
 /** The stable identity of the uniform country-BLOCK rule. */
 export const WAF_COUNTRY_BLOCK_DESCRIPTION = "doubleyoup-country-block";
@@ -53,69 +73,138 @@ export const WAF_WPADMIN_GEO_DESCRIPTION = "doubleyoup-wpadmin-geo";
 /** The stable identity of the login managed-challenge rule (the "edge login gate"). */
 export const WAF_LOGIN_GATE_DESCRIPTION = "doubleyoup-login-gate";
 
+/** The stable identity of the front-end geo managed-challenge rule. */
+export const WAF_FRONTEND_GEO_DESCRIPTION = "doubleyoup-frontend-geo";
+
+/**
+ * The stable identity of the /exec skip rule. Copied EXACTLY from the live syd rule — it does not start
+ * with "doubleyoup-", and changing it would make this op create a second rule next to syd's.
+ */
+export const WAF_EXEC_SKIP_DESCRIPTION = "skip managed WAF for cell-agent exec (internal bearer-authed endpoint)";
+
 /** The Cloudflare ruleset phase that holds WAF custom rules. */
 export const WAF_PHASE = "http_request_firewall_custom";
 
+/** The phase the Managed Ruleset executes in — and the phase the /exec rule skips. */
+export const WAF_MANAGED_PHASE = "http_request_firewall_managed";
+
 /**
- * The descriptions of OUR rules, in apply order — anything else in the firewall-custom phase is
- * somebody else's and is reported, never touched.
+ * The Cloudflare Managed Ruleset. The id is a Cloudflare-wide constant, not per account: it is the id
+ * Cloudflare's own docs deploy, and the one live on doubleyoup.com.
+ */
+export const CLOUDFLARE_MANAGED_RULESET_ID = "efb7b8c949ac4650a09736fc376e9aee";
+
+/** The description of the execute rule this op adds when it deploys the Managed Ruleset. */
+export const MANAGED_RULESET_RULE_DESCRIPTION = "doubleyoup-managed-ruleset";
+
+/**
+ * The descriptions of OUR five custom rules, in apply order. Matched EXACTLY, never by prefix: the
+ * /exec rule's description does not start with "doubleyoup-", and a prefix would also claim the
+ * `doubleyoup-ban:<id>` rules the ban system owns. Anything else in the phase is somebody else's and is
+ * reported, never touched.
  */
 export const WAF_RULE_DESCRIPTIONS: readonly string[] = [
   WAF_COUNTRY_BLOCK_DESCRIPTION,
   WAF_WPADMIN_GEO_DESCRIPTION,
   WAF_LOGIN_GATE_DESCRIPTION,
+  WAF_FRONTEND_GEO_DESCRIPTION,
+  WAF_EXEC_SKIP_DESCRIPTION,
 ];
 
 /**
- * HARD CAP on how many rules this op may ever place in a zone. Cloudflare's firewall-custom phase
- * allows 5 custom rules on a Free zone (20 on Pro), and neither side knows an agency zone's plan — so
- * the op must fit in a Free zone next to a rule or two of the agency's own. Three rules today; the
- * builder REFUSES to emit more than this, so adding a fourth is a deliberate act and adding a fifth
- * fails here rather than silently dropping a rule on a live zone.
+ * Cloudflare's custom-rule allowance per zone plan, keyed on the zone's `plan.legacy_id`
+ * (developers.cloudflare.com/waf/custom-rules: Free 5, Pro 20, Business 100, Enterprise 1,000).
+ * The actuator REFUSES before any write when our rules plus the zone's other rules would not fit.
  */
-export const WAF_RULE_BUDGET = 4;
+const WAF_CUSTOM_RULE_CAP_BY_PLAN: Readonly<Record<string, number>> = {
+  free: 5,
+  pro: 20,
+  business: 100,
+  enterprise: 1000,
+};
+
+/** The cap assumed for a plan we do not recognise: the smallest one, so a guess can only refuse. */
+export const WAF_UNKNOWN_PLAN_RULE_CAP = 5;
+
+/** The plans that may deploy the Cloudflare Managed Ruleset (Pro and above). */
+const PLANS_WITH_MANAGED_RULESET: readonly string[] = ["pro", "business", "enterprise"];
+
+/** The custom-rule allowance for a zone plan; an absent or unknown plan gets the Free allowance. */
+export function wafCustomRuleCapForPlan(planLegacyId: string | null): number {
+  if (planLegacyId === null) {
+    return WAF_UNKNOWN_PLAN_RULE_CAP;
+  }
+  const cap = WAF_CUSTOM_RULE_CAP_BY_PLAN[planLegacyId];
+  if (cap === undefined) {
+    return WAF_UNKNOWN_PLAN_RULE_CAP;
+  }
+  return cap;
+}
+
+/** True only for a plan Cloudflare lets deploy the Managed Ruleset. Unknown => false. */
+export function planSupportsManagedRuleset(planLegacyId: string | null): boolean {
+  if (planLegacyId === null) {
+    return false;
+  }
+  return PLANS_WITH_MANAGED_RULESET.includes(planLegacyId);
+}
 
 /**
- * The number of custom rules a Cloudflare FREE zone allows in this phase. Used only to EXPLAIN a
- * Cloudflare refusal to the operator — never to decide for Cloudflare, because a Pro zone allows 20
- * and this Worker cannot read the zone's plan.
+ * Cloudflare's limit on one rule expression (4,096 characters). Checked by the builder, so an
+ * over-long host list is refused with nothing written instead of failing half-way through the writes.
  */
-export const WAF_FREE_PLAN_RULE_LIMIT = 5;
+export const WAF_EXPRESSION_MAX_LENGTH = 4096;
 
 /** Countries blocked outright. ISO-3166 alpha-2. A CONSTANT: no signed job can change it. */
 const WAF_BLOCK_COUNTRIES: readonly string[] = ["RU", "CN", "KP"];
 
 /**
- * Countries allowed to reach the WordPress admin/login surface; everyone else is BLOCKED there.
- * ISO-3166 alpha-2. A CONSTANT: no signed job can change it.
+ * The allow-list: countries that may reach the WordPress admin/login surface and that are NOT
+ * challenged on the front end. ISO-3166 alpha-2. A CONSTANT: no signed job can change it.
  */
-const WAF_ADMIN_ALLOW_COUNTRIES: readonly string[] = ["AU", "US", "GB", "NZ", "FR", "IE"];
+const WAF_ALLOW_COUNTRIES: readonly string[] = ["AU", "US", "GB", "NZ", "FR", "IE"];
 
 /** The rule body Cloudflare's ruleset API takes (POST/PATCH of one rule). */
 export interface WafRule {
   description: string;
   expression: string;
-  action: "block" | "managed_challenge";
+  action: "block" | "managed_challenge" | "skip";
+  /** Only the /exec skip rule carries action parameters; the key is ABSENT on the other four. */
+  action_parameters?: { phases: string[] };
   enabled: boolean;
 }
 
-/** All three rules for one zone, named. */
+/** All five rules for one zone, named. */
 export interface WafRuleSet {
   countryBlock: WafRule;
   wpAdminGeo: WafRule;
   loginGate: WafRule;
+  frontendGeo: WafRule;
+  execSkip: WafRule;
+}
+
+/** What the builder needs: the validated params minus the Managed Ruleset switch. */
+export interface WafRuleInput {
+  /** The agency zone NAME; it lands in the media-host suffix clause. */
+  zone: string;
+  /** false switches the four PROTECTIVE rules off in place (rollback). The /exec skip stays on. */
+  enabled: boolean;
+  /** Hosts the front-end challenge never applies to — the zone's own infrastructure. */
+  excludedHosts: readonly string[];
+  /** Cell-agent hosts whose /exec skips the Managed Ruleset. */
+  agentHosts: readonly string[];
 }
 
 /**
- * A verdict, not a throw: actuators in this Worker never throw (they answer ok:false), so a bad
- * state comes back as a reason. Both failure modes here are edit-time bugs (an emptied constant
- * list, a rule set over budget), so this branch is defense in depth.
+ * A verdict, not a throw: actuators in this Worker never throw (they answer ok:false), so a bad state
+ * comes back as a reason. An empty list is an edit-time bug (the validator refuses one); an over-long
+ * expression is a real input limit.
  */
 export type WafRulesVerdict = { ok: true; rules: WafRuleSet } | { ok: false; reason: string };
 
 /**
- * Escape a value for a Cloudflare Rules-language double-quoted string literal. The country lists are
- * constants here, so this is defense in depth against a bad edit.
+ * Escape a value for a Cloudflare Rules-language double-quoted string literal. Country codes are
+ * constants and hosts are validated DNS names, so this never changes a value — defense in depth.
  */
 function escapeRulesString(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -139,10 +228,15 @@ export function normalizeWafCountryCodes(codes: readonly string[]): string[] {
   return normalized;
 }
 
+/** `{"a" "b"}` — a Rules-language set of quoted values, in the order given. */
+function quotedSet(values: readonly string[]): string {
+  const quoted = values.map((value) => `"${escapeRulesString(value)}"`);
+  return `{${quoted.join(" ")}}`;
+}
+
 /** `ip.geoip.country in {"US" "GB"}` — country-set membership (quoted string values). */
 function countrySetExpression(codes: readonly string[]): string {
-  const set = codes.map((code) => `"${escapeRulesString(code)}"`).join(" ");
-  return `ip.geoip.country in {${set}}`;
+  return `ip.geoip.country in ${quotedSet(codes)}`;
 }
 
 /**
@@ -155,7 +249,7 @@ function countrySetExpression(codes: readonly string[]): string {
  * half-way (the page renders, the interactions fail). It is not an admin surface in practice.
  *
  * It is still covered by the country BLOCK rule, which runs FIRST, so a blocked country gets no
- * admin-ajax either.
+ * admin-ajax either — and by the front-end challenge, like every other front-end request.
  */
 const WP_ADMIN_AJAX_PATH = "/wp-admin/admin-ajax.php";
 
@@ -235,15 +329,57 @@ export function wafLoginGateExpression(): string {
   ].join(" ");
 }
 
-/** Build all three rule bodies. `enabled:false` keeps every rule but switches it off (rollback). */
-export function buildEdgeWafRules(input: { enabled: boolean }): WafRulesVerdict {
+/**
+ * The front-end geo expression. Its first three clauses are the live syd text, byte for byte; the
+ * fourth is the per-site MEDIA exemption. Media hosts are `<slug>-media.<zone>` (app's
+ * agencyMediaHostFor, hub#43): one per site, so listing them would mean a re-run per new site. A
+ * subresource request (an image on a page) cannot solve a challenge, so without this clause every
+ * image on a site would break for a visitor outside the allow-list. The suffix keeps the leading "-",
+ * so it cannot match the zone apex or a host such as `media.<zone>` (those are listed explicitly when
+ * they are infrastructure).
+ */
+export function wafFrontendGeoExpression(
+  allowCountries: readonly string[],
+  excludedHosts: readonly string[],
+  zone: string,
+): string {
+  return (
+    `not (${countrySetExpression(allowCountries)}) ` +
+    'and not (cf.verified_bot_category eq "Search Engine Crawler") ' +
+    `and not (http.host in ${quotedSet(excludedHosts)}) ` +
+    `and not ends_with(http.host, "-media.${escapeRulesString(zone)}")`
+  );
+}
+
+/**
+ * The /exec skip expression. ONE agent host renders the `eq` form, which is the exact live syd rule.
+ * Two or more render the `in {…}` set form — the same predicate for a list (an agency cell has three
+ * agents: web, file and gateway).
+ */
+export function wafExecSkipExpression(agentHosts: readonly string[]): string {
+  const execPathClause = 'starts_with(http.request.uri.path, "/exec")';
+  if (agentHosts.length === 1) {
+    return `(http.host eq "${escapeRulesString(agentHosts[0] as string)}" and ${execPathClause})`;
+  }
+  return `(http.host in ${quotedSet(agentHosts)} and ${execPathClause})`;
+}
+
+/** Build all five rule bodies. `enabled:false` keeps every rule but switches the four protections off. */
+export function buildEdgeWafRules(input: WafRuleInput): WafRulesVerdict {
   const countryBlockExpression = wafCountryBlockExpression(WAF_BLOCK_COUNTRIES);
   if (countryBlockExpression === null) {
     return { ok: false, reason: "the country-block list resolved to an empty set" };
   }
-  const wpAdminGeoExpression = wafWpAdminGeoExpression(WAF_ADMIN_ALLOW_COUNTRIES);
+  const allowCountries = normalizeWafCountryCodes(WAF_ALLOW_COUNTRIES);
+  const wpAdminGeoExpression = wafWpAdminGeoExpression(allowCountries);
   if (wpAdminGeoExpression === null) {
-    return { ok: false, reason: "the admin geo allow-list resolved to an empty set" };
+    return { ok: false, reason: "the allow-list resolved to an empty set" };
+  }
+  if (input.excludedHosts.length === 0) {
+    return { ok: false, reason: "excludedHosts is empty (Cloudflare rejects an empty set)" };
+  }
+  if (input.agentHosts.length === 0) {
+    return { ok: false, reason: "agentHosts is empty — there is no cell-agent /exec to exempt" };
   }
 
   const rules: WafRuleSet = {
@@ -265,20 +401,49 @@ export function buildEdgeWafRules(input: { enabled: boolean }): WafRulesVerdict 
       action: "managed_challenge",
       enabled: input.enabled,
     },
+    frontendGeo: {
+      description: WAF_FRONTEND_GEO_DESCRIPTION,
+      expression: wafFrontendGeoExpression(allowCountries, input.excludedHosts, input.zone),
+      action: "managed_challenge",
+      enabled: input.enabled,
+    },
+    execSkip: {
+      description: WAF_EXEC_SKIP_DESCRIPTION,
+      expression: wafExecSkipExpression(input.agentHosts),
+      action: "skip",
+      action_parameters: { phases: [WAF_MANAGED_PHASE] },
+      // Always on, even in a rollback: it keeps the cell-agent working (see the header, rule 5).
+      enabled: true,
+    },
   };
 
-  // The budget guard is on the OUTPUT, so it still holds if someone adds a fourth or fifth rule to
-  // the set above. A zone's custom-rule allowance is small and this Worker cannot read its plan.
-  const ordered = edgeWafRulesInOrder(rules);
-  if (ordered.length > WAF_RULE_BUDGET) {
-    return { ok: false, reason: `the edge-defense rule set is ${ordered.length} rules, over the budget of ${WAF_RULE_BUDGET}` };
+  for (const rule of edgeWafRulesInOrder(rules)) {
+    if (rule.expression.length > WAF_EXPRESSION_MAX_LENGTH) {
+      return {
+        ok: false,
+        reason:
+          `rule "${rule.description}" would be ${rule.expression.length} characters, over Cloudflare's ` +
+          `${WAF_EXPRESSION_MAX_LENGTH}-character expression limit — shorten the host lists`,
+      };
+    }
   }
   return { ok: true, rules };
 }
 
-/** The three rules in APPLY order — strictest first (see the header: order is the policy). */
+/** The five rules in APPLY order — strictest first (see the header: order is the policy). */
 export function edgeWafRulesInOrder(rules: WafRuleSet): WafRule[] {
-  return [rules.countryBlock, rules.wpAdminGeo, rules.loginGate];
+  return [rules.countryBlock, rules.wpAdminGeo, rules.loginGate, rules.frontendGeo, rules.execSkip];
+}
+
+/** The execute rule that deploys the Cloudflare Managed Ruleset zone-wide with its default actions. */
+export function buildManagedRulesetExecuteRule(): Record<string, unknown> {
+  return {
+    description: MANAGED_RULESET_RULE_DESCRIPTION,
+    expression: "true",
+    action: "execute",
+    action_parameters: { id: CLOUDFLARE_MANAGED_RULESET_ID },
+    enabled: true,
+  };
 }
 
 /** The parts of an existing Cloudflare rule the drift check reads. */
@@ -286,13 +451,26 @@ export interface ExistingWafRule {
   action?: string;
   expression?: string;
   enabled?: boolean;
+  action_parameters?: unknown;
+}
+
+/** True for an absent, null or `{}` action_parameters — what a block/challenge rule carries. */
+function isEmptyActionParameters(value: unknown): boolean {
+  if (value === undefined || value === null) {
+    return true;
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  return Object.keys(value).length === 0;
 }
 
 /**
- * True when the live rule differs from the desired one in anything we own: action, expression or
- * enabled. A match means the upsert does nothing. There is no action_parameters comparison because
- * none of the three rules carries any — `block` and `managed_challenge` take no parameters, and an
- * extra parameter a future Cloudflare adds is not ours to fight over.
+ * True when the live rule differs from the desired one in anything we own: action, expression,
+ * enabled, or action_parameters. A match means the upsert does nothing. For the four rules without
+ * action_parameters, any NON-empty value on the live rule is drift (someone added a custom response);
+ * for the skip rule the parameters must be equal. Cloudflare's own extra fields (`id`, `ref`,
+ * `version`, `logging`, ...) are not ours and are never compared.
  */
 export function wafRuleDrifted(existing: ExistingWafRule, desired: WafRule): boolean {
   if (existing.action !== desired.action) {
@@ -301,5 +479,11 @@ export function wafRuleDrifted(existing: ExistingWafRule, desired: WafRule): boo
   if (existing.expression !== desired.expression) {
     return true;
   }
-  return existing.enabled !== desired.enabled;
+  if (existing.enabled !== desired.enabled) {
+    return true;
+  }
+  if (desired.action_parameters === undefined) {
+    return !isEmptyActionParameters(existing.action_parameters);
+  }
+  return !jsonValuesEqual(existing.action_parameters, desired.action_parameters);
 }

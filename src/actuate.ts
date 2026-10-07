@@ -62,12 +62,15 @@ import {
   type EdgeCacheRule,
 } from "./edge-cache-rule.js";
 import {
-  WAF_FREE_PLAN_RULE_LIMIT,
+  CLOUDFLARE_MANAGED_RULESET_ID,
+  WAF_MANAGED_PHASE,
   WAF_PHASE,
-  WAF_RULE_BUDGET,
   WAF_RULE_DESCRIPTIONS,
   buildEdgeWafRules,
+  buildManagedRulesetExecuteRule,
   edgeWafRulesInOrder,
+  planSupportsManagedRuleset,
+  wafCustomRuleCapForPlan,
   wafRuleDrifted,
   type WafRule,
 } from "./edge-waf-rule.js";
@@ -116,7 +119,7 @@ export type CacheRuleUpsertResult =
 /** What one upsert did to one WAF rule: created it (or created the entrypoint with it), PATCHed it, or left it. */
 export type WafRuleAction = "created" | "updated" | "unchanged";
 
-/** One of the three edge-defense rules, and what THIS dispatch did to it. */
+/** One of the five edge-defense rules, and what THIS dispatch did to it. */
 export interface WafRuleOutcome {
   /** The rule's stable description, e.g. "doubleyoup-country-block". */
   description: string;
@@ -124,23 +127,55 @@ export interface WafRuleOutcome {
   ruleId: string;
 }
 
-// The op manages THREE rules (edge-waf-rule.ts: country block, admin geo-lockdown, login gate).
-// `rules` on SUCCESS is every rule, in apply order — ok:true means all three are in force.
-// `wafRulesApplied` on FAILURE is the PREFIX that landed before the failure, so a partial apply
-// (usually a zone out of custom-rule budget) is never silent: the operator can see exactly what
-// protection the zone has right now. `otherWafRules` lists every custom rule in the zone's firewall
-// phase that is NOT ours — they cost budget and, because our rules are APPENDED, one that skips
-// traffic sits ahead of ours and wins. Reported; this Worker never touches them.
+/**
+ * What THIS dispatch did about the Cloudflare Managed Ruleset:
+ *   deployed            — this run added the execute rule;
+ *   already-deployed    — an ENABLED execute rule for it was already there (left exactly as it was,
+ *                         including any overrides the agency set);
+ *   present-disabled    — an execute rule for it exists but is switched off (left off: that is the
+ *                         agency's call, usually after a false positive);
+ *   unavailable-on-plan — the zone is below Pro (or its plan is unknown), so nothing was attempted;
+ *   not-requested       — the job did not ask for it.
+ */
+export type ManagedRulesetStatus =
+  | "deployed"
+  | "already-deployed"
+  | "present-disabled"
+  | "unavailable-on-plan"
+  | "not-requested";
+
+// The op manages FIVE custom rules (edge-waf-rule.ts) plus, on request, the Managed Ruleset.
+// `rules` on SUCCESS is every custom rule, in apply order — ok:true means all five are in force.
+// `plan` is the zone's plan.legacy_id ("unknown" when Cloudflare did not say) and `ruleCap` the
+// custom-rule allowance the op sized itself against. `otherWafRules` lists every custom rule in the
+// phase that is NOT ours — they share the allowance and, because our new rules are APPENDED, one that
+// skips traffic sits ahead of ours and wins. Reported; this Worker never touches them.
+//
+// On FAILURE, `capExceeded` (+ `ruleCap`, `plannedRuleCount`) means the op REFUSED before any write
+// because the zone has no room; `wafRulesApplied` is the prefix of our rules that DID land before a
+// later write failed, so a partial apply is never silent.
 export type WafRuleUpsertResult =
   | {
       ok: true;
       op: "waf-rule-upsert";
       zone: string;
       enabled: boolean;
+      plan: string;
+      ruleCap: number;
       rules: WafRuleOutcome[];
       otherWafRules: string[];
+      managedRuleset: ManagedRulesetStatus;
     }
-  | { ok: false; op: "waf-rule-upsert"; zone: string; detail: string; wafRulesApplied?: WafRuleOutcome[] };
+  | {
+      ok: false;
+      op: "waf-rule-upsert";
+      zone: string;
+      detail: string;
+      wafRulesApplied?: WafRuleOutcome[];
+      capExceeded?: true;
+      ruleCap?: number;
+      plannedRuleCount?: number;
+    };
 
 // `connectorToken` is the ONE deliberate secret in a result (planning/40 decision 3 (c)): the
 // orchestrator consumes it transiently — injects it into the gateway's cloudflared exactly as the
@@ -562,6 +597,8 @@ export async function actuateProvisionR2(bucketName: string, env: Env): Promise<
 interface CloudflareZoneSummary {
   id?: string;
   name?: string;
+  /** Deprecated by Cloudflare but still returned; `legacy_id` is "free" / "pro" / "business" / "enterprise". */
+  plan?: { legacy_id?: string };
 }
 
 interface CloudflareDnsRecordSummary {
@@ -585,7 +622,10 @@ function dnsFailure(name: string, detail: string): DnsRecordUpsertResult {
  * zero means the token can't see the zone (wrong account or missing Zone:Read), more than
  * one would be ambiguous (should not happen for an exact-name filter, but never guess).
  */
-async function resolveZoneId(token: string, zoneName: string): Promise<{ id: string } | { error: string }> {
+async function resolveZoneId(
+  token: string,
+  zoneName: string,
+): Promise<{ id: string; planLegacyId: string | null } | { error: string }> {
   const query = new URLSearchParams({ name: zoneName, per_page: "2" });
   let response: Response;
   try {
@@ -619,7 +659,14 @@ async function resolveZoneId(token: string, zoneName: string): Promise<{ id: str
   if (zones.length > 1) {
     return { error: `zone lookup for "${zoneName}" returned ${zones.length} zones — refusing to guess.` };
   }
-  return { id: zones[0].id as string };
+  // The plan rides along for the WAF op's rule cap (waf-rule-upsert); every other caller ignores it.
+  // Absent or not a string => null, which that op treats as the SMALLEST plan.
+  let planLegacyId: string | null = null;
+  const legacyId = zones[0].plan?.legacy_id;
+  if (typeof legacyId === "string" && legacyId.length > 0) {
+    planLegacyId = legacyId;
+  }
+  return { id: zones[0].id as string, planLegacyId };
 }
 
 /**
@@ -1413,32 +1460,36 @@ export async function actuateCacheRuleUpsert(
 }
 
 // ── waf-rule-upsert ────────────────────────────────────────────────────────────────────
-// Upsert the THREE standing edge-defense WAF custom rules in ONE agency zone, with the agency's own
-// CF_DNS_API_TOKEN. The rule bodies are built HERE (edge-waf-rule.ts) — the job carries only a zone
-// name and an on/off switch, never an expression, an action or a country list.
+// Upsert the edge-defense baseline in ONE agency zone, with the agency's own CF_DNS_API_TOKEN: the
+// FIVE custom rules, then (on request, Pro and above) the Cloudflare Managed Ruleset. The rule bodies
+// are built HERE (edge-waf-rule.ts) — the job carries a zone, an on/off switch and two host lists,
+// never an expression, an action or a country list.
 //
-// Same shape as actuateCacheRuleUpsert, one phase over: ONE entrypoint read, then the ruleset is
-// carried in memory from write to write, so rule 2 sees rule 1's write and a missing entrypoint is
-// created exactly once. Creating it with POST /rulesets (not PUT on the entrypoint path) is
-// deliberate: Cloudflare allows ONE entrypoint per phase per zone, so if one appeared between our
-// GET and our write the POST fails cleanly instead of REPLACING the agency's own firewall rules.
+// SEQUENCE (each step only runs when every earlier one succeeded):
+//   1. build the five rules (pure; refuses an over-long expression before any API call);
+//   2. resolve the zone with the agency's token — fail closed unless it sees EXACTLY this zone — and
+//      read its plan;
+//   3. read the firewall-custom entrypoint ONCE;
+//   4. REFUSE, writing nothing, when two rules carry one of our descriptions (ambiguous) or when the
+//      rules we must CREATE plus every rule already there exceed the plan's allowance;
+//   5. create / append / PATCH the five rules (the ruleset is carried in memory from write to write,
+//      so a missing entrypoint is created exactly once — with POST, never PUT, so a racing create
+//      fails instead of REPLACING the agency's own rules);
+//   6. only then, the Managed Ruleset. Its order matters: the /exec skip (rule 5) must be in force
+//      first, or the Managed Ruleset 403s the cell-agent's /exec in between (measured on syd).
 //
-// APPEND/UPDATE ONLY. Our rules are found by their stable descriptions and PATCHed in place; every
-// other rule in the zone's firewall phase is left exactly where it is, in the order it is in.
+// APPEND/UPDATE ONLY. Our rules are found by their exact descriptions and PATCHed in place; every
+// other rule in either phase is left exactly where it is, in the order it is in. An existing execute
+// rule for the Managed Ruleset is left untouched even when it is disabled or carries overrides.
 //
-// RULE BUDGET. Cloudflare allows 5 custom rules in this phase on a FREE zone (20 on Pro) and this
-// Worker cannot read the zone's plan. So the op does NOT pre-judge: it applies strictest-first and,
-// if Cloudflare refuses a rule, FAILS LOUDLY with the rules that did land (`wafRulesApplied`) and the
-// budget arithmetic in the detail. It never reports success with a rule missing.
-//
-// IDEMPOTENT (find-by-description, PATCH only on drift), so the nonce-burned-before-actuation F1
-// rule does not bite: a retry re-signs a fresh job and converges on the same three rules — including
-// after a partial apply, which it resumes rather than duplicates.
+// IDEMPOTENT (find-by-description, PATCH only on drift, execute rule found by ruleset id), so the
+// nonce-burned-before-actuation F1 rule does not bite: a retry re-signs a fresh job and converges —
+// including after a partial apply, which it resumes rather than duplicates.
 
 // The ONE scope this op needs beyond reading the zone. "Zone WAF Write" is Cloudflare's API
-// permission-group name for the firewall-custom ruleset phase (the dashboard's token editor lists it
-// under Zone as "WAF", with Edit); Cloudflare names these by product, not by phase, so quoting the
-// API name is what makes this message actionable.
+// permission-group name for the WAF ruleset phases (the dashboard's token editor lists it under Zone
+// as "WAF", with Edit); Cloudflare names these by product, not by phase, so quoting the API name is
+// what makes this message actionable.
 const WAF_RULES_DENIED_DETAIL =
   "Cloudflare denied the WAF rule change — CF_DNS_API_TOKEN needs the \"Zone WAF Write\" permission " +
   '(shown as Zone → WAF → Edit in the API-token editor) on this zone, on top of Zone:Read.';
@@ -1452,20 +1503,21 @@ function wafFailure(zone: string, detail: string, applied?: WafRuleOutcome[]): W
 }
 
 /**
- * Read the zone's firewall-custom phase entrypoint. `missing` = the zone has no custom rules yet
+ * Read one of the zone's WAF phase entrypoints. `missing` = the zone has no rules in that phase yet
  * (Cloudflare answers 404), which the caller handles by creating the entrypoint.
  */
-async function getFirewallCustomEntrypoint(
+async function getWafPhaseEntrypoint(
   token: string,
   zoneId: string,
+  phase: string,
 ): Promise<{ ruleset: CloudflareRuleset } | { missing: true } | { error: string }> {
   let response: Response;
   try {
-    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zoneId)}/rulesets/phases/${WAF_PHASE}/entrypoint`, {
+    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zoneId)}/rulesets/phases/${phase}/entrypoint`, {
       headers: { authorization: `Bearer ${token}`, accept: "application/json" },
     });
   } catch (err) {
-    return { error: `could not reach Cloudflare to read the WAF custom rules: ${errorMessage(err)}` };
+    return { error: `could not reach Cloudflare to read the ${phase} rules: ${errorMessage(err)}` };
   }
   if (response.status === 404) {
     await response.text().catch(() => "");
@@ -1478,15 +1530,10 @@ async function getFirewallCustomEntrypoint(
   const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
   const ruleset = body?.result as CloudflareRuleset | undefined;
   if (!body?.success || !ruleset || typeof ruleset.id !== "string") {
-    return { error: `WAF custom rules read failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
+    return { error: `${phase} rules read failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
   }
   return { ruleset };
 }
-
-// Cloudflare refuses a rule that does not fit the zone's custom-rule allowance, but the wording of
-// that refusal is not a contract. Matching it loosely only decides whether to ADD a budget hint; the
-// zone's own error message is always reported verbatim either way, so a miss costs nothing.
-const WAF_QUOTA_HINT_PATTERN = /exceed|maximum|limit|quota|too many/i;
 
 /** One ruleset write (create entrypoint / append rule / patch rule). Returns the updated ruleset. */
 async function writeWafRuleset(
@@ -1520,8 +1567,8 @@ function wafRuleIdIn(ruleset: CloudflareRuleset, description: string): string {
 
 /**
  * One-line summaries of the rules in the zone's firewall-custom ruleset that are NOT ours. Reported
- * (never acted on) for two reasons: they cost rule budget, and — because our rules are APPENDED —
- * one of them that skips traffic sits AHEAD of ours and wins.
+ * (never acted on) for two reasons: they share the rule allowance, and — because our new rules are
+ * APPENDED — one of them that skips traffic sits AHEAD of ours and wins.
  */
 function describeOtherWafRules(ruleset: CloudflareRuleset | null): string[] {
   const summaries: string[] = [];
@@ -1576,7 +1623,7 @@ async function upsertOneWafRule(
 
   // Two rules with our description is AMBIGUOUS: patching one would leave the other in force, so
   // fail closed and let an operator clean it up (mirrors dns-record-upsert's 2+ match rule). The
-  // caller already checked this for all three rules BEFORE any write; this is the per-rule backstop.
+  // caller already checked this for every rule BEFORE any write; this is the per-rule backstop.
   if (matches.length > 1) {
     return {
       error: `${matches.length} WAF rules already carry the description "${desired.description}" — ambiguous, refusing to change any of them.`,
@@ -1614,10 +1661,64 @@ async function upsertOneWafRule(
   return { action: "updated", ruleId: existingId, ruleset: { ...ruleset, rules: replaced } };
 }
 
+/** True for an `execute` rule that runs the Cloudflare Managed Ruleset (whatever its description). */
+function executesCloudflareManagedRuleset(rule: CloudflareRulesetRule): boolean {
+  if (rule.action !== "execute") {
+    return false;
+  }
+  const parameters = rule.action_parameters as { id?: unknown } | undefined;
+  return parameters?.id === CLOUDFLARE_MANAGED_RULESET_ID;
+}
+
 /**
- * Upsert the three edge-defense WAF rules with the agency's own CF_DNS_API_TOKEN. Returns a
- * structured result; never throws for a Cloudflare-side failure. NEVER falls back to a platform
- * credential (there is none). Never touches any other rule in the zone.
+ * Deploy the Cloudflare Managed Ruleset in the managed phase, unless an execute rule for it is
+ * already there. An existing one is NEVER changed: it may carry the agency's own overrides (a rule
+ * set to Log after a false positive), and a disabled one was switched off on purpose.
+ */
+async function ensureManagedRulesetDeployed(
+  token: string,
+  zoneId: string,
+  zonePath: string,
+): Promise<{ status: ManagedRulesetStatus } | { error: string }> {
+  const entrypoint = await getWafPhaseEntrypoint(token, zoneId, WAF_MANAGED_PHASE);
+  if ("error" in entrypoint) {
+    return entrypoint;
+  }
+
+  if (!("missing" in entrypoint)) {
+    const existing = (entrypoint.ruleset.rules ?? []).filter(executesCloudflareManagedRuleset);
+    if (existing.some((rule) => rule.enabled !== false)) {
+      return { status: "already-deployed" };
+    }
+    if (existing.length > 0) {
+      return { status: "present-disabled" };
+    }
+  }
+
+  const executeRule = buildManagedRulesetExecuteRule();
+  let written: { ruleset: CloudflareRuleset } | { error: string };
+  if ("missing" in entrypoint) {
+    // POST, not PUT on the entrypoint path: a racing create fails instead of replacing.
+    written = await writeWafRuleset(token, "POST", `${zonePath}/rulesets`, {
+      name: "default",
+      kind: "zone",
+      phase: WAF_MANAGED_PHASE,
+      rules: [executeRule],
+    });
+  } else {
+    const rulesetPath = `${zonePath}/rulesets/${encodeURIComponent(entrypoint.ruleset.id as string)}`;
+    written = await writeWafRuleset(token, "POST", `${rulesetPath}/rules`, executeRule);
+  }
+  if ("error" in written) {
+    return written;
+  }
+  return { status: "deployed" };
+}
+
+/**
+ * Upsert the edge-defense baseline with the agency's own CF_DNS_API_TOKEN. Returns a structured
+ * result; never throws for a Cloudflare-side failure. NEVER falls back to a platform credential
+ * (there is none). Never touches any other rule in the zone.
  */
 export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env): Promise<WafRuleUpsertResult> {
   const zoneName = params.zone;
@@ -1627,18 +1728,17 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
     return wafFailure(zoneName, "CF_DNS_API_TOKEN is not configured on this Worker.");
   }
 
-  const built = buildEdgeWafRules({ enabled: params.enabled });
+  const built = buildEdgeWafRules({
+    zone: zoneName,
+    enabled: params.enabled,
+    excludedHosts: params.excludedHosts,
+    agentHosts: params.agentHosts,
+  });
   if (!built.ok) {
     return wafFailure(zoneName, built.reason);
   }
-  // Strictest first: country block, then admin geo-lockdown, then the login challenge. Cloudflare
-  // evaluates top-down and the first terminating action wins, so this order IS the policy.
+  // Strictest first; see edge-waf-rule.ts ("ORDER IS THE POLICY").
   const desiredRules = edgeWafRulesInOrder(built.rules);
-  // The builder enforces this too; re-asserted here so no code path can ever place more rules in a
-  // live zone than the budget allows.
-  if (desiredRules.length > WAF_RULE_BUDGET) {
-    return wafFailure(zoneName, `refusing to apply ${desiredRules.length} rules — the budget for this op is ${WAF_RULE_BUDGET}.`);
-  }
 
   // Fail closed unless the agency's own token can see EXACTLY this zone.
   const zone = await resolveZoneId(token, zoneName);
@@ -1646,8 +1746,10 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
     return wafFailure(zoneName, zone.error);
   }
   const zonePath = `${CF_API}/zones/${encodeURIComponent(zone.id)}`;
+  const plan = zone.planLegacyId ?? "unknown";
+  const ruleCap = wafCustomRuleCapForPlan(zone.planLegacyId);
 
-  const entrypoint = await getFirewallCustomEntrypoint(token, zone.id);
+  const entrypoint = await getWafPhaseEntrypoint(token, zone.id, WAF_PHASE);
   if ("error" in entrypoint) {
     return wafFailure(zoneName, entrypoint.error);
   }
@@ -1655,38 +1757,75 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
   if (!("missing" in entrypoint)) {
     ruleset = entrypoint.ruleset;
   }
+  const existingRules = ruleset?.rules ?? [];
   const otherWafRules = describeOtherWafRules(ruleset);
 
   // Fail closed BEFORE any write: two rules carrying one of our descriptions is ambiguous (patching
-  // one would leave the other in force). Checked for all three up front so an earlier rule's write
+  // one would leave the other in force). Checked for every rule up front so an earlier rule's write
   // never lands while a later rule's state is ambiguous.
+  let rulesToCreate = 0;
   for (const desired of desiredRules) {
-    const matchCount = (ruleset?.rules ?? []).filter((candidate) => candidate.description === desired.description).length;
+    const matchCount = existingRules.filter((candidate) => candidate.description === desired.description).length;
     if (matchCount > 1) {
       return wafFailure(
         zoneName,
         `${matchCount} WAF rules already carry the description "${desired.description}" — ambiguous, refusing to change any of them.`,
       );
     }
+    if (matchCount === 0) {
+      rulesToCreate += 1;
+    }
+  }
+
+  // The plan's allowance, also BEFORE any write. A PATCH changes no count; only a create adds one.
+  // Every existing rule counts, enabled or not (Cloudflare's docs give one number per plan and do not
+  // exempt disabled rules, so assuming they count can only make this refuse, never overfill).
+  const plannedRuleCount = existingRules.length + rulesToCreate;
+  if (plannedRuleCount > ruleCap) {
+    return {
+      ok: false,
+      op: "waf-rule-upsert",
+      zone: zoneName,
+      detail:
+        `refusing to change anything: zone ${zoneName} (plan "${plan}") allows ${ruleCap} custom rules, it already ` +
+        `has ${existingRules.length} (${otherWafRules.length} not ours), and this op would add ${rulesToCreate} more ` +
+        `— ${plannedRuleCount} in total. Free ${plannedRuleCount - ruleCap} slot(s) or upgrade the zone, then re-run.`,
+      capExceeded: true,
+      ruleCap,
+      plannedRuleCount,
+    };
   }
 
   const applied: WafRuleOutcome[] = [];
   for (const desired of desiredRules) {
     const outcome = await upsertOneWafRule(token, zonePath, ruleset, desired);
     if ("error" in outcome) {
-      // LOUD, never silent: name the rule that did not land, keep Cloudflare's own message, and —
-      // when the refusal looks like a quota — spell out the arithmetic the operator needs.
-      let detail = `could not apply rule "${desired.description}": ${outcome.error}`;
-      if (WAF_QUOTA_HINT_PATTERN.test(outcome.error)) {
-        detail +=
-          ` This zone carries ${otherWafRules.length} custom rule(s) that are not ours, and a FREE Cloudflare zone ` +
-          `allows ${WAF_FREE_PLAN_RULE_LIMIT} custom rules in this phase (Pro allows 20). Free a slot or upgrade the ` +
-          "zone, then re-run — this op is idempotent and resumes.";
-      }
-      return wafFailure(zoneName, detail, applied);
+      // LOUD, never silent: name the rule that did not land and keep Cloudflare's own message.
+      return wafFailure(
+        zoneName,
+        `could not apply rule "${desired.description}": ${outcome.error} Re-run to resume (this op is idempotent).`,
+        applied,
+      );
     }
     ruleset = outcome.ruleset;
     applied.push({ description: desired.description, action: outcome.action, ruleId: outcome.ruleId });
+  }
+
+  // The Managed Ruleset, strictly AFTER the five custom rules (the /exec skip is now in force).
+  let managedRuleset: ManagedRulesetStatus = "not-requested";
+  if (params.deployManagedRuleset) {
+    managedRuleset = "unavailable-on-plan";
+    if (planSupportsManagedRuleset(zone.planLegacyId)) {
+      const managed = await ensureManagedRulesetDeployed(token, zone.id, zonePath);
+      if ("error" in managed) {
+        return wafFailure(
+          zoneName,
+          `all five custom rules are in force, but the Cloudflare Managed Ruleset could not be deployed: ${managed.error}`,
+          applied,
+        );
+      }
+      managedRuleset = managed.status;
+    }
   }
 
   return {
@@ -1694,8 +1833,11 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
     op: "waf-rule-upsert",
     zone: zoneName,
     enabled: params.enabled,
+    plan,
+    ruleCap,
     rules: applied,
     otherWafRules,
+    managedRuleset,
   };
 }
 

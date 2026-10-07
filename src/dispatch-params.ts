@@ -375,44 +375,115 @@ export function validateCacheRuleUpsertParams(raw: unknown): ParamsVerdict<Cache
 }
 
 // ── waf-rule-upsert ──────────────────────────────────────────────────────────────────
-// Upsert the THREE standing edge-defense WAF custom rules (phase http_request_firewall_custom) in an
-// agency zone: block RU/CN/KP, block the WordPress admin/login surface from outside the allow-list,
-// and managed-challenge the rest of the login surface. Actuated with the agency's own
-// CF_DNS_API_TOKEN, which needs Zone → WAF : Edit (a deploy-time scope add, not a new secret).
+// Upsert the edge-defense baseline in an agency zone: five WAF custom rules (block RU/CN/KP, block
+// the WordPress admin/login surface from outside the allow-list, managed-challenge the rest of the
+// login surface, managed-challenge the front end from outside the allow-list, and skip the Managed
+// Ruleset for the cell-agent's /exec) plus, on request, the Cloudflare Managed Ruleset. Actuated
+// with the agency's own CF_DNS_API_TOKEN, which needs Zone → WAF : Edit (a deploy-time scope add,
+// not a new secret).
 //
-// THE NARROWEST AUTHORITY OF ANY OP (Direction-B principle, fail-closed): the job carries only a
-// zone NAME and an on/off switch — NEVER an expression, an action, a path, or a country list. The
-// Worker builds all three rules itself from CONSTANTS in edge-waf-rule.ts, so the most a signed job
-// can do is switch a fixed, known-safe rule set on or off for one zone. Letting a country list
-// travel would let one signed job block every visitor to every site on the agency's zone, so it does
-// not travel. The actuator resolves the zone with the agency's own token and fails closed when it
-// cannot see it — the same "restricted to its own zone" rule dns-record-upsert follows.
+// NARROW AUTHORITY (Direction-B principle, fail-closed): the job carries a zone NAME, an on/off
+// switch, two HOST lists and a Managed Ruleset switch — NEVER an expression, an action, a path or a
+// country list. The country lists are CONSTANTS in edge-waf-rule.ts: a signed country list could
+// block every visitor to every site on the agency's zone. A host list cannot: every host must be
+// the zone apex or inside the zone, so the worst a bad list does is exempt one of the zone's own
+// hosts from the front-end challenge.
 //
-// The rules are ZONE-WIDE (no host clause) on purpose: a WAF custom rule runs per zone, which is what
-// makes it cover a site served on its own customer domain (a Cloudflare-for-SaaS custom hostname on
-// this zone). See edge-waf-rule.ts.
+// STRICT KEYS. Unlike the older ops (which drop an unknown key), an unknown key here FAILS the job:
+// a country list or a raw expression in these params is a caller bug or an attack, never a
+// harmless extra, and silently dropping it would hide which.
+//
+// The actuator resolves the zone with the agency's own token and fails closed when it cannot see
+// it — the same "restricted to its own zone" rule dns-record-upsert follows.
 
 export interface WafRuleUpsertParams {
   /** The agency zone NAME (e.g. "sbmstudio.com.au"); the actuator resolves it to a zone id. */
   zone: string;
-  /** false disables all three rules in place (a rollback that keeps them). Absent in the job => true. */
+  /** false switches the four protective rules off in place (rollback). Absent in the job => true. */
   enabled: boolean;
+  /** 1..100 hosts the front-end challenge never applies to (the zone's own infrastructure). */
+  excludedHosts: string[];
+  /** 1..30 cell-agent hosts whose /exec skips the Managed Ruleset. Each must also be in excludedHosts. */
+  agentHosts: string[];
+  /** true deploys the Cloudflare Managed Ruleset (Pro plan and above) after the custom rules. */
+  deployManagedRuleset: boolean;
+}
+
+/** Every key a waf-rule-upsert job may carry. Anything else fails the job. */
+const WAF_RULE_UPSERT_KEYS: readonly string[] = ["zone", "enabled", "excludedHosts", "agentHosts", "deployManagedRuleset"];
+// Generous for one zone's infrastructure; Cloudflare's 4,096-character expression limit is the real
+// ceiling, and the builder checks that before any write.
+const WAF_EXCLUDED_HOSTS_MAX = 100;
+// Three agents per cell (web, file, gateway), so ten cells on one zone.
+const WAF_AGENT_HOSTS_MAX = 30;
+
+/**
+ * Validate one host list: an array of `min`..`max` distinct lowercase hostnames, each the zone apex or
+ * inside the zone. Returns a FRESH array, never the caller's.
+ */
+function cleanWafHostList(
+  value: unknown,
+  zone: string,
+  label: string,
+  max: number,
+): { ok: true; hosts: string[] } | { ok: false; reason: string } {
+  const rule = `${label} must be an array of 1-${max} distinct lowercase hostnames, each the zone apex or inside the zone`;
+  if (!Array.isArray(value) || value.length < 1 || value.length > max) {
+    return { ok: false, reason: rule };
+  }
+  const hosts: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(entry)) {
+      return { ok: false, reason: rule };
+    }
+    const insideZone = entry === zone || entry.endsWith(`.${zone}`);
+    if (!insideZone) {
+      return { ok: false, reason: `${label} entry "${entry}" is not the zone apex or inside the zone ${zone}` };
+    }
+    if (hosts.includes(entry)) {
+      return { ok: false, reason: `${label} lists "${entry}" twice` };
+    }
+    hosts.push(entry);
+  }
+  return { ok: true, hosts };
 }
 
 export function validateWafRuleUpsertParams(raw: unknown): ParamsVerdict<WafRuleUpsertParams> {
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
   }
-  const { zone, enabled } = raw;
+  for (const key of Object.keys(raw)) {
+    if (!WAF_RULE_UPSERT_KEYS.includes(key)) {
+      return { ok: false, reason: `unknown param "${key}" — waf-rule-upsert takes only ${WAF_RULE_UPSERT_KEYS.join(", ")}` };
+    }
+  }
+  const { zone, enabled, excludedHosts, agentHosts, deployManagedRuleset } = raw;
 
-  // The same zone grammar the DNS ops use. The zone name never reaches a rule EXPRESSION (the rules
-  // carry no host clause), only the Cloudflare zone-lookup query, but the strict grammar stays: it
-  // is what stops a lookup for some other, longer name that happens to contain this one.
+  // The same zone grammar the DNS ops use. It also reaches the front-end rule's media-suffix clause,
+  // inside a quoted string, which this grammar keeps safe.
   if (typeof zone !== "string" || zone.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(zone)) {
     return { ok: false, reason: "zone must be a lowercase DNS zone name (e.g. example.com)" };
   }
   if (enabled !== undefined && typeof enabled !== "boolean") {
     return { ok: false, reason: "enabled, when present, must be true or false" };
+  }
+  const excluded = cleanWafHostList(excludedHosts, zone, "excludedHosts", WAF_EXCLUDED_HOSTS_MAX);
+  if (!excluded.ok) {
+    return excluded;
+  }
+  const agents = cleanWafHostList(agentHosts, zone, "agentHosts", WAF_AGENT_HOSTS_MAX);
+  if (!agents.ok) {
+    return agents;
+  }
+  // An agent host the front-end rule does not exempt would get a managed challenge on its API
+  // whenever the caller's country is outside the allow-list — every heavy op would then fail there.
+  for (const agentHost of agents.hosts) {
+    if (!excluded.hosts.includes(agentHost)) {
+      return { ok: false, reason: `agentHosts entry "${agentHost}" must also be in excludedHosts (the agent API must never be challenged)` };
+    }
+  }
+  if (typeof deployManagedRuleset !== "boolean") {
+    return { ok: false, reason: "deployManagedRuleset must be true or false" };
   }
 
   // An absent `enabled` means "on". Normalize it here so the actuator always sees a boolean.
@@ -420,9 +491,16 @@ export function validateWafRuleUpsertParams(raw: unknown): ParamsVerdict<WafRule
   if (enabled === false) {
     enabledValue = false;
   }
-  // A FRESH object holding only the known keys, so an extra key (a country list, a raw expression)
-  // can never ride along.
-  return { ok: true, params: { zone, enabled: enabledValue } };
+  return {
+    ok: true,
+    params: {
+      zone,
+      enabled: enabledValue,
+      excludedHosts: excluded.hosts,
+      agentHosts: agents.hosts,
+      deployManagedRuleset,
+    },
+  };
 }
 
 // ── cf-tunnel-create ─────────────────────────────────────────────────────────────────
