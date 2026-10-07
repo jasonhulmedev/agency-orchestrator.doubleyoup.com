@@ -1193,6 +1193,8 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       { expression: "true" },
       { action: "block" },
       { description: "doubleyoup-country-block" },
+      // The pre-2026-10-07 name: a stale caller fails closed instead of silently dropping the switch.
+      { deployManagedRuleset: true },
     ];
     for (const extra of smuggled) {
       const verdict = validateWafRuleUpsertParams({ ...WAF_RULE_PARAMS, ...extra });
