@@ -4167,8 +4167,14 @@ describe("POST /actuate route", () => {
     // The three definition changes carry NO position: each already sits after its predecessor.
     expect(writes[0]?.body?.expression).toBe(EXPECTED_WPADMIN_GEO_EXPRESSION);
     expect(writes[0]?.body?.position).toBeUndefined();
-    // The login gate's definition is right; ONLY its position is sent, so Cloudflare keeps the rest.
-    expect(writes[1]?.body).toEqual({ position: { after: "live-wpadmin" } });
+    // The login gate's definition is right, so only its position changes, but the PATCH still carries
+    // the full definition: the result must not depend on how Cloudflare merges a partial body.
+    expect(writes[1]?.body).toMatchObject({
+      description: "doubleyoup-login-gate",
+      action: "managed_challenge",
+      position: { after: "live-wpadmin" },
+    });
+    expect(typeof writes[1]?.body?.expression).toBe("string");
     expect(writes[2]?.body?.expression).toBe(
       `${SYD_LIVE_FRONTEND_GEO_EXPRESSION} and not ends_with(http.host, "-media.doubleyoup.com")`,
     );
@@ -4232,12 +4238,12 @@ describe("POST /actuate route", () => {
     expect(body.ok).toBe(true);
     expect(body.rules.map((rule) => rule.action)).toEqual(["unchanged", "unchanged", "moved", "moved", "moved"]);
     const writes = calls.filter((call) => call.method === "PATCH");
-    // Each move is relative to OUR previous rule, and carries nothing but the position. Ending order:
-    // country, wp-admin, login, front end, agent skip.
+    // Each move is relative to OUR previous rule, and carries the full (unchanged) definition plus the
+    // position. Ending order: country, wp-admin, login, front end, agent skip.
     expect(writes.map((call) => [call.path.split("/").pop(), call.body])).toEqual([
-      ["rule-login", { position: { after: "rule-wpadmin" } }],
-      ["rule-frontend", { position: { after: "rule-login" } }],
-      ["rule-exec", { position: { after: "rule-frontend" } }],
+      ["rule-login", { ...loginGate, position: { after: "rule-wpadmin" } }],
+      ["rule-frontend", { ...frontendGeo, position: { after: "rule-login" } }],
+      ["rule-exec", { ...execSkip, position: { after: "rule-frontend" } }],
     ]);
   });
 
@@ -4258,8 +4264,8 @@ describe("POST /actuate route", () => {
     await worker.fetch(actuateRequest({ job, signature }), envWith());
     const writes = calls.filter((call) => call.method === "PATCH");
     expect(writes.map((call) => [call.path.split("/").pop(), call.body])).toEqual([
-      ["rule-login", { position: { after: "rule-wpadmin" } }],
-      ["rule-frontend", { position: { after: "rule-login" } }],
+      ["rule-login", { ...loginGate, position: { after: "rule-wpadmin" } }],
+      ["rule-frontend", { ...frontendGeo, position: { after: "rule-login" } }],
     ]);
   });
 

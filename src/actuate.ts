@@ -1705,12 +1705,12 @@ async function upsertOneWafRule(
     return { error: `Cloudflare returned our rule "${desired.description}" without an id — cannot update it.` };
   }
 
-  // The PATCH body: the full definition when it drifted, plus the position when out of order. A
-  // position-only body moves the rule and keeps its definition (Cloudflare's documented reorder).
-  let body: Record<string, unknown> = {};
-  if (drifted) {
-    body = { ...desired };
-  }
+  // The PATCH body is ALWAYS the full definition, plus the position when out of order. A move of an
+  // unchanged rule sends the same definition it already has. We do not send a position-only body:
+  // the result would then depend on how Cloudflare merges a PATCH. If it refused that body, the run
+  // would stop with only some rules written. If it cleared the omitted fields, the rule would lose
+  // its description, and the next run would append a duplicate.
+  const body: Record<string, unknown> = { ...desired };
   if (outOfOrder) {
     body.position = { after: previousRuleId };
   }
