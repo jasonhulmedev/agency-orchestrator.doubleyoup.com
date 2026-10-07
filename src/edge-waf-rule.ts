@@ -18,14 +18,18 @@
 //   4. doubleyoup-frontend-geo   MANAGED-CHALLENGE everything else from outside the allow-list, except
 //                                verified search-engine crawlers, the zone's infrastructure hosts
 //                                (`excludedHosts`) and its per-site media hosts (`*-media.<zone>`).
-//   5. the /exec skip            SKIP the Managed Ruleset for the cell-agent's /exec on `agentHosts`.
-//                                The agent is a bearer-authenticated machine API whose request bodies
-//                                carry shell commands and presigned URLs, and the Managed Ruleset
-//                                blocks those bodies (measured on syd: a db-export 403'd at the edge
-//                                until this rule existed). It is NOT a protection, so `enabled:false`
-//                                (the rollback) leaves it ON — switching it off would break the agent.
-// Plus the Cloudflare Managed Ruleset in http_request_firewall_managed, deployed by the actuator AFTER
-// rule 5 is in force, never before (the same 403 would otherwise hit every /exec in between).
+//   5. the agent skip            SKIP the Managed Ruleset for EVERY request to the cell-agent hosts
+//                                (`agentHosts`). They serve no WordPress: each is a bearer-authenticated
+//                                machine API whose request bodies carry shell commands and presigned
+//                                URLs, and the Managed Ruleset blocks those bodies (measured on syd: a
+//                                db-export 403'd at the edge until a skip existed). The live syd rule
+//                                skipped /exec only; every path is skipped now (review H1, 2026-10-07),
+//                                because the agents' other endpoints carry the same kind of body. It is
+//                                NOT a protection, so `enabled:false` (the rollback) leaves it ON.
+// Plus, ONLY when the job asks for it (`includeManagedRuleset`, off by default in the script), the
+// Cloudflare Managed Ruleset in http_request_firewall_managed. The actuator touches only the execute
+// rule THIS op created, and only AFTER rule 5 is in force (the same 403 would otherwise hit the agents
+// in between).
 //
 // ORDER IS THE POLICY. Cloudflare evaluates a ruleset top-down and the first terminating action wins,
 // so the rules are applied STRICTEST FIRST (country block -> admin geo -> login gate -> front end):
@@ -42,16 +46,19 @@
 //
 // THE LIVE syd RULES. doubleyoup.com carries these five rules today (applied with the orchestrator's
 // own token). The descriptions here are IDENTICAL, so this op finds them and PATCHes them in place.
-// For syd-equivalent hosts the rendered text is byte-identical to the live rules EXCEPT two deliberate
-// changes, so the first run against syd updates exactly two rules:
+// For syd-equivalent hosts the rendered text is byte-identical to the live rules EXCEPT three
+// deliberate changes, so the first run against syd updates exactly three rules' text:
 //   - wp-admin geo: `starts_with` + the admin-ajax.php exemption (the 2026-10-04 fix, see below);
 //   - front-end geo: one clause APPENDED, `and not ends_with(http.host, "-media.<zone>")` (the media
-//     hosts, Jason 2026-10-07). The live text is an exact prefix of the new text.
-// test/dispatch.test.ts pins all five live strings and both differences.
+//     hosts, Jason 2026-10-07). The live text is an exact prefix of the new text;
+//   - the agent skip: `(http.host eq "cell-syd.doubleyoup.com" and starts_with(http.request.uri.path,
+//     "/exec"))` becomes `(http.host in {"cell-syd.doubleyoup.com"})` (every path, review H1).
+// The run also MOVES syd's login gate from first to third (see ORDER IS THE POLICY).
+// test/dispatch.test.ts pins all five live strings and every difference.
 //
 // CASE. Cloudflare does not lowercase `http.host`, and the host clauses are case-sensitive (as the
 // live rules are). Both fail SAFE on a mixed-case Host: the front-end exemption does not match, so
-// the request is challenged rather than exempted; the /exec skip does not match, so the Managed
+// the request is challenged rather than exempted; the agent skip does not match, so the Managed
 // Ruleset still runs rather than being skipped.
 //
 // ── TWIN of the orchestrator's src/edge-waf-rule.ts ────────────────────────────────────
@@ -77,15 +84,17 @@ export const WAF_LOGIN_GATE_DESCRIPTION = "doubleyoup-login-gate";
 export const WAF_FRONTEND_GEO_DESCRIPTION = "doubleyoup-frontend-geo";
 
 /**
- * The stable identity of the /exec skip rule. Copied EXACTLY from the live syd rule — it does not start
- * with "doubleyoup-", and changing it would make this op create a second rule next to syd's.
+ * The stable identity of the agent skip rule. Copied EXACTLY from the live syd rule — it does not
+ * start with "doubleyoup-", and changing it would make this op create a second rule next to syd's.
+ * It still says "exec" because that is what the live rule is called; since 2026-10-07 the rule skips
+ * EVERY path on the agent hosts (wafExecSkipExpression).
  */
 export const WAF_EXEC_SKIP_DESCRIPTION = "skip managed WAF for cell-agent exec (internal bearer-authed endpoint)";
 
 /** The Cloudflare ruleset phase that holds WAF custom rules. */
 export const WAF_PHASE = "http_request_firewall_custom";
 
-/** The phase the Managed Ruleset executes in — and the phase the /exec rule skips. */
+/** The phase the Managed Ruleset executes in — and the phase the agent skip rule skips. */
 export const WAF_MANAGED_PHASE = "http_request_firewall_managed";
 
 /**
@@ -99,7 +108,7 @@ export const MANAGED_RULESET_RULE_DESCRIPTION = "doubleyoup-managed-ruleset";
 
 /**
  * The descriptions of OUR five custom rules, in apply order. Matched EXACTLY, never by prefix: the
- * /exec rule's description does not start with "doubleyoup-", and a prefix would also claim the
+ * agent skip rule's description does not start with "doubleyoup-", and a prefix would also claim the
  * `doubleyoup-ban:<id>` rules the ban system owns. Anything else in the phase is somebody else's and is
  * reported, never touched.
  */
@@ -169,7 +178,7 @@ export interface WafRule {
   description: string;
   expression: string;
   action: "block" | "managed_challenge" | "skip";
-  /** Only the /exec skip rule carries action parameters; the key is ABSENT on the other four. */
+  /** Only the agent skip rule carries action parameters; the key is ABSENT on the other four. */
   action_parameters?: { phases: string[] };
   enabled: boolean;
 }
@@ -187,11 +196,11 @@ export interface WafRuleSet {
 export interface WafRuleInput {
   /** The agency zone NAME; it lands in the media-host suffix clause. */
   zone: string;
-  /** false switches the four PROTECTIVE rules off in place (rollback). The /exec skip stays on. */
+  /** false switches the four PROTECTIVE rules off in place (rollback). The agent skip stays on. */
   enabled: boolean;
   /** Hosts the front-end challenge never applies to — the zone's own infrastructure. */
   excludedHosts: readonly string[];
-  /** Cell-agent hosts whose /exec skips the Managed Ruleset. */
+  /** Cell-agent hosts: every request to them skips the Managed Ruleset. */
   agentHosts: readonly string[];
 }
 
@@ -352,16 +361,13 @@ export function wafFrontendGeoExpression(
 }
 
 /**
- * The /exec skip expression. ONE agent host renders the `eq` form, which is the exact live syd rule.
- * Two or more render the `in {…}` set form — the same predicate for a list (an agency cell has three
- * agents: web, file and gateway).
+ * The agent skip expression: EVERY request to a cell-agent host, whatever the path (review H1). The
+ * agent hosts serve no WordPress, so there is nothing on them for the Managed Ruleset to protect, and
+ * the agents' endpoints all carry the command bodies it blocks. One form for any number of hosts (an
+ * agency cell has three agents: web, file and gateway).
  */
 export function wafExecSkipExpression(agentHosts: readonly string[]): string {
-  const execPathClause = 'starts_with(http.request.uri.path, "/exec")';
-  if (agentHosts.length === 1) {
-    return `(http.host eq "${escapeRulesString(agentHosts[0] as string)}" and ${execPathClause})`;
-  }
-  return `(http.host in ${quotedSet(agentHosts)} and ${execPathClause})`;
+  return `(http.host in ${quotedSet(agentHosts)})`;
 }
 
 /** Build all five rule bodies. `enabled:false` keeps every rule but switches the four protections off. */
@@ -379,7 +385,7 @@ export function buildEdgeWafRules(input: WafRuleInput): WafRulesVerdict {
     return { ok: false, reason: "excludedHosts is empty (Cloudflare rejects an empty set)" };
   }
   if (input.agentHosts.length === 0) {
-    return { ok: false, reason: "agentHosts is empty — there is no cell-agent /exec to exempt" };
+    return { ok: false, reason: "agentHosts is empty — there is no cell-agent host to exempt" };
   }
 
   const rules: WafRuleSet = {

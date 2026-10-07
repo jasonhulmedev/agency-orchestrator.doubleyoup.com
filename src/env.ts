@@ -96,7 +96,7 @@ export interface Env {
   // token editor) on the zone(s) the platform may manage.
   // Used by the Direction-B actuators (src/actuate.ts): `dns-record-upsert` (create/update
   // DNS records), `cache-purge` (purge a zone's cache), `cache-rule-upsert` (the "edge page
-  // cache" Cache Rules) and `waf-rule-upsert` (the edge-defense WAF baseline + the Cloudflare
+  // cache" Cache Rules) and `waf-rule-upsert` (the edge-defense WAF baseline + the opt-in Cloudflare
   // Managed Ruleset), all through this Worker, so the platform never needs
   // direct access to the agency's Cloudflare zones. Also probed read-only by /validate
   // (validators.ts::validateCfDns, including Cache Rules and WAF read probes); the edit + purge

@@ -378,16 +378,17 @@ export function validateCacheRuleUpsertParams(raw: unknown): ParamsVerdict<Cache
 // Upsert the edge-defense baseline in an agency zone: five WAF custom rules (block RU/CN/KP, block
 // the WordPress admin/login surface from outside the allow-list, managed-challenge the rest of the
 // login surface, managed-challenge the front end from outside the allow-list, and skip the Managed
-// Ruleset for the cell-agent's /exec) plus, on request, the Cloudflare Managed Ruleset. Actuated
-// with the agency's own CF_DNS_API_TOKEN, which needs Zone → WAF : Edit (a deploy-time scope add,
-// not a new secret).
+// Ruleset for every request to the cell-agent hosts) plus, ONLY on request, the execute rule this op
+// owns for the Cloudflare Managed Ruleset. Actuated with the agency's own CF_DNS_API_TOKEN, which
+// needs Zone → WAF : Edit (a deploy-time scope add, not a new secret).
 //
 // NARROW AUTHORITY (Direction-B principle, fail-closed): the job carries a zone NAME, an on/off
 // switch, two HOST lists and a Managed Ruleset switch — NEVER an expression, an action, a path or a
 // country list. The country lists are CONSTANTS in edge-waf-rule.ts: a signed country list could
 // block every visitor to every site on the agency's zone. A host list cannot: every host must be
-// the zone apex or inside the zone, so the worst a bad list does is exempt one of the zone's own
-// hosts from the front-end challenge.
+// the zone apex or inside the zone, so the worst a bad list does is WEAKEN protection for some of
+// the zone's own hosts — an excluded host loses the front-end challenge, and an agent host (always
+// also excluded) loses the Managed Ruleset too. No host list can block a visitor.
 //
 // STRICT KEYS. Unlike the older ops (which drop an unknown key), an unknown key here FAILS the job:
 // a country list or a raw expression in these params is a caller bug or an attack, never a
@@ -403,14 +404,20 @@ export interface WafRuleUpsertParams {
   enabled: boolean;
   /** 1..100 hosts the front-end challenge never applies to (the zone's own infrastructure). */
   excludedHosts: string[];
-  /** 1..30 cell-agent hosts whose /exec skips the Managed Ruleset. Each must also be in excludedHosts. */
+  /** 1..30 cell-agent hosts: every request to them skips the Managed Ruleset. Each must also be in excludedHosts. */
   agentHosts: string[];
-  /** true deploys the Cloudflare Managed Ruleset (Pro plan and above) after the custom rules. */
-  deployManagedRuleset: boolean;
+  /**
+   * true brings the execute rule THIS op owns for the Cloudflare Managed Ruleset (description
+   * "doubleyoup-managed-ruleset") to the same `enabled` state as the run, AFTER the custom rules:
+   * enabled:true deploys or re-enables it (Pro plan and above), enabled:false disables it (never
+   * deletes it). An execute rule another owner created is never touched. false leaves the managed
+   * phase alone. Opt-in: the script sends false unless the operator passes --managed-ruleset.
+   */
+  includeManagedRuleset: boolean;
 }
 
 /** Every key a waf-rule-upsert job may carry. Anything else fails the job. */
-const WAF_RULE_UPSERT_KEYS: readonly string[] = ["zone", "enabled", "excludedHosts", "agentHosts", "deployManagedRuleset"];
+const WAF_RULE_UPSERT_KEYS: readonly string[] = ["zone", "enabled", "excludedHosts", "agentHosts", "includeManagedRuleset"];
 // Generous for one zone's infrastructure; Cloudflare's 4,096-character expression limit is the real
 // ceiling, and the builder checks that before any write.
 const WAF_EXCLUDED_HOSTS_MAX = 100;
@@ -457,7 +464,7 @@ export function validateWafRuleUpsertParams(raw: unknown): ParamsVerdict<WafRule
       return { ok: false, reason: `unknown param "${key}" — waf-rule-upsert takes only ${WAF_RULE_UPSERT_KEYS.join(", ")}` };
     }
   }
-  const { zone, enabled, excludedHosts, agentHosts, deployManagedRuleset } = raw;
+  const { zone, enabled, excludedHosts, agentHosts, includeManagedRuleset } = raw;
 
   // The same zone grammar the DNS ops use. It also reaches the front-end rule's media-suffix clause,
   // inside a quoted string, which this grammar keeps safe.
@@ -482,8 +489,8 @@ export function validateWafRuleUpsertParams(raw: unknown): ParamsVerdict<WafRule
       return { ok: false, reason: `agentHosts entry "${agentHost}" must also be in excludedHosts (the agent API must never be challenged)` };
     }
   }
-  if (typeof deployManagedRuleset !== "boolean") {
-    return { ok: false, reason: "deployManagedRuleset must be true or false" };
+  if (typeof includeManagedRuleset !== "boolean") {
+    return { ok: false, reason: "includeManagedRuleset must be true or false" };
   }
 
   // An absent `enabled` means "on". Normalize it here so the actuator always sees a boolean.
@@ -498,7 +505,7 @@ export function validateWafRuleUpsertParams(raw: unknown): ParamsVerdict<WafRule
       enabled: enabledValue,
       excludedHosts: excluded.hosts,
       agentHosts: agents.hosts,
-      deployManagedRuleset,
+      includeManagedRuleset,
     },
   };
 }

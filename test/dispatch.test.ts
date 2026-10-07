@@ -208,7 +208,7 @@ const WAF_RULE_PARAMS = {
   enabled: true,
   excludedHosts: ["cell-x.example.com", "host.example.com"],
   agentHosts: ["cell-x.example.com"],
-  deployManagedRuleset: true,
+  includeManagedRuleset: true,
 };
 function wafRuleJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
   return sampleJob({
@@ -232,6 +232,8 @@ const SYD_LIVE_FRONTEND_GEO_EXPRESSION =
 const SYD_LIVE_EXEC_SKIP_EXPRESSION =
   '(http.host eq "cell-syd.doubleyoup.com" and starts_with(http.request.uri.path, "/exec"))';
 const SYD_LIVE_EXEC_SKIP_DESCRIPTION = "skip managed WAF for cell-agent exec (internal bearer-authed endpoint)";
+// Deliberate change 3 (review H1, 2026-10-07): the agent skip covers EVERY path on the agent hosts.
+const EXPECTED_SYD_AGENT_SKIP_EXPRESSION = '(http.host in {"cell-syd.doubleyoup.com"})';
 
 // NOTE the two prefixes differ ON PURPOSE and must stay different: the geo rule uses "/wp-admin"
 // (no trailing slash) so bare `/wp-admin` is caught, the login gate uses "/wp-admin/" (with)
@@ -1161,7 +1163,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       zone: WAF_RULE_PARAMS.zone,
       excludedHosts: [...WAF_RULE_PARAMS.excludedHosts],
       agentHosts: [...WAF_RULE_PARAMS.agentHosts],
-      deployManagedRuleset: true,
+      includeManagedRuleset: true,
     };
     const verdict = validateWafRuleUpsertParams(withoutEnabled);
     expect(verdict).toEqual({ ok: true, params: WAF_RULE_PARAMS });
@@ -1170,9 +1172,9 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(verdict.params.excludedHosts).not.toBe(withoutEnabled.excludedHosts);
     expect(verdict.params.agentHosts).not.toBe(withoutEnabled.agentHosts);
 
-    expect(validateWafRuleUpsertParams({ ...WAF_RULE_PARAMS, enabled: false, deployManagedRuleset: false })).toEqual({
+    expect(validateWafRuleUpsertParams({ ...WAF_RULE_PARAMS, enabled: false, includeManagedRuleset: false })).toEqual({
       ok: true,
-      params: { ...WAF_RULE_PARAMS, enabled: false, deployManagedRuleset: false },
+      params: { ...WAF_RULE_PARAMS, enabled: false, includeManagedRuleset: false },
     });
     // The zone apex is a legitimate excluded host (and agent host).
     expect(
@@ -1208,7 +1210,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(validateWafRuleUpsertParams([]).ok).toBe(false);
     expect(validateWafRuleUpsertParams("example.com").ok).toBe(false);
     // Every required key must be present.
-    for (const key of ["zone", "excludedHosts", "agentHosts", "deployManagedRuleset"]) {
+    for (const key of ["zone", "excludedHosts", "agentHosts", "includeManagedRuleset"]) {
       const copy: Record<string, unknown> = { ...WAF_RULE_PARAMS };
       delete copy[key];
       expect(validateWafRuleUpsertParams(copy).ok).toBe(false);
@@ -1248,9 +1250,9 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     }
     const thirtyOneAgents = Array.from({ length: 31 }, (_, index) => `cell-${index}.example.com`);
     expect(bad({ excludedHosts: thirtyOneAgents, agentHosts: thirtyOneAgents }).ok).toBe(false);
-    // deployManagedRuleset
-    expect(bad({ deployManagedRuleset: "true" }).ok).toBe(false);
-    expect(bad({ deployManagedRuleset: undefined }).ok).toBe(false);
+    // includeManagedRuleset
+    expect(bad({ includeManagedRuleset: "true" }).ok).toBe(false);
+    expect(bad({ includeManagedRuleset: undefined }).ok).toBe(false);
   });
 
   // ── waf-rule-upsert: the rule BUILDER (byte-identical twin of the orchestrator's) ──
@@ -1289,7 +1291,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     'and not (http.host in {"cell-x.example.com" "host.example.com"}) ' +
     'and not ends_with(http.host, "-media.example.com")';
 
-  const EXPECTED_EXEC_SKIP_EXPRESSION = '(http.host eq "cell-x.example.com" and starts_with(http.request.uri.path, "/exec"))';
+  const EXPECTED_EXEC_SKIP_EXPRESSION = '(http.host in {"cell-x.example.com"})';
 
   /** The builder input equivalent to WAF_RULE_PARAMS. */
   const WAF_BUILD_INPUT = {
@@ -1306,13 +1308,15 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     return built.rules;
   }
 
-  it("waf-rule-upsert: syd-equivalent hosts render the LIVE syd rules — byte-identical except the two deliberate changes", () => {
+  it("waf-rule-upsert: syd-equivalent hosts render the LIVE syd rules — byte-identical except the three deliberate changes", () => {
     const rules = builtWafRules(SYD_EQUIVALENT_INPUT);
     // Byte-identical to live.
     expect(rules.loginGate.expression).toBe(SYD_LIVE_LOGIN_GATE_EXPRESSION);
     expect(rules.countryBlock.expression).toBe(SYD_LIVE_COUNTRY_BLOCK_EXPRESSION);
-    expect(rules.execSkip.expression).toBe(SYD_LIVE_EXEC_SKIP_EXPRESSION);
     expect(rules.execSkip.description).toBe(SYD_LIVE_EXEC_SKIP_DESCRIPTION);
+    // Deliberate change 3 (review H1): the skip covers every path on the agent host, not only /exec.
+    expect(rules.execSkip.expression).not.toBe(SYD_LIVE_EXEC_SKIP_EXPRESSION);
+    expect(rules.execSkip.expression).toBe(EXPECTED_SYD_AGENT_SKIP_EXPRESSION);
     expect(rules.execSkip.action).toBe("skip");
     expect(rules.execSkip.action_parameters).toEqual({ phases: ["http_request_firewall_managed"] });
     // Deliberate change 1 (2026-10-04): `starts_with` + the admin-ajax.php exemption.
@@ -1372,16 +1376,16 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(WAF_MANAGED_PHASE).toBe("http_request_firewall_managed");
   });
 
-  it("waf-rule-upsert: several agents render the /exec skip as a host SET (an agency cell has web, file and gateway agents)", () => {
+  it("waf-rule-upsert: the agent skip is a host SET covering every path (an agency cell has web, file and gateway agents)", () => {
     const agents = [
       "cell-australia-southeast2.example.com",
       "cell-australia-southeast2-file.example.com",
       "cell-australia-southeast2-gw.example.com",
     ];
     expect(wafExecSkipExpression(agents)).toBe(
-      '(http.host in {"cell-australia-southeast2.example.com" "cell-australia-southeast2-file.example.com" "cell-australia-southeast2-gw.example.com"} and starts_with(http.request.uri.path, "/exec"))',
+      '(http.host in {"cell-australia-southeast2.example.com" "cell-australia-southeast2-file.example.com" "cell-australia-southeast2-gw.example.com"})',
     );
-    expect(wafExecSkipExpression(["cell-syd.doubleyoup.com"])).toBe(SYD_LIVE_EXEC_SKIP_EXPRESSION);
+    expect(wafExecSkipExpression(["cell-syd.doubleyoup.com"])).toBe(EXPECTED_SYD_AGENT_SKIP_EXPRESSION);
     expect(wafFrontendGeoExpression(["AU"], ["cell-x.sbmstudio.com.au"], "sbmstudio.com.au")).toBe(
       'not (ip.geoip.country in {"AU"}) and not (cf.verified_bot_category eq "Search Engine Crawler") ' +
         'and not (http.host in {"cell-x.sbmstudio.com.au"}) and not ends_with(http.host, "-media.sbmstudio.com.au")',
@@ -1646,11 +1650,13 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(edgeVerdict({ ...foreign, host: "host.example.com", path: "/wp-login.php" })).toBe("block");
   });
 
-  it("waf-rule-upsert: the Managed Ruleset is skipped ONLY for /exec on an agent host", () => {
+  it("waf-rule-upsert: the Managed Ruleset is skipped for EVERY path on an agent host — and nowhere else", () => {
     expect(managedRulesetSkipped({ ...ANON_PAGE, host: "cell-x.example.com", path: "/exec" })).toBe(true);
     expect(managedRulesetSkipped({ ...ANON_PAGE, host: "cell-x.example.com", path: "/exec/async" })).toBe(true);
-    // Another path on the agent, /exec on a site, or a mixed-case agent host: the Managed Ruleset runs.
-    expect(managedRulesetSkipped({ ...ANON_PAGE, host: "cell-x.example.com", path: "/health" })).toBe(false);
+    // The agents' other endpoints carry the same kind of body (review H1), so they are skipped too.
+    expect(managedRulesetSkipped({ ...ANON_PAGE, host: "cell-x.example.com", path: "/provision-site" })).toBe(true);
+    expect(managedRulesetSkipped({ ...ANON_PAGE, host: "cell-x.example.com", path: "/health" })).toBe(true);
+    // /exec on any other host, or a mixed-case agent host: the Managed Ruleset runs.
     expect(managedRulesetSkipped({ ...ANON_PAGE, host: "host.example.com", path: "/exec" })).toBe(false);
     expect(managedRulesetSkipped({ ...ANON_PAGE, host: "shop-production.example.com", path: "/exec" })).toBe(false);
     expect(managedRulesetSkipped({ ...ANON_PAGE, host: "CELL-X.example.com", path: "/exec" })).toBe(false);
@@ -3991,6 +3997,9 @@ describe("POST /actuate route", () => {
       if (parsed.pathname.startsWith("/client/v4/zones/zone-1/rulesets/rs-1/rules/") && method === "PATCH") {
         return jsonResponse({ success: true, result: { id: "rs-1", rules: customRules } });
       }
+      if (parsed.pathname.startsWith("/client/v4/zones/zone-1/rulesets/rs-managed/rules/") && method === "PATCH") {
+        return jsonResponse({ success: true, result: { id: "rs-managed", rules: managedRules } });
+      }
       throw new Error(`unexpected fetch ${method} ${url}`);
     });
     return calls;
@@ -4091,7 +4100,7 @@ describe("POST /actuate route", () => {
     expect(body.managedRuleset).toBe("already-deployed");
   });
 
-  it("waf-rule-upsert: the live syd rule set converges IN PLACE — exactly the two deliberate changes are PATCHed, nothing is added", async () => {
+  it("waf-rule-upsert: the live syd rule set converges IN PLACE — exactly the three deliberate changes are PATCHed, nothing is added", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const sydParams = {
       zone: "doubleyoup.com",
@@ -4104,7 +4113,7 @@ describe("POST /actuate route", () => {
         "cell-syd.doubleyoup.com",
       ],
       agentHosts: ["cell-syd.doubleyoup.com"],
-      deployManagedRuleset: true,
+      includeManagedRuleset: true,
     };
     const job = wafRuleJob({ params: JSON.stringify(sydParams) });
     const signature = await signAsApp(job, privateKey);
@@ -4139,20 +4148,24 @@ describe("POST /actuate route", () => {
         { description: "doubleyoup-wpadmin-geo", action: "updated", ruleId: "live-wpadmin" },
         { description: "doubleyoup-login-gate", action: "unchanged", ruleId: "live-login" },
         { description: "doubleyoup-frontend-geo", action: "updated", ruleId: "live-frontend" },
-        { description: SYD_LIVE_EXEC_SKIP_DESCRIPTION, action: "unchanged", ruleId: "live-exec" },
+        { description: SYD_LIVE_EXEC_SKIP_DESCRIPTION, action: "updated", ruleId: "live-exec" },
       ],
       otherWafRules: [],
+      // syd's live execute rule was added by hand, without our description: another owner's, left alone.
       managedRuleset: "already-deployed",
     });
     const writes = calls.filter((call) => call.method !== "GET");
     expect(writes.map((call) => `${call.method} ${call.path}`)).toEqual([
       "PATCH /client/v4/zones/zone-1/rulesets/rs-1/rules/live-wpadmin",
       "PATCH /client/v4/zones/zone-1/rulesets/rs-1/rules/live-frontend",
+      "PATCH /client/v4/zones/zone-1/rulesets/rs-1/rules/live-exec",
     ]);
     expect(writes[0]?.body?.expression).toBe(EXPECTED_WPADMIN_GEO_EXPRESSION);
     expect(writes[1]?.body?.expression).toBe(
       `${SYD_LIVE_FRONTEND_GEO_EXPRESSION} and not ends_with(http.host, "-media.doubleyoup.com")`,
     );
+    expect(writes[2]?.body?.expression).toBe(EXPECTED_SYD_AGENT_SKIP_EXPRESSION);
+    expect(writes[2]?.body?.action_parameters).toEqual({ phases: ["http_request_firewall_managed"] });
   });
 
   it("waf-rule-upsert: an identical rule set (any order) + a deployed Managed Ruleset => NO write at all", async () => {
@@ -4190,7 +4203,7 @@ describe("POST /actuate route", () => {
 
   it("waf-rule-upsert: enabled:false PATCHes the four protections OFF in place and leaves the /exec skip ON", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
-    const job = wafRuleJob({ params: JSON.stringify({ ...WAF_RULE_PARAMS, enabled: false, deployManagedRuleset: false }) });
+    const job = wafRuleJob({ params: JSON.stringify({ ...WAF_RULE_PARAMS, enabled: false, includeManagedRuleset: false }) });
     const signature = await signAsApp(job, privateKey);
     const [countryBlock, wpAdminGeo, loginGate, frontendGeo, execSkip] = expectedWafRules(true);
     const calls = mockWafRuleApi([
@@ -4360,9 +4373,9 @@ describe("POST /actuate route", () => {
     expect(managedWrites[0]?.body).toEqual(buildManagedRulesetExecuteRule());
   });
 
-  it("waf-rule-upsert: deployManagedRuleset:false never touches the managed phase", async () => {
+  it("waf-rule-upsert: includeManagedRuleset:false never touches the managed phase", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
-    const job = wafRuleJob({ params: JSON.stringify({ ...WAF_RULE_PARAMS, deployManagedRuleset: false }) });
+    const job = wafRuleJob({ params: JSON.stringify({ ...WAF_RULE_PARAMS, includeManagedRuleset: false }) });
     const signature = await signAsApp(job, privateKey);
     const calls = mockWafRuleApi(null);
 
@@ -4371,6 +4384,104 @@ describe("POST /actuate route", () => {
     expect(body.ok).toBe(true);
     expect(body.managedRuleset).toBe("not-requested");
     expect(managedPhaseCalls(calls)).toHaveLength(0);
+  });
+
+  /** OUR execute rule (the one this op creates) as Cloudflare would list it, with an agency override. */
+  function ourManagedRule(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return managedExecuteRule({
+      id: "managed-ours",
+      description: MANAGED_RULESET_RULE_DESCRIPTION,
+      action_parameters: { id: CLOUDFLARE_MANAGED_RULESET_ID, overrides: { rules: [{ id: "fp-rule", action: "log" }] } },
+      ...overrides,
+    });
+  }
+  /** Another owner's execute rule for the SAME Managed Ruleset (syd's was added by hand like this). */
+  const foreignManagedRule = managedExecuteRule({ id: "managed-theirs", description: "" });
+
+  it("waf-rule-upsert: --disable --managed-ruleset DISABLES our execute rule in place — overrides kept, never deleted", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob({ params: JSON.stringify({ ...WAF_RULE_PARAMS, enabled: false, includeManagedRuleset: true }) });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockWafRuleApi(null, { managedRules: [foreignManagedRule, ourManagedRule()] });
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    const body = (await response.json()) as { ok: boolean; managedRuleset: string };
+    expect(body.ok).toBe(true);
+    expect(body.managedRuleset).toBe("disabled");
+    const managedWrites = managedPhaseCalls(calls).filter((call) => call.method !== "GET");
+    // ONE write: a PATCH of OUR rule. Another owner's execute rule is never the target; nothing is deleted.
+    expect(managedWrites.map((call) => `${call.method} ${call.path}`)).toEqual([
+      "PATCH /client/v4/zones/zone-1/rulesets/rs-managed/rules/managed-ours",
+    ]);
+    expect(managedWrites[0]?.body).toEqual({
+      description: "doubleyoup-managed-ruleset",
+      expression: "true",
+      action: "execute",
+      action_parameters: { id: CLOUDFLARE_MANAGED_RULESET_ID, overrides: { rules: [{ id: "fp-rule", action: "log" }] } },
+      enabled: false,
+    });
+    expect(calls.some((call) => call.method === "DELETE")).toBe(false);
+  });
+
+  it("waf-rule-upsert: a rollback never touches ANOTHER owner's execute rule ('not-ours'), and reports 'absent' when nothing runs it", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const rollback = JSON.stringify({ ...WAF_RULE_PARAMS, enabled: false, includeManagedRuleset: true });
+
+    const notOursJob = wafRuleJob({ params: rollback });
+    const notOursCalls = mockWafRuleApi(null, { managedRules: [foreignManagedRule] });
+    const notOurs = (await (await worker.fetch(actuateRequest({ job: notOursJob, signature: await signAsApp(notOursJob, privateKey) }), envWith())).json()) as { managedRuleset: string };
+    expect(notOurs.managedRuleset).toBe("not-ours");
+    expect(managedPhaseCalls(notOursCalls).filter((call) => call.method !== "GET")).toHaveLength(0);
+    vi.restoreAllMocks();
+
+    // A rollback is not plan-gated: it runs on a Free zone too (nothing of ours can be there, but it checks).
+    const absentJob = wafRuleJob({ params: rollback, nonce: "ef56ef56ef56ef56ef56ef56ef56ef56" });
+    const absentCalls = mockWafRuleApi(null, { plan: "free", managedRules: null });
+    const absent = (await (await worker.fetch(actuateRequest({ job: absentJob, signature: await signAsApp(absentJob, privateKey) }), envWith())).json()) as { managedRuleset: string };
+    expect(absent.managedRuleset).toBe("absent");
+    expect(managedPhaseCalls(absentCalls).filter((call) => call.method !== "GET")).toHaveLength(0);
+  });
+
+  it("waf-rule-upsert: a rollback of an already-disabled rule of ours writes nothing ('already-disabled')", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob({ params: JSON.stringify({ ...WAF_RULE_PARAMS, enabled: false, includeManagedRuleset: true }) });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockWafRuleApi(null, { managedRules: [ourManagedRule({ enabled: false })] });
+
+    const body = (await (await worker.fetch(actuateRequest({ job, signature }), envWith())).json()) as { managedRuleset: string };
+    expect(body.managedRuleset).toBe("already-disabled");
+    expect(managedPhaseCalls(calls).filter((call) => call.method !== "GET")).toHaveLength(0);
+  });
+
+  it("waf-rule-upsert: --managed-ruleset after a rollback RE-ENABLES our rule in place, overrides kept", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockWafRuleApi(null, { managedRules: [ourManagedRule({ enabled: false })] });
+
+    const body = (await (await worker.fetch(actuateRequest({ job, signature }), envWith())).json()) as { managedRuleset: string };
+    expect(body.managedRuleset).toBe("re-enabled");
+    const managedWrites = managedPhaseCalls(calls).filter((call) => call.method !== "GET");
+    expect(managedWrites.map((call) => `${call.method} ${call.path}`)).toEqual([
+      "PATCH /client/v4/zones/zone-1/rulesets/rs-managed/rules/managed-ours",
+    ]);
+    expect(managedWrites[0]?.body?.enabled).toBe(true);
+    expect(managedWrites[0]?.body?.action_parameters).toEqual({
+      id: CLOUDFLARE_MANAGED_RULESET_ID,
+      overrides: { rules: [{ id: "fp-rule", action: "log" }] },
+    });
+  });
+
+  it("waf-rule-upsert: two managed rules carrying our description => the Managed Ruleset step fails closed, writing nothing there", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob({ params: JSON.stringify({ ...WAF_RULE_PARAMS, enabled: false, includeManagedRuleset: true }) });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockWafRuleApi(null, { managedRules: [ourManagedRule(), ourManagedRule({ id: "managed-ours-2" })] });
+
+    const body = (await (await worker.fetch(actuateRequest({ job, signature }), envWith())).json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/ambiguous/);
+    expect(managedPhaseCalls(calls).filter((call) => call.method !== "GET")).toHaveLength(0);
   });
 
   it("waf-rule-upsert: a write that fails part-way FAILS LOUDLY, names what landed, and skips the Managed Ruleset", async () => {
@@ -4396,7 +4507,7 @@ describe("POST /actuate route", () => {
     expect(managedPhaseCalls(calls)).toHaveLength(0);
   });
 
-  it("waf-rule-upsert: a Managed Ruleset write failure is ok:false, and says all five custom rules ARE in force", async () => {
+  it("waf-rule-upsert: a Managed Ruleset write failure is ok:false, and says all five custom rules WERE applied", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const job = wafRuleJob();
     const signature = await signAsApp(job, privateKey);
@@ -4405,7 +4516,7 @@ describe("POST /actuate route", () => {
     const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
     const body = (await response.json()) as { ok: boolean; detail: string; wafRulesApplied: unknown[] };
     expect(body.ok).toBe(false);
-    expect(body.detail).toMatch(/all five custom rules are in force/);
+    expect(body.detail).toMatch(/all five custom rules were applied/);
     expect(body.detail).toMatch(/managed write failed/);
     expect(body.wafRulesApplied).toHaveLength(5);
   });

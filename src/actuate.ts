@@ -63,6 +63,7 @@ import {
 } from "./edge-cache-rule.js";
 import {
   CLOUDFLARE_MANAGED_RULESET_ID,
+  MANAGED_RULESET_RULE_DESCRIPTION,
   WAF_MANAGED_PHASE,
   WAF_PHASE,
   WAF_RULE_DESCRIPTIONS,
@@ -128,21 +129,31 @@ export interface WafRuleOutcome {
 }
 
 /**
- * What THIS dispatch did about the Cloudflare Managed Ruleset:
- *   deployed            — this run added the execute rule;
- *   already-deployed    — an ENABLED execute rule for it was already there (left exactly as it was,
- *                         including any overrides the agency set);
- *   present-disabled    — an execute rule for it exists but is switched off (left off: that is the
- *                         agency's call, usually after a false positive);
- *   unavailable-on-plan — the zone is below Pro (or its plan is unknown), so nothing was attempted;
- *   not-requested       — the job did not ask for it.
+ * What THIS dispatch did about the Cloudflare Managed Ruleset. "Ours" is the execute rule with the
+ * description "doubleyoup-managed-ruleset" (the one this op creates); any other execute rule that runs
+ * the Managed Ruleset belongs to another owner and is never written.
+ *   not-requested       — the job did not include the Managed Ruleset (the default);
+ *   unavailable-on-plan — enable was asked for, but the zone is below Pro (or its plan is unknown);
+ *   deployed            — enable: no execute rule for it existed, so this run added ours;
+ *   re-enabled          — enable: ours was switched off (an earlier rollback), so this run switched it on;
+ *   already-deployed    — enable: ours, or another owner's, is already on (left exactly as it was);
+ *   present-disabled    — enable: none of ours, and another owner's is switched off (left off: their call);
+ *   disabled            — rollback: ours was on, so this run switched it off (never deleted);
+ *   already-disabled    — rollback: ours was already off;
+ *   not-ours            — rollback: none of ours; another owner's execute rule runs it (left untouched);
+ *   absent              — rollback: nothing runs the Managed Ruleset in this zone.
  */
 export type ManagedRulesetStatus =
+  | "not-requested"
+  | "unavailable-on-plan"
   | "deployed"
+  | "re-enabled"
   | "already-deployed"
   | "present-disabled"
-  | "unavailable-on-plan"
-  | "not-requested";
+  | "disabled"
+  | "already-disabled"
+  | "not-ours"
+  | "absent";
 
 // The op manages FIVE custom rules (edge-waf-rule.ts) plus, on request, the Managed Ruleset.
 // `rules` on SUCCESS is every custom rule, in apply order — ok:true means all five are in force.
@@ -1671,28 +1682,94 @@ function executesCloudflareManagedRuleset(rule: CloudflareRulesetRule): boolean 
 }
 
 /**
- * Deploy the Cloudflare Managed Ruleset in the managed phase, unless an execute rule for it is
- * already there. An existing one is NEVER changed: it may carry the agency's own overrides (a rule
- * set to Log after a false positive), and a disabled one was switched off on purpose.
+ * The PATCH body that switches OUR execute rule on or off while keeping everything else it carries —
+ * expression, action and parameters, including any overrides the agency added to it since. A field
+ * Cloudflare did not return falls back to the value this op would have created it with.
  */
-async function ensureManagedRulesetDeployed(
+function ourManagedRuleBody(existing: CloudflareRulesetRule, enabled: boolean): Record<string, unknown> {
+  const created = buildManagedRulesetExecuteRule();
+  return {
+    description: MANAGED_RULESET_RULE_DESCRIPTION,
+    expression: existing.expression ?? created.expression,
+    action: existing.action ?? created.action,
+    action_parameters: existing.action_parameters ?? created.action_parameters,
+    enabled,
+  };
+}
+
+/**
+ * Bring the Cloudflare Managed Ruleset to the run's `enabled` state, writing ONLY the execute rule
+ * this op owns — found by its exact description, MANAGED_RULESET_RULE_DESCRIPTION, and nothing else.
+ * An execute rule another owner created (syd's was added by hand, without our description) is read
+ * so the status is honest, but never written: it may carry overrides set after a false positive, and
+ * a disabled one was switched off on purpose. A rollback DISABLES ours; it never deletes it, so
+ * switching it back on is one run. See ManagedRulesetStatus for every outcome. The caller has already
+ * checked the plan for an enable.
+ */
+async function reconcileManagedRuleset(
   token: string,
   zoneId: string,
   zonePath: string,
+  enabled: boolean,
 ): Promise<{ status: ManagedRulesetStatus } | { error: string }> {
   const entrypoint = await getWafPhaseEntrypoint(token, zoneId, WAF_MANAGED_PHASE);
   if ("error" in entrypoint) {
     return entrypoint;
   }
-
+  let rules: CloudflareRulesetRule[] = [];
   if (!("missing" in entrypoint)) {
-    const existing = (entrypoint.ruleset.rules ?? []).filter(executesCloudflareManagedRuleset);
-    if (existing.some((rule) => rule.enabled !== false)) {
-      return { status: "already-deployed" };
+    rules = entrypoint.ruleset.rules ?? [];
+  }
+  const ours = rules.filter((rule) => rule.description === MANAGED_RULESET_RULE_DESCRIPTION);
+  const othersOwners = rules.filter(
+    (rule) => rule.description !== MANAGED_RULESET_RULE_DESCRIPTION && executesCloudflareManagedRuleset(rule),
+  );
+  if (ours.length > 1) {
+    return {
+      error: `${ours.length} managed-phase rules carry the description "${MANAGED_RULESET_RULE_DESCRIPTION}" — ambiguous, refusing to change any of them.`,
+    };
+  }
+
+  const ourRule = ours[0];
+  if (ourRule !== undefined) {
+    const ourRuleIsOn = ourRule.enabled !== false;
+    if (ourRuleIsOn === enabled) {
+      if (enabled) {
+        return { status: "already-deployed" };
+      }
+      return { status: "already-disabled" };
     }
-    if (existing.length > 0) {
-      return { status: "present-disabled" };
+    if (!ourRule.id || "missing" in entrypoint) {
+      return { error: "Cloudflare returned our Managed Ruleset execute rule without an id — cannot switch it." };
     }
+    const rulesetPath = `${zonePath}/rulesets/${encodeURIComponent(entrypoint.ruleset.id as string)}`;
+    const patched = await writeWafRuleset(
+      token,
+      "PATCH",
+      `${rulesetPath}/rules/${encodeURIComponent(ourRule.id)}`,
+      ourManagedRuleBody(ourRule, enabled),
+    );
+    if ("error" in patched) {
+      return patched;
+    }
+    if (enabled) {
+      return { status: "re-enabled" };
+    }
+    return { status: "disabled" };
+  }
+
+  // None of ours from here on.
+  if (!enabled) {
+    if (othersOwners.length > 0) {
+      return { status: "not-ours" };
+    }
+    return { status: "absent" };
+  }
+  if (othersOwners.some((rule) => rule.enabled !== false)) {
+    return { status: "already-deployed" };
+  }
+  if (othersOwners.length > 0) {
+    return { status: "present-disabled" };
   }
 
   const executeRule = buildManagedRulesetExecuteRule();
@@ -1811,16 +1888,19 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
     applied.push({ description: desired.description, action: outcome.action, ruleId: outcome.ruleId });
   }
 
-  // The Managed Ruleset, strictly AFTER the five custom rules (the /exec skip is now in force).
+  // The Managed Ruleset — only when the job includes it, and strictly AFTER the five custom rules
+  // (the agent skip is now in force). An enable needs Pro or above; a rollback runs on any plan.
   let managedRuleset: ManagedRulesetStatus = "not-requested";
-  if (params.deployManagedRuleset) {
-    managedRuleset = "unavailable-on-plan";
-    if (planSupportsManagedRuleset(zone.planLegacyId)) {
-      const managed = await ensureManagedRulesetDeployed(token, zone.id, zonePath);
+  if (params.includeManagedRuleset) {
+    const enableBlockedByPlan = params.enabled && !planSupportsManagedRuleset(zone.planLegacyId);
+    if (enableBlockedByPlan) {
+      managedRuleset = "unavailable-on-plan";
+    } else {
+      const managed = await reconcileManagedRuleset(token, zone.id, zonePath, params.enabled);
       if ("error" in managed) {
         return wafFailure(
           zoneName,
-          `all five custom rules are in force, but the Cloudflare Managed Ruleset could not be deployed: ${managed.error}`,
+          `all five custom rules were applied, but the Cloudflare Managed Ruleset step failed: ${managed.error}`,
           applied,
         );
       }

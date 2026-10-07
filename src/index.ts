@@ -20,8 +20,8 @@
 //                     (the one "edge page cache" Cache Rule in an agency zone),
 //                     waf-rule-upsert (the edge-defense baseline in an agency zone: five
 //                     WAF custom rules — country block, WP admin/login geo-lockdown, login
-//                     managed-challenge, front-end geo challenge, the cell-agent /exec skip —
-//                     plus the Cloudflare Managed Ruleset), wp-cli (run a
+//                     managed-challenge, front-end geo challenge, the cell-agent host skip —
+//                     plus, opt-in, the Cloudflare Managed Ruleset), wp-cli (run a
 //                     wp-cli command on the agency's cell via its on-VM cell-agent),
 //                     db-export (the cell exports its WP DB and uploads it to the
 //                     agency's object store via a presigned URL), db-import (the cell
