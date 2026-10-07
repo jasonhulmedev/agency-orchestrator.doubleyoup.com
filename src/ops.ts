@@ -22,10 +22,10 @@
 // idempotent — each treats Google's 409 alreadyExists as success so a half-built cell resumes on
 // re-run (planning/34). `cache-rule-upsert` is idempotent too: it finds the one "edge page cache"
 // rule by its stable description and PATCHes it only on drift, so a re-run converges.
-// `waf-rule-upsert` is idempotent for the same reason, over THREE rules: each standing edge-defense
-// rule is found by its stable description and PATCHed only on drift, so a re-run converges —
-// including after a PARTIAL apply (a zone that ran out of custom-rule budget part-way), which it
-// resumes rather than duplicates.
+// `waf-rule-upsert` is idempotent for the same reason, over FIVE rules: each edge-defense rule is
+// found by its exact description and PATCHed only on drift, and the Managed Ruleset is deployed only
+// when no execute rule for it exists — so a re-run converges, including after a PARTIAL apply (a write
+// that failed part-way), which it resumes rather than duplicates.
 //
 // ALL FIVE TEARDOWN ops — `gcp-instance-delete` / `gcp-address-delete` / `gcp-firewall-delete` /
 // `gcp-router-delete` / `gcp-network-delete` — are IDEMPOTENT, the mirror of that: Google's 404

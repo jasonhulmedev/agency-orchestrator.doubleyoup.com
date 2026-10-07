@@ -18,9 +18,10 @@
 //                     dns-record-upsert (upsert a record in an agency zone),
 //                     cache-purge (purge an agency zone's cache), cache-rule-upsert
 //                     (the one "edge page cache" Cache Rule in an agency zone),
-//                     waf-rule-upsert (the three standing edge-defense WAF custom rules
-//                     in an agency zone: country block, WP admin/login geo-lockdown,
-//                     login managed-challenge), wp-cli (run a
+//                     waf-rule-upsert (the edge-defense baseline in an agency zone: five
+//                     WAF custom rules — country block, WP admin/login geo-lockdown, login
+//                     managed-challenge, front-end geo challenge, the cell-agent /exec skip —
+//                     plus the Cloudflare Managed Ruleset), wp-cli (run a
 //                     wp-cli command on the agency's cell via its on-VM cell-agent),
 //                     db-export (the cell exports its WP DB and uploads it to the
 //                     agency's object store via a presigned URL), db-import (the cell
