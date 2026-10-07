@@ -36,8 +36,10 @@
 //   - a request from a blocked country to /wp-login.php is BLOCKED, not challenged;
 //   - a request from a non-allow-listed country to /wp-admin is BLOCKED, not challenged;
 //   - a request from an allow-listed country to /wp-login.php is CHALLENGED.
-// The order only decides where a NEW rule lands. A rule that already exists is PATCHed where it is, so
-// a zone whose rules were created in another order (syd's: login gate first) keeps that order.
+// A NEW rule is appended (after every rule already in the phase). An EXISTING rule of ours that sits
+// before the rule of ours that should precede it is MOVED, with `position: { after: <that rule> }` on
+// its PATCH (review L1) — so syd's live order (login gate first) becomes this order on its first run.
+// Only our rules move, only relative to each other; every other rule keeps its place.
 //
 // NO PER-SITE HOST CLAUSE — deliberate, and the whole point. A WAF custom rule is evaluated per ZONE
 // across ALL of that zone's traffic, which is what makes it cover a site served on its own customer

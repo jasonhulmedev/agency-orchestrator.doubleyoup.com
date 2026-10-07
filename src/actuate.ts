@@ -117,8 +117,12 @@ export type CacheRuleUpsertResult =
     }
   | { ok: false; op: "cache-rule-upsert"; zone: string; detail: string };
 
-/** What one upsert did to one WAF rule: created it (or created the entrypoint with it), PATCHed it, or left it. */
-export type WafRuleAction = "created" | "updated" | "unchanged";
+/**
+ * What one upsert did to one WAF rule: created it (or created the entrypoint with it), PATCHed its
+ * definition (and, if needed, its position), PATCHed ONLY its position ("moved", definition untouched),
+ * or left it.
+ */
+export type WafRuleAction = "created" | "updated" | "moved" | "unchanged";
 
 /** One of the five edge-defense rules, and what THIS dispatch did to it. */
 export interface WafRuleOutcome {
@@ -1597,17 +1601,48 @@ function describeOtherWafRules(ruleset: CloudflareRuleset | null): string[] {
 
 type OneWafRuleOutcome = { action: WafRuleAction; ruleId: string; ruleset: CloudflareRuleset } | { error: string };
 
+/** The index of the rule with `ruleId` in the ruleset as we know it, or -1. */
+function indexOfRule(ruleset: CloudflareRuleset, ruleId: string): number {
+  return (ruleset.rules ?? []).findIndex((rule) => rule.id === ruleId);
+}
+
+/**
+ * Our copy of the ruleset with `ruleId` moved to directly after `anchorId` — what Cloudflare does for
+ * a PATCH carrying `position: { after: anchorId }`. Kept in memory so the NEXT rule's order check sees
+ * the move (the PATCH reply is not relied on).
+ */
+function withRuleMovedAfter(ruleset: CloudflareRuleset, ruleId: string, anchorId: string): CloudflareRuleset {
+  const rules = [...(ruleset.rules ?? [])];
+  const from = rules.findIndex((rule) => rule.id === ruleId);
+  if (from === -1) {
+    return ruleset;
+  }
+  const [moved] = rules.splice(from, 1);
+  const anchorIndex = rules.findIndex((rule) => rule.id === anchorId);
+  rules.splice(anchorIndex + 1, 0, moved as CloudflareRulesetRule);
+  return { ...ruleset, rules };
+}
+
 /**
  * Upsert ONE of our rules against the ruleset as we currently know it (null = the zone has no
  * firewall-custom entrypoint yet). Returns the ruleset to carry into the next rule: for a create /
  * append that is what Cloudflare returned (it carries the new ids); for a PATCH, our copy with the
- * patched rule replaced (the PATCH reply is not relied on); unchanged = untouched.
+ * patched rule replaced and, after a move, re-ordered (the PATCH reply is not relied on); unchanged =
+ * untouched.
+ *
+ * ORDER (review L1). `previousRuleId` is the id of OUR rule that comes just before this one in the
+ * documented order (null for the first). An existing rule that sits BEFORE it is out of order, so its
+ * PATCH carries `position: { after: previousRuleId }`; when its definition is already right, the PATCH
+ * body is ONLY that position (Cloudflare keeps the definition), and the action is "moved". Only OUR
+ * rules are ever moved, and only relative to each other: every other rule keeps its place, and a rule
+ * of ours already after its predecessor is never moved, even with a foreign rule in between.
  */
 async function upsertOneWafRule(
   token: string,
   zonePath: string,
   ruleset: CloudflareRuleset | null,
   desired: WafRule,
+  previousRuleId: string | null,
 ): Promise<OneWafRuleOutcome> {
   // No custom rules in this zone yet: create the phase entrypoint holding just this rule.
   if (ruleset === null) {
@@ -1657,19 +1692,46 @@ async function upsertOneWafRule(
   }
 
   const existingId = existing.id ?? "";
-  if (!wafRuleDrifted(existing, desired)) {
+  const drifted = wafRuleDrifted(existing, desired);
+  let outOfOrder = false;
+  if (previousRuleId !== null && existingId !== "") {
+    const previousIndex = indexOfRule(ruleset, previousRuleId);
+    outOfOrder = previousIndex !== -1 && indexOfRule(ruleset, existingId) < previousIndex;
+  }
+  if (!drifted && !outOfOrder) {
     return { action: "unchanged", ruleId: existingId, ruleset };
   }
   if (!existingId) {
     return { error: `Cloudflare returned our rule "${desired.description}" without an id — cannot update it.` };
   }
 
-  const patched = await writeWafRuleset(token, "PATCH", `${rulesetPath}/rules/${encodeURIComponent(existingId)}`, desired);
+  // The PATCH body: the full definition when it drifted, plus the position when out of order. A
+  // position-only body moves the rule and keeps its definition (Cloudflare's documented reorder).
+  let body: Record<string, unknown> = {};
+  if (drifted) {
+    body = { ...desired };
+  }
+  if (outOfOrder) {
+    body.position = { after: previousRuleId };
+  }
+  const patched = await writeWafRuleset(token, "PATCH", `${rulesetPath}/rules/${encodeURIComponent(existingId)}`, body);
   if ("error" in patched) {
     return patched;
   }
-  const replaced = (ruleset.rules ?? []).map((rule) => (rule.id === existingId ? { ...desired, id: existingId } : rule));
-  return { action: "updated", ruleId: existingId, ruleset: { ...ruleset, rules: replaced } };
+
+  let next = ruleset;
+  if (drifted) {
+    const replaced = (ruleset.rules ?? []).map((rule) => (rule.id === existingId ? { ...desired, id: existingId } : rule));
+    next = { ...ruleset, rules: replaced };
+  }
+  if (outOfOrder) {
+    next = withRuleMovedAfter(next, existingId, previousRuleId as string);
+  }
+  let action: WafRuleAction = "moved";
+  if (drifted) {
+    action = "updated";
+  }
+  return { action, ruleId: existingId, ruleset: next };
 }
 
 /** True for an `execute` rule that runs the Cloudflare Managed Ruleset (whatever its description). */
@@ -1874,8 +1936,11 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
   }
 
   const applied: WafRuleOutcome[] = [];
+  // The id of OUR rule just before the current one in the documented order (strictest first), so an
+  // existing rule out of that order is moved after it (review L1).
+  let previousRuleId: string | null = null;
   for (const desired of desiredRules) {
-    const outcome = await upsertOneWafRule(token, zonePath, ruleset, desired);
+    const outcome = await upsertOneWafRule(token, zonePath, ruleset, desired, previousRuleId);
     if ("error" in outcome) {
       // LOUD, never silent: name the rule that did not land and keep Cloudflare's own message.
       return wafFailure(
@@ -1886,6 +1951,7 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
     }
     ruleset = outcome.ruleset;
     applied.push({ description: desired.description, action: outcome.action, ruleId: outcome.ruleId });
+    previousRuleId = outcome.ruleId === "" ? null : outcome.ruleId;
   }
 
   // The Managed Ruleset — only when the job includes it, and strictly AFTER the five custom rules

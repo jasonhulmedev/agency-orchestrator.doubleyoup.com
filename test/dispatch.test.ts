@@ -4102,7 +4102,7 @@ describe("POST /actuate route", () => {
     expect(body.managedRuleset).toBe("already-deployed");
   });
 
-  it("waf-rule-upsert: the live syd rule set converges IN PLACE — exactly the three deliberate changes are PATCHed, nothing is added", async () => {
+  it("waf-rule-upsert: the live syd rule set converges IN PLACE — three deliberate changes PATCHed, the login gate MOVED, nothing added", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const sydParams = {
       zone: "doubleyoup.com",
@@ -4148,7 +4148,8 @@ describe("POST /actuate route", () => {
       rules: [
         { description: "doubleyoup-country-block", action: "unchanged", ruleId: "live-country" },
         { description: "doubleyoup-wpadmin-geo", action: "updated", ruleId: "live-wpadmin" },
-        { description: "doubleyoup-login-gate", action: "unchanged", ruleId: "live-login" },
+        // Live order is login gate FIRST; documented order puts it after the wp-admin geo block (L1).
+        { description: "doubleyoup-login-gate", action: "moved", ruleId: "live-login" },
         { description: "doubleyoup-frontend-geo", action: "updated", ruleId: "live-frontend" },
         { description: SYD_LIVE_EXEC_SKIP_DESCRIPTION, action: "updated", ruleId: "live-exec" },
       ],
@@ -4159,31 +4160,39 @@ describe("POST /actuate route", () => {
     const writes = calls.filter((call) => call.method !== "GET");
     expect(writes.map((call) => `${call.method} ${call.path}`)).toEqual([
       "PATCH /client/v4/zones/zone-1/rulesets/rs-1/rules/live-wpadmin",
+      "PATCH /client/v4/zones/zone-1/rulesets/rs-1/rules/live-login",
       "PATCH /client/v4/zones/zone-1/rulesets/rs-1/rules/live-frontend",
       "PATCH /client/v4/zones/zone-1/rulesets/rs-1/rules/live-exec",
     ]);
+    // The three definition changes carry NO position: each already sits after its predecessor.
     expect(writes[0]?.body?.expression).toBe(EXPECTED_WPADMIN_GEO_EXPRESSION);
-    expect(writes[1]?.body?.expression).toBe(
+    expect(writes[0]?.body?.position).toBeUndefined();
+    // The login gate's definition is right; ONLY its position is sent, so Cloudflare keeps the rest.
+    expect(writes[1]?.body).toEqual({ position: { after: "live-wpadmin" } });
+    expect(writes[2]?.body?.expression).toBe(
       `${SYD_LIVE_FRONTEND_GEO_EXPRESSION} and not ends_with(http.host, "-media.doubleyoup.com")`,
     );
-    expect(writes[2]?.body?.expression).toBe(EXPECTED_SYD_AGENT_SKIP_EXPRESSION);
-    expect(writes[2]?.body?.action_parameters).toEqual({ phases: ["http_request_firewall_managed"] });
+    expect(writes[2]?.body?.position).toBeUndefined();
+    expect(writes[3]?.body?.expression).toBe(EXPECTED_SYD_AGENT_SKIP_EXPRESSION);
+    expect(writes[3]?.body?.action_parameters).toEqual({ phases: ["http_request_firewall_managed"] });
+    expect(writes[3]?.body?.position).toBeUndefined();
   });
 
-  it("waf-rule-upsert: an identical rule set (any order) + a deployed Managed Ruleset => NO write at all", async () => {
+  it("waf-rule-upsert: an identical rule set in the documented order + a deployed Managed Ruleset => NO write at all", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const job = wafRuleJob();
     const signature = await signAsApp(job, privateKey);
     const [countryBlock, wpAdminGeo, loginGate, frontendGeo, execSkip] = expectedWafRules();
-    // Listed in a different order than we apply them, with Cloudflare's extra fields, and a managed
-    // execute rule carrying the agency's own OVERRIDES (which must survive untouched).
+    // With Cloudflare's extra fields, a FOREIGN rule between two of ours (no reason to move either),
+    // and a managed execute rule carrying the agency's own OVERRIDES (which must survive untouched).
     const calls = mockWafRuleApi(
       [
-        { ...execSkip, id: "rule-exec", ref: "cf-ref-5", logging: { enabled: true } },
+        { ...countryBlock, id: "rule-country", ref: "cf-ref-1" },
+        { id: "agency-rule", description: "agency: allow the office", expression: "ip.src in {203.0.113.7}", action: "skip", enabled: true },
+        { ...wpAdminGeo, id: "rule-wpadmin", ref: "cf-ref-2" },
         { ...loginGate, id: "rule-login", ref: "cf-ref-3" },
         { ...frontendGeo, id: "rule-frontend", ref: "cf-ref-4" },
-        { ...countryBlock, id: "rule-country", ref: "cf-ref-1" },
-        { ...wpAdminGeo, id: "rule-wpadmin", ref: "cf-ref-2" },
+        { ...execSkip, id: "rule-exec", ref: "cf-ref-5", logging: { enabled: true } },
       ],
       {
         managedRules: [
@@ -4201,6 +4210,78 @@ describe("POST /actuate route", () => {
     expect(body.rules.map((rule) => rule.ruleId)).toEqual(["rule-country", "rule-wpadmin", "rule-login", "rule-frontend", "rule-exec"]);
     expect(body.managedRuleset).toBe("already-deployed");
     expect(calls.every((call) => call.method === "GET")).toBe(true);
+  });
+
+  it("waf-rule-upsert: identical rules in the WRONG order are MOVED into the documented order — position only", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const [countryBlock, wpAdminGeo, loginGate, frontendGeo, execSkip] = expectedWafRules();
+    const calls = mockWafRuleApi([
+      { ...execSkip, id: "rule-exec" },
+      { ...loginGate, id: "rule-login" },
+      { ...frontendGeo, id: "rule-frontend" },
+      { ...countryBlock, id: "rule-country" },
+      { ...wpAdminGeo, id: "rule-wpadmin" },
+    ]);
+
+    const body = (await (await worker.fetch(actuateRequest({ job, signature }), envWith())).json()) as {
+      ok: boolean;
+      rules: Array<{ action: string }>;
+    };
+    expect(body.ok).toBe(true);
+    expect(body.rules.map((rule) => rule.action)).toEqual(["unchanged", "unchanged", "moved", "moved", "moved"]);
+    const writes = calls.filter((call) => call.method === "PATCH");
+    // Each move is relative to OUR previous rule, and carries nothing but the position. Ending order:
+    // country, wp-admin, login, front end, agent skip.
+    expect(writes.map((call) => [call.path.split("/").pop(), call.body])).toEqual([
+      ["rule-login", { position: { after: "rule-wpadmin" } }],
+      ["rule-frontend", { position: { after: "rule-login" } }],
+      ["rule-exec", { position: { after: "rule-frontend" } }],
+    ]);
+  });
+
+  it("waf-rule-upsert: the order check follows its OWN earlier moves (the in-memory copy is re-ordered)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const [countryBlock, wpAdminGeo, loginGate, frontendGeo, execSkip] = expectedWafRules();
+    // Before the login gate moves, the front-end rule looks "after" it; once it has moved, it is not.
+    const calls = mockWafRuleApi([
+      { ...loginGate, id: "rule-login" },
+      { ...frontendGeo, id: "rule-frontend" },
+      { ...countryBlock, id: "rule-country" },
+      { ...wpAdminGeo, id: "rule-wpadmin" },
+      { ...execSkip, id: "rule-exec" },
+    ]);
+
+    await worker.fetch(actuateRequest({ job, signature }), envWith());
+    const writes = calls.filter((call) => call.method === "PATCH");
+    expect(writes.map((call) => [call.path.split("/").pop(), call.body])).toEqual([
+      ["rule-login", { position: { after: "rule-wpadmin" } }],
+      ["rule-frontend", { position: { after: "rule-login" } }],
+    ]);
+  });
+
+  it("waf-rule-upsert: a rule that drifted AND is out of order gets ONE PATCH carrying both the definition and the position", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = wafRuleJob();
+    const signature = await signAsApp(job, privateKey);
+    const [countryBlock, wpAdminGeo, loginGate, frontendGeo, execSkip] = expectedWafRules();
+    const calls = mockWafRuleApi([
+      { ...loginGate, id: "rule-login", enabled: false },
+      { ...countryBlock, id: "rule-country" },
+      { ...wpAdminGeo, id: "rule-wpadmin" },
+      { ...frontendGeo, id: "rule-frontend" },
+      { ...execSkip, id: "rule-exec" },
+    ]);
+
+    const body = (await (await worker.fetch(actuateRequest({ job, signature }), envWith())).json()) as { rules: Array<{ action: string }> };
+    expect(body.rules.map((rule) => rule.action)).toEqual(["unchanged", "unchanged", "updated", "unchanged", "unchanged"]);
+    const writes = calls.filter((call) => call.method === "PATCH");
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.path).toBe("/client/v4/zones/zone-1/rulesets/rs-1/rules/rule-login");
+    expect(writes[0]?.body).toEqual({ ...loginGate, position: { after: "rule-wpadmin" } });
   });
 
   it("waf-rule-upsert: enabled:false PATCHes the four protections OFF in place and leaves the /exec skip ON", async () => {
