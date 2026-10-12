@@ -52,6 +52,13 @@ import type {
   ProvisionSshKeysParams,
   WafRuleUpsertParams,
   GcpInstanceGetParams,
+  GcpSubnetCreateParams,
+  GcpSubnetGetParams,
+  GcpSubnetDeleteParams,
+  CloudRunServiceUpsertParams,
+  CloudRunServiceGetParams,
+  CloudRunServiceDeleteParams,
+  CloudRunProbeInvokeParams,
 } from "./dispatch-params.js";
 import { edgeCacheZoneFromHostSuffix } from "./dispatch-params.js";
 import {
@@ -77,7 +84,7 @@ import {
   type WafRule,
 } from "./edge-waf-rule.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
-import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken } from "./validators.js";
+import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken, mintGoogleIdToken } from "./validators.js";
 import { errorMessage, stripTrailingSlash } from "./util.js";
 
 const CF_API = "https://api.cloudflare.com/client/v4";
@@ -447,6 +454,84 @@ export type GcpInstanceGetResult =
     }
   | { ok: false; op: "gcp-instance-get"; instanceName: string; detail: string };
 
+// planning/49 Phase 2 — the Cloud Run subnet. "created" means the Worker WAITED for the insert to
+// reach DONE, so the subnet exists on return. "already-existed" is Google's 409 alreadyExists.
+export type GcpSubnetCreateResult =
+  | { ok: true; op: "gcp-subnet-create"; subnetName: string; status: GcpResourceStatus }
+  | { ok: false; op: "gcp-subnet-create"; subnetName: string; detail: string };
+
+// READ-ONLY. `ipCidrRange` is the primary range (null when not found). Idempotence of the create is
+// by NAME, so this is how a caller sees a same-named subnet with a different range.
+export type GcpSubnetGetResult =
+  | { ok: true; op: "gcp-subnet-get"; subnetName: string; found: boolean; ipCidrRange: string | null }
+  | { ok: false; op: "gcp-subnet-get"; subnetName: string; detail: string };
+
+// "deleted" means the Worker WAITED for the delete to reach DONE. "already-absent" is a 404. On a
+// failure, `inUse` is true when Google refused because another resource still uses the subnet (review
+// L4: Direct VPC egress can hold addresses after the last service is gone). That is "retry later".
+export type GcpSubnetDeleteResult =
+  | { ok: true; op: "gcp-subnet-delete"; subnetName: string; status: GcpDeleteStatus }
+  | { ok: false; op: "gcp-subnet-delete"; subnetName: string; detail: string; inUse: boolean };
+
+// planning/49 §4.3 — "created" / "updated" says which half of create-else-patch ran. The Worker WAITS
+// for the operation and re-reads the service, so `uri` and `urls` are the service's real URLs (the
+// caller checks the URL it derives is among `urls` — §3.2) and `revision` is the latest one's name.
+export type CloudRunServiceUpsertResult =
+  | {
+      ok: true;
+      op: "cloudrun-service-upsert";
+      serviceName: string;
+      status: "created" | "updated";
+      uri: string;
+      urls: string[];
+      revision: string | null;
+    }
+  | { ok: false; op: "cloudrun-service-upsert"; serviceName: string; detail: string };
+
+// READ-ONLY. `ready` is true only when the TERMINAL condition is Ready AND succeeded. `managedByPlatform`
+// is true when the service carries this platform's managed-by label (review M1). `reconciling` is
+// Google's own flag for a deploy still in flight (review L5).
+export type CloudRunServiceGetResult =
+  | {
+      ok: true;
+      op: "cloudrun-service-get";
+      serviceName: string;
+      found: boolean;
+      uri: string | null;
+      urls: string[];
+      ready: boolean;
+      managedByPlatform: boolean;
+      reconciling: boolean;
+    }
+  | { ok: false; op: "cloudrun-service-get"; serviceName: string; detail: string };
+
+// A delete CONVERGES: a 404 is "already-absent". A service WITHOUT the managed-by label is refused.
+export type CloudRunServiceDeleteResult =
+  | { ok: true; op: "cloudrun-service-delete"; serviceName: string; status: GcpDeleteStatus }
+  | { ok: false; op: "cloudrun-service-delete"; serviceName: string; detail: string };
+
+/** ONE probe result: "open" | "refused" | "timeout" | "error:<errno>". */
+export interface CloudRunProbeResultEntry {
+  ip: string;
+  port: string;
+  result: string;
+}
+
+// planning/49 Phase 2 — the premise probe's answer. `unauthenticatedStatus` is what Cloud Run said to a
+// request with NO token (it must refuse: 401 or 403). `authenticatedStatus` is what it said with a
+// Google ID token from the agency's own key. `results` is the probe's TCP results, checked for shape.
+export type CloudRunProbeInvokeResult =
+  | {
+      ok: true;
+      op: "cloudrun-probe-invoke";
+      serviceName: string;
+      uri: string;
+      unauthenticatedStatus: number;
+      authenticatedStatus: number;
+      results: CloudRunProbeResultEntry[];
+    }
+  | { ok: false; op: "cloudrun-probe-invoke"; serviceName: string; detail: string };
+
 export type ActuateResult =
   | ProvisionR2Result
   | DnsRecordUpsertResult
@@ -476,7 +561,14 @@ export type ActuateResult =
   | GcpInstanceSetMetadataResult
   | GcpInstanceRestartResult
   | ProvisionSshKeysResult
-  | GcpInstanceGetResult;
+  | GcpInstanceGetResult
+  | GcpSubnetCreateResult
+  | GcpSubnetGetResult
+  | GcpSubnetDeleteResult
+  | CloudRunServiceUpsertResult
+  | CloudRunServiceGetResult
+  | CloudRunServiceDeleteResult
+  | CloudRunProbeInvokeResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -2732,6 +2824,39 @@ type GcpTokenOutcome = { ok: true; accessToken: string } | { ok: false; detail: 
  * header and never logs or echoes it.
  */
 async function mintPinnedGcpAccessToken(env: Env, project: string): Promise<GcpTokenOutcome> {
+  const key = readPinnedServiceAccountKey(env, project);
+  if (!key.ok) {
+    return { ok: false, detail: key.detail };
+  }
+
+  let accessToken: string;
+  try {
+    accessToken = await mintGoogleAccessToken({
+      clientEmail: key.clientEmail,
+      privateKeyPem: key.privateKeyPem,
+      tokenUri: key.tokenUri,
+      scope: GOOGLE_SCOPE_CLOUD_PLATFORM,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      detail: `could not mint a Google access token from GCP_SERVICE_ACCOUNT_KEY: ${errorMessage(err)}`,
+    };
+  }
+  return { ok: true, accessToken };
+}
+
+/** The agency's service-account key, parsed, and PINNED to the op's project — or why it is not. */
+type PinnedServiceAccountKey =
+  | { ok: true; clientEmail: string; privateKeyPem: string; tokenUri: string }
+  | { ok: false; detail: string };
+
+/**
+ * Steps 1 and 2 of mintPinnedGcpAccessToken (read + parse GCP_SERVICE_ACCOUNT_KEY, then PIN `project`
+ * to the key's OWN project_id), as one function so the access-token mint and the planning/49 ID-token
+ * mint cannot drift apart on the agency-boundary check. Makes NO network call.
+ */
+function readPinnedServiceAccountKey(env: Env, project: string): PinnedServiceAccountKey {
   if (!env.GCP_SERVICE_ACCOUNT_KEY) {
     return { ok: false, detail: "GCP_SERVICE_ACCOUNT_KEY is not configured on this Worker." };
   }
@@ -2766,23 +2891,34 @@ async function mintPinnedGcpAccessToken(env: Env, project: string): Promise<GcpT
         `${key.project_id ? ` ("${key.project_id}")` : ""} — a resource is only created in the agency's own project.`,
     };
   }
-  const tokenUri = key.token_uri || GOOGLE_DEFAULT_TOKEN_URI;
+  return { ok: true, clientEmail, privateKeyPem, tokenUri: key.token_uri || GOOGLE_DEFAULT_TOKEN_URI };
+}
 
-  let accessToken: string;
+/** The outcome of minting a Google ID token for an op pinned to `project`. */
+type GcpIdTokenOutcome = { ok: true; idToken: string } | { ok: false; detail: string };
+
+/**
+ * planning/49 Phase 2: mint a Google ID TOKEN for `audience` (a Cloud Run service URL) from the
+ * agency's OWN key, after the same project pin every gcp-* op uses. The token goes back to the caller
+ * alone, who puts it in an Authorization header and never logs or echoes it.
+ */
+async function mintPinnedGcpIdToken(env: Env, project: string, audience: string): Promise<GcpIdTokenOutcome> {
+  const key = readPinnedServiceAccountKey(env, project);
+  if (!key.ok) {
+    return { ok: false, detail: key.detail };
+  }
+  let idToken: string;
   try {
-    accessToken = await mintGoogleAccessToken({
-      clientEmail,
-      privateKeyPem,
-      tokenUri,
-      scope: GOOGLE_SCOPE_CLOUD_PLATFORM,
+    idToken = await mintGoogleIdToken({
+      clientEmail: key.clientEmail,
+      privateKeyPem: key.privateKeyPem,
+      tokenUri: key.tokenUri,
+      audience,
     });
   } catch (err) {
-    return {
-      ok: false,
-      detail: `could not mint a Google access token from GCP_SERVICE_ACCOUNT_KEY: ${errorMessage(err)}`,
-    };
+    return { ok: false, detail: `could not mint a Google ID token from GCP_SERVICE_ACCOUNT_KEY: ${errorMessage(err)}` };
   }
-  return { ok: true, accessToken };
+  return { ok: true, idToken };
 }
 
 /**
@@ -3206,7 +3342,26 @@ type ComputeDeleteOutcome =
   // operation reached DONE (still running at the bound, or the wait poll itself failed). The
   // resource may well be on its way out, so the caller must say "re-run to resume" rather than
   // treat it as gone — gcp-instance-delete surfaces exactly this as `stillRunning: true`.
-  | { kind: "failed"; detail: string; unconfirmed: boolean };
+  //
+  // `inUse` is true ONLY when Google refused the delete because ANOTHER resource still uses this
+  // one (reason resourceInUseByAnotherResource / code RESOURCE_IN_USE_BY_ANOTHER_RESOURCE). planning/49
+  // review L4: Cloud Run Direct VPC egress can hold addresses on a subnet for a while after its last
+  // service is deleted, so gcp-subnet-delete surfaces this as a discriminable "retry later".
+  | { kind: "failed"; detail: string; unconfirmed: boolean; inUse?: boolean };
+
+/** Google's reason / code for "another resource still uses this one" (the delete is refused). */
+const GCP_RESOURCE_IN_USE_REASON = "resourceInUseByAnotherResource";
+const GCP_RESOURCE_IN_USE_CODE = "RESOURCE_IN_USE_BY_ANOTHER_RESOURCE";
+
+/** True when a Compute error body or an operation's error entries say the resource is in use. */
+function isResourceInUse(entries: Array<{ code?: string; reason?: string }>): boolean {
+  for (const entry of entries) {
+    if (entry.reason === GCP_RESOURCE_IN_USE_REASON || entry.code === GCP_RESOURCE_IN_USE_CODE) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /**
  * DELETE one Compute Engine resource and WAIT for its operation to finish. The twin of
@@ -3267,6 +3422,7 @@ async function deleteComputeResource(input: {
       kind: "failed",
       detail: `${what} delete failed with HTTP ${response.status}${googleErrorMessage(body)}.`,
       unconfirmed: false,
+      inUse: isResourceInUse(body?.error?.errors ?? []),
     };
   }
 
@@ -3289,6 +3445,7 @@ async function deleteComputeResource(input: {
       kind: "failed",
       detail: `${what} delete operation ${operationName} failed: ${operationErrorMessages(operationErrors)}.`,
       unconfirmed: false,
+      inUse: isResourceInUse(operationErrors),
     };
   }
 
@@ -3303,7 +3460,15 @@ async function deleteComputeResource(input: {
   }
   // completed:true = the operation finished CARRYING errors (a real, observed delete failure).
   // completed:false = we could not observe the outcome at all (see ComputeDeleteOutcome).
-  return { kind: "failed", detail: waited.detail, unconfirmed: !waited.completed };
+  if (!waited.completed) {
+    return { kind: "failed", detail: waited.detail, unconfirmed: true };
+  }
+  return {
+    kind: "failed",
+    detail: waited.detail,
+    unconfirmed: false,
+    inUse: waited.errorCodes.includes(GCP_RESOURCE_IN_USE_CODE),
+  };
 }
 
 // ── gcp-network-create ───────────────────────────────────────────────────────────────────
@@ -5063,4 +5228,863 @@ export async function readComputeInstanceAddress(params: GcpInstanceGetParams, e
     privateIp: firstInterfaceAddress(body),
     status,
   };
+}
+
+// ── planning/49 Phase 2: gcp-subnet-create / -get / -delete (the Cloud Run range) ─────────────
+// A SECOND subnet on a cell's EXISTING VPC: the range the Cloud Run services take their
+// Direct-VPC-egress addresses from (planning/49 §4.1). gcp-network-create stays the "build the VPC" op.
+// The names this touches are PINNED upstream (validateGcpSubnetCreateParams / -DeleteParams).
+
+export async function actuateGcpSubnetCreate(params: GcpSubnetCreateParams, env: Env): Promise<GcpSubnetCreateResult> {
+  const { project, region, subnetName } = params;
+  const failure = (detail: string): GcpSubnetCreateResult => ({ ok: false, op: "gcp-subnet-create", subnetName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const accessToken = token.accessToken;
+  // Path segments are grammar-checked upstream AND URL-encoded here.
+  const regionPath = `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}/regions/${encodeURIComponent(region)}`;
+
+  const outcome = await insertComputeResource({
+    url: `${regionPath}/subnetworks`,
+    accessToken,
+    // Project-relative references, like gcp-network-create's. Never a caller-supplied URL.
+    body: {
+      name: subnetName,
+      network: `global/networks/${params.networkName}`,
+      ipCidrRange: params.ipCidr,
+      region: `regions/${region}`,
+    },
+    what: `subnetwork "${subnetName}"`,
+    project,
+    permissionHint: "compute.subnetworks.create (e.g. roles/compute.networkAdmin)",
+  });
+  if (outcome.kind === "failed") {
+    return failure(outcome.detail);
+  }
+  // WAIT for a create, so "created" means the subnet EXISTS and a Cloud Run deploy cannot race it.
+  if (outcome.kind === "created") {
+    const waited = await waitForComputeOperation({
+      waitUrl: `${regionPath}/operations/${encodeURIComponent(outcome.operationName)}/wait`,
+      accessToken,
+      what: `subnetwork "${subnetName}"`,
+    });
+    if (!waited.ok) {
+      return failure(waited.detail);
+    }
+  }
+  return { ok: true, op: "gcp-subnet-create", subnetName, status: outcome.kind };
+}
+
+/** What subnetworks.get answers with (the fields this op reads). */
+interface ComputeSubnetworkResponse {
+  name?: string;
+  ipCidrRange?: string;
+  error?: ComputeInsertResponse["error"];
+}
+
+export async function readComputeSubnet(params: GcpSubnetGetParams, env: Env): Promise<GcpSubnetGetResult> {
+  const { project, region, subnetName } = params;
+  const failure = (detail: string): GcpSubnetGetResult => ({ ok: false, op: "gcp-subnet-get", subnetName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const url =
+    `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}` +
+    `/regions/${encodeURIComponent(region)}/subnetworks/${encodeURIComponent(subnetName)}`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: gcpHeaders(token.accessToken) });
+  } catch (err) {
+    return failure(`could not reach Google Compute Engine to read subnetwork "${subnetName}": ${errorMessage(err)}`);
+  }
+  const body = (await response.json().catch(() => null)) as ComputeSubnetworkResponse | null;
+
+  if (response.status === 404) {
+    return { ok: true, op: "gcp-subnet-get", subnetName, found: false, ipCidrRange: null };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return failure(
+      `Google Cloud denied reading subnetwork "${subnetName}" (HTTP ${response.status})${googleErrorMessage(body)} — the ` +
+        `service account needs compute.subnetworks.get (e.g. roles/compute.viewer) on project "${project}".`,
+    );
+  }
+  if (!response.ok) {
+    return failure(`reading subnetwork "${subnetName}" failed with HTTP ${response.status}${googleErrorMessage(body)}.`);
+  }
+
+  let range: string | null = null;
+  if (typeof body?.ipCidrRange === "string" && body.ipCidrRange.length > 0) {
+    range = body.ipCidrRange;
+  }
+  return { ok: true, op: "gcp-subnet-get", subnetName, found: true, ipCidrRange: range };
+}
+
+export async function actuateGcpSubnetDelete(params: GcpSubnetDeleteParams, env: Env): Promise<GcpSubnetDeleteResult> {
+  const { project, region, subnetName } = params;
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return { ok: false, op: "gcp-subnet-delete", subnetName, detail: token.detail, inUse: false };
+  }
+  const regionPath = `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}/regions/${encodeURIComponent(region)}`;
+
+  // The shared delete: a 404 is SUCCESS ("already-absent"), and the delete is WAITED to DONE, so the
+  // network delete that runs next can assume this subnet is really gone.
+  const outcome = await deleteComputeResource({
+    url: `${regionPath}/subnetworks/${encodeURIComponent(subnetName)}`,
+    waitUrlBase: `${regionPath}/operations`,
+    accessToken: token.accessToken,
+    what: `subnetwork "${subnetName}"`,
+    project,
+    permissionHint: "compute.subnetworks.delete (e.g. roles/compute.networkAdmin)",
+  });
+  if (outcome.kind === "failed") {
+    let detail = outcome.detail;
+    const inUse = outcome.inUse === true;
+    if (inUse) {
+      detail +=
+        " Cloud Run Direct VPC egress can hold addresses on this subnet for a while after its last service is " +
+        "deleted. Re-run later; nothing else was changed.";
+    }
+    return { ok: false, op: "gcp-subnet-delete", subnetName, detail, inUse };
+  }
+  return { ok: true, op: "gcp-subnet-delete", subnetName, status: outcome.kind };
+}
+
+// ── planning/49 Phase 2: the Cloud Run ops ────────────────────────────────────────────────────
+// ONE Cloud Run (v2) service in the AGENCY's own project, on the cell's own VPC, with the same agency
+// GCP_SERVICE_ACCOUNT_KEY every gcp-* op uses. No platform credential is here either.
+//
+// FIXED IN PLACE, never taken from a job (planning/49 §4.3): ingress, VPC egress, gen2, the port, the
+// request timeout, minInstances, the managed-by label, invoker IAM ON, and the probe's command and
+// program. NO IAM policy is ever WRITTEN here, so there is no path to an allUsers binding. The one IAM
+// call is a READ (getIamPolicy) that refuses to update a service with a public binding (review M1).
+
+const GCP_CLOUD_RUN_API = "https://run.googleapis.com/v2";
+/** Cloud Run runs every container on this port. Fixed policy, not a job parameter. */
+const CLOUD_RUN_CONTAINER_PORT = 8080;
+/** A session may be a long-lived shell or WebSocket. 3600s is Cloud Run's own ceiling. */
+const CLOUD_RUN_REQUEST_TIMEOUT = "3600s";
+/** Scale to zero when idle — the whole point of an EPHEMERAL tier. */
+const CLOUD_RUN_MIN_INSTANCES = 0;
+/** How long ONE operations wait call blocks, and how many are made before the op gives up. */
+const CLOUD_RUN_OPERATION_WAIT_TIMEOUT = "60s";
+const CLOUD_RUN_OPERATION_WAIT_ATTEMPTS = 3;
+/**
+ * The label every service this platform creates carries (review M1). PATCH and DELETE require it, so
+ * a same-named service that someone else made is never taken over or removed.
+ */
+const CLOUD_RUN_MANAGED_BY_LABEL_KEY = "managed-by";
+const CLOUD_RUN_MANAGED_BY_LABEL_VALUE = "doubleyoup";
+/** IAM members that make a service public. A service with either is never updated (review M1). */
+const CLOUD_RUN_PUBLIC_MEMBERS = ["allUsers", "allAuthenticatedUsers"];
+/**
+ * The shape of an operation name Google returns, which goes back into a URL PATH (it is a resource
+ * path, so it cannot be percent-encoded whole). Checked, not trusted: a name with "../" or a query
+ * string would re-path the wait call. Real names are `projects/<p>/locations/<l>/operations/<id>`.
+ */
+const CLOUD_RUN_OPERATION_NAME_RE = /^projects\/[a-z0-9-]{1,63}\/locations\/[a-z0-9-]{1,63}\/operations\/[A-Za-z0-9._-]{1,128}$/;
+
+/**
+ * The premise probe's program (planning/49 §9 Phase 2), run by CLOUD_RUN_PROBE_IMAGE as
+ * `python3 -c <program>`. It serves HTTP on $PORT. On each GET it opens ONE TCP connection to each
+ * target in DY_PROBE_TARGETS (which the Worker builds from the VALIDATED targets) and answers with
+ * open / refused / timeout / error:<errno>. It reads no data, writes no file and sends no payload.
+ * The Worker owns this text. A signed job carries only the targets.
+ */
+export const CLOUD_RUN_PROBE_PROGRAM = [
+  "import json",
+  "import os",
+  "import socket",
+  "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer",
+  "",
+  'TARGETS = json.loads(os.environ["DY_PROBE_TARGETS"])',
+  "",
+  "",
+  "def check(ip, port):",
+  "    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)",
+  "    sock.settimeout(3)",
+  "    try:",
+  "        sock.connect((ip, int(port)))",
+  '        return "open"',
+  "    except socket.timeout:",
+  '        return "timeout"',
+  "    except ConnectionRefusedError:",
+  '        return "refused"',
+  "    except OSError as error:",
+  '        return "error:" + str(error.errno or 0)',
+  "    finally:",
+  "        sock.close()",
+  "",
+  "",
+  "class Handler(BaseHTTPRequestHandler):",
+  "    def do_GET(self):",
+  "        results = []",
+  "        for target in TARGETS:",
+  '            result = check(target["ip"], target["port"])',
+  '            results.append({"ip": target["ip"], "port": target["port"], "result": result})',
+  '        body = json.dumps({"results": results}).encode()',
+  "        self.send_response(200)",
+  '        self.send_header("Content-Type", "application/json")',
+  '        self.send_header("Content-Length", str(len(body)))',
+  "        self.end_headers()",
+  "        self.wfile.write(body)",
+  "",
+  "    def log_message(self, format, *args):",
+  "        pass",
+  "",
+  "",
+  'ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()',
+  "",
+].join("\n");
+/** The probe's ONE environment variable, set by the Worker, never by a job. */
+const CLOUD_RUN_PROBE_TARGETS_ENV = "DY_PROBE_TARGETS";
+/** A probe answer bigger than this is not the probe's answer. */
+const CLOUD_RUN_PROBE_BODY_MAX_LENGTH = 16 * 1024;
+/** One probe result value, exactly as CLOUD_RUN_PROBE_PROGRAM writes it. */
+const CLOUD_RUN_PROBE_RESULT_RE = /^(?:open|refused|timeout|error:[0-9]{1,5})$/;
+/**
+ * A cold probe can answer 429 "no available instance" with maxInstances 1 (the 2026-10-07 W2 probe
+ * saw this on 1 of 2 cold connects), or 503 while it starts. So the invoke tries a few times.
+ */
+const CLOUD_RUN_PROBE_INVOKE_ATTEMPTS = 4;
+/** The gap between probe invoke attempts. An object, so a test can set it to 0 (real timers there). */
+export const cloudRunProbeInvokeTuning = { retryDelayMs: 3000 };
+
+/** What a Cloud Run v2 Operation looks like (the fields these ops read). */
+interface CloudRunOperation {
+  name?: string;
+  done?: boolean;
+  error?: { code?: number; message?: string };
+  code?: number;
+  message?: string;
+}
+
+/** What a Cloud Run v2 Service looks like (the fields these ops read). */
+interface CloudRunService {
+  name?: string;
+  uri?: string;
+  urls?: string[];
+  labels?: Record<string, string>;
+  reconciling?: boolean;
+  latestCreatedRevision?: string;
+  terminalCondition?: { type?: string; state?: string; message?: string };
+  error?: { code?: number; message?: string };
+  code?: number;
+  message?: string;
+}
+
+/** What getIamPolicy answers with (the fields these ops read). */
+interface CloudRunIamPolicy {
+  bindings?: Array<{ role?: string; members?: string[] }>;
+  error?: { code?: number; message?: string };
+  message?: string;
+}
+
+/** Google's top-level error message from a Cloud Run response body, if any (for detail strings). */
+function cloudRunErrorMessage(body: { error?: { message?: string }; message?: string } | null): string {
+  const message = body?.error?.message ?? body?.message;
+  if (message) {
+    return `: ${message}`;
+  }
+  return "";
+}
+
+/** The short last segment of a Cloud Run resource path, e.g. ".../revisions/term-x-00001-abc". */
+function cloudRunShortName(resourcePath: string | undefined): string | null {
+  if (typeof resourcePath !== "string" || resourcePath.length === 0) {
+    return null;
+  }
+  const last = resourcePath.slice(resourcePath.lastIndexOf("/") + 1);
+  if (last.length === 0) {
+    return null;
+  }
+  return last;
+}
+
+/** The service's URLs as strings only (Cloud Run lists every URL that serves the service). */
+function cloudRunServiceUrls(service: CloudRunService): string[] {
+  const urls: string[] = [];
+  if (Array.isArray(service.urls)) {
+    for (const url of service.urls) {
+      if (typeof url === "string" && url.length > 0) {
+        urls.push(url);
+      }
+    }
+  }
+  return urls;
+}
+
+/** True when the service carries this platform's managed-by label (review M1). */
+function isManagedByPlatform(service: CloudRunService): boolean {
+  return service.labels?.[CLOUD_RUN_MANAGED_BY_LABEL_KEY] === CLOUD_RUN_MANAGED_BY_LABEL_VALUE;
+}
+
+/** The `projects/<p>/locations/<r>/services` collection URL for a validated project + region. */
+function cloudRunServicesUrl(project: string, region: string): string {
+  return `${GCP_CLOUD_RUN_API}/projects/${encodeURIComponent(project)}/locations/${encodeURIComponent(region)}/services`;
+}
+
+/** The outcome of reading one Cloud Run service: present, absent (404), or a read failure. */
+type CloudRunServiceReadOutcome =
+  | { kind: "found"; service: CloudRunService }
+  | { kind: "absent" }
+  | { kind: "failed"; detail: string };
+
+/**
+ * GET one Cloud Run service. A 404 is "absent". Any other non-2xx (and an unreachable API) is a
+ * failure with Google's own message. A 403 names both the role AND API enablement, because a project
+ * without the Cloud Run API enabled is the first thing planning/49 §10 expects the probe to find.
+ */
+async function readCloudRunServiceRaw(input: {
+  url: string;
+  accessToken: string;
+  serviceName: string;
+  project: string;
+}): Promise<CloudRunServiceReadOutcome> {
+  const { url, accessToken, serviceName, project } = input;
+
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: gcpHeaders(accessToken) });
+  } catch (err) {
+    return { kind: "failed", detail: `could not reach Cloud Run to read service "${serviceName}": ${errorMessage(err)}` };
+  }
+  const body = (await response.json().catch(() => null)) as CloudRunService | null;
+
+  if (response.status === 404) {
+    return { kind: "absent" };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return {
+      kind: "failed",
+      detail:
+        `Google Cloud denied reading Cloud Run service "${serviceName}" (HTTP ${response.status})` +
+        `${cloudRunErrorMessage(body)} — the service account needs run.services.get (e.g. roles/run.admin) on ` +
+        `project "${project}". If the Cloud Run API is not enabled on that project, enable it first.`,
+    };
+  }
+  if (!response.ok || body === null) {
+    return {
+      kind: "failed",
+      detail: `reading Cloud Run service "${serviceName}" failed with HTTP ${response.status}${cloudRunErrorMessage(body)}.`,
+    };
+  }
+  return { kind: "found", service: body };
+}
+
+/**
+ * The PUBLIC members (allUsers / allAuthenticatedUsers) bound on one service, read with getIamPolicy,
+ * or the reason the read failed. A READ: nothing here writes IAM.
+ */
+async function readCloudRunPublicMembers(input: {
+  serviceUrl: string;
+  accessToken: string;
+  serviceName: string;
+  project: string;
+}): Promise<{ ok: true; publicMembers: string[] } | { ok: false; detail: string }> {
+  const { serviceUrl, accessToken, serviceName, project } = input;
+
+  let response: Response;
+  try {
+    response = await fetch(`${serviceUrl}:getIamPolicy`, { headers: gcpHeaders(accessToken) });
+  } catch (err) {
+    return { ok: false, detail: `could not reach Cloud Run to read the IAM policy of "${serviceName}": ${errorMessage(err)}` };
+  }
+  const body = (await response.json().catch(() => null)) as CloudRunIamPolicy | null;
+  if (!response.ok || body === null) {
+    return {
+      ok: false,
+      detail:
+        `reading the IAM policy of Cloud Run service "${serviceName}" failed with HTTP ${response.status}` +
+        `${cloudRunErrorMessage(body)} — the service account needs run.services.getIamPolicy (e.g. roles/run.admin) ` +
+        `on project "${project}".`,
+    };
+  }
+
+  const publicMembers: string[] = [];
+  for (const binding of body.bindings ?? []) {
+    for (const member of binding.members ?? []) {
+      if (CLOUD_RUN_PUBLIC_MEMBERS.includes(member) && !publicMembers.includes(member)) {
+        publicMembers.push(member);
+      }
+    }
+  }
+  return { ok: true, publicMembers };
+}
+
+/**
+ * Block until a Cloud Run operation is done, bounded to CLOUD_RUN_OPERATION_WAIT_ATTEMPTS calls of
+ * `:wait`. Returns null on success, or the reason it could not be confirmed. A deploy that is still
+ * running at the bound is NOT confirmed: the caller re-runs. It is never assumed to have landed.
+ */
+async function waitForCloudRunOperation(input: {
+  operationName: string;
+  accessToken: string;
+  what: string;
+  verb: string;
+}): Promise<string | null> {
+  const { operationName, accessToken, what, verb } = input;
+
+  if (!CLOUD_RUN_OPERATION_NAME_RE.test(operationName)) {
+    return `Cloud Run returned an operation name this Worker will not put in a URL ("${operationName}") — the ${what} ${verb} may still be running; re-run to resume.`;
+  }
+  const waitUrl = `${GCP_CLOUD_RUN_API}/${operationName}:wait`;
+
+  for (let attempt = 1; attempt <= CLOUD_RUN_OPERATION_WAIT_ATTEMPTS; attempt += 1) {
+    let response: Response;
+    try {
+      response = await fetch(waitUrl, {
+        method: "POST",
+        headers: gcpHeaders(accessToken),
+        body: JSON.stringify({ timeout: CLOUD_RUN_OPERATION_WAIT_TIMEOUT }),
+      });
+    } catch (err) {
+      return `could not reach Cloud Run while waiting for the ${what} ${verb} to finish: ${errorMessage(err)}`;
+    }
+    const body = (await response.json().catch(() => null)) as CloudRunOperation | null;
+    if (!response.ok) {
+      return `waiting for the ${what} ${verb} to finish failed with HTTP ${response.status}${cloudRunErrorMessage(body)}.`;
+    }
+    if (body?.done !== true) {
+      continue;
+    }
+    if (body.error) {
+      return `${what} ${verb} operation failed${cloudRunErrorMessage(body)}.`;
+    }
+    return null;
+  }
+
+  return `the ${what} ${verb} operation was still not done after ${CLOUD_RUN_OPERATION_WAIT_ATTEMPTS} waits — re-run to resume once it finishes.`;
+}
+
+/**
+ * Build the Cloud Run v2 Service body from the VALIDATED params plus this module's fixed policy.
+ * PURE and exported, so the split between "parameter" and "fixed policy" (this op's security
+ * boundary) can be asserted directly.
+ */
+export function buildCloudRunServiceBody(params: CloudRunServiceUpsertParams): Record<string, unknown> {
+  const env: Array<Record<string, unknown>> = [];
+  for (const entry of params.env ?? []) {
+    env.push({ name: entry.name, value: entry.value });
+  }
+  for (const entry of params.secretEnv ?? []) {
+    env.push({ name: entry.name, valueSource: { secretKeyRef: { secret: entry.secretName, version: entry.version } } });
+  }
+
+  const volumes: Array<Record<string, unknown>> = [];
+  const volumeMounts: Array<Record<string, unknown>> = [];
+  for (const volume of params.nfsVolumes ?? []) {
+    volumes.push({ name: volume.name, nfs: { server: volume.server, path: volume.path, readOnly: volume.readOnly === true } });
+    volumeMounts.push({ name: volume.name, mountPath: volume.mountPath });
+  }
+
+  const container: Record<string, unknown> = {
+    image: params.image,
+    ports: [{ name: "http1", containerPort: CLOUD_RUN_CONTAINER_PORT }],
+    resources: { limits: { cpu: params.cpu, memory: params.memory } },
+  };
+
+  // THE PROBE: the Worker's own program under the stock image. The validator already refused env,
+  // secretEnv and nfsVolumes for a probe, so the one variable below is the probe's whole environment.
+  if (params.probe !== undefined) {
+    const targets: Array<{ ip: string; port: string }> = [];
+    for (const target of params.probe.tcpTargets) {
+      targets.push({ ip: target.ip, port: target.port });
+    }
+    container.command = ["python3"];
+    container.args = ["-c", CLOUD_RUN_PROBE_PROGRAM];
+    env.push({ name: CLOUD_RUN_PROBE_TARGETS_ENV, value: JSON.stringify(targets) });
+  }
+
+  if (env.length > 0) {
+    container.env = env;
+  }
+  if (volumeMounts.length > 0) {
+    container.volumeMounts = volumeMounts;
+  }
+
+  const template: Record<string, unknown> = {
+    serviceAccount: params.runServiceAccount,
+    timeout: CLOUD_RUN_REQUEST_TIMEOUT,
+    executionEnvironment: "EXECUTION_ENVIRONMENT_GEN2",
+    scaling: { minInstanceCount: CLOUD_RUN_MIN_INSTANCES, maxInstanceCount: params.maxInstances },
+    // Direct VPC egress onto the cell's OWN VPC: an interface on the cell network and the Run subnet,
+    // with only private ranges going through it.
+    vpcAccess: {
+      networkInterfaces: [{ network: params.network, subnetwork: params.subnet }],
+      egress: "PRIVATE_RANGES_ONLY",
+    },
+    containers: [container],
+  };
+  if (volumes.length > 0) {
+    template.volumes = volumes;
+  }
+
+  // INGRESS_TRAFFIC_ALL + invoker IAM explicitly ON + no allUsers binding = reachable from the edge
+  // gate, callable only with a Google ID token (review M1: `invokerIamDisabled: false` on purpose).
+  return {
+    labels: { [CLOUD_RUN_MANAGED_BY_LABEL_KEY]: CLOUD_RUN_MANAGED_BY_LABEL_VALUE },
+    ingress: "INGRESS_TRAFFIC_ALL",
+    invokerIamDisabled: false,
+    template,
+  };
+}
+
+/**
+ * The reason an EXISTING service must not be patched, or null when it may be. Review M1 + L5: the
+ * service must carry the managed-by label, must not be reconciling (a create still in flight), and
+ * must hold no public IAM binding.
+ */
+async function existingServicePatchRefusal(input: {
+  service: CloudRunService;
+  serviceUrl: string;
+  accessToken: string;
+  serviceName: string;
+  project: string;
+}): Promise<string | null> {
+  const { service, serviceName } = input;
+  if (!isManagedByPlatform(service)) {
+    return (
+      `Cloud Run service "${serviceName}" exists but does not carry the ${CLOUD_RUN_MANAGED_BY_LABEL_KEY}=` +
+      `${CLOUD_RUN_MANAGED_BY_LABEL_VALUE} label, so this platform did not create it. It is left alone, not taken over.`
+    );
+  }
+  if (service.reconciling === true) {
+    return `Cloud Run service "${serviceName}" is still reconciling (an earlier deploy is in flight). Re-run once it settles.`;
+  }
+  const iam = await readCloudRunPublicMembers(input);
+  if (!iam.ok) {
+    return iam.detail;
+  }
+  if (iam.publicMembers.length > 0) {
+    return (
+      `Cloud Run service "${serviceName}" has a public IAM binding (${iam.publicMembers.join(", ")}). This platform never ` +
+      "updates a public service. Remove the binding first."
+    );
+  }
+  return null;
+}
+
+export async function actuateCloudRunServiceUpsert(params: CloudRunServiceUpsertParams, env: Env): Promise<CloudRunServiceUpsertResult> {
+  const { project, region, serviceName } = params;
+  const failure = (detail: string): CloudRunServiceUpsertResult => ({ ok: false, op: "cloudrun-service-upsert", serviceName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const accessToken = token.accessToken;
+  const collectionUrl = cloudRunServicesUrl(project, region);
+  const serviceUrl = `${collectionUrl}/${encodeURIComponent(serviceName)}`;
+  const what = `Cloud Run service "${serviceName}"`;
+
+  // CREATE or PATCH is decided by a read, not by trying one and reading the error.
+  const existing = await readCloudRunServiceRaw({ url: serviceUrl, accessToken, serviceName, project });
+  if (existing.kind === "failed") {
+    return failure(existing.detail);
+  }
+
+  let status: "created" | "updated" = "created";
+  let writeUrl = `${collectionUrl}?${new URLSearchParams({ serviceId: serviceName }).toString()}`;
+  let method = "POST";
+  let verb = "create";
+  if (existing.kind === "found") {
+    const refusal = await existingServicePatchRefusal({ service: existing.service, serviceUrl, accessToken, serviceName, project });
+    if (refusal !== null) {
+      return failure(refusal);
+    }
+    status = "updated";
+    writeUrl = serviceUrl;
+    method = "PATCH";
+    verb = "update";
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(writeUrl, { method, headers: gcpHeaders(accessToken), body: JSON.stringify(buildCloudRunServiceBody(params)) });
+  } catch (err) {
+    return failure(`could not reach Cloud Run to ${verb} ${what}: ${errorMessage(err)}`);
+  }
+  const writeBody = (await response.json().catch(() => null)) as CloudRunOperation | null;
+
+  if (response.status === 401 || response.status === 403) {
+    return failure(
+      `Google Cloud denied the ${what} ${verb} (HTTP ${response.status})${cloudRunErrorMessage(writeBody)} — the service ` +
+        `account needs run.services.${verb} (e.g. roles/run.admin) on project "${project}", and iam.serviceAccounts.actAs ` +
+        `on "${params.runServiceAccount}".`,
+    );
+  }
+  if (!response.ok) {
+    return failure(`${what} ${verb} failed with HTTP ${response.status}${cloudRunErrorMessage(writeBody)}.`);
+  }
+  // A 2xx must carry an Operation. Without one, the deploy cannot be confirmed.
+  const operationName = writeBody?.name;
+  if (!operationName) {
+    return failure(`Cloud Run returned HTTP ${response.status} but no operation — cannot confirm the ${what} ${verb} was accepted.`);
+  }
+  const waitProblem = await waitForCloudRunOperation({ operationName, accessToken, what, verb });
+  if (waitProblem !== null) {
+    return failure(waitProblem);
+  }
+
+  // Re-READ the service rather than parse the operation's embedded response. `uri` and `urls` are
+  // load-bearing (planning/49 §3.2), so they come from the service's own current state.
+  const settled = await readCloudRunServiceRaw({ url: serviceUrl, accessToken, serviceName, project });
+  if (settled.kind === "failed") {
+    return failure(settled.detail);
+  }
+  if (settled.kind === "absent") {
+    return failure(`${what} reported a finished ${verb} but is not present on read-back — re-run to resume.`);
+  }
+  const uri = settled.service.uri;
+  if (typeof uri !== "string" || uri.length === 0) {
+    return failure(`${what} was deployed but Cloud Run reported no uri for it — re-run to resume.`);
+  }
+
+  return {
+    ok: true,
+    op: "cloudrun-service-upsert",
+    serviceName,
+    status,
+    uri,
+    urls: cloudRunServiceUrls(settled.service),
+    revision: cloudRunShortName(settled.service.latestCreatedRevision),
+  };
+}
+
+export async function readCloudRunService(params: CloudRunServiceGetParams, env: Env): Promise<CloudRunServiceGetResult> {
+  const { project, region, serviceName } = params;
+  const failure = (detail: string): CloudRunServiceGetResult => ({ ok: false, op: "cloudrun-service-get", serviceName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const serviceUrl = `${cloudRunServicesUrl(project, region)}/${encodeURIComponent(serviceName)}`;
+
+  const outcome = await readCloudRunServiceRaw({ url: serviceUrl, accessToken: token.accessToken, serviceName, project });
+  if (outcome.kind === "failed") {
+    return failure(outcome.detail);
+  }
+  if (outcome.kind === "absent") {
+    return {
+      ok: true,
+      op: "cloudrun-service-get",
+      serviceName,
+      found: false,
+      uri: null,
+      urls: [],
+      ready: false,
+      managedByPlatform: false,
+      reconciling: false,
+    };
+  }
+
+  // "exists" and "serving" are different questions. `ready` answers the second, off the TERMINAL
+  // condition Cloud Run settles on.
+  const service = outcome.service;
+  const condition = service.terminalCondition;
+  const ready = condition?.type === "Ready" && condition?.state === "CONDITION_SUCCEEDED";
+  let uri: string | null = null;
+  if (typeof service.uri === "string" && service.uri.length > 0) {
+    uri = service.uri;
+  }
+  return {
+    ok: true,
+    op: "cloudrun-service-get",
+    serviceName,
+    found: true,
+    uri,
+    urls: cloudRunServiceUrls(service),
+    ready,
+    managedByPlatform: isManagedByPlatform(service),
+    reconciling: service.reconciling === true,
+  };
+}
+
+export async function actuateCloudRunServiceDelete(params: CloudRunServiceDeleteParams, env: Env): Promise<CloudRunServiceDeleteResult> {
+  const { project, region, serviceName } = params;
+  const failure = (detail: string): CloudRunServiceDeleteResult => ({ ok: false, op: "cloudrun-service-delete", serviceName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const accessToken = token.accessToken;
+  const serviceUrl = `${cloudRunServicesUrl(project, region)}/${encodeURIComponent(serviceName)}`;
+  const what = `Cloud Run service "${serviceName}"`;
+
+  // Read first (review M1): delete ONLY a service this platform labelled. Absent already = success.
+  const existing = await readCloudRunServiceRaw({ url: serviceUrl, accessToken, serviceName, project });
+  if (existing.kind === "failed") {
+    return failure(existing.detail);
+  }
+  if (existing.kind === "absent") {
+    return { ok: true, op: "cloudrun-service-delete", serviceName, status: "already-absent" };
+  }
+  if (!isManagedByPlatform(existing.service)) {
+    return failure(
+      `${what} does not carry the ${CLOUD_RUN_MANAGED_BY_LABEL_KEY}=${CLOUD_RUN_MANAGED_BY_LABEL_VALUE} label, so this ` +
+        "platform did not create it. It is left in place.",
+    );
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(serviceUrl, { method: "DELETE", headers: gcpHeaders(accessToken) });
+  } catch (err) {
+    return failure(`could not reach Cloud Run to delete ${what}: ${errorMessage(err)}`);
+  }
+  const body = (await response.json().catch(() => null)) as CloudRunOperation | null;
+
+  // A delete CONVERGES: gone between the read and the delete is still the desired state.
+  if (response.status === 404) {
+    return { ok: true, op: "cloudrun-service-delete", serviceName, status: "already-absent" };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return failure(
+      `Google Cloud denied the ${what} delete (HTTP ${response.status})${cloudRunErrorMessage(body)} — the service account ` +
+        `needs run.services.delete (e.g. roles/run.admin) on project "${project}".`,
+    );
+  }
+  if (!response.ok) {
+    return failure(`${what} delete failed with HTTP ${response.status}${cloudRunErrorMessage(body)}.`);
+  }
+  const operationName = body?.name;
+  if (!operationName) {
+    return failure(`Cloud Run returned HTTP ${response.status} but no operation — cannot confirm the ${what} delete was accepted.`);
+  }
+  const waitProblem = await waitForCloudRunOperation({ operationName, accessToken, what, verb: "delete" });
+  if (waitProblem !== null) {
+    return failure(waitProblem);
+  }
+  return { ok: true, op: "cloudrun-service-delete", serviceName, status: "deleted" };
+}
+
+/** Wait `ms` milliseconds (the probe invoke's retry gap). */
+function sleepMilliseconds(ms: number): Promise<void> {
+  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+}
+
+/** Parse and CHECK the probe's answer. Only entries of the exact shape the program writes survive. */
+function parseProbeResults(text: string): CloudRunProbeResultEntry[] | null {
+  if (text.length > CLOUD_RUN_PROBE_BODY_MAX_LENGTH) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return null;
+  }
+  const results = (parsed as { results?: unknown }).results;
+  if (!Array.isArray(results)) {
+    return null;
+  }
+  const clean: CloudRunProbeResultEntry[] = [];
+  for (const entry of results) {
+    if (typeof entry !== "object" || entry === null) {
+      return null;
+    }
+    const { ip, port, result } = entry as { ip?: unknown; port?: unknown; result?: unknown };
+    if (typeof ip !== "string" || typeof port !== "string" || typeof result !== "string") {
+      return null;
+    }
+    if (!CLOUD_RUN_PROBE_RESULT_RE.test(result)) {
+      return null;
+    }
+    clean.push({ ip, port, result });
+  }
+  return clean;
+}
+
+/**
+ * planning/49 Phase 2 — invoke the premise PROBE service (that name only) twice:
+ *   1. WITHOUT a token. Cloud Run must refuse it (401 or 403). That proves no allUsers binding.
+ *   2. WITH a Google ID token minted from the agency's OWN key, audience = the service URL. That
+ *      proves the Worker's identity holds run.invoker and that IAM-only ingress works.
+ * Then it returns the probe's TCP results. A READ in effect: the probe opens connections and sends
+ * nothing. The ID token is never returned or logged.
+ */
+export async function actuateCloudRunProbeInvoke(params: CloudRunProbeInvokeParams, env: Env): Promise<CloudRunProbeInvokeResult> {
+  const { project, region, serviceName } = params;
+  const failure = (detail: string): CloudRunProbeInvokeResult => ({ ok: false, op: "cloudrun-probe-invoke", serviceName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const serviceUrl = `${cloudRunServicesUrl(project, region)}/${encodeURIComponent(serviceName)}`;
+  const existing = await readCloudRunServiceRaw({ url: serviceUrl, accessToken: token.accessToken, serviceName, project });
+  if (existing.kind === "failed") {
+    return failure(existing.detail);
+  }
+  if (existing.kind === "absent") {
+    return failure(`the probe service "${serviceName}" does not exist — deploy it with cloudrun-service-upsert first`);
+  }
+  if (!isManagedByPlatform(existing.service)) {
+    return failure(`"${serviceName}" does not carry this platform's managed-by label, so it is not our probe`);
+  }
+  const uri = existing.service.uri;
+  if (typeof uri !== "string" || !uri.startsWith("https://")) {
+    return failure(`the probe service "${serviceName}" has no https uri yet`);
+  }
+
+  // 1. NO token. Anything but a refusal means the service is public.
+  let unauthenticated: Response;
+  try {
+    unauthenticated = await fetch(uri, { method: "GET" });
+  } catch (err) {
+    return failure(`could not reach the probe at ${uri} (no token): ${errorMessage(err)}`);
+  }
+  const unauthenticatedStatus = unauthenticated.status;
+  await unauthenticated.text().catch(() => "");
+
+  // 2. WITH an ID token from the agency's own key.
+  const idToken = await mintPinnedGcpIdToken(env, project, uri);
+  if (!idToken.ok) {
+    return failure(idToken.detail);
+  }
+  let authenticatedStatus = 0;
+  let bodyText = "";
+  for (let attempt = 1; attempt <= CLOUD_RUN_PROBE_INVOKE_ATTEMPTS; attempt += 1) {
+    let response: Response;
+    try {
+      response = await fetch(uri, { method: "GET", headers: { authorization: `Bearer ${idToken.idToken}` } });
+    } catch (err) {
+      return failure(`could not reach the probe at ${uri} (with an ID token): ${errorMessage(err)}`);
+    }
+    authenticatedStatus = response.status;
+    bodyText = await response.text().catch(() => "");
+    // A cold start can answer 429 or 503 (see CLOUD_RUN_PROBE_INVOKE_ATTEMPTS). Anything else is final.
+    if (authenticatedStatus !== 429 && authenticatedStatus !== 503) {
+      break;
+    }
+    if (attempt < CLOUD_RUN_PROBE_INVOKE_ATTEMPTS) {
+      await sleepMilliseconds(cloudRunProbeInvokeTuning.retryDelayMs);
+    }
+  }
+
+  if (authenticatedStatus !== 200) {
+    return failure(
+      `the probe answered HTTP ${authenticatedStatus} to a request with an ID token from the agency's own key ` +
+        `(the request without a token got HTTP ${unauthenticatedStatus}). The Worker's service account needs run.invoker on ` +
+        `project "${project}".`,
+    );
+  }
+  const results = parseProbeResults(bodyText);
+  if (results === null) {
+    return failure("the probe answered HTTP 200, but the body is not the probe's results");
+  }
+  return { ok: true, op: "cloudrun-probe-invoke", serviceName, uri, unauthenticatedStatus, authenticatedStatus, results };
 }

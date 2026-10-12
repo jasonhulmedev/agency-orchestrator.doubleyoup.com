@@ -40,7 +40,11 @@
 // `gcp-instance-restart` is NOT — every run reboots the node again, and on the NFS file node every
 // reboot interrupts every site — so it runs exactly once under F1 (see actuate.ts for both).
 //
-// The planning/49 ephemeral-compute ops are ALL idempotent. `gcp-instance-get` is a read.
+// The planning/49 ephemeral-compute ops are ALL idempotent. `gcp-instance-get`, `gcp-subnet-get`,
+// `cloudrun-service-get` and `cloudrun-probe-invoke` are reads (the probe only opens TCP connections).
+// `gcp-subnet-create` treats Google's 409 alreadyExists as success. `gcp-subnet-delete` and
+// `cloudrun-service-delete` treat a 404 as "already-absent". `cloudrun-service-upsert` READS the
+// service first and then creates or patches ONE named service, so a re-run converges on it.
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -75,6 +79,13 @@ import {
   type GcpInstanceRestartParams,
   type ProvisionSshKeysParams,
   type GcpInstanceGetParams,
+  type GcpSubnetCreateParams,
+  type GcpSubnetGetParams,
+  type GcpSubnetDeleteParams,
+  type CloudRunServiceUpsertParams,
+  type CloudRunServiceGetParams,
+  type CloudRunServiceDeleteParams,
+  type CloudRunProbeInvokeParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
@@ -104,6 +115,13 @@ import {
   validateGcpInstanceRestartParams,
   validateProvisionSshKeysParams,
   validateGcpInstanceGetParams,
+  validateGcpSubnetCreateParams,
+  validateGcpSubnetGetParams,
+  validateGcpSubnetDeleteParams,
+  validateCloudRunServiceUpsertParams,
+  validateCloudRunServiceGetParams,
+  validateCloudRunServiceDeleteParams,
+  validateCloudRunProbeInvokeParams,
 } from "./dispatch-params.js";
 import {
   type ActuateResult,
@@ -136,6 +154,13 @@ import {
   actuateGcpInstanceRestart,
   actuateProvisionSshKeys,
   readComputeInstanceAddress,
+  actuateGcpSubnetCreate,
+  readComputeSubnet,
+  actuateGcpSubnetDelete,
+  actuateCloudRunServiceUpsert,
+  readCloudRunService,
+  actuateCloudRunServiceDelete,
+  actuateCloudRunProbeInvoke,
 } from "./actuate.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
@@ -278,6 +303,34 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "gcp-instance-get": defineOp<GcpInstanceGetParams>({
     validateParams: validateGcpInstanceGetParams,
     actuate: (params, env) => readComputeInstanceAddress(params, env),
+  }),
+  "gcp-subnet-create": defineOp<GcpSubnetCreateParams>({
+    validateParams: validateGcpSubnetCreateParams,
+    actuate: (params, env) => actuateGcpSubnetCreate(params, env),
+  }),
+  "gcp-subnet-get": defineOp<GcpSubnetGetParams>({
+    validateParams: validateGcpSubnetGetParams,
+    actuate: (params, env) => readComputeSubnet(params, env),
+  }),
+  "gcp-subnet-delete": defineOp<GcpSubnetDeleteParams>({
+    validateParams: validateGcpSubnetDeleteParams,
+    actuate: (params, env) => actuateGcpSubnetDelete(params, env),
+  }),
+  "cloudrun-service-upsert": defineOp<CloudRunServiceUpsertParams>({
+    validateParams: validateCloudRunServiceUpsertParams,
+    actuate: (params, env) => actuateCloudRunServiceUpsert(params, env),
+  }),
+  "cloudrun-service-get": defineOp<CloudRunServiceGetParams>({
+    validateParams: validateCloudRunServiceGetParams,
+    actuate: (params, env) => readCloudRunService(params, env),
+  }),
+  "cloudrun-service-delete": defineOp<CloudRunServiceDeleteParams>({
+    validateParams: validateCloudRunServiceDeleteParams,
+    actuate: (params, env) => actuateCloudRunServiceDelete(params, env),
+  }),
+  "cloudrun-probe-invoke": defineOp<CloudRunProbeInvokeParams>({
+    validateParams: validateCloudRunProbeInvokeParams,
+    actuate: (params, env) => actuateCloudRunProbeInvoke(params, env),
   }),
 };
 

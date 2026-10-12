@@ -2111,6 +2111,758 @@ export function validateGcpInstanceGetParams(raw: unknown): ParamsVerdict<GcpIns
   return { ok: true, params: { project, zone, name } };
 }
 
+// ── planning/49 Phase 2: the Cloud Run subnet, the Cloud Run service, the premise probe ──
+// The names below are PINNED, not free-form (review M2/M3, 2026-10-07). Each one is DERIVED from a
+// value the same request carries and this file has already validated. A signed job therefore cannot
+// point a subnet op at the cell's NODE subnet, attach a service to another network, run it as
+// another identity, or take over a Cloud Run service this platform does not name.
+
+/** The cell's VPC network: `dy-cell-<region>` (orchestrator cell-provision.ts cellResourceNames). */
+function cellNetworkNameFor(region: string): string {
+  return `dy-cell-${region}`;
+}
+
+/** The cell's Cloud Run subnet: `dy-cell-<region>-run` (planning/49 §4.1). */
+function cellRunSubnetNameFor(region: string): string {
+  return `dy-cell-${region}-run`;
+}
+
+/**
+ * The RUNTIME identity of every Cloud Run service on a cell: `dy-run@<project>`. The agency creates
+ * it ONCE at onboarding and grants the Worker's own service account `iam.serviceAccounts.actAs` on
+ * it, so the Worker never needs serviceAccountAdmin (planning/49 §4.1, §8).
+ */
+function cellRunServiceAccountFor(project: string): string {
+  return `dy-run@${project}.iam.gserviceaccount.com`;
+}
+
+// ── gcp-subnet-create ────────────────────────────────────────────────────────────────
+// Create the cell's Cloud Run subnet on its EXISTING VPC in the AGENCY's own project (planning/49
+// §4.1). It is separate from the node subnet, because Direct VPC egress takes addresses from a subnet
+// and must not compete with the VMs. gcp-network-create stays the "build the VPC" op; this adds ONE
+// range to a built VPC. Five REQUIRED strings:
+//   1. `project`     — pinned to the SA key's own project by the actuator.
+//   2. `region`      — a Compute region (a URL path segment).
+//   3. `networkName` — PINNED: exactly `dy-cell-<region>`.
+//   4. `subnetName`  — PINNED: exactly `dy-cell-<region>-run`.
+//   5. `ipCidr`      — a PRIVATE (RFC 1918) block, /8-/29. The platform sends CELL_RUN_SUBNET_CIDR.
+//
+// IDEMPOTENT: Google's 409 alreadyExists is success, so a re-run resumes. Idempotence is by NAME: a
+// re-run with a DIFFERENT ipCidr is a no-op, so the caller reads the range back with gcp-subnet-get.
+
+export interface GcpSubnetCreateParams {
+  /** The agency's GCP project id the subnet is created in. */
+  project: string;
+  /** The Compute Engine region of the subnet, e.g. "australia-southeast2". */
+  region: string;
+  /** The cell's EXISTING VPC: exactly `dy-cell-<region>`. */
+  networkName: string;
+  /** The Cloud Run subnet: exactly `dy-cell-<region>-run`. */
+  subnetName: string;
+  /** The subnet's primary IPv4 range — a private RFC 1918 block between /8 and /29. */
+  ipCidr: string;
+}
+
+export function validateGcpSubnetCreateParams(raw: unknown): ParamsVerdict<GcpSubnetCreateParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region, networkName, subnetName, ipCidr } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast2)" };
+  }
+  const expectedNetwork = cellNetworkNameFor(region);
+  if (networkName !== expectedNetwork) {
+    return { ok: false, reason: `networkName must be exactly "${expectedNetwork}" (the cell's own VPC)` };
+  }
+  const expectedSubnet = cellRunSubnetNameFor(region);
+  if (subnetName !== expectedSubnet) {
+    return { ok: false, reason: `subnetName must be exactly "${expectedSubnet}" (the cell's Cloud Run subnet)` };
+  }
+  if (typeof ipCidr !== "string" || !GCP_SUBNET_CIDR_RE.test(ipCidr)) {
+    return {
+      ok: false,
+      reason: "ipCidr must be a private (RFC 1918) IPv4 CIDR block between /8 and /29 (e.g. 10.20.4.0/24)",
+    };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, region, networkName: expectedNetwork, subnetName: expectedSubnet, ipCidr } };
+}
+
+// ── gcp-subnet-get ───────────────────────────────────────────────────────────────────
+// READ-ONLY: does ONE subnet EXIST in the AGENCY's own project, and what is its primary range? The
+// subnet twin of gcp-firewall-get. Idempotence of the create is by NAME, so reading `ipCidrRange` back
+// is how a caller sees a same-named subnet with a different range. NOT pinned: a read of the node
+// subnet is harmless and useful. Three REQUIRED strings: `project` (pinned to the SA key's own project
+// by the actuator), `region` and `subnetName` (URL path segments).
+//
+// IDEMPOTENT: a read has no side effect.
+
+export interface GcpSubnetGetParams {
+  /** The agency's GCP project id the subnet lives in. */
+  project: string;
+  /** The Compute Engine region of the subnet, e.g. "australia-southeast2". */
+  region: string;
+  /** The subnetwork's resource name to read back. */
+  subnetName: string;
+}
+
+export function validateGcpSubnetGetParams(raw: unknown): ParamsVerdict<GcpSubnetGetParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region, subnetName } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast2)" };
+  }
+  if (typeof subnetName !== "string" || !GCP_RESOURCE_NAME_RE.test(subnetName)) {
+    return { ok: false, reason: `subnetName ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, region, subnetName } };
+}
+
+// ── gcp-subnet-delete ────────────────────────────────────────────────────────────────
+// Delete the cell's Cloud Run subnet. gcp-network-delete deletes exactly ONE named subnet and then the
+// network, so a cell that has a Run subnet could not be torn down without this op: Google answers the
+// network delete with `resourceInUse` while a second subnet is still attached.
+//
+// THE NAME IS PINNED: `subnetName` must be EXACTLY `dy-cell-<region>-run`. This op destroys
+// infrastructure, it can run against a LIVE cell, and the cell's NODE subnet `dy-cell-<region>-subnet`
+// is one typo away. Deleting that would take a live cell off the network. teardown removes the node
+// subnet through gcp-network-delete, where the order is not optional.
+//
+// IDEMPOTENT: Google's 404 is "already-absent" (success), the same rule the teardown ops follow.
+
+export interface GcpSubnetDeleteParams {
+  /** The agency's GCP project id the subnet lives in. */
+  project: string;
+  /** The Compute Engine region of the subnet, e.g. "australia-southeast2". */
+  region: string;
+  /** EXACTLY `dy-cell-<region>-run`, nothing else. */
+  subnetName: string;
+}
+
+export function validateGcpSubnetDeleteParams(raw: unknown): ParamsVerdict<GcpSubnetDeleteParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region, subnetName } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast2)" };
+  }
+  const expectedSubnet = cellRunSubnetNameFor(region);
+  if (subnetName !== expectedSubnet) {
+    return {
+      ok: false,
+      reason:
+        `subnetName must be exactly "${expectedSubnet}" — gcp-subnet-delete removes a cell's Cloud Run subnet ` +
+        "and nothing else (the cell's node subnet is deleted by gcp-network-delete, with the network)",
+    };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, region, subnetName: expectedSubnet } };
+}
+
+// ── Cloud Run: service names, the premise probe, and the shared grammars ─────────────
+// ONE Cloud Run (v2) service in the AGENCY's own project and region, on the cell's own VPC
+// (planning/49 §4.3). The upsert carries what the three on-cell `provision-*.sh` recipes set today,
+// minus everything that is POLICY rather than configuration.
+//
+// WHAT IS A PARAM AND WHAT IS NOT, because the split is the security boundary:
+//   PARAMS  project / region / serviceName / image / runServiceAccount / network / subnet / cpu /
+//           memory / maxInstances / env / secretEnv / nfsVolumes / probe.
+//   FIXED by the actuator: ingress (INGRESS_TRAFFIC_ALL), VPC egress (PRIVATE_RANGES_ONLY), gen2,
+//           the container port (8080), the request timeout (3600s), minInstances (0), the
+//           `managed-by` label, invoker IAM ON, and (for a probe) the command and its program.
+//
+// THERE IS NO `allUsers` PATH AND NO `allowUnauthenticated` PARAM. Not defaulted to false: ABSENT.
+// planning/49 §1: an agency project in a Workspace organisation with the default
+// constraints/iam.allowedPolicyMemberDomains REFUSES an allUsers binding. The design never needs one:
+// callers present a Google ID token and Cloud Run's own IAM does the rest. These ops write NO IAM
+// policy. The Worker's own service account gets run.invoker on its project once, at onboarding.
+
+/** The host label of each session purpose. The service name IS the label (planning/49 §3.2). */
+export const CLOUD_RUN_SESSION_SERVICE_PREFIXES = ["term", "pma", "staging", "sterm", "spma"] as const;
+/** The ONE service name the Phase 2 premise probe uses. Not a session name, so it cannot collide. */
+export const CLOUD_RUN_PROBE_SERVICE_NAME = "dy-run-probe";
+/**
+ * The ONE image the premise probe may run (Jason's decision, 2026-10-12: a stock public image with
+ * a command override). The Worker supplies the command and the program. The platform supplies only
+ * the targets. A tag, not a digest: the probe has no NFS volume, no secret and no site data.
+ */
+export const CLOUD_RUN_PROBE_IMAGE = "docker.io/library/python:3.12-slim";
+/** The ONLY ports the probe may test: MariaDB on the data node and NFS on the file node. */
+export const CLOUD_RUN_PROBE_PORTS = ["2049", "3306"] as const;
+const CLOUD_RUN_PROBE_TARGETS_MAX = 8;
+
+// A Cloud Run SERVICE name: a Compute-style name capped at 49 characters (the name becomes a label
+// of the generated *.run.app hostname).
+const CLOUD_RUN_SERVICE_NAME_RE = /^[a-z]([-a-z0-9]{0,47}[a-z0-9])?$/;
+// The part of a session service name after its prefix: the site slug.
+const CLOUD_RUN_SESSION_SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
+// A container image reference: <host>[:port]/<path>[:tag | @sha256:<64 hex>]. A WELL-FORMEDNESS
+// check for a session image. The probe image is pinned exactly (CLOUD_RUN_PROBE_IMAGE).
+const CONTAINER_IMAGE_RE =
+  /^[a-z0-9][a-z0-9.-]*(?::[0-9]{1,5})?(?:\/[a-z0-9][a-z0-9._-]*){1,6}(?::[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}|@sha256:[a-f0-9]{64})?$/;
+const CONTAINER_IMAGE_MAX_LENGTH = 512;
+// Cloud Run CPU: whole cores (1/2/4/8) or millicores ("500m" … "8000m"). v2 takes no decimal form.
+const RUN_CPU_RE = /^(?:[1248]|[1-9][0-9]{2,3}m)$/;
+// Cloud Run memory: a whole number of MiB or GiB, e.g. "512Mi" / "2Gi".
+const RUN_MEMORY_RE = /^[1-9][0-9]{0,4}(?:Mi|Gi)$/;
+// A session service is a SINGLE container for a SINGLE user. 100 catches a typo. The NFS invariant
+// below is far tighter.
+const RUN_MAX_INSTANCES_MIN = 1;
+const RUN_MAX_INSTANCES_MAX = 100;
+// POSIX env-var grammar. Google SETS four variables on every container and rejects a service that
+// declares one of them; naming them here beats relaying Google's message.
+const RUN_ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const RUN_RESERVED_ENV_NAMES = ["PORT", "K_SERVICE", "K_REVISION", "K_CONFIGURATION"];
+// An env VALUE is opaque, so it is bounded rather than charset-checked. An EMPTY value is legitimate.
+const RUN_ENV_VALUE_MAX_LENGTH = 32 * 1024;
+const RUN_ENV_MAX = 64;
+const RUN_SECRET_ENV_MAX = 32;
+// A Secret Manager secret's short name, and a version: "latest" or a positive integer.
+const SECRET_MANAGER_NAME_RE = /^[a-zA-Z0-9_-]{1,255}$/;
+const SECRET_MANAGER_VERSION_RE = /^(?:latest|[1-9][0-9]{0,18})$/;
+// A session service mounts its own site's tree, plus at most a few helpers.
+const RUN_NFS_VOLUMES_MAX = 8;
+// An absolute POSIX path of [A-Za-z0-9._-] segments. Anchored, so no NUL, newline, space, quote,
+// backslash or empty segment can appear. "." and ".." segments are refused separately.
+const POSIX_ABSOLUTE_PATH_RE = /^(?:\/[A-Za-z0-9._-]+)+$/;
+const POSIX_PATH_MAX_LENGTH = 512;
+// A PRIVATE (RFC 1918) IPv4 LITERAL. A hostname cannot match a dotted quad, which is the point: a
+// Direct-VPC-egress service does not join the project's internal DNS, so a hostname never resolves.
+// A PUBLIC address is refused for a different reason: it would reach across the internet.
+const PRIVATE_IPV4_ADDRESS_RE = new RegExp(
+  `^(?:10(?:\\.${IPV4_OCTET}){3}` +
+    `|172\\.(?:1[6-9]|2[0-9]|3[01])(?:\\.${IPV4_OCTET}){2}` +
+    `|192\\.168(?:\\.${IPV4_OCTET}){2})$`,
+);
+
+/** True when `name` is a session service name: `<prefix>-<slug>`, prefix from the fixed list. */
+function isCloudRunSessionServiceName(name: string): boolean {
+  if (!CLOUD_RUN_SERVICE_NAME_RE.test(name)) {
+    return false;
+  }
+  for (const prefix of CLOUD_RUN_SESSION_SERVICE_PREFIXES) {
+    const head = `${prefix}-`;
+    if (name.startsWith(head) && CLOUD_RUN_SESSION_SLUG_RE.test(name.slice(head.length))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The reason a Cloud Run service name is not allowed for an op, or null when it is. `allowed` says
+ * which names the op may touch: session services, the probe service, or either.
+ */
+function cloudRunServiceNameReason(serviceName: unknown, allowed: "session" | "probe" | "either"): string | null {
+  if (typeof serviceName !== "string") {
+    return "serviceName must be a string";
+  }
+  const isProbe = serviceName === CLOUD_RUN_PROBE_SERVICE_NAME;
+  const isSession = isCloudRunSessionServiceName(serviceName);
+  const sessionRule = `one of ${CLOUD_RUN_SESSION_SERVICE_PREFIXES.map((prefix) => `${prefix}-<slug>`).join(", ")} (at most 49 characters)`;
+  if (allowed === "probe" && !isProbe) {
+    return `serviceName must be exactly "${CLOUD_RUN_PROBE_SERVICE_NAME}" for this op`;
+  }
+  if (allowed === "session" && !isSession) {
+    return `serviceName must be a session service name: ${sessionRule}`;
+  }
+  if (allowed === "either" && !isProbe && !isSession) {
+    return `serviceName must be a session service name (${sessionRule}) or "${CLOUD_RUN_PROBE_SERVICE_NAME}"`;
+  }
+  return null;
+}
+
+/** True when `value` is an absolute POSIX path that contains no "." or ".." segment. */
+function isTraversalFreeAbsolutePath(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > POSIX_PATH_MAX_LENGTH) {
+    return false;
+  }
+  if (!POSIX_ABSOLUTE_PATH_RE.test(value)) {
+    return false;
+  }
+  for (const segment of value.split("/")) {
+    if (segment === "." || segment === "..") {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** A Cloud Run plain environment variable. `value` is opaque (bounded), never a secret. */
+export interface CloudRunEnvVar {
+  name: string;
+  value: string;
+}
+
+/** A Cloud Run env var sourced from ONE Secret Manager secret version in the SAME project. */
+export interface CloudRunSecretEnvVar {
+  name: string;
+  /** The Secret Manager secret's short name (not a full resource path). */
+  secretName: string;
+  /** "latest" or a numeric version. */
+  version: string;
+}
+
+/** ONE NFS volume the service mounts from a node inside the cell's VPC. */
+export interface CloudRunNfsVolume {
+  /** The volume's name within the service (a Compute-style resource name). */
+  name: string;
+  /** The NFS server — a PRIVATE (RFC 1918) IPv4 LITERAL. A hostname never resolves. */
+  server: string;
+  /** The exported path ON the server, e.g. "/srv/dy-storage/sites/<slug>". */
+  path: string;
+  /** Where the container sees it, e.g. "/sites/<slug>". */
+  mountPath: string;
+  /** Mount read-only. Absent => read-write. */
+  readOnly?: boolean;
+}
+
+/** ONE TCP target the premise probe opens a connection to. */
+export interface CloudRunProbeTarget {
+  /** A PRIVATE (RFC 1918) IPv4 literal on the cell's VPC. */
+  ip: string;
+  /** One of CLOUD_RUN_PROBE_PORTS, as a string. */
+  port: string;
+}
+
+/** The premise probe: which TCP targets to open. The Worker owns the image's command and program. */
+export interface CloudRunProbeSpec {
+  tcpTargets: CloudRunProbeTarget[];
+}
+
+/** Validate the OPTIONAL `env` list into a FRESH array, or return the reason it is invalid. */
+function cleanCloudRunEnv(value: unknown): { ok: true; env: CloudRunEnvVar[] | undefined } | { ok: false; reason: string } {
+  if (value === undefined) {
+    return { ok: true, env: undefined };
+  }
+  if (!Array.isArray(value) || value.length > RUN_ENV_MAX) {
+    return { ok: false, reason: `env, when present, must be an array of 0-${RUN_ENV_MAX} { name, value } entries` };
+  }
+  const clean: CloudRunEnvVar[] = [];
+  const seenNames = new Set<string>();
+  for (const entry of value) {
+    if (!isPlainObject(entry)) {
+      return { ok: false, reason: "each env entry must be an object { name, value }" };
+    }
+    const { name, value: entryValue } = entry;
+    if (typeof name !== "string" || !RUN_ENV_NAME_RE.test(name)) {
+      return { ok: false, reason: "each env entry's name must be an environment-variable name (1-128 chars of letters, digits, underscores; not starting with a digit)" };
+    }
+    if (RUN_RESERVED_ENV_NAMES.includes(name)) {
+      return { ok: false, reason: `env must not set "${name}" — Cloud Run sets it on every container (reserved: ${RUN_RESERVED_ENV_NAMES.join(", ")})` };
+    }
+    if (seenNames.has(name)) {
+      return { ok: false, reason: `env names the variable "${name}" more than once` };
+    }
+    if (typeof entryValue !== "string" || entryValue.length > RUN_ENV_VALUE_MAX_LENGTH) {
+      return { ok: false, reason: `each env entry's value must be a string of at most ${RUN_ENV_VALUE_MAX_LENGTH} characters` };
+    }
+    seenNames.add(name);
+    clean.push({ name, value: entryValue });
+  }
+  return { ok: true, env: clean };
+}
+
+/** Validate the OPTIONAL `secretEnv` list into a FRESH array, or return the reason it is invalid. */
+function cleanCloudRunSecretEnv(
+  value: unknown,
+): { ok: true; secretEnv: CloudRunSecretEnvVar[] | undefined } | { ok: false; reason: string } {
+  if (value === undefined) {
+    return { ok: true, secretEnv: undefined };
+  }
+  if (!Array.isArray(value) || value.length > RUN_SECRET_ENV_MAX) {
+    return { ok: false, reason: `secretEnv, when present, must be an array of 0-${RUN_SECRET_ENV_MAX} { name, secretName, version } entries` };
+  }
+  const clean: CloudRunSecretEnvVar[] = [];
+  const seenNames = new Set<string>();
+  for (const entry of value) {
+    if (!isPlainObject(entry)) {
+      return { ok: false, reason: "each secretEnv entry must be an object { name, secretName, version }" };
+    }
+    const { name, secretName, version } = entry;
+    if (typeof name !== "string" || !RUN_ENV_NAME_RE.test(name)) {
+      return { ok: false, reason: "each secretEnv entry's name must be an environment-variable name (1-128 chars of letters, digits, underscores; not starting with a digit)" };
+    }
+    if (RUN_RESERVED_ENV_NAMES.includes(name)) {
+      return { ok: false, reason: `secretEnv must not set "${name}" — Cloud Run sets it on every container (reserved: ${RUN_RESERVED_ENV_NAMES.join(", ")})` };
+    }
+    if (seenNames.has(name)) {
+      return { ok: false, reason: `secretEnv names the variable "${name}" more than once` };
+    }
+    if (typeof secretName !== "string" || !SECRET_MANAGER_NAME_RE.test(secretName)) {
+      return { ok: false, reason: "each secretEnv entry's secretName must be a Secret Manager secret name (1-255 chars of letters, digits, hyphens, underscores)" };
+    }
+    if (typeof version !== "string" || !SECRET_MANAGER_VERSION_RE.test(version)) {
+      return { ok: false, reason: 'each secretEnv entry\'s version must be "latest" or a positive integer' };
+    }
+    seenNames.add(name);
+    clean.push({ name, secretName, version });
+  }
+  return { ok: true, secretEnv: clean };
+}
+
+/**
+ * Validate the OPTIONAL `nfsVolumes` list into a FRESH array, or return the reason it is invalid.
+ * Two rules are the design's invariants, not shape checks (planning/49 §4.3): `server` MUST be a
+ * private IPv4 LITERAL, and a volume name and a mountPath each appear ONCE.
+ */
+function cleanCloudRunNfsVolumes(
+  value: unknown,
+): { ok: true; nfsVolumes: CloudRunNfsVolume[] | undefined } | { ok: false; reason: string } {
+  if (value === undefined) {
+    return { ok: true, nfsVolumes: undefined };
+  }
+  if (!Array.isArray(value) || value.length < 1 || value.length > RUN_NFS_VOLUMES_MAX) {
+    return { ok: false, reason: `nfsVolumes, when present, must be an array of 1-${RUN_NFS_VOLUMES_MAX} { name, server, path, mountPath, readOnly? } entries` };
+  }
+  const clean: CloudRunNfsVolume[] = [];
+  const seenNames = new Set<string>();
+  const seenMountPaths = new Set<string>();
+  for (const entry of value) {
+    if (!isPlainObject(entry)) {
+      return { ok: false, reason: "each nfsVolumes entry must be an object { name, server, path, mountPath, readOnly? }" };
+    }
+    const { name, server, path, mountPath, readOnly } = entry;
+    if (typeof name !== "string" || !GCP_RESOURCE_NAME_RE.test(name)) {
+      return { ok: false, reason: `each nfsVolumes entry's name ${GCP_RESOURCE_NAME_RULE}` };
+    }
+    if (seenNames.has(name)) {
+      return { ok: false, reason: `nfsVolumes names the volume "${name}" more than once` };
+    }
+    if (typeof server !== "string" || !PRIVATE_IPV4_ADDRESS_RE.test(server)) {
+      return {
+        ok: false,
+        reason:
+          "each nfsVolumes entry's server must be a PRIVATE (RFC 1918) IPv4 literal, e.g. 10.20.0.4 — a hostname does not " +
+          "resolve from a Direct-VPC-egress service, and a public address would mount an export over the internet",
+      };
+    }
+    if (!isTraversalFreeAbsolutePath(path)) {
+      return { ok: false, reason: `each nfsVolumes entry's path must be an absolute POSIX path of [A-Za-z0-9._-] segments with no "." or ".." segment (at most ${POSIX_PATH_MAX_LENGTH} chars)` };
+    }
+    if (!isTraversalFreeAbsolutePath(mountPath)) {
+      return { ok: false, reason: `each nfsVolumes entry's mountPath must be an absolute POSIX path of [A-Za-z0-9._-] segments with no "." or ".." segment (at most ${POSIX_PATH_MAX_LENGTH} chars)` };
+    }
+    if (seenMountPaths.has(mountPath)) {
+      return { ok: false, reason: `nfsVolumes mounts "${mountPath}" more than once` };
+    }
+    if (readOnly !== undefined && typeof readOnly !== "boolean") {
+      return { ok: false, reason: "each nfsVolumes entry's readOnly, when present, must be a boolean" };
+    }
+    seenNames.add(name);
+    seenMountPaths.add(mountPath);
+    const volume: CloudRunNfsVolume = { name, server, path, mountPath };
+    if (readOnly !== undefined) {
+      volume.readOnly = readOnly;
+    }
+    clean.push(volume);
+  }
+  return { ok: true, nfsVolumes: clean };
+}
+
+/**
+ * Validate the OPTIONAL `probe` spec into a FRESH object, or return the reason it is invalid. Each
+ * target is a private IPv4 literal and one of CLOUD_RUN_PROBE_PORTS. No target repeats. The probe
+ * reaches nothing else, so it can only answer the premise question (planning/49 §9 Phase 2).
+ */
+function cleanCloudRunProbe(value: unknown): { ok: true; probe: CloudRunProbeSpec | undefined } | { ok: false; reason: string } {
+  if (value === undefined) {
+    return { ok: true, probe: undefined };
+  }
+  if (!isPlainObject(value)) {
+    return { ok: false, reason: "probe, when present, must be an object { tcpTargets }" };
+  }
+  const { tcpTargets } = value;
+  if (!Array.isArray(tcpTargets) || tcpTargets.length < 1 || tcpTargets.length > CLOUD_RUN_PROBE_TARGETS_MAX) {
+    return { ok: false, reason: `probe.tcpTargets must be an array of 1-${CLOUD_RUN_PROBE_TARGETS_MAX} { ip, port } entries` };
+  }
+  const allowedPorts: readonly string[] = CLOUD_RUN_PROBE_PORTS;
+  const clean: CloudRunProbeTarget[] = [];
+  const seenTargets = new Set<string>();
+  for (const entry of tcpTargets) {
+    if (!isPlainObject(entry)) {
+      return { ok: false, reason: "each probe.tcpTargets entry must be an object { ip, port }" };
+    }
+    const { ip, port } = entry;
+    if (typeof ip !== "string" || !PRIVATE_IPV4_ADDRESS_RE.test(ip)) {
+      return { ok: false, reason: "each probe target's ip must be a PRIVATE (RFC 1918) IPv4 literal" };
+    }
+    if (typeof port !== "string" || !allowedPorts.includes(port)) {
+      return { ok: false, reason: `each probe target's port must be one of ${CLOUD_RUN_PROBE_PORTS.join(", ")} (as a string)` };
+    }
+    const key = `${ip}:${port}`;
+    if (seenTargets.has(key)) {
+      return { ok: false, reason: `probe.tcpTargets names ${key} more than once` };
+    }
+    seenTargets.add(key);
+    clean.push({ ip, port });
+  }
+  return { ok: true, probe: { tcpTargets: clean } };
+}
+
+// ── cloudrun-service-upsert ──────────────────────────────────────────────────────────
+// Create or update ONE Cloud Run service. The actuator READS the service first. It CREATES a missing
+// one with the `managed-by` label, and it PATCHes an existing one ONLY when that one carries the label,
+// is not still reconciling, and its IAM policy holds no allUsers / allAuthenticatedUsers binding
+// (review M1, L5). So a same-named service this platform did not create is never taken over.
+//
+// THE PREMISE PROBE (`probe` set) is the only service that runs a stock public image: exactly
+// CLOUD_RUN_PROBE_IMAGE under exactly CLOUD_RUN_PROBE_SERVICE_NAME, with NO env, secretEnv or
+// nfsVolumes, and maxInstances 1. The Worker sets its command and program itself.
+//
+// IDEMPOTENT: a re-dispatch with the same params converges on the same named service.
+
+export interface CloudRunServiceUpsertParams {
+  /** The agency's GCP project id the service is created in. */
+  project: string;
+  /** The Cloud Run region, e.g. "australia-southeast2". */
+  region: string;
+  /** A session service name (`<prefix>-<slug>`), or the probe name when `probe` is set. */
+  serviceName: string;
+  /** The container image reference. Exactly CLOUD_RUN_PROBE_IMAGE when `probe` is set. */
+  image: string;
+  /** EXACTLY `dy-run@<project>.iam.gserviceaccount.com`. */
+  runServiceAccount: string;
+  /** EXACTLY `dy-cell-<region>`. */
+  network: string;
+  /** EXACTLY `dy-cell-<region>-run`. */
+  subnet: string;
+  /** Cloud Run CPU, e.g. "1" or "1000m". */
+  cpu: string;
+  /** Cloud Run memory, e.g. "2Gi". */
+  memory: string;
+  /** The instance ceiling. MUST be exactly 1 with `nfsVolumes` or `probe`. */
+  maxInstances: number;
+  /** OPTIONAL plain environment variables. Never with `probe`. */
+  env?: CloudRunEnvVar[];
+  /** OPTIONAL Secret Manager-sourced environment variables. Never with `probe`. */
+  secretEnv?: CloudRunSecretEnvVar[];
+  /** OPTIONAL NFS volumes mounted from inside the cell's VPC. Never with `probe`. */
+  nfsVolumes?: CloudRunNfsVolume[];
+  /** OPTIONAL: makes this the planning/49 Phase 2 premise probe. */
+  probe?: CloudRunProbeSpec;
+}
+
+export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict<CloudRunServiceUpsertParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region, serviceName, image, runServiceAccount, network, subnet, cpu, memory, maxInstances, env, secretEnv, nfsVolumes, probe } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast2)" };
+  }
+  const cleanedProbe = cleanCloudRunProbe(probe);
+  if (!cleanedProbe.ok) {
+    return { ok: false, reason: cleanedProbe.reason };
+  }
+  const isProbe = cleanedProbe.probe !== undefined;
+
+  let allowedNames: "session" | "probe" = "session";
+  if (isProbe) {
+    allowedNames = "probe";
+  }
+  const nameReason = cloudRunServiceNameReason(serviceName, allowedNames);
+  if (nameReason !== null) {
+    return { ok: false, reason: nameReason };
+  }
+  if (typeof image !== "string" || image.length > CONTAINER_IMAGE_MAX_LENGTH || !CONTAINER_IMAGE_RE.test(image)) {
+    return {
+      ok: false,
+      reason: "image must be a container image reference, e.g. <region>-docker.pkg.dev/<project>/<repo>/<name>:<tag> or <registry>/<path>@sha256:<digest>",
+    };
+  }
+  if (isProbe && image !== CLOUD_RUN_PROBE_IMAGE) {
+    return { ok: false, reason: `a probe must run exactly "${CLOUD_RUN_PROBE_IMAGE}"` };
+  }
+  const expectedServiceAccount = cellRunServiceAccountFor(project);
+  if (runServiceAccount !== expectedServiceAccount) {
+    return { ok: false, reason: `runServiceAccount must be exactly "${expectedServiceAccount}" (the cell's runtime identity)` };
+  }
+  const expectedNetwork = cellNetworkNameFor(region);
+  if (network !== expectedNetwork) {
+    return { ok: false, reason: `network must be exactly "${expectedNetwork}" (the cell's own VPC)` };
+  }
+  const expectedSubnet = cellRunSubnetNameFor(region);
+  if (subnet !== expectedSubnet) {
+    return { ok: false, reason: `subnet must be exactly "${expectedSubnet}" (the cell's Cloud Run subnet)` };
+  }
+  if (typeof cpu !== "string" || !RUN_CPU_RE.test(cpu)) {
+    return { ok: false, reason: 'cpu must be a Cloud Run CPU value: "1", "2", "4", "8" or a millicore value like "1000m"' };
+  }
+  if (typeof memory !== "string" || !RUN_MEMORY_RE.test(memory)) {
+    return { ok: false, reason: 'memory must be a Cloud Run memory value, e.g. "512Mi" or "2Gi"' };
+  }
+  if (
+    typeof maxInstances !== "number" ||
+    !Number.isInteger(maxInstances) ||
+    maxInstances < RUN_MAX_INSTANCES_MIN ||
+    maxInstances > RUN_MAX_INSTANCES_MAX
+  ) {
+    return { ok: false, reason: `maxInstances must be an integer in [${RUN_MAX_INSTANCES_MIN}, ${RUN_MAX_INSTANCES_MAX}]` };
+  }
+
+  const cleanedEnv = cleanCloudRunEnv(env);
+  if (!cleanedEnv.ok) {
+    return { ok: false, reason: cleanedEnv.reason };
+  }
+  const cleanedSecretEnv = cleanCloudRunSecretEnv(secretEnv);
+  if (!cleanedSecretEnv.ok) {
+    return { ok: false, reason: cleanedSecretEnv.reason };
+  }
+  const cleanedNfsVolumes = cleanCloudRunNfsVolumes(nfsVolumes);
+  if (!cleanedNfsVolumes.ok) {
+    return { ok: false, reason: cleanedNfsVolumes.reason };
+  }
+
+  // THE PROBE CARRIES NOTHING BUT ITS TARGETS (Jason's decision, 2026-10-12: refuse nfsVolumes).
+  // env and secretEnv are refused too: the Worker sets the probe's one variable itself.
+  if (isProbe) {
+    if (cleanedNfsVolumes.nfsVolumes !== undefined) {
+      return { ok: false, reason: "a probe must not mount nfsVolumes — it opens TCP connections and reads no data" };
+    }
+    if (cleanedEnv.env !== undefined || cleanedSecretEnv.secretEnv !== undefined) {
+      return { ok: false, reason: "a probe must not carry env or secretEnv — the Worker sets the probe's environment itself" };
+    }
+    if (maxInstances !== 1) {
+      return { ok: false, reason: `a probe must have maxInstances exactly 1 (got ${maxInstances})` };
+    }
+  }
+
+  // THE SINGLE-WRITER INVARIANT (planning/49 §4.3), as code rather than a comment. Two instances of
+  // one NFS-mounting service would write the same site's files through two independent mounts, with
+  // nothing in the stack to lock against.
+  if (cleanedNfsVolumes.nfsVolumes !== undefined && maxInstances !== 1) {
+    return {
+      ok: false,
+      reason:
+        "maxInstances must be exactly 1 when nfsVolumes is present — an NFS-mounting service is a SINGLE writer, " +
+        `and there is nothing in the stack for a second instance to lock against (got ${maxInstances})`,
+    };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object — so no extra key (an
+  // `allowUnauthenticated`, an `ingress`, a raw `template`) can ride along under the platform's
+  // signature. Every optional field is added ONLY when present.
+  const params: CloudRunServiceUpsertParams = {
+    project,
+    region,
+    serviceName: serviceName as string,
+    image,
+    runServiceAccount: expectedServiceAccount,
+    network: expectedNetwork,
+    subnet: expectedSubnet,
+    cpu,
+    memory,
+    maxInstances,
+  };
+  if (cleanedEnv.env !== undefined) {
+    params.env = cleanedEnv.env;
+  }
+  if (cleanedSecretEnv.secretEnv !== undefined) {
+    params.secretEnv = cleanedSecretEnv.secretEnv;
+  }
+  if (cleanedNfsVolumes.nfsVolumes !== undefined) {
+    params.nfsVolumes = cleanedNfsVolumes.nfsVolumes;
+  }
+  if (cleanedProbe.probe !== undefined) {
+    params.probe = cleanedProbe.probe;
+  }
+  return { ok: true, params };
+}
+
+// ── cloudrun-service-get / -delete / cloudrun-probe-invoke ───────────────────────────
+// The same three params each: `project` (pinned to the SA key's own project by the actuator),
+// `region` and `serviceName`.
+//   get    — READ-ONLY: found, uri, urls, ready, and whether it carries the managed-by label. The uri
+//            read-back is load-bearing: planning/49 §3.2 derives every session origin from the
+//            service NAME, and the caller asserts the derived URL is among the service's urls.
+//   delete — how a session ENDS. The actuator deletes ONLY a service with the managed-by label
+//            (review M1). Google's 404 is "already-absent", so a re-run converges.
+//   probe-invoke — READ-ONLY in effect: call the PROBE service (that name only) once WITHOUT a token
+//            (it must refuse) and once with a Google ID token minted from the agency's own key, and
+//            return the probe's TCP results. This is how "invoked with an ID token from the agency's
+//            own SA" (planning/49 §9 Phase 2) is possible at all: the platform holds no such key.
+
+export interface CloudRunServiceGetParams {
+  project: string;
+  region: string;
+  serviceName: string;
+}
+
+export interface CloudRunServiceDeleteParams {
+  project: string;
+  region: string;
+  serviceName: string;
+}
+
+export interface CloudRunProbeInvokeParams {
+  project: string;
+  region: string;
+  /** EXACTLY CLOUD_RUN_PROBE_SERVICE_NAME. */
+  serviceName: string;
+}
+
+/** The shared validator body for the three {project, region, serviceName} ops. */
+function validateCloudRunServiceRef(
+  raw: unknown,
+  allowedNames: "session" | "probe" | "either",
+): ParamsVerdict<{ project: string; region: string; serviceName: string }> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region, serviceName } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast2)" };
+  }
+  const nameReason = cloudRunServiceNameReason(serviceName, allowedNames);
+  if (nameReason !== null) {
+    return { ok: false, reason: nameReason };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, region, serviceName: serviceName as string } };
+}
+
+export function validateCloudRunServiceGetParams(raw: unknown): ParamsVerdict<CloudRunServiceGetParams> {
+  return validateCloudRunServiceRef(raw, "either");
+}
+
+export function validateCloudRunServiceDeleteParams(raw: unknown): ParamsVerdict<CloudRunServiceDeleteParams> {
+  return validateCloudRunServiceRef(raw, "either");
+}
+
+export function validateCloudRunProbeInvokeParams(raw: unknown): ParamsVerdict<CloudRunProbeInvokeParams> {
+  return validateCloudRunServiceRef(raw, "probe");
+}
+
 // ── shared ─────────────────────────────────────────────────────────────────────────
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

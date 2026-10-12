@@ -69,6 +69,16 @@ export const DISPATCH_OPS = [
   // planning/49 Phase 1 — READ one cell node's in-VPC private IP. Nothing else returns it, and a
   // Direct-VPC-egress Cloud Run service needs IP literals (it does not join the project's DNS).
   "gcp-instance-get",
+  // planning/49 Phase 2 — the Cloud Run subnet on the cell's VPC (create, read, take back), the Cloud
+  // Run service (upsert, read, delete), and the premise probe's invoke. Names are pinned in
+  // dispatch-params.ts. No op writes IAM.
+  "gcp-subnet-create",
+  "gcp-subnet-get",
+  "gcp-subnet-delete",
+  "cloudrun-service-upsert",
+  "cloudrun-service-get",
+  "cloudrun-service-delete",
+  "cloudrun-probe-invoke",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 

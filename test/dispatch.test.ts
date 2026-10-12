@@ -52,6 +52,15 @@ import {
   validateGcpInstanceRestartParams,
   validateProvisionSshKeysParams,
   validateGcpInstanceGetParams,
+  validateGcpSubnetCreateParams,
+  validateGcpSubnetGetParams,
+  validateGcpSubnetDeleteParams,
+  validateCloudRunServiceUpsertParams,
+  validateCloudRunServiceGetParams,
+  validateCloudRunServiceDeleteParams,
+  validateCloudRunProbeInvokeParams,
+  CLOUD_RUN_PROBE_IMAGE,
+  CLOUD_RUN_PROBE_SERVICE_NAME,
   validateCacheRuleUpsertParams,
   validateWafRuleUpsertParams,
   edgeCacheZoneFromHostSuffix,
@@ -103,6 +112,7 @@ import {
   PLACEHOLDER_VALUES_SAFE_TO_ECHO,
   mergeMetadataItems,
   substituteMetadataPlaceholders,
+  cloudRunProbeInvokeTuning,
 } from "../src/actuate.js";
 import { GOOGLE_SCOPE_CLOUD_PLATFORM } from "../src/validators.js";
 
@@ -444,6 +454,57 @@ function gcpInstanceGetJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
     nonce: "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
     ...overrides,
   });
+}
+
+// planning/49 Phase 2 — the Cloud Run subnet, the Cloud Run service and the premise probe.
+const GCP_SUBNET_CREATE_PARAMS = {
+  project: "dy-agency-proof",
+  region: "australia-southeast1",
+  networkName: "dy-cell-australia-southeast1",
+  subnetName: "dy-cell-australia-southeast1-run",
+  ipCidr: "10.20.4.0/24",
+};
+const GCP_SUBNET_REF_PARAMS = {
+  project: "dy-agency-proof",
+  region: "australia-southeast1",
+  subnetName: "dy-cell-australia-southeast1-run",
+};
+/** A terminal session service — the shape Phase 3 deploys (NFS-mounting, so maxInstances 1). */
+const CLOUD_RUN_SESSION_PARAMS = {
+  project: "dy-agency-proof",
+  region: "australia-southeast1",
+  serviceName: "term-docs-892769",
+  image: "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run/dy-run-terminal:v5",
+  runServiceAccount: "dy-run@dy-agency-proof.iam.gserviceaccount.com",
+  network: "dy-cell-australia-southeast1",
+  subnet: "dy-cell-australia-southeast1-run",
+  cpu: "1",
+  memory: "2Gi",
+  maxInstances: 1,
+};
+/** The premise probe: the stock image, two targets, and nothing else. */
+const CLOUD_RUN_PROBE_PARAMS = {
+  project: "dy-agency-proof",
+  region: "australia-southeast1",
+  serviceName: "dy-run-probe",
+  image: "docker.io/library/python:3.12-slim",
+  runServiceAccount: "dy-run@dy-agency-proof.iam.gserviceaccount.com",
+  network: "dy-cell-australia-southeast1",
+  subnet: "dy-cell-australia-southeast1-run",
+  cpu: "1",
+  memory: "512Mi",
+  maxInstances: 1,
+  probe: {
+    tcpTargets: [
+      { ip: "10.20.0.4", port: "2049" },
+      { ip: "10.20.0.2", port: "3306" },
+    ],
+  },
+};
+const CLOUD_RUN_PROBE_REF_PARAMS = { project: "dy-agency-proof", region: "australia-southeast1", serviceName: "dy-run-probe" };
+
+function planning49Job(op: DispatchJob["op"], params: unknown, nonce: string): DispatchJob {
+  return sampleJob({ op, params: JSON.stringify(params), nonce });
 }
 
 // The TEARDOWN ops (planning/34 teardown) — the reverse of the cell-infra creates above, against the
@@ -1021,6 +1082,10 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "cf-tunnel-config",
       "cf-tunnel-create",
       "cf-tunnel-delete",
+      "cloudrun-probe-invoke",
+      "cloudrun-service-delete",
+      "cloudrun-service-get",
+      "cloudrun-service-upsert",
       "db-export",
       "db-import",
       "dns-record-delete",
@@ -1041,6 +1106,9 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-router-delete",
       "gcp-router-get",
       "gcp-router-nat-create",
+      "gcp-subnet-create",
+      "gcp-subnet-delete",
+      "gcp-subnet-get",
       "provision-r2",
       "provision-ssh-keys",
       "waf-rule-upsert",
@@ -3036,6 +3104,124 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       expect(verdict.ok).toBe(false);
       if (!verdict.ok) expect(verdict.reason).toMatch(expected);
     }
+  });
+
+  // ── planning/49 Phase 2: subnet + Cloud Run + probe validators (twin of the app's rules) ────
+
+  /** Assert a verdict is a refusal whose reason matches. */
+  function expectRefused(verdict: { ok: boolean; reason?: string }, expected: RegExp): void {
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+  }
+
+  it("gcp-subnet-create: accepts the cell's OWN network + Run subnet and returns ONLY the known keys", () => {
+    expect(validateGcpSubnetCreateParams({ ...GCP_SUBNET_CREATE_PARAMS, extra: "x" })).toEqual({ ok: true, params: GCP_SUBNET_CREATE_PARAMS });
+  });
+
+  it("gcp-subnet-create: the network AND the subnet name are PINNED to the region (review M3)", () => {
+    const bad = (overrides: Record<string, unknown>) => validateGcpSubnetCreateParams({ ...GCP_SUBNET_CREATE_PARAMS, ...overrides });
+    expectRefused(bad({ networkName: "default" }), /^networkName must be exactly "dy-cell-australia-southeast1"/);
+    expectRefused(bad({ networkName: "dy-cell-australia-southeast2" }), /^networkName must be exactly/);
+    // The NODE subnet is one typo away and must be unreachable from here.
+    expectRefused(bad({ subnetName: "dy-cell-australia-southeast1-subnet" }), /^subnetName must be exactly "dy-cell-australia-southeast1-run"/);
+    expectRefused(bad({ subnetName: "dy-cell-australia-southeast2-run" }), /^subnetName must be exactly/);
+    expectRefused(bad({ ipCidr: "8.8.8.0/24" }), /^ipCidr must be a private/);
+    expectRefused(bad({ ipCidr: "10.20.4.0/30" }), /^ipCidr must be a private/);
+    expectRefused(bad({ project: "Bad" }), /^project must be/);
+    expectRefused(bad({ region: "australia-southeast1-a" }), /^region must be/);
+    expect(validateGcpSubnetCreateParams(null).ok).toBe(false);
+  });
+
+  it("gcp-subnet-get: a READ is not pinned (the node subnet may be read), but every field is grammar-checked", () => {
+    expect(validateGcpSubnetGetParams({ ...GCP_SUBNET_REF_PARAMS, extra: "x" })).toEqual({ ok: true, params: GCP_SUBNET_REF_PARAMS });
+    const nodeSubnet = { ...GCP_SUBNET_REF_PARAMS, subnetName: "dy-cell-australia-southeast1-subnet" };
+    expect(validateGcpSubnetGetParams(nodeSubnet)).toEqual({ ok: true, params: nodeSubnet });
+    expectRefused(validateGcpSubnetGetParams({ ...GCP_SUBNET_REF_PARAMS, subnetName: "a/b" }), /^subnetName must be/);
+  });
+
+  it("gcp-subnet-delete: ONLY dy-cell-<region>-run — the cell's NODE subnet is unreachable", () => {
+    expect(validateGcpSubnetDeleteParams({ ...GCP_SUBNET_REF_PARAMS, extra: "x" })).toEqual({ ok: true, params: GCP_SUBNET_REF_PARAMS });
+    for (const subnetName of ["dy-cell-australia-southeast1-subnet", "dy-cell-australia-southeast2-run", "dy-cell-australia-southeast1", "default"]) {
+      expectRefused(validateGcpSubnetDeleteParams({ ...GCP_SUBNET_REF_PARAMS, subnetName }), /^subnetName must be exactly "dy-cell-australia-southeast1-run"/);
+    }
+  });
+
+  it("cloudrun-service-upsert: accepts a session service and a probe, returning ONLY the known keys", () => {
+    expect(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, extra: "x" })).toEqual({ ok: true, params: CLOUD_RUN_SESSION_PARAMS });
+    expect(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, extra: "x" })).toEqual({ ok: true, params: CLOUD_RUN_PROBE_PARAMS });
+    expect(CLOUD_RUN_PROBE_IMAGE).toBe("docker.io/library/python:3.12-slim");
+    expect(CLOUD_RUN_PROBE_SERVICE_NAME).toBe("dy-run-probe");
+  });
+
+  it("cloudrun-service-upsert: the service name is PINNED to a session prefix or the probe (review M2)", () => {
+    for (const serviceName of ["term-docs-892769", "pma-docs-892769", "staging-docs-892769", "sterm-docs-892769", "spma-docs-892769"]) {
+      expect(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, serviceName }).ok).toBe(true);
+    }
+    for (const serviceName of ["docs-892769", "terminal-docs", "term-", "term-Docs", "dy-cell-agent", "term-x-".padEnd(50, "a"), "dy-run-probe"]) {
+      expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, serviceName }), /^serviceName must be a session service name/);
+    }
+    // A probe must use the probe name, and only the probe may use it.
+    expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, serviceName: "term-docs-892769" }), /^serviceName must be exactly "dy-run-probe"/);
+  });
+
+  it("cloudrun-service-upsert: network, subnet and runtime identity are PINNED (review M3)", () => {
+    const bad = (overrides: Record<string, unknown>) => validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, ...overrides });
+    expectRefused(bad({ network: "default" }), /^network must be exactly "dy-cell-australia-southeast1"/);
+    expectRefused(bad({ subnet: "dy-cell-australia-southeast1-subnet" }), /^subnet must be exactly "dy-cell-australia-southeast1-run"/);
+    expectRefused(bad({ runServiceAccount: "other@dy-agency-proof.iam.gserviceaccount.com" }), /^runServiceAccount must be exactly "dy-run@dy-agency-proof/);
+    expectRefused(bad({ runServiceAccount: "dy-run@someone-else.iam.gserviceaccount.com" }), /^runServiceAccount must be exactly/);
+    expectRefused(bad({ runServiceAccount: "123-compute@developer.gserviceaccount.com" }), /^runServiceAccount must be exactly/);
+  });
+
+  it("cloudrun-service-upsert INVARIANTS: one writer with NFS, a private-literal NFS server, and NO unauthenticated path", () => {
+    const volume = { name: "sites", server: "10.20.0.4", path: "/srv/dy-storage/sites/docs-892769", mountPath: "/sites/docs-892769" };
+    expect(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, nfsVolumes: [volume] }).ok).toBe(true);
+    expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, maxInstances: 2, nfsVolumes: [volume] }), /^maxInstances must be exactly 1 when nfsVolumes/);
+    for (const server of ["dy-file-australia-southeast1-1", "8.8.8.8", "10.20.0.256", "10.20.0.4 "]) {
+      expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, nfsVolumes: [{ ...volume, server }] }), /server must be a PRIVATE/);
+    }
+    expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, nfsVolumes: [{ ...volume, path: "/srv/../etc" }] }), /path must be an absolute POSIX path/);
+    // An unauthenticated / ingress / template key is DROPPED, never honoured.
+    const verdict = validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, allowUnauthenticated: true, ingress: "x", template: {} });
+    expect(verdict).toEqual({ ok: true, params: CLOUD_RUN_SESSION_PARAMS });
+  });
+
+  it("cloudrun-service-upsert PROBE: the stock image only, its targets only, and nothing else (Jason 2026-10-12)", () => {
+    const bad = (overrides: Record<string, unknown>) => validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, ...overrides });
+    expectRefused(bad({ image: "docker.io/library/python:3.13-slim" }), /^a probe must run exactly "docker.io\/library\/python:3.12-slim"/);
+    expectRefused(bad({ image: "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run/dy-run-terminal:v5" }), /^a probe must run exactly/);
+    expectRefused(
+      bad({ nfsVolumes: [{ name: "sites", server: "10.20.0.4", path: "/srv/dy-storage/sites", mountPath: "/sites" }] }),
+      /^a probe must not mount nfsVolumes/,
+    );
+    expectRefused(bad({ env: [{ name: "X", value: "y" }] }), /^a probe must not carry env or secretEnv/);
+    expectRefused(bad({ secretEnv: [{ name: "X", secretName: "s", version: "latest" }] }), /^a probe must not carry env or secretEnv/);
+    expectRefused(bad({ maxInstances: 2 }), /^a probe must have maxInstances exactly 1/);
+    // Targets: private literals, the two allowed ports (as strings), no repeats, 1-8 of them.
+    expectRefused(bad({ probe: { tcpTargets: [{ ip: "8.8.8.8", port: "2049" }] } }), /ip must be a PRIVATE/);
+    expectRefused(bad({ probe: { tcpTargets: [{ ip: "dy-file-x-1", port: "2049" }] } }), /ip must be a PRIVATE/);
+    expectRefused(bad({ probe: { tcpTargets: [{ ip: "10.20.0.4", port: "22" }] } }), /port must be one of 2049, 3306/);
+    expectRefused(bad({ probe: { tcpTargets: [{ ip: "10.20.0.4", port: 2049 }] } }), /port must be one of/);
+    expectRefused(
+      bad({ probe: { tcpTargets: [{ ip: "10.20.0.4", port: "2049" }, { ip: "10.20.0.4", port: "2049" }] } }),
+      /names 10.20.0.4:2049 more than once/,
+    );
+    expectRefused(bad({ probe: { tcpTargets: [] } }), /^probe.tcpTargets must be an array of 1-8/);
+    expectRefused(bad({ probe: "yes" }), /^probe, when present, must be an object/);
+    // A probe target object carries ONLY ip + port into the signed params.
+    const verdict = bad({ probe: { tcpTargets: [{ ip: "10.20.0.4", port: "2049", command: "rm" }], extra: 1 } });
+    expect(verdict).toEqual({ ok: true, params: { ...CLOUD_RUN_PROBE_PARAMS, probe: { tcpTargets: [{ ip: "10.20.0.4", port: "2049" }] } } });
+  });
+
+  it("cloudrun-service-get / -delete accept a session name or the probe; cloudrun-probe-invoke accepts ONLY the probe", () => {
+    const session = { project: "dy-agency-proof", region: "australia-southeast1", serviceName: "term-docs-892769" };
+    for (const validate of [validateCloudRunServiceGetParams, validateCloudRunServiceDeleteParams]) {
+      expect(validate({ ...session, extra: "x" })).toEqual({ ok: true, params: session });
+      expect(validate(CLOUD_RUN_PROBE_REF_PARAMS)).toEqual({ ok: true, params: CLOUD_RUN_PROBE_REF_PARAMS });
+      expectRefused(validate({ ...session, serviceName: "someone-elses-service" }), /^serviceName must be a session service name .* or "dy-run-probe"/);
+    }
+    expect(validateCloudRunProbeInvokeParams(CLOUD_RUN_PROBE_REF_PARAMS)).toEqual({ ok: true, params: CLOUD_RUN_PROBE_REF_PARAMS });
+    expectRefused(validateCloudRunProbeInvokeParams(session), /^serviceName must be exactly "dy-run-probe"/);
   });
 });
 
@@ -5542,6 +5728,15 @@ describe("POST /actuate route", () => {
   // non-2xx (403 / 409 / 404) is a TERMINAL ok:false — a 409 is NOT an idempotent success here.
 
   const GCP_ACCESS_TOKEN = "ya29.agency-token-never-echoed";
+  /** planning/49: the ID token the probe invoke mints. It must never appear in a result either. */
+  const GCP_ID_TOKEN = "eyJ.agency-id-token-never-echoed.sig";
+
+  /** The claims of a JWT assertion the Worker sent to the token endpoint (no signature check). */
+  function jwtClaimsOf(assertion: string): Record<string, unknown> {
+    const payload = assertion.split(".")[1] ?? "";
+    const json = Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    return JSON.parse(json) as Record<string, unknown>;
+  }
   const GCP_INSERT_URL =
     "https://compute.googleapis.com/compute/v1/projects/dy-agency-proof/zones/australia-southeast1-a/instances";
 
@@ -5586,10 +5781,17 @@ describe("POST /actuate route", () => {
       const method = init?.method ?? "GET";
       const auth = new Headers(init?.headers).get("authorization");
       if (url === "https://oauth2.googleapis.com/token") {
-        calls.push({ method, url, auth, form: new URLSearchParams(String(init?.body)) });
+        const form = new URLSearchParams(String(init?.body));
+        calls.push({ method, url, auth, form });
+        // planning/49: an assertion that carries target_audience asks for an ID TOKEN, not an access token.
+        if (jwtClaimsOf(form.get("assertion") ?? "").target_audience !== undefined) {
+          return jsonResponse({ id_token: GCP_ID_TOKEN });
+        }
         return jsonResponse({ access_token: GCP_ACCESS_TOKEN, expires_in: 3600, token_type: "Bearer" });
       }
-      if (url.startsWith("https://compute.googleapis.com/")) {
+      // Cloud Run (planning/49) and the probe's own *.run.app URL share the ONE ordered queue with
+      // Compute, so a test's reply list stays in the order of the calls it asserts.
+      if (url.startsWith("https://compute.googleapis.com/") || url.startsWith("https://run.googleapis.com/") || url.includes(".run.app")) {
         const rawBody = init?.body ? String(init.body) : undefined;
         calls.push({ method, url, auth, rawBody, body: rawBody ? JSON.parse(rawBody) : undefined });
         const reply = queue.shift();
@@ -6981,6 +7183,422 @@ describe("POST /actuate route", () => {
 
     const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
     const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/does not match the service-account key's own project/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── planning/49 Phase 2 through the registry: subnet, Cloud Run service, premise probe ─────────
+
+  /** Every non-token call the mock recorded, in order (Compute, Cloud Run and the probe URL). */
+  function googleCalls<T extends { url: string }>(calls: T[]): T[] {
+    return calls.filter((call) => call.url !== "https://oauth2.googleapis.com/token");
+  }
+
+  async function actuate(job: DispatchJob): Promise<Record<string, unknown>> {
+    const signature = await signAsApp(job, privateKey);
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    return (await response.json()) as Record<string, unknown>;
+  }
+
+  const CLOUD_RUN_SERVICES_URL = "https://run.googleapis.com/v2/projects/dy-agency-proof/locations/australia-southeast1/services";
+  const CLOUD_RUN_OPERATION = "projects/dy-agency-proof/locations/australia-southeast1/operations/op-123";
+  const PROBE_URI = "https://dy-run-probe-abc123xyz-ts.a.run.app";
+  const PROBE_DETERMINISTIC_URL = "https://dy-run-probe-123456789012.australia-southeast1.run.app";
+  const MANAGED_LABELS = { "managed-by": "doubleyoup" };
+  /** A settled service as Cloud Run returns it on read-back. */
+  function settledService(name: string, extra: Record<string, unknown> = {}) {
+    return {
+      name: `projects/dy-agency-proof/locations/australia-southeast1/services/${name}`,
+      uri: PROBE_URI,
+      urls: [PROBE_URI, PROBE_DETERMINISTIC_URL],
+      labels: MANAGED_LABELS,
+      reconciling: false,
+      latestCreatedRevision: `projects/dy-agency-proof/locations/australia-southeast1/services/${name}/revisions/${name}-00001-abc`,
+      terminalCondition: { type: "Ready", state: "CONDITION_SUCCEEDED" },
+      ...extra,
+    };
+  }
+
+  it("gcp-subnet-create: inserts the PINNED subnet project-relative and WAITS for the operation", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([{ body: { name: "op-subnet-1", status: "RUNNING" } }, { body: { status: "DONE" } }]);
+
+    const body = await actuate(planning49Job("gcp-subnet-create", GCP_SUBNET_CREATE_PARAMS, "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2"));
+    expect(body).toEqual({ ok: true, op: "gcp-subnet-create", subnetName: "dy-cell-australia-southeast1-run", status: "created" });
+
+    const [insert, wait] = googleCalls(calls);
+    expect(insert.method).toBe("POST");
+    expect(insert.url).toBe(`${GCP_REGION_URL}/subnetworks`);
+    expect(insert.body).toEqual({
+      name: "dy-cell-australia-southeast1-run",
+      network: "global/networks/dy-cell-australia-southeast1",
+      ipCidrRange: "10.20.4.0/24",
+      region: "regions/australia-southeast1",
+    });
+    expect(wait.url).toBe(`${GCP_REGION_URL}/operations/op-subnet-1/wait`);
+  });
+
+  it("gcp-subnet-create: a re-run of an existing subnet is already-existed, with nothing waited on", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([alreadyExists409("dy-cell-australia-southeast1-run")]);
+    const body = await actuate(planning49Job("gcp-subnet-create", GCP_SUBNET_CREATE_PARAMS, "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3"));
+    expect(body).toEqual({ ok: true, op: "gcp-subnet-create", subnetName: "dy-cell-australia-southeast1-run", status: "already-existed" });
+    expect(googleCalls(calls)).toHaveLength(1);
+  });
+
+  it("gcp-subnet-get: reports found + the primary range; a 404 is a clean found:false", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([{ body: { name: "dy-cell-australia-southeast1-run", ipCidrRange: "10.20.4.0/24" } }]);
+    expect(await actuate(planning49Job("gcp-subnet-get", GCP_SUBNET_REF_PARAMS, "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"))).toEqual({
+      ok: true,
+      op: "gcp-subnet-get",
+      subnetName: "dy-cell-australia-southeast1-run",
+      found: true,
+      ipCidrRange: "10.20.4.0/24",
+    });
+    expect(googleCalls(calls)[0]?.url).toBe(`${GCP_REGION_URL}/subnetworks/dy-cell-australia-southeast1-run`);
+    vi.restoreAllMocks();
+
+    mockGcpApiQueue([{ status: 404, body: { error: { code: 404, message: "not found" } } }]);
+    expect(await actuate(planning49Job("gcp-subnet-get", GCP_SUBNET_REF_PARAMS, "d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5"))).toEqual({
+      ok: true,
+      op: "gcp-subnet-get",
+      subnetName: "dy-cell-australia-southeast1-run",
+      found: false,
+      ipCidrRange: null,
+    });
+  });
+
+  it("gcp-subnet-delete: DELETEs the regional Run subnet and WAITS; a 404 is already-absent", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([{ body: { name: "op-del-1", status: "RUNNING" } }, { body: { status: "DONE" } }]);
+    expect(await actuate(planning49Job("gcp-subnet-delete", GCP_SUBNET_REF_PARAMS, "d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6"))).toEqual({
+      ok: true,
+      op: "gcp-subnet-delete",
+      subnetName: "dy-cell-australia-southeast1-run",
+      status: "deleted",
+    });
+    const [deleteCall, waitCall] = googleCalls(calls);
+    expect(deleteCall.method).toBe("DELETE");
+    expect(deleteCall.url).toBe(`${GCP_REGION_URL}/subnetworks/dy-cell-australia-southeast1-run`);
+    expect(waitCall.url).toBe(`${GCP_REGION_URL}/operations/op-del-1/wait`);
+    vi.restoreAllMocks();
+
+    mockGcpApiQueue([{ status: 404, body: { error: { code: 404, message: "not found" } } }]);
+    expect(await actuate(planning49Job("gcp-subnet-delete", GCP_SUBNET_REF_PARAMS, "d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7"))).toMatchObject({
+      ok: true,
+      status: "already-absent",
+    });
+  });
+
+  it("gcp-subnet-delete: Google's resourceInUse is ok:false with inUse:true and a retry-later detail (review L4)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const message = "The subnetwork resource is already being used by 'projects/dy-agency-proof/regions/australia-southeast1/addresses/serverless-ipv4-1'";
+    mockGcpApiQueue([{ status: 400, body: { error: { code: 400, message, errors: [{ reason: "resourceInUseByAnotherResource", message }] } } }]);
+    const body = await actuate(planning49Job("gcp-subnet-delete", GCP_SUBNET_REF_PARAMS, "d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8"));
+    expect(body.ok).toBe(false);
+    expect(body.inUse).toBe(true);
+    expect(body.detail).toMatch(/Re-run later/);
+    vi.restoreAllMocks();
+
+    // Any OTHER failure is inUse:false.
+    mockGcpApiQueue([denied403("compute.subnetworks.delete")]);
+    const denied = await actuate(planning49Job("gcp-subnet-delete", GCP_SUBNET_REF_PARAMS, "d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9"));
+    expect(denied.ok).toBe(false);
+    expect(denied.inUse).toBe(false);
+  });
+
+  it("gcp-subnet-delete: a signed job naming the cell's NODE subnet is refused BEFORE any Google call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = planning49Job("gcp-subnet-delete", { ...GCP_SUBNET_REF_PARAMS, subnetName: "dy-cell-australia-southeast1-subnet" }, "dadadadadadadadadadadadadadadada");
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(400);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("cloudrun-service-upsert: a MISSING service is CREATEd with the label + invoker IAM ON, waited, then re-read", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([
+      { status: 404, body: { error: { code: 404, message: "not found" } } },
+      { body: { name: CLOUD_RUN_OPERATION } },
+      { body: { name: CLOUD_RUN_OPERATION, done: true } },
+      { body: settledService("term-docs-892769") },
+    ]);
+
+    const body = await actuate(planning49Job("cloudrun-service-upsert", CLOUD_RUN_SESSION_PARAMS, "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"));
+    expect(body).toEqual({
+      ok: true,
+      op: "cloudrun-service-upsert",
+      serviceName: "term-docs-892769",
+      status: "created",
+      uri: PROBE_URI,
+      urls: [PROBE_URI, PROBE_DETERMINISTIC_URL],
+      revision: "term-docs-892769-00001-abc",
+    });
+
+    const run = googleCalls(calls);
+    expect(run.map((call) => call.method)).toEqual(["GET", "POST", "POST", "GET"]);
+    expect(run[1].url).toBe(`${CLOUD_RUN_SERVICES_URL}?serviceId=term-docs-892769`);
+    expect(run[2].url).toBe(`https://run.googleapis.com/v2/${CLOUD_RUN_OPERATION}:wait`);
+    expect(run[1].body).toEqual({
+      labels: MANAGED_LABELS,
+      ingress: "INGRESS_TRAFFIC_ALL",
+      invokerIamDisabled: false,
+      template: {
+        serviceAccount: "dy-run@dy-agency-proof.iam.gserviceaccount.com",
+        timeout: "3600s",
+        executionEnvironment: "EXECUTION_ENVIRONMENT_GEN2",
+        scaling: { minInstanceCount: 0, maxInstanceCount: 1 },
+        vpcAccess: {
+          networkInterfaces: [{ network: "dy-cell-australia-southeast1", subnetwork: "dy-cell-australia-southeast1-run" }],
+          egress: "PRIVATE_RANGES_ONLY",
+        },
+        containers: [
+          {
+            image: "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run/dy-run-terminal:v5",
+            ports: [{ name: "http1", containerPort: 8080 }],
+            resources: { limits: { cpu: "1", memory: "2Gi" } },
+          },
+        ],
+      },
+    });
+    // NO IAM is written anywhere.
+    expect(run.some((call) => call.url.includes(":setIamPolicy"))).toBe(false);
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+  });
+
+  it("cloudrun-service-upsert: an EXISTING labelled, settled, private service is PATCHed after an IAM read", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([
+      { body: settledService("term-docs-892769") },
+      { body: { bindings: [{ role: "roles/run.invoker", members: ["serviceAccount:agency-worker@dy-agency-proof.iam.gserviceaccount.com"] }] } },
+      { body: { name: CLOUD_RUN_OPERATION } },
+      { body: { name: CLOUD_RUN_OPERATION, done: true } },
+      { body: settledService("term-docs-892769") },
+    ]);
+    const body = await actuate(planning49Job("cloudrun-service-upsert", CLOUD_RUN_SESSION_PARAMS, "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2"));
+    expect(body).toMatchObject({ ok: true, status: "updated" });
+    const run = googleCalls(calls);
+    expect(run.map((call) => call.method)).toEqual(["GET", "GET", "PATCH", "POST", "GET"]);
+    expect(run[1].url).toBe(`${CLOUD_RUN_SERVICES_URL}/term-docs-892769:getIamPolicy`);
+    expect(run[2].url).toBe(`${CLOUD_RUN_SERVICES_URL}/term-docs-892769`);
+    expect((run[2].body as Record<string, unknown>).labels).toEqual(MANAGED_LABELS);
+  });
+
+  it("cloudrun-service-upsert REFUSES to take over: no label, still reconciling, or a public binding — and never PATCHes (review M1, L5)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const cases: Array<[Array<{ body: unknown; status?: number }>, RegExp]> = [
+      [[{ body: settledService("term-docs-892769", { labels: {} }) }], /does not carry the managed-by=doubleyoup label/],
+      [[{ body: settledService("term-docs-892769", { labels: { "managed-by": "someone-else" } }) }], /does not carry the managed-by=doubleyoup label/],
+      [[{ body: settledService("term-docs-892769", { reconciling: true }) }], /still reconciling/],
+      [
+        [{ body: settledService("term-docs-892769") }, { body: { bindings: [{ role: "roles/run.invoker", members: ["allUsers"] }] } }],
+        /public IAM binding \(allUsers\)/,
+      ],
+      [
+        [{ body: settledService("term-docs-892769") }, { body: { bindings: [{ role: "roles/run.invoker", members: ["allAuthenticatedUsers"] }] } }],
+        /public IAM binding \(allAuthenticatedUsers\)/,
+      ],
+    ];
+    let nonce = 0;
+    for (const [replies, expected] of cases) {
+      nonce += 1;
+      const calls = mockGcpApiQueue(replies);
+      const body = await actuate(planning49Job("cloudrun-service-upsert", CLOUD_RUN_SESSION_PARAMS, `e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3${String(nonce).padStart(2, "0")}`));
+      expect(body.ok).toBe(false);
+      expect(body.detail).toMatch(expected);
+      expect(googleCalls(calls).some((call) => call.method === "PATCH" || call.method === "POST")).toBe(false);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("cloudrun-service-upsert PROBE: the Worker's own command + program under the stock image, ONE env var, no volumes", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([
+      { status: 404, body: { error: { code: 404, message: "not found" } } },
+      { body: { name: CLOUD_RUN_OPERATION } },
+      { body: { name: CLOUD_RUN_OPERATION, done: true } },
+      { body: settledService("dy-run-probe") },
+    ]);
+    const body = await actuate(planning49Job("cloudrun-service-upsert", CLOUD_RUN_PROBE_PARAMS, "e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4"));
+    expect(body).toMatchObject({ ok: true, status: "created", serviceName: "dy-run-probe" });
+
+    const create = googleCalls(calls)[1];
+    const template = (create.body as { template: { containers: Array<Record<string, unknown>>; volumes?: unknown } }).template;
+    const container = template.containers[0] ?? {};
+    expect(container.image).toBe("docker.io/library/python:3.12-slim");
+    expect(container.command).toEqual(["python3"]);
+    expect((container.args as string[])[0]).toBe("-c");
+    expect((container.args as string[])[1]).toMatch(/ThreadingHTTPServer/);
+    expect(container.env).toEqual([
+      {
+        name: "DY_PROBE_TARGETS",
+        value: JSON.stringify([
+          { ip: "10.20.0.4", port: "2049" },
+          { ip: "10.20.0.2", port: "3306" },
+        ]),
+      },
+    ]);
+    expect(container.volumeMounts).toBeUndefined();
+    expect(template.volumes).toBeUndefined();
+  });
+
+  it("cloudrun-service-get: reports found, uri, urls, ready, managed and reconciling; a 404 is a clean found:false", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    mockGcpApiQueue([{ body: settledService("dy-run-probe") }]);
+    expect(await actuate(planning49Job("cloudrun-service-get", CLOUD_RUN_PROBE_REF_PARAMS, "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5"))).toEqual({
+      ok: true,
+      op: "cloudrun-service-get",
+      serviceName: "dy-run-probe",
+      found: true,
+      uri: PROBE_URI,
+      urls: [PROBE_URI, PROBE_DETERMINISTIC_URL],
+      ready: true,
+      managedByPlatform: true,
+      reconciling: false,
+    });
+    vi.restoreAllMocks();
+
+    mockGcpApiQueue([{ status: 404, body: { error: { code: 404, message: "not found" } } }]);
+    expect(await actuate(planning49Job("cloudrun-service-get", CLOUD_RUN_PROBE_REF_PARAMS, "e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6"))).toMatchObject({
+      ok: true,
+      found: false,
+      uri: null,
+      urls: [],
+      ready: false,
+    });
+  });
+
+  it("cloudrun-service-delete: deletes a LABELLED service and waits; refuses an unlabelled one; a missing one is already-absent", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    let calls = mockGcpApiQueue([{ body: settledService("dy-run-probe") }, { body: { name: CLOUD_RUN_OPERATION } }, { body: { name: CLOUD_RUN_OPERATION, done: true } }]);
+    expect(await actuate(planning49Job("cloudrun-service-delete", CLOUD_RUN_PROBE_REF_PARAMS, "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7"))).toEqual({
+      ok: true,
+      op: "cloudrun-service-delete",
+      serviceName: "dy-run-probe",
+      status: "deleted",
+    });
+    expect(googleCalls(calls).map((call) => call.method)).toEqual(["GET", "DELETE", "POST"]);
+    vi.restoreAllMocks();
+
+    calls = mockGcpApiQueue([{ body: settledService("dy-run-probe", { labels: {} }) }]);
+    const refused = await actuate(planning49Job("cloudrun-service-delete", CLOUD_RUN_PROBE_REF_PARAMS, "e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8"));
+    expect(refused.ok).toBe(false);
+    expect(refused.detail).toMatch(/does not carry the managed-by=doubleyoup label/);
+    expect(googleCalls(calls).some((call) => call.method === "DELETE")).toBe(false);
+    vi.restoreAllMocks();
+
+    calls = mockGcpApiQueue([{ status: 404, body: { error: { code: 404, message: "not found" } } }]);
+    expect(await actuate(planning49Job("cloudrun-service-delete", CLOUD_RUN_PROBE_REF_PARAMS, "e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9"))).toMatchObject({
+      ok: true,
+      status: "already-absent",
+    });
+    expect(googleCalls(calls)).toHaveLength(1);
+  });
+
+  it("cloudrun-probe-invoke: no token is refused (403), the agency's ID token gets the results — tokens never echoed", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const results = [
+      { ip: "10.20.0.4", port: "2049", result: "open" },
+      { ip: "10.20.0.2", port: "3306", result: "open" },
+    ];
+    const calls = mockGcpApiQueue([{ body: settledService("dy-run-probe") }, { status: 403, body: { error: "Forbidden" } }, { body: { results } }]);
+
+    const body = await actuate(planning49Job("cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS, "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"));
+    expect(body).toEqual({
+      ok: true,
+      op: "cloudrun-probe-invoke",
+      serviceName: "dy-run-probe",
+      uri: PROBE_URI,
+      unauthenticatedStatus: 403,
+      authenticatedStatus: 200,
+      results,
+    });
+
+    const [read, unauthenticated, authenticated] = googleCalls(calls);
+    expect(read.url).toBe(`${CLOUD_RUN_SERVICES_URL}/dy-run-probe`);
+    expect(unauthenticated.url).toBe(PROBE_URI);
+    expect(unauthenticated.auth).toBeNull();
+    expect(authenticated.url).toBe(PROBE_URI);
+    expect(authenticated.auth).toBe(`Bearer ${GCP_ID_TOKEN}`);
+    // The ID token was minted for the probe's OWN uri, from the agency's key.
+    const idTokenMint = calls.find((call) => call.form !== undefined && jwtClaimsOf(call.form.get("assertion") ?? "").target_audience !== undefined);
+    expect(jwtClaimsOf(idTokenMint?.form?.get("assertion") ?? "").target_audience).toBe(PROBE_URI);
+    expect(JSON.stringify(body)).not.toContain(GCP_ID_TOKEN);
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+  });
+
+  it("cloudrun-probe-invoke: a cold 429 is retried; a non-200 or a body that is not the probe's is ok:false", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    cloudRunProbeInvokeTuning.retryDelayMs = 0;
+    const results = [{ ip: "10.20.0.4", port: "2049", result: "refused" }];
+    mockGcpApiQueue([{ body: settledService("dy-run-probe") }, { status: 403, body: {} }, { status: 429, body: {} }, { body: { results } }]);
+    expect(await actuate(planning49Job("cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS, "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2"))).toMatchObject({ ok: true, results });
+    vi.restoreAllMocks();
+
+    mockGcpApiQueue([{ body: settledService("dy-run-probe") }, { status: 403, body: {} }, { status: 403, body: {} }]);
+    const denied = await actuate(planning49Job("cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS, "f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3"));
+    expect(denied.ok).toBe(false);
+    expect(denied.detail).toMatch(/run\.invoker/);
+    vi.restoreAllMocks();
+
+    mockGcpApiQueue([{ body: settledService("dy-run-probe") }, { status: 403, body: {} }, { body: { results: [{ ip: "x", port: "1", result: "<script>" }] } }]);
+    const junk = await actuate(planning49Job("cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS, "f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4"));
+    expect(junk.ok).toBe(false);
+    expect(junk.detail).toMatch(/not the probe's results/);
+    cloudRunProbeInvokeTuning.retryDelayMs = 3000;
+  });
+
+  it("cloudrun-probe-invoke: refuses a missing or unlabelled probe before any request to its URL", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    let calls = mockGcpApiQueue([{ status: 404, body: { error: { code: 404, message: "not found" } } }]);
+    const missing = await actuate(planning49Job("cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS, "f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5"));
+    expect(missing.ok).toBe(false);
+    expect(googleCalls(calls)).toHaveLength(1);
+    vi.restoreAllMocks();
+
+    calls = mockGcpApiQueue([{ body: settledService("dy-run-probe", { labels: {} }) }]);
+    const unlabelled = await actuate(planning49Job("cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS, "f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6"));
+    expect(unlabelled.ok).toBe(false);
+    expect(googleCalls(calls)).toHaveLength(1);
+  });
+
+  it("the Phase 2 ops touch NO API without GCP_SERVICE_ACCOUNT_KEY, and refuse another project with no Google call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const jobs: Array<[DispatchJob["op"], Record<string, unknown>]> = [
+      ["gcp-subnet-create", GCP_SUBNET_CREATE_PARAMS],
+      ["gcp-subnet-get", GCP_SUBNET_REF_PARAMS],
+      ["gcp-subnet-delete", GCP_SUBNET_REF_PARAMS],
+      ["cloudrun-service-upsert", CLOUD_RUN_SESSION_PARAMS],
+      ["cloudrun-service-get", CLOUD_RUN_PROBE_REF_PARAMS],
+      ["cloudrun-service-delete", CLOUD_RUN_PROBE_REF_PARAMS],
+      ["cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS],
+    ];
+    let nonce = 0;
+    for (const [op, params] of jobs) {
+      nonce += 1;
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      const job = planning49Job(op, params, `fafafafafafafafafafafafafafafa${String(nonce).padStart(2, "0")}`);
+      const signature = await signAsApp(job, privateKey);
+      const noKey = (await (await worker.fetch(actuateRequest({ job, signature }), envWith())).json()) as { ok: boolean; detail: string };
+      expect(noKey.ok).toBe(false);
+      expect(noKey.detail).toMatch(/GCP_SERVICE_ACCOUNT_KEY is not configured/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+    }
+    // Another project: the pin refuses before any token mint.
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const otherProject = { ...GCP_SUBNET_REF_PARAMS, project: "some-other-project" };
+    const job = planning49Job("gcp-subnet-get", otherProject, "fbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfb");
+    const signature = await signAsApp(job, privateKey);
+    const body = (await (await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }))).json()) as {
+      ok: boolean;
+      detail: string;
+    };
     expect(body.ok).toBe(false);
     expect(body.detail).toMatch(/does not match the service-account key's own project/);
     expect(fetchSpy).not.toHaveBeenCalled();

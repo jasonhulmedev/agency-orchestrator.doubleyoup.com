@@ -780,6 +780,74 @@ export async function mintGoogleAccessToken(options: {
   return data.access_token;
 }
 
+/**
+ * planning/49 Phase 2: mint a Google-signed ID TOKEN for `audience` from a service-account key.
+ * Cloud Run checks an ID token, not an access token, before it lets a caller invoke an IAM-protected
+ * service, and the audience must be the service's URL.
+ *
+ * The same RS256 JWT-bearer grant as mintGoogleAccessToken, with ONE difference: the assertion carries
+ * `target_audience` instead of `scope`, and Google answers with `id_token`. The token goes back to the
+ * caller alone, who puts it in an Authorization header and never logs or echoes it.
+ */
+export async function mintGoogleIdToken(options: {
+  clientEmail: string;
+  privateKeyPem: string;
+  tokenUri: string;
+  /** The URL of the Cloud Run service the token is for. */
+  audience: string;
+}): Promise<string> {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  const header = { alg: "RS256", typ: "JWT" };
+  const claims = {
+    iss: options.clientEmail,
+    sub: options.clientEmail,
+    aud: options.tokenUri,
+    target_audience: options.audience,
+    iat: nowSeconds,
+    exp: nowSeconds + 3600,
+  };
+
+  const signingInput =
+    `${base64UrlEncodeString(JSON.stringify(header))}.` +
+    `${base64UrlEncodeString(JSON.stringify(claims))}`;
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8",
+    pemToDer(options.privateKeyPem),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signatureBytes = new Uint8Array(
+    await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, new TextEncoder().encode(signingInput)),
+  );
+  const jwt = `${signingInput}.${base64UrlEncodeBytes(signatureBytes)}`;
+
+  const form = new URLSearchParams();
+  form.set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer");
+  form.set("assertion", jwt);
+
+  const response = await fetch(options.tokenUri, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      accept: "application/json",
+    },
+    body: form.toString(),
+  });
+
+  if (!response.ok) {
+    const body = (await response.text()).slice(0, 300);
+    throw new Error(`Google token endpoint returned HTTP ${response.status}. ${body}`);
+  }
+  const data = (await response.json()) as { id_token?: string };
+  if (!data.id_token) {
+    throw new Error("Google token endpoint response had no id_token.");
+  }
+  return data.id_token;
+}
+
 // The permissions doubleyoup's GCP integration REQUIRES. Cell provisioning (planning/34) builds a
 // whole cell in the agency's OWN project through signed jobs -> the agency Worker: a VPC + subnet,
 // two firewall rules, a Cloud NAT (via a router), a static gateway address, and one VM per node.
