@@ -469,12 +469,12 @@ const GCP_SUBNET_REF_PARAMS = {
   region: "australia-southeast1",
   subnetName: "dy-cell-australia-southeast1-run",
 };
-/** A terminal session service — the shape Phase 3 deploys (NFS-mounting, so maxInstances 1). */
+/** A terminal session service — the shape Phase 3 deploys. REFUSED for now: the upsert is probe-only until M4. */
 const CLOUD_RUN_SESSION_PARAMS = {
   project: "dy-agency-proof",
   region: "australia-southeast1",
   serviceName: "term-docs-892769",
-  image: "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run/dy-run-terminal:v5",
+  image: "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run/dy-run-terminal@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   runServiceAccount: "dy-run@dy-agency-proof.iam.gserviceaccount.com",
   network: "dy-cell-australia-southeast1",
   subnet: "dy-cell-australia-southeast1-run",
@@ -487,7 +487,7 @@ const CLOUD_RUN_PROBE_PARAMS = {
   project: "dy-agency-proof",
   region: "australia-southeast1",
   serviceName: "dy-run-probe",
-  image: "docker.io/library/python:3.12-slim",
+  image: "docker.io/library/python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe",
   runServiceAccount: "dy-run@dy-agency-proof.iam.gserviceaccount.com",
   network: "dy-cell-australia-southeast1",
   subnet: "dy-cell-australia-southeast1-run",
@@ -3118,6 +3118,13 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(validateGcpSubnetCreateParams({ ...GCP_SUBNET_CREATE_PARAMS, extra: "x" })).toEqual({ ok: true, params: GCP_SUBNET_CREATE_PARAMS });
   });
 
+  it("gcp-subnet-create: the Run range has its own /26 floor (review L4) — a /27 is refused, a /26 accepted", () => {
+    expect(validateGcpSubnetCreateParams({ ...GCP_SUBNET_CREATE_PARAMS, ipCidr: "10.20.4.0/26" }).ok).toBe(true);
+    for (const ipCidr of ["10.20.4.0/27", "10.20.4.0/29", "172.16.0.0/28", "192.168.4.0/27"]) {
+      expectRefused(validateGcpSubnetCreateParams({ ...GCP_SUBNET_CREATE_PARAMS, ipCidr }), /^ipCidr must be a private .* between \/8 and \/26/);
+    }
+  });
+
   it("gcp-subnet-create: the network AND the subnet name are PINNED to the region (review M3)", () => {
     const bad = (overrides: Record<string, unknown>) => validateGcpSubnetCreateParams({ ...GCP_SUBNET_CREATE_PARAMS, ...overrides });
     expectRefused(bad({ networkName: "default" }), /^networkName must be exactly "dy-cell-australia-southeast1"/);
@@ -3146,26 +3153,30 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     }
   });
 
-  it("cloudrun-service-upsert: accepts a session service and a probe, returning ONLY the known keys", () => {
-    expect(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, extra: "x" })).toEqual({ ok: true, params: CLOUD_RUN_SESSION_PARAMS });
+  it("cloudrun-service-upsert: accepts the probe, returning ONLY the known keys; the image is pinned BY DIGEST", () => {
     expect(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, extra: "x" })).toEqual({ ok: true, params: CLOUD_RUN_PROBE_PARAMS });
-    expect(CLOUD_RUN_PROBE_IMAGE).toBe("docker.io/library/python:3.12-slim");
+    expect(CLOUD_RUN_PROBE_IMAGE).toBe("docker.io/library/python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe");
     expect(CLOUD_RUN_PROBE_SERVICE_NAME).toBe("dy-run-probe");
   });
 
-  it("cloudrun-service-upsert: the service name is PINNED to a session prefix or the probe (review M2)", () => {
+  it("cloudrun-service-upsert is PROBE-ONLY until M4: every session prefix is refused (review High)", () => {
     for (const serviceName of ["term-docs-892769", "pma-docs-892769", "staging-docs-892769", "sterm-docs-892769", "spma-docs-892769"]) {
-      expect(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, serviceName }).ok).toBe(true);
+      expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, serviceName }), /^cloudrun-service-upsert is probe-only until planning\/49 M4 lands/);
     }
-    for (const serviceName of ["docs-892769", "terminal-docs", "term-", "term-Docs", "dy-cell-agent", "term-x-".padEnd(50, "a"), "dy-run-probe"]) {
-      expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, serviceName }), /^serviceName must be a session service name/);
-    }
-    // A probe must use the probe name, and only the probe may use it.
+    // The probe must use the probe name.
     expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, serviceName: "term-docs-892769" }), /^serviceName must be exactly "dy-run-probe"/);
   });
 
+  it("cloudrun-service-upsert: an image is accepted ONLY when pinned by @sha256: digest (review M1/L2)", () => {
+    for (const image of ["docker.io/library/python:3.12-slim", "docker.io/library/python", "docker.io/library/python:3.12-slim@sha256:" + "a".repeat(63)]) {
+      expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, image }), /^image must be a container image reference pinned by digest/);
+    }
+    // A well-formed digest that is not THE probe digest is refused too.
+    expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, image: "docker.io/library/python@sha256:" + "b".repeat(64) }), /^a probe must run exactly/);
+  });
+
   it("cloudrun-service-upsert: network, subnet and runtime identity are PINNED (review M3)", () => {
-    const bad = (overrides: Record<string, unknown>) => validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, ...overrides });
+    const bad = (overrides: Record<string, unknown>) => validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, ...overrides });
     expectRefused(bad({ network: "default" }), /^network must be exactly "dy-cell-australia-southeast1"/);
     expectRefused(bad({ subnet: "dy-cell-australia-southeast1-subnet" }), /^subnet must be exactly "dy-cell-australia-southeast1-run"/);
     expectRefused(bad({ runServiceAccount: "other@dy-agency-proof.iam.gserviceaccount.com" }), /^runServiceAccount must be exactly "dy-run@dy-agency-proof/);
@@ -3173,23 +3184,22 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expectRefused(bad({ runServiceAccount: "123-compute@developer.gserviceaccount.com" }), /^runServiceAccount must be exactly/);
   });
 
-  it("cloudrun-service-upsert INVARIANTS: one writer with NFS, a private-literal NFS server, and NO unauthenticated path", () => {
+  it("cloudrun-service-upsert: the NFS shape rules still run (for M4 later), and NO unauthenticated key is honoured", () => {
     const volume = { name: "sites", server: "10.20.0.4", path: "/srv/dy-storage/sites/docs-892769", mountPath: "/sites/docs-892769" };
-    expect(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, nfsVolumes: [volume] }).ok).toBe(true);
-    expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, maxInstances: 2, nfsVolumes: [volume] }), /^maxInstances must be exactly 1 when nfsVolumes/);
+    // While the upsert is probe-only, any NFS volume is refused; a malformed one names its own fault first.
+    expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, nfsVolumes: [volume] }), /^a probe must not mount nfsVolumes/);
     for (const server of ["dy-file-australia-southeast1-1", "8.8.8.8", "10.20.0.256", "10.20.0.4 "]) {
-      expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, nfsVolumes: [{ ...volume, server }] }), /server must be a PRIVATE/);
+      expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, nfsVolumes: [{ ...volume, server }] }), /server must be a PRIVATE/);
     }
-    expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, nfsVolumes: [{ ...volume, path: "/srv/../etc" }] }), /path must be an absolute POSIX path/);
+    expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, nfsVolumes: [{ ...volume, path: "/srv/../etc" }] }), /path must be an absolute POSIX path/);
     // An unauthenticated / ingress / template key is DROPPED, never honoured.
-    const verdict = validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, allowUnauthenticated: true, ingress: "x", template: {} });
-    expect(verdict).toEqual({ ok: true, params: CLOUD_RUN_SESSION_PARAMS });
+    const verdict = validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, allowUnauthenticated: true, ingress: "x", template: {} });
+    expect(verdict).toEqual({ ok: true, params: CLOUD_RUN_PROBE_PARAMS });
   });
 
   it("cloudrun-service-upsert PROBE: the stock image only, its targets only, and nothing else (Jason 2026-10-12)", () => {
     const bad = (overrides: Record<string, unknown>) => validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, ...overrides });
-    expectRefused(bad({ image: "docker.io/library/python:3.13-slim" }), /^a probe must run exactly "docker.io\/library\/python:3.12-slim"/);
-    expectRefused(bad({ image: "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run/dy-run-terminal:v5" }), /^a probe must run exactly/);
+    expectRefused(bad({ image: "docker.io/library/python@sha256:" + "c".repeat(64) }), /^a probe must run exactly "docker.io\/library\/python@sha256:2b4f19da/);
     expectRefused(
       bad({ nfsVolumes: [{ name: "sites", server: "10.20.0.4", path: "/srv/dy-storage/sites", mountPath: "/sites" }] }),
       /^a probe must not mount nfsVolumes/,
@@ -7098,7 +7108,13 @@ describe("POST /actuate route", () => {
         body: {
           name: "dy-file-australia-southeast1-1",
           status: "RUNNING",
-          networkInterfaces: [{ networkIP: "10.20.0.4", name: "nic0" }],
+          networkInterfaces: [
+            {
+              networkIP: "10.20.0.4",
+              name: "nic0",
+              network: "https://www.googleapis.com/compute/v1/projects/dy-agency-proof/global/networks/dy-cell-australia-southeast1",
+            },
+          ],
         },
       },
     ]);
@@ -7112,6 +7128,7 @@ describe("POST /actuate route", () => {
       instanceName: "dy-file-australia-southeast1-1",
       found: true,
       privateIp: "10.20.0.4",
+      network: "dy-cell-australia-southeast1",
       status: "RUNNING",
     });
 
@@ -7137,6 +7154,7 @@ describe("POST /actuate route", () => {
       instanceName: "dy-file-australia-southeast1-1",
       found: false,
       privateIp: null,
+      network: null,
       status: null,
     });
   });
@@ -7155,6 +7173,7 @@ describe("POST /actuate route", () => {
         instanceName: "dy-file-australia-southeast1-1",
         found: true,
         privateIp: null,
+        network: null,
         status: "TERMINATED",
       });
       vi.restoreAllMocks();
@@ -7207,10 +7226,15 @@ describe("POST /actuate route", () => {
   const PROBE_URI = "https://dy-run-probe-abc123xyz-ts.a.run.app";
   const PROBE_DETERMINISTIC_URL = "https://dy-run-probe-123456789012.australia-southeast1.run.app";
   const MANAGED_LABELS = { "managed-by": "doubleyoup" };
-  /** A settled service as Cloud Run returns it on read-back. */
+  const DEPLOYED_TARGETS = [
+    { ip: "10.20.0.4", port: "2049" },
+    { ip: "10.20.0.2", port: "3306" },
+  ];
+  /** A settled service as Cloud Run returns it on read-back, carrying the probe targets it was deployed with. */
   function settledService(name: string, extra: Record<string, unknown> = {}) {
     return {
       name: `projects/dy-agency-proof/locations/australia-southeast1/services/${name}`,
+      template: { containers: [{ env: [{ name: "DY_PROBE_TARGETS", value: JSON.stringify(DEPLOYED_TARGETS) }] }] },
       uri: PROBE_URI,
       urls: [PROBE_URI, PROBE_DETERMINISTIC_URL],
       labels: MANAGED_LABELS,
@@ -7326,45 +7350,35 @@ describe("POST /actuate route", () => {
       { status: 404, body: { error: { code: 404, message: "not found" } } },
       { body: { name: CLOUD_RUN_OPERATION } },
       { body: { name: CLOUD_RUN_OPERATION, done: true } },
-      { body: settledService("term-docs-892769") },
+      { body: settledService("dy-run-probe") },
     ]);
 
-    const body = await actuate(planning49Job("cloudrun-service-upsert", CLOUD_RUN_SESSION_PARAMS, "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"));
+    const body = await actuate(planning49Job("cloudrun-service-upsert", CLOUD_RUN_PROBE_PARAMS, "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"));
     expect(body).toEqual({
       ok: true,
       op: "cloudrun-service-upsert",
-      serviceName: "term-docs-892769",
+      serviceName: "dy-run-probe",
       status: "created",
       uri: PROBE_URI,
       urls: [PROBE_URI, PROBE_DETERMINISTIC_URL],
-      revision: "term-docs-892769-00001-abc",
+      revision: "dy-run-probe-00001-abc",
     });
 
     const run = googleCalls(calls);
     expect(run.map((call) => call.method)).toEqual(["GET", "POST", "POST", "GET"]);
-    expect(run[1].url).toBe(`${CLOUD_RUN_SERVICES_URL}?serviceId=term-docs-892769`);
+    expect(run[1].url).toBe(`${CLOUD_RUN_SERVICES_URL}?serviceId=dy-run-probe`);
     expect(run[2].url).toBe(`https://run.googleapis.com/v2/${CLOUD_RUN_OPERATION}:wait`);
-    expect(run[1].body).toEqual({
-      labels: MANAGED_LABELS,
-      ingress: "INGRESS_TRAFFIC_ALL",
-      invokerIamDisabled: false,
-      template: {
-        serviceAccount: "dy-run@dy-agency-proof.iam.gserviceaccount.com",
-        timeout: "3600s",
-        executionEnvironment: "EXECUTION_ENVIRONMENT_GEN2",
-        scaling: { minInstanceCount: 0, maxInstanceCount: 1 },
-        vpcAccess: {
-          networkInterfaces: [{ network: "dy-cell-australia-southeast1", subnetwork: "dy-cell-australia-southeast1-run" }],
-          egress: "PRIVATE_RANGES_ONLY",
-        },
-        containers: [
-          {
-            image: "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run/dy-run-terminal:v5",
-            ports: [{ name: "http1", containerPort: 8080 }],
-            resources: { limits: { cpu: "1", memory: "2Gi" } },
-          },
-        ],
-      },
+    const created = run[1].body as Record<string, unknown> & { template: Record<string, unknown> };
+    expect(created.labels).toEqual(MANAGED_LABELS);
+    expect(created.ingress).toBe("INGRESS_TRAFFIC_ALL");
+    expect(created.invokerIamDisabled).toBe(false);
+    expect(created.template.serviceAccount).toBe("dy-run@dy-agency-proof.iam.gserviceaccount.com");
+    expect(created.template.timeout).toBe("3600s");
+    expect(created.template.executionEnvironment).toBe("EXECUTION_ENVIRONMENT_GEN2");
+    expect(created.template.scaling).toEqual({ minInstanceCount: 0, maxInstanceCount: 1 });
+    expect(created.template.vpcAccess).toEqual({
+      networkInterfaces: [{ network: "dy-cell-australia-southeast1", subnetwork: "dy-cell-australia-southeast1-run" }],
+      egress: "PRIVATE_RANGES_ONLY",
     });
     // NO IAM is written anywhere.
     expect(run.some((call) => call.url.includes(":setIamPolicy"))).toBe(false);
@@ -7374,33 +7388,33 @@ describe("POST /actuate route", () => {
   it("cloudrun-service-upsert: an EXISTING labelled, settled, private service is PATCHed after an IAM read", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const calls = mockGcpApiQueue([
-      { body: settledService("term-docs-892769") },
+      { body: settledService("dy-run-probe") },
       { body: { bindings: [{ role: "roles/run.invoker", members: ["serviceAccount:agency-worker@dy-agency-proof.iam.gserviceaccount.com"] }] } },
       { body: { name: CLOUD_RUN_OPERATION } },
       { body: { name: CLOUD_RUN_OPERATION, done: true } },
-      { body: settledService("term-docs-892769") },
+      { body: settledService("dy-run-probe") },
     ]);
-    const body = await actuate(planning49Job("cloudrun-service-upsert", CLOUD_RUN_SESSION_PARAMS, "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2"));
+    const body = await actuate(planning49Job("cloudrun-service-upsert", CLOUD_RUN_PROBE_PARAMS, "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2"));
     expect(body).toMatchObject({ ok: true, status: "updated" });
     const run = googleCalls(calls);
     expect(run.map((call) => call.method)).toEqual(["GET", "GET", "PATCH", "POST", "GET"]);
-    expect(run[1].url).toBe(`${CLOUD_RUN_SERVICES_URL}/term-docs-892769:getIamPolicy`);
-    expect(run[2].url).toBe(`${CLOUD_RUN_SERVICES_URL}/term-docs-892769`);
+    expect(run[1].url).toBe(`${CLOUD_RUN_SERVICES_URL}/dy-run-probe:getIamPolicy`);
+    expect(run[2].url).toBe(`${CLOUD_RUN_SERVICES_URL}/dy-run-probe`);
     expect((run[2].body as Record<string, unknown>).labels).toEqual(MANAGED_LABELS);
   });
 
   it("cloudrun-service-upsert REFUSES to take over: no label, still reconciling, or a public binding — and never PATCHes (review M1, L5)", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const cases: Array<[Array<{ body: unknown; status?: number }>, RegExp]> = [
-      [[{ body: settledService("term-docs-892769", { labels: {} }) }], /does not carry the managed-by=doubleyoup label/],
-      [[{ body: settledService("term-docs-892769", { labels: { "managed-by": "someone-else" } }) }], /does not carry the managed-by=doubleyoup label/],
-      [[{ body: settledService("term-docs-892769", { reconciling: true }) }], /still reconciling/],
+      [[{ body: settledService("dy-run-probe", { labels: {} }) }], /does not carry the managed-by=doubleyoup label/],
+      [[{ body: settledService("dy-run-probe", { labels: { "managed-by": "someone-else" } }) }], /does not carry the managed-by=doubleyoup label/],
+      [[{ body: settledService("dy-run-probe", { reconciling: true }) }], /still reconciling/],
       [
-        [{ body: settledService("term-docs-892769") }, { body: { bindings: [{ role: "roles/run.invoker", members: ["allUsers"] }] } }],
+        [{ body: settledService("dy-run-probe") }, { body: { bindings: [{ role: "roles/run.invoker", members: ["allUsers"] }] } }],
         /public IAM binding \(allUsers\)/,
       ],
       [
-        [{ body: settledService("term-docs-892769") }, { body: { bindings: [{ role: "roles/run.invoker", members: ["allAuthenticatedUsers"] }] } }],
+        [{ body: settledService("dy-run-probe") }, { body: { bindings: [{ role: "roles/run.invoker", members: ["allAuthenticatedUsers"] }] } }],
         /public IAM binding \(allAuthenticatedUsers\)/,
       ],
     ];
@@ -7408,7 +7422,7 @@ describe("POST /actuate route", () => {
     for (const [replies, expected] of cases) {
       nonce += 1;
       const calls = mockGcpApiQueue(replies);
-      const body = await actuate(planning49Job("cloudrun-service-upsert", CLOUD_RUN_SESSION_PARAMS, `e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3${String(nonce).padStart(2, "0")}`));
+      const body = await actuate(planning49Job("cloudrun-service-upsert", CLOUD_RUN_PROBE_PARAMS, `e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3${String(nonce).padStart(2, "0")}`));
       expect(body.ok).toBe(false);
       expect(body.detail).toMatch(expected);
       expect(googleCalls(calls).some((call) => call.method === "PATCH" || call.method === "POST")).toBe(false);
@@ -7430,7 +7444,7 @@ describe("POST /actuate route", () => {
     const create = googleCalls(calls)[1];
     const template = (create.body as { template: { containers: Array<Record<string, unknown>>; volumes?: unknown } }).template;
     const container = template.containers[0] ?? {};
-    expect(container.image).toBe("docker.io/library/python:3.12-slim");
+    expect(container.image).toBe("docker.io/library/python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe");
     expect(container.command).toEqual(["python3"]);
     expect((container.args as string[])[0]).toBe("-c");
     expect((container.args as string[])[1]).toMatch(/ThreadingHTTPServer/);
@@ -7535,7 +7549,10 @@ describe("POST /actuate route", () => {
   it("cloudrun-probe-invoke: a cold 429 is retried; a non-200 or a body that is not the probe's is ok:false", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     cloudRunProbeInvokeTuning.retryDelayMs = 0;
-    const results = [{ ip: "10.20.0.4", port: "2049", result: "refused" }];
+    const results = [
+      { ip: "10.20.0.4", port: "2049", result: "refused" },
+      { ip: "10.20.0.2", port: "3306", result: "open" },
+    ];
     mockGcpApiQueue([{ body: settledService("dy-run-probe") }, { status: 403, body: {} }, { status: 429, body: {} }, { body: { results } }]);
     expect(await actuate(planning49Job("cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS, "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2"))).toMatchObject({ ok: true, results });
     vi.restoreAllMocks();
@@ -7551,6 +7568,85 @@ describe("POST /actuate route", () => {
     expect(junk.ok).toBe(false);
     expect(junk.detail).toMatch(/not the probe's results/);
     cloudRunProbeInvokeTuning.retryDelayMs = 3000;
+  });
+
+  it("cloudrun-probe-invoke: a token-less request that is NOT refused is ok:false with public:true (review L1)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([{ body: settledService("dy-run-probe") }, { status: 200, body: { results: [] } }]);
+    const body = await actuate(planning49Job("cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS, "f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7"));
+    expect(body.ok).toBe(false);
+    expect(body.public).toBe(true);
+    expect(body.unauthenticatedStatus).toBe(200);
+    expect(body.detail).toMatch(/may be PUBLIC/);
+    // It stops there: no ID token is minted and no authenticated request is made.
+    expect(googleCalls(calls)).toHaveLength(2);
+  });
+
+  it("cloudrun-probe-invoke: the results must be EXACTLY the deployed targets — none missing, none extra, none repeated (review L3)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const both = [
+      { ip: "10.20.0.4", port: "2049", result: "open" },
+      { ip: "10.20.0.2", port: "3306", result: "open" },
+    ];
+    const badAnswers: unknown[] = [
+      { results: [both[0]] },
+      { results: [...both, { ip: "10.20.0.9", port: "3306", result: "open" }] },
+      { results: [both[0], both[0]] },
+      { results: [both[0], { ip: "10.20.0.9", port: "3306", result: "open" }] },
+      { results: [] },
+      { notResults: true },
+    ];
+    let nonce = 0;
+    for (const answer of badAnswers) {
+      nonce += 1;
+      mockGcpApiQueue([{ body: settledService("dy-run-probe") }, { status: 403, body: {} }, { body: answer }]);
+      const body = await actuate(planning49Job("cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS, `f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8${String(nonce).padStart(2, "0")}`));
+      expect(body.ok).toBe(false);
+      expect(body.detail).toMatch(/exactly the targets it was deployed with/);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("cloudrun-probe-invoke: an answer bigger than the cap is refused while it streams (review L3)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const huge = { results: [{ ip: "10.20.0.4", port: "2049", result: "open" }], padding: "x".repeat(20 * 1024) };
+    mockGcpApiQueue([{ body: settledService("dy-run-probe") }, { status: 403, body: {} }, { body: huge }]);
+    const body = await actuate(planning49Job("cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS, "f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9"));
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/could not be read within 16384 bytes/);
+  });
+
+  it("cloudrun-probe-invoke: a probe service with no deployed targets is refused before any request to its URL", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([{ body: settledService("dy-run-probe", { template: { containers: [{ env: [] }] } }) }]);
+    const body = await actuate(planning49Job("cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS, "fcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfc"));
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/carries no well-formed DY_PROBE_TARGETS/);
+    expect(googleCalls(calls)).toHaveLength(1);
+  });
+
+  it("cloudrun-service-upsert: a deploy still running at the wait bound is ok:false with unconfirmed:true; a Google 400 is NOT unconfirmed", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    mockGcpApiQueue([
+      { status: 404, body: { error: { code: 404, message: "not found" } } },
+      { body: { name: CLOUD_RUN_OPERATION } },
+      { body: { name: CLOUD_RUN_OPERATION, done: false } },
+      { body: { name: CLOUD_RUN_OPERATION, done: false } },
+      { body: { name: CLOUD_RUN_OPERATION, done: false } },
+    ]);
+    const stillRunning = await actuate(planning49Job("cloudrun-service-upsert", CLOUD_RUN_PROBE_PARAMS, "fdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfd"));
+    expect(stillRunning.ok).toBe(false);
+    expect(stillRunning.unconfirmed).toBe(true);
+    vi.restoreAllMocks();
+
+    mockGcpApiQueue([
+      { status: 404, body: { error: { code: 404, message: "not found" } } },
+      { status: 400, body: { error: { code: 400, message: "Invalid VPC network" } } },
+    ]);
+    const refused = await actuate(planning49Job("cloudrun-service-upsert", CLOUD_RUN_PROBE_PARAMS, "fefefefefefefefefefefefefefefefe"));
+    expect(refused.ok).toBe(false);
+    expect(refused.unconfirmed).toBeUndefined();
+    expect(refused.detail).toMatch(/Invalid VPC network/);
   });
 
   it("cloudrun-probe-invoke: refuses a missing or unlabelled probe before any request to its URL", async () => {
@@ -7573,7 +7669,7 @@ describe("POST /actuate route", () => {
       ["gcp-subnet-create", GCP_SUBNET_CREATE_PARAMS],
       ["gcp-subnet-get", GCP_SUBNET_REF_PARAMS],
       ["gcp-subnet-delete", GCP_SUBNET_REF_PARAMS],
-      ["cloudrun-service-upsert", CLOUD_RUN_SESSION_PARAMS],
+      ["cloudrun-service-upsert", CLOUD_RUN_PROBE_PARAMS],
       ["cloudrun-service-get", CLOUD_RUN_PROBE_REF_PARAMS],
       ["cloudrun-service-delete", CLOUD_RUN_PROBE_REF_PARAMS],
       ["cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS],

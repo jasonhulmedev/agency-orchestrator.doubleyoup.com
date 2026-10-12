@@ -449,6 +449,11 @@ export type GcpInstanceGetResult =
       found: boolean;
       /** The instance's first network interface's internal IP, or null (not found / no interface). */
       privateIp: string | null;
+      /**
+       * The short name of the VPC network THAT interface is on, e.g. "dy-cell-australia-southeast2",
+       * or null. Review L5: the caller checks it is the cell's own network before it accepts the IP.
+       */
+      network: string | null;
       /** PROVISIONING | STAGING | RUNNING | STOPPING | TERMINATED | … , or null when not found. */
       status: string | null;
     }
@@ -486,7 +491,10 @@ export type CloudRunServiceUpsertResult =
       urls: string[];
       revision: string | null;
     }
-  | { ok: false; op: "cloudrun-service-upsert"; serviceName: string; detail: string };
+  // `unconfirmed` is true ONLY when Google accepted the write but the Worker's bounded wait could not
+  // see it finish (still running, or the wait call itself failed). The deploy may still land, so the
+  // caller may poll cloudrun-service-get. Every OTHER failure is a clear refusal (orchestrator L1).
+  | { ok: false; op: "cloudrun-service-upsert"; serviceName: string; detail: string; unconfirmed?: boolean };
 
 // READ-ONLY. `ready` is true only when the TERMINAL condition is Ready AND succeeded. `managedByPlatform`
 // is true when the service carries this platform's managed-by label (review M1). `reconciling` is
@@ -530,7 +538,9 @@ export type CloudRunProbeInvokeResult =
       authenticatedStatus: number;
       results: CloudRunProbeResultEntry[];
     }
-  | { ok: false; op: "cloudrun-probe-invoke"; serviceName: string; detail: string };
+  // `public` is true when the request with NO token was NOT refused (review L1): the service may be
+  // reachable by anyone. That is a failure here, not only in the orchestrator's verdict.
+  | { ok: false; op: "cloudrun-probe-invoke"; serviceName: string; detail: string; public?: boolean; unauthenticatedStatus?: number };
 
 export type ActuateResult =
   | ProvisionR2Result
@@ -5160,23 +5170,35 @@ export async function actuateGcpInstanceRestart(
 interface ComputeInstanceAddressResponse {
   name?: string;
   status?: string;
-  /** Each interface's `networkIP` is its in-VPC private IPv4. A cell node has exactly one. */
-  networkInterfaces?: Array<{ networkIP?: string }>;
+  /** Each interface's `networkIP` is its in-VPC private IPv4, on `network` (a URL). A cell node has one. */
+  networkInterfaces?: Array<{ networkIP?: string; network?: string }>;
   error?: ComputeInsertResponse["error"];
 }
 
-/** The first non-empty `networkIP` among an instance's interfaces, or null when there is none. */
-function firstInterfaceAddress(body: ComputeInstanceAddressResponse | null): string | null {
+/**
+ * The first interface with a non-empty `networkIP`: its address and the SHORT name of its network
+ * (the last segment of Google's network URL). Both null when there is none.
+ */
+function firstInterfaceAddress(body: ComputeInstanceAddressResponse | null): { address: string | null; network: string | null } {
   if (!body || !Array.isArray(body.networkInterfaces)) {
-    return null;
+    return { address: null, network: null };
   }
   for (const networkInterface of body.networkInterfaces) {
     const address = networkInterface?.networkIP;
-    if (typeof address === "string" && address.length > 0) {
-      return address;
+    if (typeof address !== "string" || address.length === 0) {
+      continue;
     }
+    let network: string | null = null;
+    const networkUrl = networkInterface?.network;
+    if (typeof networkUrl === "string" && networkUrl.length > 0) {
+      const lastSegment = networkUrl.slice(networkUrl.lastIndexOf("/") + 1);
+      if (lastSegment.length > 0) {
+        network = lastSegment;
+      }
+    }
+    return { address, network };
   }
-  return null;
+  return { address: null, network: null };
 }
 
 export async function readComputeInstanceAddress(params: GcpInstanceGetParams, env: Env): Promise<GcpInstanceGetResult> {
@@ -5202,7 +5224,7 @@ export async function readComputeInstanceAddress(params: GcpInstanceGetParams, e
   const body = (await response.json().catch(() => null)) as ComputeInstanceAddressResponse | null;
 
   if (response.status === 404) {
-    return { ok: true, op: "gcp-instance-get", instanceName, found: false, privateIp: null, status: null };
+    return { ok: true, op: "gcp-instance-get", instanceName, found: false, privateIp: null, network: null, status: null };
   }
   if (response.status === 401 || response.status === 403) {
     return failure(
@@ -5220,12 +5242,14 @@ export async function readComputeInstanceAddress(params: GcpInstanceGetParams, e
   if (typeof body?.status === "string" && body.status.length > 0) {
     status = body.status;
   }
+  const firstInterface = firstInterfaceAddress(body);
   return {
     ok: true,
     op: "gcp-instance-get",
     instanceName,
     found: true,
-    privateIp: firstInterfaceAddress(body),
+    privateIp: firstInterface.address,
+    network: firstInterface.network,
     status,
   };
 }
@@ -5393,21 +5417,23 @@ const CLOUD_RUN_OPERATION_NAME_RE = /^projects\/[a-z0-9-]{1,63}\/locations\/[a-z
 
 /**
  * The premise probe's program (planning/49 §9 Phase 2), run by CLOUD_RUN_PROBE_IMAGE as
- * `python3 -c <program>`. It serves HTTP on $PORT. On each GET it opens ONE TCP connection to each
- * target in DY_PROBE_TARGETS (which the Worker builds from the VALIDATED targets) and answers with
- * open / refused / timeout / error:<errno>. It reads no data, writes no file and sends no payload.
+ * `python3 -c <program>`. It serves HTTP on $PORT. On each GET it tries a TCP connection to each
+ * target in DY_PROBE_TARGETS (which the Worker builds from the VALIDATED targets) up to 3 times, 1 s
+ * apart (review L6: one lost SYN is not "closed"), and answers with the first "open" or the last
+ * failure: open / refused / timeout / error:<errno>. It reads no data, writes no file and sends no payload.
  * The Worker owns this text. A signed job carries only the targets.
  */
 export const CLOUD_RUN_PROBE_PROGRAM = [
   "import json",
   "import os",
   "import socket",
+  "import time",
   "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer",
   "",
   'TARGETS = json.loads(os.environ["DY_PROBE_TARGETS"])',
   "",
   "",
-  "def check(ip, port):",
+  "def check_once(ip, port):",
   "    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)",
   "    sock.settimeout(3)",
   "    try:",
@@ -5421,6 +5447,16 @@ export const CLOUD_RUN_PROBE_PROGRAM = [
   '        return "error:" + str(error.errno or 0)',
   "    finally:",
   "        sock.close()",
+  "",
+  "",
+  "def check(ip, port):",
+  "    result = check_once(ip, port)",
+  "    for _ in range(2):",
+  '        if result == "open":',
+  "            break",
+  "        time.sleep(1)",
+  "        result = check_once(ip, port)",
+  "    return result",
   "",
   "",
   "class Handler(BaseHTTPRequestHandler):",
@@ -5475,6 +5511,8 @@ interface CloudRunService {
   reconciling?: boolean;
   latestCreatedRevision?: string;
   terminalCondition?: { type?: string; state?: string; message?: string };
+  /** The deployed spec. The probe invoke reads its OWN DY_PROBE_TARGETS back from here. */
+  template?: { containers?: Array<{ env?: Array<{ name?: string; value?: string }> }> };
   error?: { code?: number; message?: string };
   code?: number;
   message?: string;
@@ -5619,21 +5657,32 @@ async function readCloudRunPublicMembers(input: {
   return { ok: true, publicMembers };
 }
 
+/** How a Cloud Run operation wait ended (orchestrator review L1 needs the difference). */
+type CloudRunWaitOutcome =
+  | { kind: "done" }
+  /** The operation finished WITH an error, or the name was unsafe: a clear failure. */
+  | { kind: "failed"; detail: string }
+  /** The operation may still be running (wait bound hit, or the wait call failed). Not confirmed. */
+  | { kind: "unconfirmed"; detail: string };
+
 /**
  * Block until a Cloud Run operation is done, bounded to CLOUD_RUN_OPERATION_WAIT_ATTEMPTS calls of
- * `:wait`. Returns null on success, or the reason it could not be confirmed. A deploy that is still
- * running at the bound is NOT confirmed: the caller re-runs. It is never assumed to have landed.
+ * `:wait`. A deploy still running at the bound is UNCONFIRMED: it may still land, so it is never
+ * assumed to have landed and never reported as a plain failure.
  */
 async function waitForCloudRunOperation(input: {
   operationName: string;
   accessToken: string;
   what: string;
   verb: string;
-}): Promise<string | null> {
+}): Promise<CloudRunWaitOutcome> {
   const { operationName, accessToken, what, verb } = input;
 
   if (!CLOUD_RUN_OPERATION_NAME_RE.test(operationName)) {
-    return `Cloud Run returned an operation name this Worker will not put in a URL ("${operationName}") — the ${what} ${verb} may still be running; re-run to resume.`;
+    return {
+      kind: "unconfirmed",
+      detail: `Cloud Run returned an operation name this Worker will not put in a URL ("${operationName}") — the ${what} ${verb} may still be running; re-run to resume.`,
+    };
   }
   const waitUrl = `${GCP_CLOUD_RUN_API}/${operationName}:wait`;
 
@@ -5646,22 +5695,28 @@ async function waitForCloudRunOperation(input: {
         body: JSON.stringify({ timeout: CLOUD_RUN_OPERATION_WAIT_TIMEOUT }),
       });
     } catch (err) {
-      return `could not reach Cloud Run while waiting for the ${what} ${verb} to finish: ${errorMessage(err)}`;
+      return { kind: "unconfirmed", detail: `could not reach Cloud Run while waiting for the ${what} ${verb} to finish: ${errorMessage(err)}` };
     }
     const body = (await response.json().catch(() => null)) as CloudRunOperation | null;
     if (!response.ok) {
-      return `waiting for the ${what} ${verb} to finish failed with HTTP ${response.status}${cloudRunErrorMessage(body)}.`;
+      return {
+        kind: "unconfirmed",
+        detail: `waiting for the ${what} ${verb} to finish failed with HTTP ${response.status}${cloudRunErrorMessage(body)}.`,
+      };
     }
     if (body?.done !== true) {
       continue;
     }
     if (body.error) {
-      return `${what} ${verb} operation failed${cloudRunErrorMessage(body)}.`;
+      return { kind: "failed", detail: `${what} ${verb} operation failed${cloudRunErrorMessage(body)}.` };
     }
-    return null;
+    return { kind: "done" };
   }
 
-  return `the ${what} ${verb} operation was still not done after ${CLOUD_RUN_OPERATION_WAIT_ATTEMPTS} waits — re-run to resume once it finishes.`;
+  return {
+    kind: "unconfirmed",
+    detail: `the ${what} ${verb} operation was still not done after ${CLOUD_RUN_OPERATION_WAIT_ATTEMPTS} waits — re-run to resume once it finishes.`,
+  };
 }
 
 /**
@@ -5829,9 +5884,12 @@ export async function actuateCloudRunServiceUpsert(params: CloudRunServiceUpsert
   if (!operationName) {
     return failure(`Cloud Run returned HTTP ${response.status} but no operation — cannot confirm the ${what} ${verb} was accepted.`);
   }
-  const waitProblem = await waitForCloudRunOperation({ operationName, accessToken, what, verb });
-  if (waitProblem !== null) {
-    return failure(waitProblem);
+  const waited = await waitForCloudRunOperation({ operationName, accessToken, what, verb });
+  if (waited.kind === "unconfirmed") {
+    return { ok: false, op: "cloudrun-service-upsert", serviceName, detail: waited.detail, unconfirmed: true };
+  }
+  if (waited.kind === "failed") {
+    return failure(waited.detail);
   }
 
   // Re-READ the service rather than parse the operation's embedded response. `uri` and `urls` are
@@ -5961,9 +6019,9 @@ export async function actuateCloudRunServiceDelete(params: CloudRunServiceDelete
   if (!operationName) {
     return failure(`Cloud Run returned HTTP ${response.status} but no operation — cannot confirm the ${what} delete was accepted.`);
   }
-  const waitProblem = await waitForCloudRunOperation({ operationName, accessToken, what, verb: "delete" });
-  if (waitProblem !== null) {
-    return failure(waitProblem);
+  const waited = await waitForCloudRunOperation({ operationName, accessToken, what, verb: "delete" });
+  if (waited.kind !== "done") {
+    return failure(waited.detail);
   }
   return { ok: true, op: "cloudrun-service-delete", serviceName, status: "deleted" };
 }
@@ -5973,11 +6031,65 @@ function sleepMilliseconds(ms: number): Promise<void> {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
 
-/** Parse and CHECK the probe's answer. Only entries of the exact shape the program writes survive. */
-function parseProbeResults(text: string): CloudRunProbeResultEntry[] | null {
-  if (text.length > CLOUD_RUN_PROBE_BODY_MAX_LENGTH) {
+/** Drop a response body we do not read, so the connection is released. */
+async function discardBody(response: Response): Promise<void> {
+  if (response.body !== null) {
+    await response.body.cancel().catch(() => undefined);
+  }
+}
+
+/**
+ * The probe targets the Worker ITSELF deployed: DY_PROBE_TARGETS from the service's own spec. The
+ * answer is checked against these (review L3), not against anything the job or the probe says.
+ * Returns the "ip:port" keys, or null when the spec carries no well-formed targets.
+ */
+function deployedProbeTargets(service: CloudRunService): Set<string> | null {
+  const containers = service.template?.containers;
+  if (!Array.isArray(containers) || containers.length === 0) {
     return null;
   }
+  const envList = containers[0]?.env;
+  if (!Array.isArray(envList)) {
+    return null;
+  }
+  let raw: string | null = null;
+  for (const entry of envList) {
+    if (entry?.name === CLOUD_RUN_PROBE_TARGETS_ENV && typeof entry.value === "string") {
+      raw = entry.value;
+    }
+  }
+  if (raw === null) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    return null;
+  }
+  const keys = new Set<string>();
+  for (const target of parsed) {
+    if (typeof target !== "object" || target === null) {
+      return null;
+    }
+    const { ip, port } = target as { ip?: unknown; port?: unknown };
+    if (typeof ip !== "string" || typeof port !== "string") {
+      return null;
+    }
+    keys.add(`${ip}:${port}`);
+  }
+  return keys;
+}
+
+/**
+ * Parse and CHECK the probe's answer. Every entry must have the exact shape the program writes, and
+ * the set of ip:port pairs must EQUAL the deployed targets: none missing, none extra, none repeated,
+ * not empty (review L3). Returns null on any mismatch.
+ */
+function parseProbeResults(text: string, expectedTargets: Set<string>): CloudRunProbeResultEntry[] | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -5988,10 +6100,11 @@ function parseProbeResults(text: string): CloudRunProbeResultEntry[] | null {
     return null;
   }
   const results = (parsed as { results?: unknown }).results;
-  if (!Array.isArray(results)) {
+  if (!Array.isArray(results) || results.length === 0 || results.length !== expectedTargets.size) {
     return null;
   }
   const clean: CloudRunProbeResultEntry[] = [];
+  const seen = new Set<string>();
   for (const entry of results) {
     if (typeof entry !== "object" || entry === null) {
       return null;
@@ -6003,6 +6116,11 @@ function parseProbeResults(text: string): CloudRunProbeResultEntry[] | null {
     if (!CLOUD_RUN_PROBE_RESULT_RE.test(result)) {
       return null;
     }
+    const key = `${ip}:${port}`;
+    if (!expectedTargets.has(key) || seen.has(key)) {
+      return null;
+    }
+    seen.add(key);
     clean.push({ ip, port, result });
   }
   return clean;
@@ -6040,7 +6158,13 @@ export async function actuateCloudRunProbeInvoke(params: CloudRunProbeInvokePara
     return failure(`the probe service "${serviceName}" has no https uri yet`);
   }
 
-  // 1. NO token. Anything but a refusal means the service is public.
+  const expectedTargets = deployedProbeTargets(existing.service);
+  if (expectedTargets === null) {
+    return failure(`the probe service "${serviceName}" carries no well-formed ${CLOUD_RUN_PROBE_TARGETS_ENV}, so its answer cannot be checked`);
+  }
+
+  // 1. NO token. Anything but a refusal means the service may be PUBLIC (review L1). That is a
+  //    failure HERE, so no caller can read it as a pass.
   let unauthenticated: Response;
   try {
     unauthenticated = await fetch(uri, { method: "GET" });
@@ -6048,7 +6172,19 @@ export async function actuateCloudRunProbeInvoke(params: CloudRunProbeInvokePara
     return failure(`could not reach the probe at ${uri} (no token): ${errorMessage(err)}`);
   }
   const unauthenticatedStatus = unauthenticated.status;
-  await unauthenticated.text().catch(() => "");
+  await discardBody(unauthenticated);
+  if (unauthenticatedStatus !== 401 && unauthenticatedStatus !== 403) {
+    return {
+      ok: false,
+      op: "cloudrun-probe-invoke",
+      serviceName,
+      detail:
+        `the probe answered HTTP ${unauthenticatedStatus} to a request with NO token. It must refuse (401 or 403). ` +
+        "The service may be PUBLIC: delete it now.",
+      public: true,
+      unauthenticatedStatus,
+    };
+  }
 
   // 2. WITH an ID token from the agency's own key.
   const idToken = await mintPinnedGcpIdToken(env, project, uri);
@@ -6056,7 +6192,8 @@ export async function actuateCloudRunProbeInvoke(params: CloudRunProbeInvokePara
     return failure(idToken.detail);
   }
   let authenticatedStatus = 0;
-  let bodyText = "";
+  // The probe's answer, read with the shared STREAMING byte cap (review L3): never buffered whole.
+  let capped: { ok: true; text: string } | { ok: false; detail: string } = { ok: false, detail: "no answer was read" };
   for (let attempt = 1; attempt <= CLOUD_RUN_PROBE_INVOKE_ATTEMPTS; attempt += 1) {
     let response: Response;
     try {
@@ -6065,14 +6202,20 @@ export async function actuateCloudRunProbeInvoke(params: CloudRunProbeInvokePara
       return failure(`could not reach the probe at ${uri} (with an ID token): ${errorMessage(err)}`);
     }
     authenticatedStatus = response.status;
-    bodyText = await response.text().catch(() => "");
     // A cold start can answer 429 or 503 (see CLOUD_RUN_PROBE_INVOKE_ATTEMPTS). Anything else is final.
-    if (authenticatedStatus !== 429 && authenticatedStatus !== 503) {
+    if (authenticatedStatus === 429 || authenticatedStatus === 503) {
+      await discardBody(response);
+      if (attempt < CLOUD_RUN_PROBE_INVOKE_ATTEMPTS) {
+        await sleepMilliseconds(cloudRunProbeInvokeTuning.retryDelayMs);
+      }
+      continue;
+    }
+    if (authenticatedStatus !== 200) {
+      await discardBody(response);
       break;
     }
-    if (attempt < CLOUD_RUN_PROBE_INVOKE_ATTEMPTS) {
-      await sleepMilliseconds(cloudRunProbeInvokeTuning.retryDelayMs);
-    }
+    capped = await readBodyCapped(response, CLOUD_RUN_PROBE_BODY_MAX_LENGTH);
+    break;
   }
 
   if (authenticatedStatus !== 200) {
@@ -6082,9 +6225,12 @@ export async function actuateCloudRunProbeInvoke(params: CloudRunProbeInvokePara
         `project "${project}".`,
     );
   }
-  const results = parseProbeResults(bodyText);
+  if (!capped.ok) {
+    return failure(`the probe's answer could not be read within ${CLOUD_RUN_PROBE_BODY_MAX_LENGTH} bytes: ${capped.detail}`);
+  }
+  const results = parseProbeResults(capped.text, expectedTargets);
   if (results === null) {
-    return failure("the probe answered HTTP 200, but the body is not the probe's results");
+    return failure("the probe answered HTTP 200, but the body is not the probe's results for exactly the targets it was deployed with");
   }
   return { ok: true, op: "cloudrun-probe-invoke", serviceName, uri, unauthenticatedStatus, authenticatedStatus, results };
 }

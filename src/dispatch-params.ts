@@ -2145,7 +2145,9 @@ function cellRunServiceAccountFor(project: string): string {
 //   2. `region`      — a Compute region (a URL path segment).
 //   3. `networkName` — PINNED: exactly `dy-cell-<region>`.
 //   4. `subnetName`  — PINNED: exactly `dy-cell-<region>-run`.
-//   5. `ipCidr`      — a PRIVATE (RFC 1918) block, /8-/29. The platform sends CELL_RUN_SUBNET_CIDR.
+//   5. `ipCidr`      — a PRIVATE (RFC 1918) block, /8-/26. The platform sends CELL_RUN_SUBNET_CIDR.
+//                      /26 is Cloud Run's own floor for a Direct VPC egress subnet (review L4), so
+//                      this is a separate rule from GCP_SUBNET_CIDR_RE (which allows /29).
 //
 // IDEMPOTENT: Google's 409 alreadyExists is success, so a re-run resumes. Idempotence is by NAME: a
 // re-run with a DIFFERENT ipCidr is a no-op, so the caller reads the range back with gcp-subnet-get.
@@ -2159,9 +2161,19 @@ export interface GcpSubnetCreateParams {
   networkName: string;
   /** The Cloud Run subnet: exactly `dy-cell-<region>-run`. */
   subnetName: string;
-  /** The subnet's primary IPv4 range — a private RFC 1918 block between /8 and /29. */
+  /** The subnet's primary IPv4 range — a private RFC 1918 block between /8 and /26. */
   ipCidr: string;
 }
+
+/**
+ * A Cloud Run subnet range: a PRIVATE (RFC 1918) IPv4 block from /8 to /26. Direct VPC egress
+ * needs at least a /26, so a smaller block is refused here rather than at Google.
+ */
+const RUN_SUBNET_CIDR_RE = new RegExp(
+  `^(?:10(?:\\.${IPV4_OCTET}){3}\\/(?:[89]|1[0-9]|2[0-6])` +
+    `|172\\.(?:1[6-9]|2[0-9]|3[01])(?:\\.${IPV4_OCTET}){2}\\/(?:1[2-9]|2[0-6])` +
+    `|192\\.168(?:\\.${IPV4_OCTET}){2}\\/(?:1[6-9]|2[0-6]))$`,
+);
 
 export function validateGcpSubnetCreateParams(raw: unknown): ParamsVerdict<GcpSubnetCreateParams> {
   if (!isPlainObject(raw)) {
@@ -2183,10 +2195,10 @@ export function validateGcpSubnetCreateParams(raw: unknown): ParamsVerdict<GcpSu
   if (subnetName !== expectedSubnet) {
     return { ok: false, reason: `subnetName must be exactly "${expectedSubnet}" (the cell's Cloud Run subnet)` };
   }
-  if (typeof ipCidr !== "string" || !GCP_SUBNET_CIDR_RE.test(ipCidr)) {
+  if (typeof ipCidr !== "string" || !RUN_SUBNET_CIDR_RE.test(ipCidr)) {
     return {
       ok: false,
-      reason: "ipCidr must be a private (RFC 1918) IPv4 CIDR block between /8 and /29 (e.g. 10.20.4.0/24)",
+      reason: "ipCidr must be a private (RFC 1918) IPv4 CIDR block between /8 and /26 (e.g. 10.20.4.0/24)",
     };
   }
 
@@ -2304,9 +2316,16 @@ export const CLOUD_RUN_PROBE_SERVICE_NAME = "dy-run-probe";
 /**
  * The ONE image the premise probe may run (Jason's decision, 2026-10-12: a stock public image with
  * a command override). The Worker supplies the command and the program. The platform supplies only
- * the targets. A tag, not a digest: the probe has no NFS volume, no secret and no site data.
+ * the targets.
+ *
+ * PINNED BY DIGEST (review M1/L2), so the publisher cannot repoint it. This is the linux/amd64
+ * MANIFEST of `python:3.12-slim` (Cloud Run runs linux/amd64), read from Docker Hub's tags API on
+ * 2026-10-12. The multi-arch INDEX digest at the same time was
+ * sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1. A new digest is a change
+ * to both twins and a Worker sync.
  */
-export const CLOUD_RUN_PROBE_IMAGE = "docker.io/library/python:3.12-slim";
+export const CLOUD_RUN_PROBE_IMAGE =
+  "docker.io/library/python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe";
 /** The ONLY ports the probe may test: MariaDB on the data node and NFS on the file node. */
 export const CLOUD_RUN_PROBE_PORTS = ["2049", "3306"] as const;
 const CLOUD_RUN_PROBE_TARGETS_MAX = 8;
@@ -2316,10 +2335,11 @@ const CLOUD_RUN_PROBE_TARGETS_MAX = 8;
 const CLOUD_RUN_SERVICE_NAME_RE = /^[a-z]([-a-z0-9]{0,47}[a-z0-9])?$/;
 // The part of a session service name after its prefix: the site slug.
 const CLOUD_RUN_SESSION_SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
-// A container image reference: <host>[:port]/<path>[:tag | @sha256:<64 hex>]. A WELL-FORMEDNESS
-// check for a session image. The probe image is pinned exactly (CLOUD_RUN_PROBE_IMAGE).
+// A container image reference PINNED BY DIGEST: <host>[:port]/<path>@sha256:<64 hex>. No tag form
+// is accepted (review M1/L2): a tag can be repointed by its publisher, a digest cannot. The probe
+// image is pinned exactly (CLOUD_RUN_PROBE_IMAGE).
 const CONTAINER_IMAGE_RE =
-  /^[a-z0-9][a-z0-9.-]*(?::[0-9]{1,5})?(?:\/[a-z0-9][a-z0-9._-]*){1,6}(?::[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}|@sha256:[a-f0-9]{64})?$/;
+  /^[a-z0-9][a-z0-9.-]*(?::[0-9]{1,5})?(?:\/[a-z0-9][a-z0-9._-]*){1,6}@sha256:[a-f0-9]{64}$/;
 const CONTAINER_IMAGE_MAX_LENGTH = 512;
 // Cloud Run CPU: whole cores (1/2/4/8) or millicores ("500m" … "8000m"). v2 takes no decimal form.
 const RUN_CPU_RE = /^(?:[1248]|[1-9][0-9]{2,3}m)$/;
@@ -2621,6 +2641,11 @@ function cleanCloudRunProbe(value: unknown): { ok: true; probe: CloudRunProbeSpe
 }
 
 // ── cloudrun-service-upsert ──────────────────────────────────────────────────────────
+// PROBE-ONLY UNTIL planning/49 M4 LANDS (review, 2026-10-12). M4 is the check in app that a job's
+// params agree with the account's Cell and CellNode rows (planning/49 §6 layer 2). Until it exists,
+// a signed session service could name any NFS server and path on the agency's VPC. So every upsert
+// without `probe` is refused, in both twins. Phase 3 lifts this together with M4.
+//
 // Create or update ONE Cloud Run service. The actuator READS the service first. It CREATES a missing
 // one with the `managed-by` label, and it PATCHes an existing one ONLY when that one carries the label,
 // is not still reconciling, and its IAM policy holds no allUsers / allAuthenticatedUsers binding
@@ -2679,23 +2704,25 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
   if (!cleanedProbe.ok) {
     return { ok: false, reason: cleanedProbe.reason };
   }
-  const isProbe = cleanedProbe.probe !== undefined;
-
-  let allowedNames: "session" | "probe" = "session";
-  if (isProbe) {
-    allowedNames = "probe";
+  if (cleanedProbe.probe === undefined) {
+    return {
+      ok: false,
+      reason:
+        "cloudrun-service-upsert is probe-only until planning/49 M4 lands (app must first check the params against " +
+        "the account's Cell and CellNode rows); a session service cannot be signed yet",
+    };
   }
-  const nameReason = cloudRunServiceNameReason(serviceName, allowedNames);
+  const nameReason = cloudRunServiceNameReason(serviceName, "probe");
   if (nameReason !== null) {
     return { ok: false, reason: nameReason };
   }
   if (typeof image !== "string" || image.length > CONTAINER_IMAGE_MAX_LENGTH || !CONTAINER_IMAGE_RE.test(image)) {
     return {
       ok: false,
-      reason: "image must be a container image reference, e.g. <region>-docker.pkg.dev/<project>/<repo>/<name>:<tag> or <registry>/<path>@sha256:<digest>",
+      reason: "image must be a container image reference pinned by digest: <registry>/<path>@sha256:<64 hex>",
     };
   }
-  if (isProbe && image !== CLOUD_RUN_PROBE_IMAGE) {
+  if (image !== CLOUD_RUN_PROBE_IMAGE) {
     return { ok: false, reason: `a probe must run exactly "${CLOUD_RUN_PROBE_IMAGE}"` };
   }
   const expectedServiceAccount = cellRunServiceAccountFor(project);
@@ -2740,21 +2767,20 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
 
   // THE PROBE CARRIES NOTHING BUT ITS TARGETS (Jason's decision, 2026-10-12: refuse nfsVolumes).
   // env and secretEnv are refused too: the Worker sets the probe's one variable itself.
-  if (isProbe) {
-    if (cleanedNfsVolumes.nfsVolumes !== undefined) {
-      return { ok: false, reason: "a probe must not mount nfsVolumes — it opens TCP connections and reads no data" };
-    }
-    if (cleanedEnv.env !== undefined || cleanedSecretEnv.secretEnv !== undefined) {
-      return { ok: false, reason: "a probe must not carry env or secretEnv — the Worker sets the probe's environment itself" };
-    }
-    if (maxInstances !== 1) {
-      return { ok: false, reason: `a probe must have maxInstances exactly 1 (got ${maxInstances})` };
-    }
+  if (cleanedNfsVolumes.nfsVolumes !== undefined) {
+    return { ok: false, reason: "a probe must not mount nfsVolumes — it opens TCP connections and reads no data" };
+  }
+  if (cleanedEnv.env !== undefined || cleanedSecretEnv.secretEnv !== undefined) {
+    return { ok: false, reason: "a probe must not carry env or secretEnv — the Worker sets the probe's environment itself" };
+  }
+  if (maxInstances !== 1) {
+    return { ok: false, reason: `a probe must have maxInstances exactly 1 (got ${maxInstances})` };
   }
 
   // THE SINGLE-WRITER INVARIANT (planning/49 §4.3), as code rather than a comment. Two instances of
   // one NFS-mounting service would write the same site's files through two independent mounts, with
-  // nothing in the stack to lock against.
+  // nothing in the stack to lock against. It cannot fire while the upsert is probe-only (a probe has
+  // no nfsVolumes). It stays so the rule is already code when M4 lifts that restriction.
   if (cleanedNfsVolumes.nfsVolumes !== undefined && maxInstances !== 1) {
     return {
       ok: false,
