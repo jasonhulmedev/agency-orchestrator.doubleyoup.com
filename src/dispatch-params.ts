@@ -2059,6 +2059,58 @@ export function validateProvisionSshKeysParams(raw: unknown): ParamsVerdict<Prov
   return { ok: true, params: { project, slug, authorizedKeys: cleanKeys } };
 }
 
+// ── planning/49: the agency-side ephemeral-compute ops ───────────────────────────────
+// planning/49 places the terminal / phpMyAdmin / staging runner in the AGENCY's own GCP project, as
+// a Cloud Run service with Direct VPC egress onto that cell's own VPC. In the agency's own project,
+// the three conditions for Direct VPC egress (same project, same region, same VPC) are all
+// satisfiable by resources these ops create.
+//
+// ONE FACT RUNS THROUGH ALL OF THEM. A Direct-VPC-egress Cloud Run service does NOT join the
+// project's internal DNS. A node's short hostname does not resolve from inside it, so every address
+// such a service gets (an NFS mount target, a database host) must be an IP LITERAL. That is why
+// `gcp-instance-get` exists (no other op returns a node's address: gcp-instances-list parses only
+// `name` and `zone`), and why an NFS volume's `server` must be a private IPv4 literal.
+
+// ── gcp-instance-get ─────────────────────────────────────────────────────────────────
+// READ-ONLY: GET ONE Compute Engine VM in the AGENCY's own project and report its in-VPC PRIVATE
+// IPv4 address and its lifecycle status (planning/49 Phase 1, "cell coordinates become facts").
+// Three REQUIRED strings, each with the same grammar its twin gcp-instance-delete uses: `project`
+// (pinned to the SA key's own project by the actuator), `zone` and `name` (both URL path segments).
+//
+// A MISSING INSTANCE IS NOT A FAILURE: the actuator answers found:false, like gcp-firewall-get, so a
+// caller that reads back a replaced or renamed VM gets a clean "not there", not an error to parse.
+//
+// IDEMPOTENT: a read has no side effect. Registered `true` in AGENCY_OP_IDEMPOTENT.
+
+export interface GcpInstanceGetParams {
+  /** The agency's GCP project id the VM lives in. */
+  project: string;
+  /** The Compute Engine zone of the VM, e.g. "australia-southeast1-a". */
+  zone: string;
+  /** The instance's resource name. */
+  name: string;
+}
+
+export function validateGcpInstanceGetParams(raw: unknown): ParamsVerdict<GcpInstanceGetParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, zone, name } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof zone !== "string" || zone.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a Compute Engine zone name (e.g. australia-southeast1-a)" };
+  }
+  if (typeof name !== "string" || !GCP_RESOURCE_NAME_RE.test(name)) {
+    return { ok: false, reason: `name ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, zone, name } };
+}
+
 // ── shared ─────────────────────────────────────────────────────────────────────────
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

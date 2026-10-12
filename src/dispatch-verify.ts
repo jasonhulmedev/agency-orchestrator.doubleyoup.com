@@ -66,6 +66,9 @@ export const DISPATCH_OPS = [
   "gcp-instance-set-metadata",
   "gcp-instance-restart",
   "provision-ssh-keys",
+  // planning/49 Phase 1 — READ one cell node's in-VPC private IP. Nothing else returns it, and a
+  // Direct-VPC-egress Cloud Run service needs IP literals (it does not join the project's DNS).
+  "gcp-instance-get",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 

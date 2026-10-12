@@ -51,6 +51,7 @@ import {
   validateGcpInstanceSetMetadataParams,
   validateGcpInstanceRestartParams,
   validateProvisionSshKeysParams,
+  validateGcpInstanceGetParams,
   validateCacheRuleUpsertParams,
   validateWafRuleUpsertParams,
   edgeCacheZoneFromHostSuffix,
@@ -425,6 +426,22 @@ function gcpInstancesListJob(overrides: Partial<DispatchJob> = {}): DispatchJob 
     op: "gcp-instances-list",
     params: JSON.stringify(GCP_INSTANCES_LIST_PARAMS),
     nonce: "77aa77aa77aa77aa77aa77aa77aa77aa",
+    ...overrides,
+  });
+}
+
+// ── planning/49 ephemeral compute job fixtures ────────────────────────────────────────────────
+// A gcp-instance-get job — READ one node's in-VPC private IPv4 (Phase 1: cell coordinates become facts).
+const GCP_INSTANCE_GET_PARAMS = {
+  project: "dy-agency-proof",
+  zone: "australia-southeast1-a",
+  name: "dy-file-australia-southeast1-1",
+};
+function gcpInstanceGetJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
+  return sampleJob({
+    op: "gcp-instance-get",
+    params: JSON.stringify(GCP_INSTANCE_GET_PARAMS),
+    nonce: "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
     ...overrides,
   });
 }
@@ -1015,6 +1032,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-firewall-get",
       "gcp-instance-create",
       "gcp-instance-delete",
+      "gcp-instance-get",
       "gcp-instance-restart",
       "gcp-instance-set-metadata",
       "gcp-instances-list",
@@ -2982,6 +3000,36 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       [{ project: "Bad" }, /^project must be/],
       [{ zone: "australia-southeast1" }, /^zone must be/],
       [{ name: "Bad" }, /^name must be/],
+    ];
+    for (const [overrides, expected] of cases) {
+      const verdict = bad(overrides);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toMatch(expected);
+    }
+  });
+
+  // ── planning/49 Phase 1: gcp-instance-get (twin of the app's rules) ──────────────────
+
+  it("gcp-instance-get: accepts valid params and returns ONLY the three known keys", () => {
+    expect(validateGcpInstanceGetParams({ ...GCP_INSTANCE_GET_PARAMS, extra: "x" })).toEqual({
+      ok: true,
+      params: GCP_INSTANCE_GET_PARAMS,
+    });
+  });
+
+  it("gcp-instance-get: rejects bad input field by field, and names the field", () => {
+    const bad = (overrides: Record<string, unknown>) => validateGcpInstanceGetParams({ ...GCP_INSTANCE_GET_PARAMS, ...overrides });
+
+    expect(validateGcpInstanceGetParams(null).ok).toBe(false);
+    expect(validateGcpInstanceGetParams([]).ok).toBe(false);
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ project: "Bad" }, /^project must be/],
+      [{ zone: "australia-southeast1" }, /^zone must be/],
+      [{ zone: `${"a".repeat(62)}-b-c` }, /^zone must be/],
+      [{ name: "Bad_Name" }, /^name must be/],
+      [{ name: "a/b" }, /^name must be/],
+      [{ name: undefined }, /^name must be/],
     ];
     for (const [overrides, expected] of cases) {
       const verdict = bad(overrides);
@@ -6832,6 +6880,109 @@ describe("POST /actuate route", () => {
     const body = (await response.json()) as { ok: boolean; detail: string };
     expect(body.ok).toBe(false);
     expect(body.detail).toMatch(/GCP_SERVICE_ACCOUNT_KEY is not configured/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── planning/49 Phase 1: gcp-instance-get through the registry ───────────────────────
+  // It reads ONE node's in-VPC private IPv4: the fact nothing else records, and the one a
+  // Direct-VPC-egress Cloud Run service cannot do without (it does not join internal DNS).
+
+  it("gcp-instance-get: GETs the instance and reports its first interface's networkIP + status", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceGetJob();
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockGcpApiQueue([
+      {
+        body: {
+          name: "dy-file-australia-southeast1-1",
+          status: "RUNNING",
+          networkInterfaces: [{ networkIP: "10.20.0.4", name: "nic0" }],
+        },
+      },
+    ]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({
+      ok: true,
+      op: "gcp-instance-get",
+      instanceName: "dy-file-australia-southeast1-1",
+      found: true,
+      privateIp: "10.20.0.4",
+      status: "RUNNING",
+    });
+
+    const [getCall] = computeCalls(calls);
+    expect(getCall.method).toBe("GET");
+    expect(getCall.url).toBe(`${GCP_PROJECT_URL}/zones/australia-southeast1-a/instances/dy-file-australia-southeast1-1`);
+    expect(getCall.auth).toBe(`Bearer ${GCP_ACCESS_TOKEN}`);
+    expect(getCall.body).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+  });
+
+  it("gcp-instance-get: a MISSING instance is ok:true found:false with nulls, not a failure", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceGetJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([{ status: 404, body: { error: { code: 404, message: "not found" } } }]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "gcp-instance-get",
+      instanceName: "dy-file-australia-southeast1-1",
+      found: false,
+      privateIp: null,
+      status: null,
+    });
+  });
+
+  it("gcp-instance-get: an instance with NO usable interface address reports privateIp null (never a blank string)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    for (const networkInterfaces of [[], [{ networkIP: "" }], [{ name: "nic0" }]]) {
+      const job = gcpInstanceGetJob();
+      const signature = await signAsApp(job, privateKey);
+      mockGcpApiQueue([{ body: { name: "dy-file-australia-southeast1-1", status: "TERMINATED", networkInterfaces } }]);
+
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+      expect(await response.json()).toEqual({
+        ok: true,
+        op: "gcp-instance-get",
+        instanceName: "dy-file-australia-southeast1-1",
+        found: true,
+        privateIp: null,
+        status: "TERMINATED",
+      });
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("gcp-instance-get: a 403 is ok:false naming the read permission, token not echoed", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceGetJob();
+    const signature = await signAsApp(job, privateKey);
+    mockGcpApiQueue([denied403("compute.instances.get")]);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; op: string; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.op).toBe("gcp-instance-get");
+    expect(body.detail).toMatch(/compute\.instances\.get/);
+    expect(JSON.stringify(body)).not.toContain(GCP_ACCESS_TOKEN);
+  });
+
+  it("gcp-instance-get: pinned to the SA key's OWN project, with NO Google call for another project", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = gcpInstanceGetJob({ params: JSON.stringify({ ...GCP_INSTANCE_GET_PARAMS, project: "some-other-project" }) });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/does not match the service-account key's own project/);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 

@@ -39,6 +39,8 @@
 // idempotent (a re-run re-reads the fingerprint and writes the same merged values), while
 // `gcp-instance-restart` is NOT — every run reboots the node again, and on the NFS file node every
 // reboot interrupts every site — so it runs exactly once under F1 (see actuate.ts for both).
+//
+// The planning/49 ephemeral-compute ops are ALL idempotent. `gcp-instance-get` is a read.
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -72,6 +74,7 @@ import {
   type GcpInstanceSetMetadataParams,
   type GcpInstanceRestartParams,
   type ProvisionSshKeysParams,
+  type GcpInstanceGetParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
@@ -100,6 +103,7 @@ import {
   validateGcpInstanceSetMetadataParams,
   validateGcpInstanceRestartParams,
   validateProvisionSshKeysParams,
+  validateGcpInstanceGetParams,
 } from "./dispatch-params.js";
 import {
   type ActuateResult,
@@ -131,6 +135,7 @@ import {
   actuateGcpInstanceSetMetadata,
   actuateGcpInstanceRestart,
   actuateProvisionSshKeys,
+  readComputeInstanceAddress,
 } from "./actuate.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
@@ -269,6 +274,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "provision-ssh-keys": defineOp<ProvisionSshKeysParams>({
     validateParams: validateProvisionSshKeysParams,
     actuate: (params, env) => actuateProvisionSshKeys(params, env),
+  }),
+  "gcp-instance-get": defineOp<GcpInstanceGetParams>({
+    validateParams: validateGcpInstanceGetParams,
+    actuate: (params, env) => readComputeInstanceAddress(params, env),
   }),
 };
 

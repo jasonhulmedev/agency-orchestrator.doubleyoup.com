@@ -51,6 +51,7 @@ import type {
   GcpInstanceRestartParams,
   ProvisionSshKeysParams,
   WafRuleUpsertParams,
+  GcpInstanceGetParams,
 } from "./dispatch-params.js";
 import { edgeCacheZoneFromHostSuffix } from "./dispatch-params.js";
 import {
@@ -429,6 +430,23 @@ export type ProvisionSshKeysResult =
   | { ok: true; op: "provision-ssh-keys"; slug: string; count: number }
   | { ok: false; op: "provision-ssh-keys"; slug: string; detail: string };
 
+// planning/49 Phase 1 — READ one VM's in-VPC PRIVATE IPv4. `found` is false on a 404 (a clean "that
+// VM is not there", like gcp-firewall-get), and then `privateIp` and `status` are null. `privateIp` is
+// also null for a found instance with no network interface. Google should never produce that state,
+// and we report it as null, not as an empty string. ok:false is a read failure.
+export type GcpInstanceGetResult =
+  | {
+      ok: true;
+      op: "gcp-instance-get";
+      instanceName: string;
+      found: boolean;
+      /** The instance's first network interface's internal IP, or null (not found / no interface). */
+      privateIp: string | null;
+      /** PROVISIONING | STAGING | RUNNING | STOPPING | TERMINATED | … , or null when not found. */
+      status: string | null;
+    }
+  | { ok: false; op: "gcp-instance-get"; instanceName: string; detail: string };
+
 export type ActuateResult =
   | ProvisionR2Result
   | DnsRecordUpsertResult
@@ -457,7 +475,8 @@ export type ActuateResult =
   | GcpNetworkDeleteResult
   | GcpInstanceSetMetadataResult
   | GcpInstanceRestartResult
-  | ProvisionSshKeysResult;
+  | ProvisionSshKeysResult
+  | GcpInstanceGetResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -4959,4 +4978,89 @@ export async function actuateGcpInstanceRestart(
     result.stopOperationName = stopOperationName;
   }
   return result;
+}
+
+// ── planning/49: gcp-instance-get (READ a cell node's private IP) ─────────────────────────────
+// The op Phase 1 exists for. `CellNode.privateIp` is NULL for every auto-provisioned cell, and no
+// other op returns an address: gcp-instances-list parses only `name` and `zone`. A Cloud Run service
+// on Direct VPC egress does not join the project's internal DNS, so an NFS mount target and a DB host
+// must be IP LITERALS. Without this read there is nowhere to get them.
+//
+// The same read-only contract as gcp-firewall-get / gcp-router-get: the agency's OWN token, a 404 is
+// a clean found:false (NOT a failure), and only auth, an unreachable API or an unexpected non-2xx is
+// ok:false. Deliberately NOT built on readComputeInstance(). That helper treats a 404 as a failure,
+// because its callers (set-metadata / restart) have nothing to update when the VM is gone.
+
+/** What instances.get answers with for THIS op (the fields it reads). */
+interface ComputeInstanceAddressResponse {
+  name?: string;
+  status?: string;
+  /** Each interface's `networkIP` is its in-VPC private IPv4. A cell node has exactly one. */
+  networkInterfaces?: Array<{ networkIP?: string }>;
+  error?: ComputeInsertResponse["error"];
+}
+
+/** The first non-empty `networkIP` among an instance's interfaces, or null when there is none. */
+function firstInterfaceAddress(body: ComputeInstanceAddressResponse | null): string | null {
+  if (!body || !Array.isArray(body.networkInterfaces)) {
+    return null;
+  }
+  for (const networkInterface of body.networkInterfaces) {
+    const address = networkInterface?.networkIP;
+    if (typeof address === "string" && address.length > 0) {
+      return address;
+    }
+  }
+  return null;
+}
+
+export async function readComputeInstanceAddress(params: GcpInstanceGetParams, env: Env): Promise<GcpInstanceGetResult> {
+  const { project, zone } = params;
+  const instanceName = params.name;
+  const failure = (detail: string): GcpInstanceGetResult => ({ ok: false, op: "gcp-instance-get", instanceName, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  // Path segments are grammar-checked upstream AND URL-encoded here.
+  const url =
+    `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}` +
+    `/zones/${encodeURIComponent(zone)}/instances/${encodeURIComponent(instanceName)}`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: gcpHeaders(token.accessToken) });
+  } catch (err) {
+    return failure(`could not reach Google Compute Engine to read instance "${instanceName}": ${errorMessage(err)}`);
+  }
+  const body = (await response.json().catch(() => null)) as ComputeInstanceAddressResponse | null;
+
+  if (response.status === 404) {
+    return { ok: true, op: "gcp-instance-get", instanceName, found: false, privateIp: null, status: null };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return failure(
+      `Google Cloud denied reading instance "${instanceName}" (HTTP ${response.status})${googleErrorMessage(body)} — the ` +
+        `service account needs compute.instances.get (e.g. roles/compute.viewer) on project "${project}".`,
+    );
+  }
+  if (!response.ok) {
+    return failure(`reading instance "${instanceName}" failed with HTTP ${response.status}${googleErrorMessage(body)}.`);
+  }
+
+  // A cell node has exactly one interface (cell-provision attaches one). An instance with none gives
+  // null, not an empty string, so a caller can tell "no address reported" from a blank address.
+  let status: string | null = null;
+  if (typeof body?.status === "string" && body.status.length > 0) {
+    status = body.status;
+  }
+  return {
+    ok: true,
+    op: "gcp-instance-get",
+    instanceName,
+    found: true,
+    privateIp: firstInterfaceAddress(body),
+    status,
+  };
 }
