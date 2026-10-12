@@ -538,8 +538,9 @@ export type CloudRunProbeInvokeResult =
       authenticatedStatus: number;
       results: CloudRunProbeResultEntry[];
     }
-  // `public` is true when the request with NO token was NOT refused (review L1): the service may be
-  // reachable by anyone. That is a failure here, not only in the orchestrator's verdict.
+  // `public` is true when the request with NO token got an ANSWER (2xx or 3xx, review L1): the service
+  // may be reachable by anyone. That is a failure here, not only in the orchestrator's verdict. A
+  // token-less 404, 429 or 5xx is a plain failure without `public` (re-review L1).
   | { ok: false; op: "cloudrun-probe-invoke"; serviceName: string; detail: string; public?: boolean; unauthenticatedStatus?: number };
 
 export type ActuateResult =
@@ -6163,17 +6164,25 @@ export async function actuateCloudRunProbeInvoke(params: CloudRunProbeInvokePara
     return failure(`the probe service "${serviceName}" carries no well-formed ${CLOUD_RUN_PROBE_TARGETS_ENV}, so its answer cannot be checked`);
   }
 
-  // 1. NO token. Anything but a refusal means the service may be PUBLIC (review L1). That is a
-  //    failure HERE, so no caller can read it as a pass.
+  // 1. NO token. Cloud Run must refuse it (401 or 403). The other answers are of two kinds:
+  //    - 2xx or 3xx: the service ANSWERED a request with no token, so it may be PUBLIC (review L1).
+  //      That is a failure HERE, so no caller can read it as a pass.
+  //    - anything else (404, 429, 5xx): the call failed and proves nothing either way (re-review L1).
+  //      That is a plain failure. It is NOT reported as public.
+  //    redirect:"manual" keeps a 3xx as a 3xx instead of following it to some other answer. A runtime
+  //    that gives an opaque-redirect response for it reports status 0, which is a redirect too
+  //    (the same rule as validators.ts).
   let unauthenticated: Response;
   try {
-    unauthenticated = await fetch(uri, { method: "GET" });
+    unauthenticated = await fetch(uri, { method: "GET", redirect: "manual" });
   } catch (err) {
     return failure(`could not reach the probe at ${uri} (no token): ${errorMessage(err)}`);
   }
   const unauthenticatedStatus = unauthenticated.status;
   await discardBody(unauthenticated);
-  if (unauthenticatedStatus !== 401 && unauthenticatedStatus !== 403) {
+  const refused = unauthenticatedStatus === 401 || unauthenticatedStatus === 403;
+  const answered = unauthenticatedStatus === 0 || (unauthenticatedStatus >= 200 && unauthenticatedStatus < 400);
+  if (answered) {
     return {
       ok: false,
       op: "cloudrun-probe-invoke",
@@ -6182,6 +6191,17 @@ export async function actuateCloudRunProbeInvoke(params: CloudRunProbeInvokePara
         `the probe answered HTTP ${unauthenticatedStatus} to a request with NO token. It must refuse (401 or 403). ` +
         "The service may be PUBLIC: delete it now.",
       public: true,
+      unauthenticatedStatus,
+    };
+  }
+  if (!refused) {
+    return {
+      ok: false,
+      op: "cloudrun-probe-invoke",
+      serviceName,
+      detail:
+        `the request with NO token got HTTP ${unauthenticatedStatus}: not a refusal (401 or 403) and not an answer. ` +
+        "The check did not complete, so it proves nothing about public access. Try again later.",
       unauthenticatedStatus,
     };
   }

@@ -5784,6 +5784,7 @@ describe("POST /actuate route", () => {
       body?: unknown;
       rawBody?: string;
       form?: URLSearchParams;
+      redirect?: RequestInit["redirect"];
     }> = [];
     const queue = [...computeReplies];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -5803,7 +5804,7 @@ describe("POST /actuate route", () => {
       // Compute, so a test's reply list stays in the order of the calls it asserts.
       if (url.startsWith("https://compute.googleapis.com/") || url.startsWith("https://run.googleapis.com/") || url.includes(".run.app")) {
         const rawBody = init?.body ? String(init.body) : undefined;
-        calls.push({ method, url, auth, rawBody, body: rawBody ? JSON.parse(rawBody) : undefined });
+        calls.push({ method, url, auth, rawBody, body: rawBody ? JSON.parse(rawBody) : undefined, redirect: init?.redirect });
         const reply = queue.shift();
         if (!reply) {
           // gcp-instance-create now WAITS on its insert operation (planning/34 zone fallback). A test
@@ -7580,6 +7581,31 @@ describe("POST /actuate route", () => {
     expect(body.detail).toMatch(/may be PUBLIC/);
     // It stops there: no ID token is minted and no authenticated request is made.
     expect(googleCalls(calls)).toHaveLength(2);
+    // The token-less request does not follow a redirect, so a 3xx stays visible as a 3xx.
+    expect(googleCalls(calls)[1]?.redirect).toBe("manual");
+  });
+
+  it("cloudrun-probe-invoke: a token-less 3xx is public too; a token-less 404, 429 or 5xx is a plain failure, NOT public (re-review L1)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const redirected = mockGcpApiQueue([{ body: settledService("dy-run-probe") }, { status: 302, body: {} }]);
+    const redirectBody = await actuate(planning49Job("cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS, "fdfdfdfdfdfdfdfdfdfdfdfdfdfdfd01"));
+    expect(redirectBody).toMatchObject({ ok: false, public: true, unauthenticatedStatus: 302 });
+    expect(googleCalls(redirected)).toHaveLength(2);
+    vi.restoreAllMocks();
+
+    const failingStatuses = [404, 429, 500, 503];
+    for (const [index, status] of failingStatuses.entries()) {
+      const calls = mockGcpApiQueue([{ body: settledService("dy-run-probe") }, { status, body: {} }]);
+      const nonce = `fdfdfdfdfdfdfdfdfdfdfdfdfdfdfd${String(index + 10)}`;
+      const body = await actuate(planning49Job("cloudrun-probe-invoke", CLOUD_RUN_PROBE_REF_PARAMS, nonce));
+      expect(body.ok).toBe(false);
+      expect(body.public).toBeUndefined();
+      expect(body.unauthenticatedStatus).toBe(status);
+      expect(body.detail).toMatch(/proves nothing about public access/);
+      // It stops there too: no ID token is minted and no authenticated request is made.
+      expect(googleCalls(calls)).toHaveLength(2);
+      vi.restoreAllMocks();
+    }
   });
 
   it("cloudrun-probe-invoke: the results must be EXACTLY the deployed targets — none missing, none extra, none repeated (review L3)", async () => {
