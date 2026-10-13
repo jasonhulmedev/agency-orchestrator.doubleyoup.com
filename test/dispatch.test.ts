@@ -15,6 +15,9 @@
 // over the identical canonical bytes, so this is a faithful app->Worker round trip.
 
 import { describe, it, expect, vi, afterEach, beforeAll } from "vitest";
+// hub#93 twin-block pin: the Worker's own params source as text (Vite's `?raw`), so the check stays
+// Worker-native — no node:fs, and the hash below is Web Crypto.
+import dispatchParamsSource from "../src/dispatch-params.ts?raw";
 import worker from "../src/index.js";
 import type { Env } from "../src/env.js";
 import {
@@ -61,6 +64,19 @@ import {
   validateCloudRunProbeInvokeParams,
   CLOUD_RUN_PROBE_IMAGE,
   CLOUD_RUN_PROBE_SERVICE_NAME,
+  validateGcpSubnetsListParams,
+  validateWorkersRouteUpsertParams,
+  validateWorkersRouteDeleteParams,
+  isSiteRunSlot,
+  siteRunSubnetCidrForSlot,
+  cellSiteRunSubnetNameFor,
+  siteRunSlotFromSubnetName,
+  siteSubnetDescriptionFor,
+  siteSlugFromSubnetDescription,
+  cellSessionsFirewallRuleFor,
+  workersRoutePatternFor,
+  EDGE_GATE_SCRIPT_NAME,
+  SITE_RUN_SUPERNET_CIDR,
   validateCacheRuleUpsertParams,
   validateWafRuleUpsertParams,
   edgeCacheZoneFromHostSuffix,
@@ -502,6 +518,13 @@ const CLOUD_RUN_PROBE_PARAMS = {
   },
 };
 const CLOUD_RUN_PROBE_REF_PARAMS = { project: "dy-agency-proof", region: "australia-southeast1", serviceName: "dy-run-probe" };
+
+// hub#93: the planning/49 twin block of src/dispatch-params.ts must stay BYTE-IDENTICAL with the app's
+// src/server/services/agency-dispatch-params.ts block. Both repos pin the SAME sha256 of the block (from
+// this marker up to, not including, the next section rule after it). Changing the block means changing
+// BOTH twins and BOTH pins in one go.
+const TWIN_BLOCK_START_MARKER = "// ── planning/49: the agency-side ephemeral-compute ops";
+const TWIN_BLOCK_SHA256 = "32af709283e582162477ac47a3fff34953af7f6c61838fb1a4af207eaceeb9d6";
 
 function planning49Job(op: DispatchJob["op"], params: unknown, nonce: string): DispatchJob {
   return sampleJob({ op, params: JSON.stringify(params), nonce });
@@ -1109,9 +1132,12 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-subnet-create",
       "gcp-subnet-delete",
       "gcp-subnet-get",
+      "gcp-subnets-list",
       "provision-r2",
       "provision-ssh-keys",
       "waf-rule-upsert",
+      "workers-route-delete",
+      "workers-route-upsert",
       "wp-cli",
     ]);
     for (const entry of Object.values(DISPATCH_OP_REGISTRY)) {
@@ -3159,9 +3185,14 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(CLOUD_RUN_PROBE_SERVICE_NAME).toBe("dy-run-probe");
   });
 
-  it("cloudrun-service-upsert is PROBE-ONLY until M4: every session prefix is refused (review High)", () => {
+  it("cloudrun-service-upsert (hub#93 M4 lift): a session on the SHARED probe subnet, or with no slot, is still refused", () => {
     for (const serviceName of ["term-docs-892769", "pma-docs-892769", "staging-docs-892769", "sterm-docs-892769", "spma-docs-892769"]) {
-      expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, serviceName }), /^cloudrun-service-upsert is probe-only until planning\/49 M4 lands/);
+      // The pre-M4 shape: no slot, the probe subnet. Never signable for a session.
+      expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, serviceName }), /^a session service must carry its site's Run slot/);
+      expectRefused(
+        validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, serviceName, slot: 3 }),
+        /^subnet must be exactly "dy-cell-australia-southeast1-run-s003"/,
+      );
     }
     // The probe must use the probe name.
     expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, serviceName: "term-docs-892769" }), /^serviceName must be exactly "dy-run-probe"/);
@@ -3232,6 +3263,182 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     }
     expect(validateCloudRunProbeInvokeParams(CLOUD_RUN_PROBE_REF_PARAMS)).toEqual({ ok: true, params: CLOUD_RUN_PROBE_REF_PARAMS });
     expectRefused(validateCloudRunProbeInvokeParams(session), /^serviceName must be exactly "dy-run-probe"/);
+  });
+
+  // ── hub#93: per-site Run subnets (twin of the app's rules) ──────────────────────────────────
+
+  /** A session service upsert ON its site's own subnet (slot 3 of the fixture region). */
+  const SITE_SESSION_PARAMS = {
+    ...CLOUD_RUN_SESSION_PARAMS,
+    subnet: "dy-cell-australia-southeast1-run-s003",
+    slot: 3,
+  };
+
+  it("hub#93 helpers: slot N -> 10.20.(128+N).0/24 and dy-cell-<region>-run-s<NNN>; 128, -1 and 1.5 are refused", () => {
+    expect(siteRunSubnetCidrForSlot(0)).toBe("10.20.128.0/24");
+    expect(siteRunSubnetCidrForSlot(1)).toBe("10.20.129.0/24");
+    expect(siteRunSubnetCidrForSlot(127)).toBe("10.20.255.0/24");
+    expect(cellSiteRunSubnetNameFor("australia-southeast2", 0)).toBe("dy-cell-australia-southeast2-run-s000");
+    expect(cellSiteRunSubnetNameFor("australia-southeast2", 7)).toBe("dy-cell-australia-southeast2-run-s007");
+    expect(cellSiteRunSubnetNameFor("australia-southeast2", 127)).toBe("dy-cell-australia-southeast2-run-s127");
+    for (const bad of [128, -1, 1.5, Number.NaN]) {
+      expect(isSiteRunSlot(bad)).toBe(false);
+      expect(() => siteRunSubnetCidrForSlot(bad)).toThrow(RangeError);
+      expect(() => cellSiteRunSubnetNameFor("australia-southeast2", bad)).toThrow(RangeError);
+    }
+    expect(SITE_RUN_SUPERNET_CIDR).toBe("10.20.128.0/17");
+    // The name parses back to its slot only in the canonical three-digit form.
+    expect(siteRunSlotFromSubnetName("australia-southeast2", "dy-cell-australia-southeast2-run-s042")).toBe(42);
+    for (const name of ["dy-cell-australia-southeast2-run-s42", "dy-cell-australia-southeast2-run-s128", "dy-cell-australia-southeast2-run", "dy-cell-australia-southeast1-run-s001"]) {
+      expect(siteRunSlotFromSubnetName("australia-southeast2", name)).toBe(null);
+    }
+    // The description binds a subnet to EXACTLY one slug.
+    expect(siteSubnetDescriptionFor("docs-892769")).toBe("doubleyoup site subnet: docs-892769");
+    expect(siteSlugFromSubnetDescription("doubleyoup site subnet: docs-892769")).toBe("docs-892769");
+    for (const description of ["doubleyoup site subnet: ", "doubleyoup site subnet: Docs", "doubleyoup site subnet: a b", "other", null, undefined]) {
+      expect(siteSlugFromSubnetDescription(description)).toBe(null);
+    }
+  });
+
+  it("gcp-subnet-create/-get/-delete SITE form: {project, region, slot, siteSlug} only, never a free-form name or range", () => {
+    const site = { project: "dy-agency-proof", region: "australia-southeast2", slot: 5, siteSlug: "docs-892769" };
+    for (const validate of [validateGcpSubnetCreateParams, validateGcpSubnetGetParams, validateGcpSubnetDeleteParams]) {
+      expect(validate({ ...site, extra: "x" })).toEqual({ ok: true, params: site });
+      expectRefused(validate({ ...site, slot: 128 }), /^slot must be a Run slot: an integer from 0 to 127/);
+      expectRefused(validate({ ...site, slot: -1 }), /^slot must be a Run slot/);
+      expectRefused(validate({ ...site, slot: "5" }), /^slot must be a Run slot/);
+      expectRefused(validate({ ...site, siteSlug: "Docs" }), /^siteSlug must be a site slug/);
+      expectRefused(validate({ ...site, siteSlug: "docs/../x" }), /^siteSlug must be a site slug/);
+      expectRefused(validate({ project: "dy-agency-proof", region: "australia-southeast2", slot: 5 }), /^siteSlug must be a site slug/);
+      for (const extra of [{ subnetName: "dy-cell-australia-southeast2-subnet" }, { ipCidr: "10.20.0.0/24" }, { networkName: "default" }]) {
+        expectRefused(validate({ ...site, ...extra }), /must not carry networkName, subnetName or ipCidr/);
+      }
+    }
+    // The probe forms are unchanged.
+    expect(validateGcpSubnetCreateParams(GCP_SUBNET_CREATE_PARAMS)).toEqual({ ok: true, params: GCP_SUBNET_CREATE_PARAMS });
+    expect(validateGcpSubnetDeleteParams(GCP_SUBNET_REF_PARAMS)).toEqual({ ok: true, params: GCP_SUBNET_REF_PARAMS });
+  });
+
+  it("gcp-subnets-list: project + region only; the name prefix is derived, never a parameter", () => {
+    const params = { project: "dy-agency-proof", region: "australia-southeast2" };
+    expect(validateGcpSubnetsListParams({ ...params, namePrefix: "dy-" })).toEqual({ ok: true, params });
+    expectRefused(validateGcpSubnetsListParams({ ...params, region: "australia-southeast2-a" }), /^region must be/);
+    expectRefused(validateGcpSubnetsListParams({ ...params, project: "Bad" }), /^project must be/);
+  });
+
+  it("cloudrun-service-upsert SESSION (hub#93 M4): accepted only on the subnet derived from its slot, with ONLY the known keys", () => {
+    expect(validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, extra: "x", allowUnauthenticated: true })).toEqual({
+      ok: true,
+      params: SITE_SESSION_PARAMS,
+    });
+    const bad = (overrides: Record<string, unknown>) => validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, ...overrides });
+    // A mismatched NNN: the subnet of another slot.
+    expectRefused(bad({ subnet: "dy-cell-australia-southeast1-run-s004" }), /^subnet must be exactly "dy-cell-australia-southeast1-run-s003"/);
+    // NNN > 127 and other non-slots.
+    expectRefused(bad({ slot: 128, subnet: "dy-cell-australia-southeast1-run-s128" }), /^a session service must carry its site's Run slot/);
+    expectRefused(bad({ slot: -1 }), /^a session service must carry its site's Run slot/);
+    expectRefused(bad({ slot: "3" }), /^a session service must carry its site's Run slot/);
+    // One instance per service (the /24 is sized for it, G1).
+    expectRefused(bad({ maxInstances: 2 }), /^a session service must have maxInstances exactly 1/);
+    // The probe never carries a slot.
+    expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, slot: 0 }), /^a probe must not carry a slot/);
+    // The probe's params are byte-identical to before (no slot key appears).
+    const probe = validateCloudRunServiceUpsertParams(CLOUD_RUN_PROBE_PARAMS);
+    expect(probe.ok && "slot" in probe.params).toBe(false);
+  });
+
+  it("cloudrun-service-upsert SESSION: each NFS path is one of the EXACT per-purpose paths for the service's OWN slug", () => {
+    const volume = (path: string, name = "v") => ({ name, server: "10.20.0.4", path, mountPath: `/m/${name}` });
+    const accept = (serviceName: string, paths: string[]) => {
+      const nfsVolumes = paths.map((path, index) => volume(path, `v${index}`));
+      const verdict = validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, serviceName, nfsVolumes });
+      expect(verdict.ok).toBe(true);
+    };
+    accept("term-docs-892769", ["/srv/dy-storage/sites/docs-892769", "/srv/dy-storage/platform/docs-892769"]);
+    accept("staging-docs-892769", ["/srv/dy-storage/sites/docs-892769", "/srv/dy-storage/platform/docs-892769-staging"]);
+    accept("sterm-docs-892769", ["/srv/dy-storage/sites/docs-892769/staging", "/srv/dy-storage/platform/docs-892769-staging"]);
+
+    const refuse = (serviceName: string, path: string) =>
+      expectRefused(validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, serviceName, nfsVolumes: [volume(path)] }), /session for "docs-892769" may mount/);
+    // Another site's tree — including the prefix trap (docs-892769 vs docs-892769-x).
+    refuse("term-docs-892769", "/srv/dy-storage/sites/geelongns");
+    refuse("term-docs-892769", "/srv/dy-storage/sites/docs-892769-x");
+    refuse("term-docs-892769", "/srv/dy-storage/sites");
+    refuse("term-docs-892769", "/srv/dy-storage/sites/docs-892769/public");
+    // A staging service never gets the LIVE platform dir (the live DB password).
+    refuse("staging-docs-892769", "/srv/dy-storage/platform/docs-892769");
+    refuse("sterm-docs-892769", "/srv/dy-storage/sites/docs-892769");
+    // phpMyAdmin mounts nothing.
+    refuse("pma-docs-892769", "/srv/dy-storage/sites/docs-892769");
+    refuse("spma-docs-892769", "/srv/dy-storage/platform/docs-892769-staging");
+    // The server rule still applies to a session.
+    expectRefused(
+      validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, nfsVolumes: [{ ...volume("/srv/dy-storage/sites/docs-892769"), server: "dy-file-x-1" }] }),
+      /server must be a PRIVATE/,
+    );
+  });
+
+  it("workers-route-upsert/-delete: EXACTLY <session service>.<zone>; no wildcard, no bare zone, no extra label", () => {
+    const params = { zone: "sbmstudio.com.au", host: "term-docs-892769.sbmstudio.com.au" };
+    for (const validate of [validateWorkersRouteUpsertParams, validateWorkersRouteDeleteParams]) {
+      expect(validate({ ...params, script: "evil", pattern: "*.sbmstudio.com.au/*" })).toEqual({ ok: true, params });
+      for (const host of [
+        "sbmstudio.com.au",
+        "*.sbmstudio.com.au",
+        "*-docs.sbmstudio.com.au",
+        "term-*.sbmstudio.com.au",
+        "a.term-docs-892769.sbmstudio.com.au",
+        "www.sbmstudio.com.au",
+        "dy-run-probe.sbmstudio.com.au",
+        "term-docs-892769.other.com",
+        "TERM-docs.sbmstudio.com.au",
+        "term-docs-892769.sbmstudio.com.au/*",
+      ]) {
+        expectRefused(validate({ ...params, host }), /^host must be exactly <session service name>\.sbmstudio\.com\.au/);
+      }
+      expectRefused(validate({ ...params, zone: "*.sbmstudio.com.au" }), /^zone must be a lowercase DNS zone name/);
+    }
+    expect(workersRoutePatternFor("term-docs-892769.sbmstudio.com.au")).toBe("term-docs-892769.sbmstudio.com.au/*");
+    expect(EDGE_GATE_SCRIPT_NAME).toBe("dy-edge-gate");
+  });
+
+  it("gcp-firewall-create: the sessions rule is pinned to its EXACT shape; other rule names are unaffected", () => {
+    const sessionsRule = cellSessionsFirewallRuleFor("dy-agency-proof", "australia-southeast2");
+    expect(sessionsRule).toEqual({
+      project: "dy-agency-proof",
+      networkName: "dy-cell-australia-southeast2",
+      ruleName: "dy-cell-australia-southeast2-sessions-to-nodes",
+      allowed: [
+        { protocol: "tcp", ports: ["3306", "2049"] },
+        { protocol: "udp", ports: ["2049"] },
+      ],
+      sourceRanges: ["10.20.128.0/17"],
+      targetTags: ["dy-cell-australia-southeast2-node"],
+    });
+    expect(validateGcpFirewallCreateParams(sessionsRule)).toEqual({ ok: true, params: sessionsRule });
+    const bad = (overrides: Record<string, unknown>) => validateGcpFirewallCreateParams({ ...sessionsRule, ...overrides });
+    expectRefused(bad({ sourceRanges: ["0.0.0.0/0"] }), /^a sessions rule must have exactly the source range 10\.20\.128\.0\/17/);
+    expectRefused(bad({ sourceRanges: ["10.20.128.0/17", "10.20.4.0/24"] }), /^a sessions rule must have exactly the source range/);
+    expectRefused(bad({ allowed: [{ protocol: "all" }] }), /^a sessions rule must allow exactly tcp 3306 and 2049, then udp 2049/);
+    expectRefused(bad({ targetTags: ["dy-gateway"] }), /^a sessions rule must target exactly/);
+    expectRefused(bad({ networkName: "default" }), /^a sessions rule must attach to "dy-cell-australia-southeast2"/);
+    expectRefused(bad({ ruleName: "dy-cell-a-b-c-sessions-to-nodes" }), /^a sessions rule must be named dy-cell-<region>-sessions-to-nodes/);
+    // Any other rule name is not pinned (the probe rule, for one).
+    expect(validateGcpFirewallCreateParams({ ...sessionsRule, ruleName: "dy-cell-australia-southeast2-run-to-nodes", sourceRanges: ["10.20.4.0/24"] }).ok).toBe(true);
+  });
+
+  it("the planning/49 twin block is byte-identical with the app copy (pinned sha256 — change BOTH twins and BOTH pins together)", async () => {
+    const start = dispatchParamsSource.indexOf(TWIN_BLOCK_START_MARKER);
+    const end = dispatchParamsSource.indexOf("\n// ── shared", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const block = dispatchParamsSource.slice(start, end);
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(block)));
+    let hex = "";
+    for (const byte of digest) {
+      hex += byte.toString(16).padStart(2, "0");
+    }
+    expect(hex).toBe(TWIN_BLOCK_SHA256);
   });
 });
 
@@ -7343,6 +7550,296 @@ describe("POST /actuate route", () => {
     const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
     expect(response.status).toBe(400);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── hub#93 through the registry: per-site subnets, the subnet list, the session bind ─────────────
+
+  const SITE_SUBNET_PARAMS = { project: "dy-agency-proof", region: "australia-southeast1", slot: 7, siteSlug: "docs-892769" };
+  const SITE_SUBNET_NAME = "dy-cell-australia-southeast1-run-s007";
+  const SITE_SUBNET_RANGE = "10.20.135.0/24";
+  const SITE_SUBNET_DESCRIPTION = "doubleyoup site subnet: docs-892769";
+
+  it("gcp-subnet-create SITE form: inserts the DERIVED name, range and description on the cell's VPC, and WAITS", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([{ body: { name: "op-site-1", status: "RUNNING" } }, { body: { status: "DONE" } }]);
+    const body = await actuate(planning49Job("gcp-subnet-create", SITE_SUBNET_PARAMS, "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0"));
+    expect(body).toEqual({ ok: true, op: "gcp-subnet-create", subnetName: SITE_SUBNET_NAME, status: "created" });
+    const [insert, wait] = googleCalls(calls);
+    expect(insert.method).toBe("POST");
+    expect(insert.url).toBe(`${GCP_REGION_URL}/subnetworks`);
+    expect(insert.body).toEqual({
+      name: SITE_SUBNET_NAME,
+      network: "global/networks/dy-cell-australia-southeast1",
+      ipCidrRange: SITE_SUBNET_RANGE,
+      region: "regions/australia-southeast1",
+      description: SITE_SUBNET_DESCRIPTION,
+    });
+    expect(wait.url).toBe(`${GCP_REGION_URL}/operations/op-site-1/wait`);
+  });
+
+  it("gcp-subnet-create SITE form: a 409 is success ONLY when the read-back is this site's range AND description", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    mockGcpApiQueue([alreadyExists409(SITE_SUBNET_NAME), { body: { name: SITE_SUBNET_NAME, ipCidrRange: SITE_SUBNET_RANGE, description: SITE_SUBNET_DESCRIPTION } }]);
+    expect(await actuate(planning49Job("gcp-subnet-create", SITE_SUBNET_PARAMS, "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"))).toEqual({
+      ok: true,
+      op: "gcp-subnet-create",
+      subnetName: SITE_SUBNET_NAME,
+      status: "already-existed",
+    });
+    vi.restoreAllMocks();
+
+    // Another site's description on the same name: a conflict, never adopted.
+    mockGcpApiQueue([alreadyExists409(SITE_SUBNET_NAME), { body: { name: SITE_SUBNET_NAME, ipCidrRange: SITE_SUBNET_RANGE, description: "doubleyoup site subnet: geelongns" } }]);
+    const conflict = await actuate(planning49Job("gcp-subnet-create", SITE_SUBNET_PARAMS, "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2"));
+    expect(conflict.ok).toBe(false);
+    expect(conflict.outcome).toBe("conflict");
+    expect(conflict.detail).toMatch(/not this site's subnet/);
+  });
+
+  it("gcp-subnet-create SITE form: every failure says refused (definite) or unknown, for the slot release rule (M5)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    // A 4xx (here a quota refusal) is DEFINITE: no subnet was made.
+    mockGcpApiQueue([{ status: 403, body: { error: { code: 403, message: "Quota 'SUBNETWORKS' exceeded. Limit: 100.0 globally." } } }]);
+    const refused = await actuate(planning49Job("gcp-subnet-create", SITE_SUBNET_PARAMS, "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3"));
+    expect(refused).toMatchObject({ ok: false, outcome: "refused" });
+    vi.restoreAllMocks();
+
+    // A 5xx may or may not have created it: UNKNOWN.
+    mockGcpApiQueue([{ status: 503, body: { error: { code: 503, message: "backend error" } } }]);
+    expect(await actuate(planning49Job("gcp-subnet-create", SITE_SUBNET_PARAMS, "e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4"))).toMatchObject({ ok: false, outcome: "unknown" });
+    vi.restoreAllMocks();
+
+    // An accepted insert whose wait never sees DONE: UNKNOWN.
+    mockGcpApiQueue([{ body: { name: "op-site-2", status: "RUNNING" } }, { body: { status: "RUNNING" } }, { body: { status: "RUNNING" } }, { body: { status: "RUNNING" } }]);
+    expect(await actuate(planning49Job("gcp-subnet-create", SITE_SUBNET_PARAMS, "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5"))).toMatchObject({ ok: false, outcome: "unknown" });
+    vi.restoreAllMocks();
+
+    // An operation that FINISHED with errors: DEFINITE.
+    mockGcpApiQueue([{ body: { name: "op-site-3", status: "RUNNING" } }, { body: { status: "DONE", error: { errors: [{ code: "IP_SPACE_OVERLAP", message: "overlaps" }] } } }]);
+    expect(await actuate(planning49Job("gcp-subnet-create", SITE_SUBNET_PARAMS, "e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6"))).toMatchObject({ ok: false, outcome: "refused" });
+  });
+
+  it("gcp-subnet-get SITE form: reads the derived name and reports matchesSite (range AND description)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([{ body: { name: SITE_SUBNET_NAME, ipCidrRange: SITE_SUBNET_RANGE, description: SITE_SUBNET_DESCRIPTION } }]);
+    expect(await actuate(planning49Job("gcp-subnet-get", SITE_SUBNET_PARAMS, "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7"))).toEqual({
+      ok: true,
+      op: "gcp-subnet-get",
+      subnetName: SITE_SUBNET_NAME,
+      found: true,
+      ipCidrRange: SITE_SUBNET_RANGE,
+      description: SITE_SUBNET_DESCRIPTION,
+      slot: 7,
+      siteSlug: "docs-892769",
+      matchesSite: true,
+    });
+    expect(googleCalls(calls)[0]?.url).toBe(`${GCP_REGION_URL}/subnetworks/${SITE_SUBNET_NAME}`);
+    vi.restoreAllMocks();
+
+    mockGcpApiQueue([{ body: { name: SITE_SUBNET_NAME, ipCidrRange: "10.20.4.0/24", description: SITE_SUBNET_DESCRIPTION } }]);
+    expect(await actuate(planning49Job("gcp-subnet-get", SITE_SUBNET_PARAMS, "e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8"))).toMatchObject({ found: true, matchesSite: false });
+    vi.restoreAllMocks();
+
+    mockGcpApiQueue([{ status: 404, body: { error: { code: 404, message: "not found" } } }]);
+    expect(await actuate(planning49Job("gcp-subnet-get", SITE_SUBNET_PARAMS, "e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9"))).toMatchObject({ found: false, matchesSite: false, description: null });
+  });
+
+  it("gcp-subnet-delete SITE form: deletes ONLY a subnet whose description names THIS site; absent is already-absent", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([
+      { body: { name: SITE_SUBNET_NAME, ipCidrRange: SITE_SUBNET_RANGE, description: SITE_SUBNET_DESCRIPTION } },
+      { body: { name: "op-del-site", status: "RUNNING" } },
+      { body: { status: "DONE" } },
+    ]);
+    expect(await actuate(planning49Job("gcp-subnet-delete", SITE_SUBNET_PARAMS, "eaeaeaeaeaeaeaeaeaeaeaeaeaeaeaea"))).toEqual({
+      ok: true,
+      op: "gcp-subnet-delete",
+      subnetName: SITE_SUBNET_NAME,
+      status: "deleted",
+    });
+    const [read, deleteCall] = googleCalls(calls);
+    expect(read.method).toBe("GET");
+    expect(deleteCall.method).toBe("DELETE");
+    expect(deleteCall.url).toBe(`${GCP_REGION_URL}/subnetworks/${SITE_SUBNET_NAME}`);
+    vi.restoreAllMocks();
+
+    // Another site's (or no) doubleyoup description: refused, and NO delete call is made.
+    for (const description of ["doubleyoup site subnet: geelongns", "doubleyoup site subnet: docs-892769-x", undefined]) {
+      const refusedCalls = mockGcpApiQueue([{ body: { name: SITE_SUBNET_NAME, ipCidrRange: SITE_SUBNET_RANGE, description } }]);
+      const refused = await actuate(planning49Job("gcp-subnet-delete", SITE_SUBNET_PARAMS, "ebebebebebebebebebebebebebebebeb"));
+      expect(refused).toMatchObject({ ok: false, foreign: true, inUse: false });
+      expect(googleCalls(refusedCalls).filter((call) => call.method === "DELETE")).toHaveLength(0);
+      vi.restoreAllMocks();
+    }
+
+    const absentCalls = mockGcpApiQueue([{ status: 404, body: { error: { code: 404, message: "not found" } } }]);
+    expect(await actuate(planning49Job("gcp-subnet-delete", SITE_SUBNET_PARAMS, "ecececececececececececececececec"))).toMatchObject({ ok: true, status: "already-absent" });
+    expect(googleCalls(absentCalls)).toHaveLength(1);
+  });
+
+  it("gcp-subnets-list: filters on the DERIVED prefix, reads every page, and parses slot + site from each entry", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([
+      {
+        body: {
+          items: [
+            { name: "dy-cell-australia-southeast1-run-s000", ipCidrRange: "10.20.128.0/24", description: "doubleyoup site subnet: docs-892769", network: "https://www.googleapis.com/compute/v1/projects/dy-agency-proof/global/networks/dy-cell-australia-southeast1" },
+          ],
+          nextPageToken: "page-2",
+        },
+      },
+      { body: { items: [{ name: "dy-cell-australia-southeast1-run-s200", ipCidrRange: "10.20.200.0/24" }] } },
+    ]);
+    const body = await actuate(planning49Job("gcp-subnets-list", { project: "dy-agency-proof", region: "australia-southeast1" }, "edededededededededededededededed"));
+    expect(body).toEqual({
+      ok: true,
+      op: "gcp-subnets-list",
+      subnets: [
+        { name: "dy-cell-australia-southeast1-run-s000", slot: 0, ipCidrRange: "10.20.128.0/24", description: "doubleyoup site subnet: docs-892769", siteSlug: "docs-892769", network: "dy-cell-australia-southeast1" },
+        // An orphan the teardown must still SEE: not a canonical slot, not a doubleyoup description.
+        { name: "dy-cell-australia-southeast1-run-s200", slot: null, ipCidrRange: "10.20.200.0/24", description: null, siteSlug: null, network: null },
+      ],
+    });
+    const [first, second] = googleCalls(calls);
+    const firstUrl = new URL(first.url);
+    expect(firstUrl.pathname).toBe("/compute/v1/projects/dy-agency-proof/regions/australia-southeast1/subnetworks");
+    expect(firstUrl.searchParams.get("filter")).toBe('name eq "dy-cell-australia-southeast1-run-s.*"');
+    expect(new URL(second.url).searchParams.get("pageToken")).toBe("page-2");
+    vi.restoreAllMocks();
+
+    mockGcpApiQueue([denied403("compute.subnetworks.list")]);
+    const denied = await actuate(planning49Job("gcp-subnets-list", { project: "dy-agency-proof", region: "australia-southeast1" }, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"));
+    expect(denied.ok).toBe(false);
+    expect(denied.detail).toMatch(/compute\.subnetworks\.list/);
+  });
+
+  /** A session upsert of term-docs-892769 on its own subnet (slot 7). */
+  const SITE_SESSION_UPSERT_PARAMS = { ...CLOUD_RUN_SESSION_PARAMS, subnet: SITE_SUBNET_NAME, slot: 7 };
+
+  it("cloudrun-service-upsert SESSION: reads the subnet FIRST and refuses, with NO Cloud Run call, unless it is this site's (D7)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const cases: Array<[unknown, RegExp]> = [
+      [{ name: SITE_SUBNET_NAME, ipCidrRange: SITE_SUBNET_RANGE, description: "doubleyoup site subnet: geelongns" }, /does not bind it to "docs-892769"/],
+      [{ name: SITE_SUBNET_NAME, ipCidrRange: "10.20.4.0/24", description: SITE_SUBNET_DESCRIPTION }, /has the range 10\.20\.4\.0\/24, not 10\.20\.135\.0\/24/],
+    ];
+    for (const [subnetBody, expected] of cases) {
+      const calls = mockGcpApiQueue([{ body: subnetBody }]);
+      const body = await actuate(planning49Job("cloudrun-service-upsert", SITE_SESSION_UPSERT_PARAMS, "efefefefefefefefefefefefefefefef"));
+      expect(body.ok).toBe(false);
+      expect(body.detail).toMatch(expected);
+      expect(googleCalls(calls).filter((call) => call.url.startsWith("https://run.googleapis.com/"))).toHaveLength(0);
+      vi.restoreAllMocks();
+    }
+    const absentCalls = mockGcpApiQueue([{ status: 404, body: { error: { code: 404, message: "not found" } } }]);
+    const absent = await actuate(planning49Job("cloudrun-service-upsert", SITE_SESSION_UPSERT_PARAMS, "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0"));
+    expect(absent.detail).toMatch(/does not exist — create the site's subnet before its session service/);
+    expect(googleCalls(absentCalls)).toHaveLength(1);
+  });
+
+  it("cloudrun-service-upsert SESSION: with a bound subnet it CREATEs the service on THAT subnet", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const serviceName = "term-docs-892769";
+    const calls = mockGcpApiQueue([
+      { body: { name: SITE_SUBNET_NAME, ipCidrRange: SITE_SUBNET_RANGE, description: SITE_SUBNET_DESCRIPTION } },
+      { status: 404, body: { error: { code: 404, message: "not found" } } },
+      { body: { name: CLOUD_RUN_OPERATION } },
+      { body: { name: CLOUD_RUN_OPERATION, done: true } },
+      { body: settledService(serviceName) },
+    ]);
+    const body = await actuate(planning49Job("cloudrun-service-upsert", SITE_SESSION_UPSERT_PARAMS, "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"));
+    expect(body).toMatchObject({ ok: true, op: "cloudrun-service-upsert", serviceName, status: "created" });
+    const create = googleCalls(calls).find((call) => call.method === "POST" && call.url.startsWith(CLOUD_RUN_SERVICES_URL));
+    const template = (create?.body as { template: { vpcAccess: { networkInterfaces: Array<{ subnetwork: string }> } } }).template;
+    expect(template.vpcAccess.networkInterfaces).toEqual([{ network: "dy-cell-australia-southeast1", subnetwork: SITE_SUBNET_NAME }]);
+  });
+
+  // ── planning/49 §8 + hub#93: workers-route-upsert / workers-route-delete ─────────────────────────
+
+  const ROUTE_PARAMS = { zone: "sbmstudio.com.au", host: "term-docs-892769.sbmstudio.com.au" };
+  const ROUTE_PATTERN = "term-docs-892769.sbmstudio.com.au/*";
+
+  /** A routed Cloudflare mock: the zone lookup, the route list, then the write. Records every call. */
+  function mockWorkersRoutesApi(existingRoutes: Array<{ id: string; pattern: string; script?: string }>, writeReply: { status?: number; body: unknown }) {
+    const calls: Array<{ method: string; url: string; body?: unknown; auth: string | null }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = new URL(urlOf(input));
+      const method = init?.method ?? "GET";
+      const auth = new Headers(init?.headers).get("authorization");
+      calls.push({ method, url: url.toString(), body: init?.body ? JSON.parse(String(init.body)) : undefined, auth });
+      if (url.pathname === "/client/v4/zones") {
+        return jsonResponse({ success: true, result: [{ id: "zone-sbm", name: "sbmstudio.com.au" }] });
+      }
+      if (url.pathname === "/client/v4/zones/zone-sbm/workers/routes" && method === "GET") {
+        return jsonResponse({ success: true, result: existingRoutes });
+      }
+      return jsonResponse(writeReply.body, writeReply.status ?? 200);
+    });
+    return calls;
+  }
+
+  async function actuateRoute(op: "workers-route-upsert" | "workers-route-delete", nonce: string): Promise<Record<string, unknown>> {
+    const job = planning49Job(op, ROUTE_PARAMS, nonce);
+    const signature = await signAsApp(job, privateKey);
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    return (await response.json()) as Record<string, unknown>;
+  }
+
+  it("workers-route-upsert: POSTs the DERIVED exact-host pattern to the edge gate script with the agency's own token", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockWorkersRoutesApi([{ id: "r-other", pattern: "other.sbmstudio.com.au/*", script: "dy-edge-gate" }], { body: { success: true, result: { id: "r-new" } } });
+    expect(await actuateRoute("workers-route-upsert", "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2")).toEqual({
+      ok: true,
+      op: "workers-route-upsert",
+      pattern: ROUTE_PATTERN,
+      routeId: "r-new",
+      status: "created",
+    });
+    const post = calls.find((call) => call.method === "POST");
+    expect(post?.url).toBe("https://api.cloudflare.com/client/v4/zones/zone-sbm/workers/routes");
+    expect(post?.body).toEqual({ pattern: ROUTE_PATTERN, script: "dy-edge-gate" });
+    for (const call of calls) {
+      expect(call.auth).toBe("Bearer cf-dns-token-abc");
+    }
+  });
+
+  it("workers-route-upsert: a route already on the gate is unchanged; one pointing ELSEWHERE is never taken over", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const unchangedCalls = mockWorkersRoutesApi([{ id: "r-1", pattern: ROUTE_PATTERN, script: "dy-edge-gate" }], { status: 500, body: {} });
+    expect(await actuateRoute("workers-route-upsert", "f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3")).toEqual({
+      ok: true,
+      op: "workers-route-upsert",
+      pattern: ROUTE_PATTERN,
+      routeId: "r-1",
+      status: "unchanged",
+    });
+    expect(unchangedCalls.filter((call) => call.method !== "GET")).toHaveLength(0);
+    vi.restoreAllMocks();
+
+    const foreignCalls = mockWorkersRoutesApi([{ id: "r-2", pattern: ROUTE_PATTERN, script: "agency-own-worker" }], { status: 500, body: {} });
+    expect(await actuateRoute("workers-route-upsert", "f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4")).toMatchObject({ ok: false, foreign: true });
+    expect(foreignCalls.filter((call) => call.method !== "GET")).toHaveLength(0);
+  });
+
+  it("workers-route-delete: deletes the gate's route; absent is already-absent; a route to another script is left in place", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockWorkersRoutesApi([{ id: "r-1", pattern: ROUTE_PATTERN, script: "dy-edge-gate" }], { body: { success: true, result: { id: "r-1" } } });
+    expect(await actuateRoute("workers-route-delete", "f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5")).toEqual({
+      ok: true,
+      op: "workers-route-delete",
+      pattern: ROUTE_PATTERN,
+      status: "deleted",
+    });
+    expect(calls.find((call) => call.method === "DELETE")?.url).toBe("https://api.cloudflare.com/client/v4/zones/zone-sbm/workers/routes/r-1");
+    vi.restoreAllMocks();
+
+    mockWorkersRoutesApi([], { status: 500, body: {} });
+    expect(await actuateRoute("workers-route-delete", "f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6")).toMatchObject({ ok: true, status: "already-absent" });
+    vi.restoreAllMocks();
+
+    const foreignCalls = mockWorkersRoutesApi([{ id: "r-2", pattern: ROUTE_PATTERN, script: "agency-own-worker" }], { status: 500, body: {} });
+    expect(await actuateRoute("workers-route-delete", "f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7")).toMatchObject({ ok: false, foreign: true });
+    expect(foreignCalls.filter((call) => call.method === "DELETE")).toHaveLength(0);
   });
 
   it("cloudrun-service-upsert: a MISSING service is CREATEd with the label + invoker IAM ON, waited, then re-read", async () => {

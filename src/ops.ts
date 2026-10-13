@@ -41,10 +41,12 @@
 // reboot interrupts every site — so it runs exactly once under F1 (see actuate.ts for both).
 //
 // The planning/49 ephemeral-compute ops are ALL idempotent. `gcp-instance-get`, `gcp-subnet-get`,
-// `cloudrun-service-get` and `cloudrun-probe-invoke` are reads (the probe only opens TCP connections).
-// `gcp-subnet-create` treats Google's 409 alreadyExists as success. `gcp-subnet-delete` and
-// `cloudrun-service-delete` treat a 404 as "already-absent". `cloudrun-service-upsert` READS the
-// service first and then creates or patches ONE named service, so a re-run converges on it.
+// `gcp-subnets-list`, `cloudrun-service-get` and `cloudrun-probe-invoke` are reads (the probe only opens
+// TCP connections). `gcp-subnet-create` treats Google's 409 alreadyExists as success (for a hub#93
+// site subnet only after a read-back finds that site's range and description). `gcp-subnet-delete`,
+// `cloudrun-service-delete` and `workers-route-delete` treat an absent resource as "already-absent".
+// `cloudrun-service-upsert` READS the service first and then creates or patches ONE named service, and
+// `workers-route-upsert` creates an absent route and leaves a correct one alone, so a re-run converges.
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -86,6 +88,9 @@ import {
   type CloudRunServiceGetParams,
   type CloudRunServiceDeleteParams,
   type CloudRunProbeInvokeParams,
+  type GcpSubnetsListParams,
+  type WorkersRouteUpsertParams,
+  type WorkersRouteDeleteParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
@@ -122,6 +127,9 @@ import {
   validateCloudRunServiceGetParams,
   validateCloudRunServiceDeleteParams,
   validateCloudRunProbeInvokeParams,
+  validateGcpSubnetsListParams,
+  validateWorkersRouteUpsertParams,
+  validateWorkersRouteDeleteParams,
 } from "./dispatch-params.js";
 import {
   type ActuateResult,
@@ -161,6 +169,9 @@ import {
   readCloudRunService,
   actuateCloudRunServiceDelete,
   actuateCloudRunProbeInvoke,
+  readComputeSubnetsList,
+  actuateWorkersRouteUpsert,
+  actuateWorkersRouteDelete,
 } from "./actuate.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
@@ -331,6 +342,18 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "cloudrun-probe-invoke": defineOp<CloudRunProbeInvokeParams>({
     validateParams: validateCloudRunProbeInvokeParams,
     actuate: (params, env) => actuateCloudRunProbeInvoke(params, env),
+  }),
+  "gcp-subnets-list": defineOp<GcpSubnetsListParams>({
+    validateParams: validateGcpSubnetsListParams,
+    actuate: (params, env) => readComputeSubnetsList(params, env),
+  }),
+  "workers-route-upsert": defineOp<WorkersRouteUpsertParams>({
+    validateParams: validateWorkersRouteUpsertParams,
+    actuate: (params, env) => actuateWorkersRouteUpsert(params, env),
+  }),
+  "workers-route-delete": defineOp<WorkersRouteDeleteParams>({
+    validateParams: validateWorkersRouteDeleteParams,
+    actuate: (params, env) => actuateWorkersRouteDelete(params, env),
   }),
 };
 

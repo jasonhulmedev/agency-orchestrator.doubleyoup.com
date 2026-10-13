@@ -1343,10 +1343,21 @@ export function validateGcpFirewallCreateParams(raw: unknown): ParamsVerdict<Gcp
     };
   }
 
-  return {
-    ok: true,
-    params: { project, networkName, ruleName, allowed: cleanAllowed, sourceRanges: cleanSourceRanges, targetTags: cleanTargetTags },
+  const params: GcpFirewallCreateParams = {
+    project,
+    networkName,
+    ruleName,
+    allowed: cleanAllowed,
+    sourceRanges: cleanSourceRanges,
+    targetTags: cleanTargetTags,
   };
+  // hub#93: the cell's ONE sessions rule is pinned to its exact shape (sessionsFirewallRuleShapeReason,
+  // in the planning/49 section below). Every other rule name is unaffected.
+  const sessionsRuleReason = sessionsFirewallRuleShapeReason(params);
+  if (sessionsRuleReason !== null) {
+    return { ok: false, reason: sessionsRuleReason };
+  }
+  return { ok: true, params };
 }
 
 // ── gcp-address-create ───────────────────────────────────────────────────────────────
@@ -2118,7 +2129,7 @@ export function validateGcpInstanceGetParams(raw: unknown): ParamsVerdict<GcpIns
 // another identity, or take over a Cloud Run service this platform does not name.
 
 /** The cell's VPC network: `dy-cell-<region>` (orchestrator cell-provision.ts cellResourceNames). */
-function cellNetworkNameFor(region: string): string {
+export function cellNetworkNameFor(region: string): string {
   return `dy-cell-${region}`;
 }
 
@@ -2136,11 +2147,267 @@ function cellRunServiceAccountFor(project: string): string {
   return `dy-run@${project}.iam.gserviceaccount.com`;
 }
 
+// ── hub#93: per-site Run subnets (one /24 per site) ──────────────────────────────────
+// Every session service of a site (term-, pma-, staging-, sterm-, spma-<slug>) egresses from that
+// site's OWN subnet, so the file node's exports and the data node's grants can tell one site's
+// session from another's. A site holds ONE Run slot N (0-127, recorded in app as Site.runSlot), and
+// every value below is DERIVED from N, here, on both sides of the boundary:
+//   subnet  `dy-cell-<region>-run-s<NNN>` (NNN = N zero-padded to three digits)
+//   range   10.20.(128+N).0/24, inside the session supernet 10.20.128.0/17
+//   description `doubleyoup site subnet: <slug>` — set at create, and Google refuses to patch it
+//           later (hub#93 gate G4), so the Worker can bind a subnet to its site by reading it back.
+// The slug is NOT in the subnet name: `dy-cell-australia-southeast2-run-` is already 33 characters,
+// a slug can be longer than the 30 left, and a Compute name stops at 63. The probe subnet
+// `dy-cell-<region>-run` (10.20.4.0/24) is unchanged and gets no export and no grant.
+//
+// These helpers are PURE. A derive helper given a slot outside 0-127 THROWS a RangeError: it is only
+// ever called after the validator checked the slot, so reaching it with a bad one is a programming
+// error that must not produce a plausible-looking range.
+
+/** The supernet every per-site session subnet lives in: 128 /24 slots (hub#93 §1). */
+export const SITE_RUN_SUPERNET_CIDR = "10.20.128.0/17";
+/** The lowest Run slot. */
+export const SITE_RUN_SLOT_MIN = 0;
+/** The highest Run slot: 10.20.(128+127).0/24 = 10.20.255.0/24 is the last /24 of the supernet. */
+export const SITE_RUN_SLOT_MAX = 127;
+/** Slot N lives in the third octet 128+N. */
+const SITE_RUN_SLOT_THIRD_OCTET_BASE = 128;
+/** The fixed head of every per-site subnet description; the site slug follows it. */
+const SITE_SUBNET_DESCRIPTION_PREFIX = "doubleyoup site subnet: ";
+/**
+ * A site slug where a per-site subnet, a session host or an NFS path names it: [a-z0-9-], alphanumeric
+ * at both ends, at most 46 characters. 46 is app's own ceiling for a slug (sites.ts uniqueSlug: a 39-char
+ * base plus "-" plus a 6-char disambiguation suffix). Anchored, so no "/", ".", space or quote appears.
+ */
+const SITE_SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,44}[a-z0-9])?$/;
+/** The NFS export root on the file node. Every per-site export path sits under it (hub#93 §3). */
+const SITE_STORAGE_ROOT = "/srv/dy-storage";
+
+/** True when `value` is a Run slot: an integer from 0 to 127. */
+export function isSiteRunSlot(value: unknown): value is number {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    return false;
+  }
+  return value >= SITE_RUN_SLOT_MIN && value <= SITE_RUN_SLOT_MAX;
+}
+
+/** True when `value` is a site slug in the grammar above. */
+export function isSiteSlug(value: unknown): value is string {
+  return typeof value === "string" && SITE_SLUG_RE.test(value);
+}
+
+/** Throw unless `slot` is a Run slot. Every derive helper calls this first. */
+function assertSiteRunSlot(slot: number): void {
+  if (!isSiteRunSlot(slot)) {
+    throw new RangeError(`a Run slot must be an integer from ${SITE_RUN_SLOT_MIN} to ${SITE_RUN_SLOT_MAX}, got ${String(slot)}`);
+  }
+}
+
+/** The zero-padded slot label in a per-site subnet name: 0 -> "s000", 7 -> "s007", 127 -> "s127". */
+export function siteRunSlotLabel(slot: number): string {
+  assertSiteRunSlot(slot);
+  return `s${String(slot).padStart(3, "0")}`;
+}
+
+/** Slot N -> its subnet's primary range, 10.20.(128+N).0/24. The ONE derivation of the range. */
+export function siteRunSubnetCidrForSlot(slot: number): string {
+  assertSiteRunSlot(slot);
+  return `10.20.${SITE_RUN_SLOT_THIRD_OCTET_BASE + slot}.0/24`;
+}
+
+/** The name prefix every per-site subnet of an agency cell starts with: `dy-cell-<region>-run-s`. */
+export function cellSiteRunSubnetNamePrefixFor(region: string): string {
+  return `${cellRunSubnetNameFor(region)}-s`;
+}
+
+/** An agency cell's per-site subnet for slot N: `dy-cell-<region>-run-s<NNN>`. */
+export function cellSiteRunSubnetNameFor(region: string, slot: number): string {
+  return `${cellRunSubnetNameFor(region)}-${siteRunSlotLabel(slot)}`;
+}
+
+/**
+ * The slot a per-site subnet name encodes, or null when the name is not exactly
+ * `dy-cell-<region>-run-s<NNN>` with a canonical three-digit NNN from 000 to 127.
+ */
+export function siteRunSlotFromSubnetName(region: string, subnetName: string): number | null {
+  const prefix = cellSiteRunSubnetNamePrefixFor(region);
+  if (!subnetName.startsWith(prefix)) {
+    return null;
+  }
+  const digits = subnetName.slice(prefix.length);
+  if (!/^[0-9]{3}$/.test(digits)) {
+    return null;
+  }
+  const slot = Number(digits);
+  if (!isSiteRunSlot(slot)) {
+    return null;
+  }
+  return slot;
+}
+
+/** The description a site's subnet is created with: `doubleyoup site subnet: <slug>`. */
+export function siteSubnetDescriptionFor(slug: string): string {
+  return `${SITE_SUBNET_DESCRIPTION_PREFIX}${slug}`;
+}
+
+/**
+ * The slug a subnet's description binds it to, or null when the description is not EXACTLY
+ * `doubleyoup site subnet: <slug>` with a slug in the site grammar (a missing, foreign or edited
+ * description binds the subnet to no site).
+ */
+export function siteSlugFromSubnetDescription(description: unknown): string | null {
+  if (typeof description !== "string" || !description.startsWith(SITE_SUBNET_DESCRIPTION_PREFIX)) {
+    return null;
+  }
+  const slug = description.slice(SITE_SUBNET_DESCRIPTION_PREFIX.length);
+  if (!isSiteSlug(slug)) {
+    return null;
+  }
+  return slug;
+}
+
+/** The network tag every VM of an agency cell carries: `dy-cell-<region>-node`. */
+function cellNodeTagFor(region: string): string {
+  return `dy-cell-${region}-node`;
+}
+
+/** The ONE sessions firewall rule of an agency cell: `dy-cell-<region>-sessions-to-nodes`. */
+export function cellSessionsFirewallRuleNameFor(region: string): string {
+  return `dy-cell-${region}-sessions-to-nodes`;
+}
+
+/**
+ * The exact sessions rule (hub#93 §2, decision D4): from the session supernet to the cell's node tag,
+ * tcp 3306 (MariaDB) and tcp+udp 2049 (NFS). It mirrors the probe's `<cell>-run-to-nodes` rule
+ * (orchestrator cellRunIngressPolicy) with the supernet as its source, and is created with the
+ * existing gcp-firewall-create. One rule per cell: every site needs the same ports on the same two
+ * hosts, so a per-site rule would add no isolation — the per-site exports and grants are the
+ * isolation layer.
+ */
+export function cellSessionsFirewallRuleFor(project: string, region: string): GcpFirewallCreateParams {
+  return {
+    project,
+    networkName: cellNetworkNameFor(region),
+    ruleName: cellSessionsFirewallRuleNameFor(region),
+    allowed: [
+      { protocol: "tcp", ports: ["3306", "2049"] },
+      { protocol: "udp", ports: ["2049"] },
+    ],
+    sourceRanges: [SITE_RUN_SUPERNET_CIDR],
+    targetTags: [cellNodeTagFor(region)],
+  };
+}
+
+/**
+ * gcp-firewall-create's extra rule for the sessions rule. A rule NAMED `dy-cell-<region>-sessions-to-nodes`
+ * must be EXACTLY cellSessionsFirewallRuleFor(project, region): any other source range, port or target
+ * under that name is refused, so a caller bug cannot widen the one rule every site's sessions share.
+ * Returns null for every other rule name (they are not pinned).
+ */
+export function sessionsFirewallRuleShapeReason(params: GcpFirewallCreateParams): string | null {
+  const match = /^dy-cell-(.+)-sessions-to-nodes$/.exec(params.ruleName);
+  if (match === null) {
+    return null;
+  }
+  const region = match[1];
+  if (region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return "a sessions rule must be named dy-cell-<region>-sessions-to-nodes for a Compute region";
+  }
+  const expected = cellSessionsFirewallRuleFor(params.project, region);
+  // Compare the canonical JSON of the cleaned params with the canonical rule, part by part, so the
+  // reason names the part that differs. Order matters: the rule is built in one fixed order.
+  if (params.networkName !== expected.networkName) {
+    return `a sessions rule must attach to "${expected.networkName}" (the cell's own VPC)`;
+  }
+  if (JSON.stringify(params.sourceRanges) !== JSON.stringify(expected.sourceRanges)) {
+    return `a sessions rule must have exactly the source range ${SITE_RUN_SUPERNET_CIDR}`;
+  }
+  if (JSON.stringify(params.targetTags) !== JSON.stringify(expected.targetTags)) {
+    return `a sessions rule must target exactly the "${cellNodeTagFor(region)}" tag`;
+  }
+  if (JSON.stringify(params.allowed) !== JSON.stringify(expected.allowed)) {
+    return "a sessions rule must allow exactly tcp 3306 and 2049, then udp 2049";
+  }
+  return null;
+}
+
+// ── gcp-subnet-create / -get / -delete: the probe form and the SITE form ─────────────
+// Each of the three subnet ops accepts exactly ONE of two shapes, never a free-form name or range:
+//   PROBE form (planning/49 Phase 2, unchanged): the cell's ONE probe subnet `dy-cell-<region>-run`.
+//   SITE form (hub#93 §2): `{ project, region, slot, siteSlug }`. The name, the range and the
+//            description are DERIVED from the slot and the slug (the helpers above). A site-form job
+//            that ALSO carries networkName / subnetName / ipCidr is refused: those are never inputs.
+// A job carrying `slot` or `siteSlug` is a site-form job; any other job is a probe-form job.
+//
+// What the twin CAN check: the shapes agree (a valid slot, a valid slug, the derived name). What it
+// CANNOT check, because it holds no DB: that N is THIS slug's slot. app checks that in buildDispatch
+// before it signs (agency-dispatch-site-binding.ts), and the Worker binds the subnet to the slug with
+// its description (set at create, read back before every upsert and delete).
+
+/** The SITE form of a subnet op: a slot and a slug. The Worker derives everything else. */
+export interface GcpSiteSubnetRef {
+  /** The agency's GCP project id the subnet lives in. */
+  project: string;
+  /** The Compute Engine region of the subnet (and of the cell), e.g. "australia-southeast2". */
+  region: string;
+  /** The site's Run slot, 0-127. */
+  slot: number;
+  /** The site's slug — the subnet's description binds it to this site. */
+  siteSlug: string;
+}
+
+/** True when a validated subnet-op params object is the SITE form. */
+export function isGcpSiteSubnetRef(params: object): params is GcpSiteSubnetRef {
+  return "siteSlug" in params;
+}
+
+/** True when a RAW params object asks for the site form (it names a slot or a slug). */
+function asksForSiteSubnetForm(raw: Record<string, unknown>): boolean {
+  return raw.slot !== undefined || raw.siteSlug !== undefined;
+}
+
+/**
+ * Validate the SITE form shared by the three subnet ops. `op` only names the op in a reason. The
+ * derived subnet name must itself be a valid Compute name, which bounds the region's length.
+ */
+function validateGcpSiteSubnetRef(raw: Record<string, unknown>, op: string): ParamsVerdict<GcpSiteSubnetRef> {
+  const { project, region, slot, siteSlug } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast2)" };
+  }
+  if (!isSiteRunSlot(slot)) {
+    return { ok: false, reason: `slot must be a Run slot: an integer from ${SITE_RUN_SLOT_MIN} to ${SITE_RUN_SLOT_MAX}` };
+  }
+  if (!isSiteSlug(siteSlug)) {
+    return { ok: false, reason: "siteSlug must be a site slug ([a-z0-9-], 1-46 chars, alphanumeric at both ends)" };
+  }
+  // NEVER a free-form name or range: the site form derives both. A caller that sends them has
+  // confused the two forms, and silently ignoring the values would hide that.
+  if (raw.networkName !== undefined || raw.subnetName !== undefined || raw.ipCidr !== undefined) {
+    return {
+      ok: false,
+      reason: `the site form of ${op} derives the network, the subnet name and the range itself — it must not carry networkName, subnetName or ipCidr`,
+    };
+  }
+  if (!GCP_RESOURCE_NAME_RE.test(cellSiteRunSubnetNameFor(region, slot))) {
+    return { ok: false, reason: `region is too long: the derived subnet name ${GCP_RESOURCE_NAME_RULE}` };
+  }
+
+  // A FRESH object of only the four known keys — never the caller's object.
+  return { ok: true, params: { project, region, slot, siteSlug } };
+}
+
 // ── gcp-subnet-create ────────────────────────────────────────────────────────────────
-// Create the cell's Cloud Run subnet on its EXISTING VPC in the AGENCY's own project (planning/49
-// §4.1). It is separate from the node subnet, because Direct VPC egress takes addresses from a subnet
-// and must not compete with the VMs. gcp-network-create stays the "build the VPC" op; this adds ONE
-// range to a built VPC. Five REQUIRED strings:
+// Create a Cloud Run subnet on the cell's EXISTING VPC in the AGENCY's own project (planning/49 §4.1).
+// It is separate from the node subnet, because Direct VPC egress takes addresses from a subnet and
+// must not compete with the VMs. gcp-network-create stays the "build the VPC" op; this adds ONE range
+// to a built VPC.
+//
+// PROBE form — five REQUIRED strings:
 //   1. `project`     — pinned to the SA key's own project by the actuator.
 //   2. `region`      — a Compute region (a URL path segment).
 //   3. `networkName` — PINNED: exactly `dy-cell-<region>`.
@@ -2148,11 +2415,17 @@ function cellRunServiceAccountFor(project: string): string {
 //   5. `ipCidr`      — a PRIVATE (RFC 1918) block, /8-/26. The platform sends CELL_RUN_SUBNET_CIDR.
 //                      /26 is Cloud Run's own floor for a Direct VPC egress subnet (review L4), so
 //                      this is a separate rule from GCP_SUBNET_CIDR_RE (which allows /29).
+// SITE form — `{ project, region, slot, siteSlug }`. The Worker creates `dy-cell-<region>-run-s<NNN>`
+// on `dy-cell-<region>` with the range 10.20.(128+N).0/24 and the description
+// `doubleyoup site subnet: <siteSlug>`. An EXISTING subnet of that name passes only when its range AND
+// its description match exactly; anything else is a conflict, never adopted.
 //
-// IDEMPOTENT: Google's 409 alreadyExists is success, so a re-run resumes. Idempotence is by NAME: a
-// re-run with a DIFFERENT ipCidr is a no-op, so the caller reads the range back with gcp-subnet-get.
+// IDEMPOTENT: Google's 409 alreadyExists is success, so a re-run resumes. For the probe form,
+// idempotence is by NAME: a re-run with a DIFFERENT ipCidr is a no-op, so the caller reads the range
+// back with gcp-subnet-get.
 
-export interface GcpSubnetCreateParams {
+/** The PROBE form of gcp-subnet-create (planning/49 Phase 2). */
+export interface GcpProbeSubnetCreateParams {
   /** The agency's GCP project id the subnet is created in. */
   project: string;
   /** The Compute Engine region of the subnet, e.g. "australia-southeast2". */
@@ -2164,6 +2437,9 @@ export interface GcpSubnetCreateParams {
   /** The subnet's primary IPv4 range — a private RFC 1918 block between /8 and /26. */
   ipCidr: string;
 }
+
+/** gcp-subnet-create takes the probe form or the site form. */
+export type GcpSubnetCreateParams = GcpProbeSubnetCreateParams | GcpSiteSubnetRef;
 
 /**
  * A Cloud Run subnet range: a PRIVATE (RFC 1918) IPv4 block from /8 to /26. Direct VPC egress
@@ -2178,6 +2454,9 @@ const RUN_SUBNET_CIDR_RE = new RegExp(
 export function validateGcpSubnetCreateParams(raw: unknown): ParamsVerdict<GcpSubnetCreateParams> {
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
+  }
+  if (asksForSiteSubnetForm(raw)) {
+    return validateGcpSiteSubnetRef(raw, "gcp-subnet-create");
   }
   const { project, region, networkName, subnetName, ipCidr } = raw;
 
@@ -2208,14 +2487,18 @@ export function validateGcpSubnetCreateParams(raw: unknown): ParamsVerdict<GcpSu
 
 // ── gcp-subnet-get ───────────────────────────────────────────────────────────────────
 // READ-ONLY: does ONE subnet EXIST in the AGENCY's own project, and what is its primary range? The
-// subnet twin of gcp-firewall-get. Idempotence of the create is by NAME, so reading `ipCidrRange` back
-// is how a caller sees a same-named subnet with a different range. NOT pinned: a read of the node
-// subnet is harmless and useful. Three REQUIRED strings: `project` (pinned to the SA key's own project
-// by the actuator), `region` and `subnetName` (URL path segments).
+// subnet twin of gcp-firewall-get.
+//   PROBE / NAMED form — `{ project, region, subnetName }`. NOT pinned: a read of the node subnet is
+//            harmless and useful. Idempotence of the probe-form create is by NAME, so reading
+//            `ipCidrRange` back is how a caller sees a same-named subnet with a different range.
+//   SITE form — `{ project, region, slot, siteSlug }`. The Worker reads `dy-cell-<region>-run-s<NNN>`
+//            and also reports its description and whether range + description match this site. This
+//            is the read the slot reconcile uses after an UNKNOWN create outcome (hub#93 M5).
 //
 // IDEMPOTENT: a read has no side effect.
 
-export interface GcpSubnetGetParams {
+/** The NAMED form of gcp-subnet-get: any subnet, by name. */
+export interface GcpNamedSubnetRef {
   /** The agency's GCP project id the subnet lives in. */
   project: string;
   /** The Compute Engine region of the subnet, e.g. "australia-southeast2". */
@@ -2224,9 +2507,15 @@ export interface GcpSubnetGetParams {
   subnetName: string;
 }
 
+/** gcp-subnet-get takes the named form or the site form. */
+export type GcpSubnetGetParams = GcpNamedSubnetRef | GcpSiteSubnetRef;
+
 export function validateGcpSubnetGetParams(raw: unknown): ParamsVerdict<GcpSubnetGetParams> {
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
+  }
+  if (asksForSiteSubnetForm(raw)) {
+    return validateGcpSiteSubnetRef(raw, "gcp-subnet-get");
   }
   const { project, region, subnetName } = raw;
 
@@ -2245,18 +2534,23 @@ export function validateGcpSubnetGetParams(raw: unknown): ParamsVerdict<GcpSubne
 }
 
 // ── gcp-subnet-delete ────────────────────────────────────────────────────────────────
-// Delete the cell's Cloud Run subnet. gcp-network-delete deletes exactly ONE named subnet and then the
-// network, so a cell that has a Run subnet could not be torn down without this op: Google answers the
-// network delete with `resourceInUse` while a second subnet is still attached.
+// Delete a Cloud Run subnet. gcp-network-delete deletes exactly ONE named subnet and then the network,
+// so a cell that has a Run subnet could not be torn down without this op: Google answers the network
+// delete with `resourceInUse` while a second subnet is still attached.
 //
-// THE NAME IS PINNED: `subnetName` must be EXACTLY `dy-cell-<region>-run`. This op destroys
-// infrastructure, it can run against a LIVE cell, and the cell's NODE subnet `dy-cell-<region>-subnet`
-// is one typo away. Deleting that would take a live cell off the network. teardown removes the node
-// subnet through gcp-network-delete, where the order is not optional.
+// THE NAME IS NEVER FREE-FORM. This op destroys infrastructure, it can run against a LIVE cell, and the
+// cell's NODE subnet `dy-cell-<region>-subnet` is one typo away. Deleting that would take a live cell
+// off the network. Teardown removes the node subnet through gcp-network-delete, where the order is not
+// optional.
+//   PROBE form — `subnetName` must be EXACTLY `dy-cell-<region>-run`.
+//   SITE form  — `{ project, region, slot, siteSlug }`. The Worker reads the derived subnet first and
+//            refuses unless its description is EXACTLY `doubleyoup site subnet: <siteSlug>` — this
+//            site's, not merely any doubleyoup description (hub#93 §2, §5 H6).
 //
 // IDEMPOTENT: Google's 404 is "already-absent" (success), the same rule the teardown ops follow.
 
-export interface GcpSubnetDeleteParams {
+/** The PROBE form of gcp-subnet-delete. */
+export interface GcpProbeSubnetDeleteParams {
   /** The agency's GCP project id the subnet lives in. */
   project: string;
   /** The Compute Engine region of the subnet, e.g. "australia-southeast2". */
@@ -2265,9 +2559,15 @@ export interface GcpSubnetDeleteParams {
   subnetName: string;
 }
 
+/** gcp-subnet-delete takes the probe form or the site form. */
+export type GcpSubnetDeleteParams = GcpProbeSubnetDeleteParams | GcpSiteSubnetRef;
+
 export function validateGcpSubnetDeleteParams(raw: unknown): ParamsVerdict<GcpSubnetDeleteParams> {
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
+  }
+  if (asksForSiteSubnetForm(raw)) {
+    return validateGcpSiteSubnetRef(raw, "gcp-subnet-delete");
   }
   const { project, region, subnetName } = raw;
 
@@ -2289,6 +2589,40 @@ export function validateGcpSubnetDeleteParams(raw: unknown): ParamsVerdict<GcpSu
 
   // A FRESH object of only the known keys — never the caller's object.
   return { ok: true, params: { project, region, subnetName: expectedSubnet } };
+}
+
+// ── gcp-subnets-list ─────────────────────────────────────────────────────────────────
+// READ-ONLY (hub#93 §2): every subnet in the cell's region whose name starts with
+// `dy-cell-<region>-run-s` — the per-site subnets, orphans included — without 128 reads. The cell
+// teardown uses it to find and delete every site subnet BEFORE any VM. Two REQUIRED strings: `project`
+// (pinned to the SA key's own project by the actuator) and `region`. The name prefix is DERIVED from
+// the region; it is never a parameter. The actuator reads every page or fails closed: a teardown that
+// relied on a partial list would leave a subnet behind and then fail the network delete.
+//
+// IDEMPOTENT: a read has no side effect.
+
+export interface GcpSubnetsListParams {
+  /** The agency's GCP project id the subnets live in. */
+  project: string;
+  /** The Compute Engine region of the cell, e.g. "australia-southeast2". */
+  region: string;
+}
+
+export function validateGcpSubnetsListParams(raw: unknown): ParamsVerdict<GcpSubnetsListParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast2)" };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, region } };
 }
 
 // ── Cloud Run: service names, the premise probe, and the shared grammars ─────────────
@@ -2410,6 +2744,63 @@ function cloudRunServiceNameReason(serviceName: unknown, allowed: "session" | "p
     return `serviceName must be a session service name (${sessionRule}) or "${CLOUD_RUN_PROBE_SERVICE_NAME}"`;
   }
   return null;
+}
+
+/** One session purpose's host label prefix, e.g. "term" for `term-<slug>`. */
+type CloudRunSessionServicePrefix = (typeof CLOUD_RUN_SESSION_SERVICE_PREFIXES)[number];
+
+/**
+ * Split a session service name into its prefix and site slug ("sterm-docs-892769" -> sterm,
+ * docs-892769), or null when the name is not `<prefix>-<slug>` with a slug in the site grammar. No two
+ * prefixes overlap once the hyphen is included ("term-" is not a prefix of "sterm-"), so at most one
+ * prefix can match.
+ */
+export function splitCloudRunSessionServiceName(
+  serviceName: string,
+): { prefix: CloudRunSessionServicePrefix; slug: string } | null {
+  if (!isCloudRunSessionServiceName(serviceName)) {
+    return null;
+  }
+  for (const prefix of CLOUD_RUN_SESSION_SERVICE_PREFIXES) {
+    const head = `${prefix}-`;
+    if (!serviceName.startsWith(head)) {
+      continue;
+    }
+    const slug = serviceName.slice(head.length);
+    if (!isSiteSlug(slug)) {
+      return null;
+    }
+    return { prefix, slug };
+  }
+  return null;
+}
+
+/**
+ * The EXACT NFS export paths a session service may mount (hub#93 §2, §3), per purpose. They are the
+ * paths the session recipes mount today (infra cell-run/provision-terminal.sh, provision-staging.sh,
+ * provision-staging-terminal.sh), all under the same slug as the service:
+ *   term    sites/<slug>, platform/<slug>
+ *   staging sites/<slug>, platform/<slug>-staging
+ *   sterm   sites/<slug>/staging, platform/<slug>-staging
+ *   pma, spma  none (phpMyAdmin mounts nothing).
+ * EXACT paths, not a prefix test: a prefix test on `sites/<slug>` would also admit `sites/<slug>-x`,
+ * which is ANOTHER site's tree. And a staging service gets no path to the LIVE `platform/<slug>`, which
+ * holds the live DB password.
+ */
+export function siteSessionNfsPathsFor(prefix: CloudRunSessionServicePrefix, slug: string): string[] {
+  const sitesPath = `${SITE_STORAGE_ROOT}/sites/${slug}`;
+  const platformPath = `${SITE_STORAGE_ROOT}/platform/${slug}`;
+  const stagingPlatformPath = `${SITE_STORAGE_ROOT}/platform/${slug}-staging`;
+  if (prefix === "term") {
+    return [sitesPath, platformPath];
+  }
+  if (prefix === "staging") {
+    return [sitesPath, stagingPlatformPath];
+  }
+  if (prefix === "sterm") {
+    return [`${sitesPath}/staging`, stagingPlatformPath];
+  }
+  return [];
 }
 
 /** True when `value` is an absolute POSIX path that contains no "." or ".." segment. */
@@ -2641,19 +3032,30 @@ function cleanCloudRunProbe(value: unknown): { ok: true; probe: CloudRunProbeSpe
 }
 
 // ── cloudrun-service-upsert ──────────────────────────────────────────────────────────
-// PROBE-ONLY UNTIL planning/49 M4 LANDS (review, 2026-10-12). M4 is the check in app that a job's
-// params agree with the account's Cell and CellNode rows (planning/49 §6 layer 2). Until it exists,
-// a signed session service could name any NFS server and path on the agency's VPC. So every upsert
-// without `probe` is refused, in both twins. Phase 3 lifts this together with M4.
-//
 // Create or update ONE Cloud Run service. The actuator READS the service first. It CREATES a missing
 // one with the `managed-by` label, and it PATCHes an existing one ONLY when that one carries the label,
 // is not still reconciling, and its IAM policy holds no allUsers / allAuthenticatedUsers binding
 // (review M1, L5). So a same-named service this platform did not create is never taken over.
 //
-// THE PREMISE PROBE (`probe` set) is the only service that runs a stock public image: exactly
-// CLOUD_RUN_PROBE_IMAGE under exactly CLOUD_RUN_PROBE_SERVICE_NAME, with NO env, secretEnv or
-// nfsVolumes, and maxInstances 1. The Worker sets its command and program itself.
+// TWO KINDS OF SERVICE, told apart by `probe`:
+//   THE PREMISE PROBE (`probe` set) is the only service that runs a stock public image: exactly
+//     CLOUD_RUN_PROBE_IMAGE under exactly CLOUD_RUN_PROBE_SERVICE_NAME, on the probe subnet
+//     `dy-cell-<region>-run`, with NO env, secretEnv, nfsVolumes or slot, and maxInstances 1. The
+//     Worker sets its command and program itself.
+//   A SESSION SERVICE (no `probe`) — `<prefix>-<slug>` — is the hub#93 / planning/49 M4 lift. Until
+//     M4 every non-probe upsert was refused, because a signed session service could name any NFS
+//     server and path on the agency's VPC. The lift is TWO layers, because this file is PURE:
+//       1. HERE (both twins): the NAME grammar. The job carries its site's Run `slot`, and `subnet` must
+//          be EXACTLY `dy-cell-<region>-run-s<NNN>` for that slot. Each NFS volume's `server` must be a
+//          private literal and its `path` one of the EXACT per-purpose paths for the service's OWN slug
+//          (siteSessionNfsPathsFor). `maxInstances` must be exactly 1: one writer per NFS mount, and the
+//          per-site /24 is sized for one instance per service (hub#93 G1).
+//       2. app ONLY, before it signs (agency-dispatch-site-binding.ts): slug -> Site -> Cell must match
+//          the job's project, region and account, the slot must be Site.runSlot, its subnet must be
+//          confirmed created, and each NFS server must be the cell's file node. The twin can see that
+//          the shapes agree; it cannot know that N is THIS slug's slot.
+//     The Worker adds a third check at actuation: it reads the subnet and refuses unless its
+//     description names the same slug and its range is the one derived from the slot (D7).
 //
 // IDEMPOTENT: a re-dispatch with the same params converges on the same named service.
 
@@ -2670,14 +3072,16 @@ export interface CloudRunServiceUpsertParams {
   runServiceAccount: string;
   /** EXACTLY `dy-cell-<region>`. */
   network: string;
-  /** EXACTLY `dy-cell-<region>-run`. */
+  /** The probe: EXACTLY `dy-cell-<region>-run`. A session: EXACTLY `dy-cell-<region>-run-s<NNN>` for `slot`. */
   subnet: string;
   /** Cloud Run CPU, e.g. "1" or "1000m". */
   cpu: string;
   /** Cloud Run memory, e.g. "2Gi". */
   memory: string;
-  /** The instance ceiling. MUST be exactly 1 with `nfsVolumes` or `probe`. */
+  /** The instance ceiling. MUST be exactly 1 for a session service and for the probe. */
   maxInstances: number;
+  /** A session service only: its site's Run slot (0-127). Never with `probe`. */
+  slot?: number;
   /** OPTIONAL plain environment variables. Never with `probe`. */
   env?: CloudRunEnvVar[];
   /** OPTIONAL Secret Manager-sourced environment variables. Never with `probe`. */
@@ -2692,7 +3096,7 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
   }
-  const { project, region, serviceName, image, runServiceAccount, network, subnet, cpu, memory, maxInstances, env, secretEnv, nfsVolumes, probe } = raw;
+  const { project, region, serviceName, image, runServiceAccount, network, subnet, cpu, memory, maxInstances, slot, env, secretEnv, nfsVolumes, probe } = raw;
 
   if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
     return { ok: false, reason: GCP_PROJECT_ID_RULE };
@@ -2704,15 +3108,14 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
   if (!cleanedProbe.ok) {
     return { ok: false, reason: cleanedProbe.reason };
   }
-  if (cleanedProbe.probe === undefined) {
-    return {
-      ok: false,
-      reason:
-        "cloudrun-service-upsert is probe-only until planning/49 M4 lands (app must first check the params against " +
-        "the account's Cell and CellNode rows); a session service cannot be signed yet",
-    };
+  const isProbe = cleanedProbe.probe !== undefined;
+
+  let nameReason: string | null;
+  if (isProbe) {
+    nameReason = cloudRunServiceNameReason(serviceName, "probe");
+  } else {
+    nameReason = cloudRunServiceNameReason(serviceName, "session");
   }
-  const nameReason = cloudRunServiceNameReason(serviceName, "probe");
   if (nameReason !== null) {
     return { ok: false, reason: nameReason };
   }
@@ -2722,7 +3125,7 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
       reason: "image must be a container image reference pinned by digest: <registry>/<path>@sha256:<64 hex>",
     };
   }
-  if (image !== CLOUD_RUN_PROBE_IMAGE) {
+  if (isProbe && image !== CLOUD_RUN_PROBE_IMAGE) {
     return { ok: false, reason: `a probe must run exactly "${CLOUD_RUN_PROBE_IMAGE}"` };
   }
   const expectedServiceAccount = cellRunServiceAccountFor(project);
@@ -2733,10 +3136,36 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
   if (network !== expectedNetwork) {
     return { ok: false, reason: `network must be exactly "${expectedNetwork}" (the cell's own VPC)` };
   }
-  const expectedSubnet = cellRunSubnetNameFor(region);
-  if (subnet !== expectedSubnet) {
-    return { ok: false, reason: `subnet must be exactly "${expectedSubnet}" (the cell's Cloud Run subnet)` };
+
+  // THE SUBNET. The probe runs on the probe subnet and carries no slot. A session service runs on its
+  // site's OWN subnet, which is derived from the slot the job carries — never taken as a free name.
+  let expectedSubnet: string;
+  if (isProbe) {
+    if (slot !== undefined) {
+      return { ok: false, reason: "a probe must not carry a slot — it runs on the probe subnet, not a site's" };
+    }
+    expectedSubnet = cellRunSubnetNameFor(region);
+    if (subnet !== expectedSubnet) {
+      return { ok: false, reason: `subnet must be exactly "${expectedSubnet}" (the cell's Cloud Run subnet)` };
+    }
+  } else {
+    if (!isSiteRunSlot(slot)) {
+      return {
+        ok: false,
+        reason:
+          `a session service must carry its site's Run slot: an integer from ${SITE_RUN_SLOT_MIN} to ${SITE_RUN_SLOT_MAX} ` +
+          "(it runs on that site's own subnet, never the shared probe subnet)",
+      };
+    }
+    expectedSubnet = cellSiteRunSubnetNameFor(region, slot);
+    if (!GCP_RESOURCE_NAME_RE.test(expectedSubnet)) {
+      return { ok: false, reason: `region is too long: the derived subnet name ${GCP_RESOURCE_NAME_RULE}` };
+    }
+    if (subnet !== expectedSubnet) {
+      return { ok: false, reason: `subnet must be exactly "${expectedSubnet}" (the site's own Run subnet for slot ${slot})` };
+    }
   }
+
   if (typeof cpu !== "string" || !RUN_CPU_RE.test(cpu)) {
     return { ok: false, reason: 'cpu must be a Cloud Run CPU value: "1", "2", "4", "8" or a millicore value like "1000m"' };
   }
@@ -2765,22 +3194,52 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
     return { ok: false, reason: cleanedNfsVolumes.reason };
   }
 
-  // THE PROBE CARRIES NOTHING BUT ITS TARGETS (Jason's decision, 2026-10-12: refuse nfsVolumes).
-  // env and secretEnv are refused too: the Worker sets the probe's one variable itself.
-  if (cleanedNfsVolumes.nfsVolumes !== undefined) {
-    return { ok: false, reason: "a probe must not mount nfsVolumes — it opens TCP connections and reads no data" };
-  }
-  if (cleanedEnv.env !== undefined || cleanedSecretEnv.secretEnv !== undefined) {
-    return { ok: false, reason: "a probe must not carry env or secretEnv — the Worker sets the probe's environment itself" };
-  }
-  if (maxInstances !== 1) {
-    return { ok: false, reason: `a probe must have maxInstances exactly 1 (got ${maxInstances})` };
+  if (isProbe) {
+    // THE PROBE CARRIES NOTHING BUT ITS TARGETS (Jason's decision, 2026-10-12: refuse nfsVolumes).
+    // env and secretEnv are refused too: the Worker sets the probe's one variable itself.
+    if (cleanedNfsVolumes.nfsVolumes !== undefined) {
+      return { ok: false, reason: "a probe must not mount nfsVolumes — it opens TCP connections and reads no data" };
+    }
+    if (cleanedEnv.env !== undefined || cleanedSecretEnv.secretEnv !== undefined) {
+      return { ok: false, reason: "a probe must not carry env or secretEnv — the Worker sets the probe's environment itself" };
+    }
+    if (maxInstances !== 1) {
+      return { ok: false, reason: `a probe must have maxInstances exactly 1 (got ${maxInstances})` };
+    }
+  } else {
+    // A SESSION SERVICE: ONE instance (hub#93 G1 sizes each site's /24 for one instance per service),
+    // and only its OWN site's export paths for its purpose.
+    if (maxInstances !== 1) {
+      return {
+        ok: false,
+        reason:
+          `a session service must have maxInstances exactly 1 (got ${maxInstances}) — it serves one user, it may be ` +
+          "an NFS single writer, and its site's /24 is sized for one instance per service",
+      };
+    }
+    const sessionName = splitCloudRunSessionServiceName(serviceName as string);
+    if (sessionName === null) {
+      return { ok: false, reason: "serviceName must be <prefix>-<slug> with a site slug ([a-z0-9-], alphanumeric at both ends)" };
+    }
+    const allowedPaths = siteSessionNfsPathsFor(sessionName.prefix, sessionName.slug);
+    for (const volume of cleanedNfsVolumes.nfsVolumes ?? []) {
+      if (!allowedPaths.includes(volume.path)) {
+        let allowedText = "no NFS volume at all";
+        if (allowedPaths.length > 0) {
+          allowedText = `only ${allowedPaths.join(" or ")}`;
+        }
+        return {
+          ok: false,
+          reason: `a ${sessionName.prefix}- session for "${sessionName.slug}" may mount ${allowedText} — not "${volume.path}"`,
+        };
+      }
+    }
   }
 
   // THE SINGLE-WRITER INVARIANT (planning/49 §4.3), as code rather than a comment. Two instances of
   // one NFS-mounting service would write the same site's files through two independent mounts, with
-  // nothing in the stack to lock against. It cannot fire while the upsert is probe-only (a probe has
-  // no nfsVolumes). It stays so the rule is already code when M4 lifts that restriction.
+  // nothing in the stack to lock against. The session rule above already requires exactly 1; this
+  // stays as the invariant's own statement, so it holds even if that rule is ever relaxed.
   if (cleanedNfsVolumes.nfsVolumes !== undefined && maxInstances !== 1) {
     return {
       ok: false,
@@ -2792,7 +3251,8 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
 
   // A FRESH object of only the known keys — never the caller's object — so no extra key (an
   // `allowUnauthenticated`, an `ingress`, a raw `template`) can ride along under the platform's
-  // signature. Every optional field is added ONLY when present.
+  // signature. Every optional field is added ONLY when present, so a probe's params are byte-identical
+  // to what they were before the session form existed.
   const params: CloudRunServiceUpsertParams = {
     project,
     region,
@@ -2805,6 +3265,9 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
     memory,
     maxInstances,
   };
+  if (!isProbe) {
+    params.slot = slot as number;
+  }
   if (cleanedEnv.env !== undefined) {
     params.env = cleanedEnv.env;
   }
@@ -2887,6 +3350,72 @@ export function validateCloudRunServiceDeleteParams(raw: unknown): ParamsVerdict
 
 export function validateCloudRunProbeInvokeParams(raw: unknown): ParamsVerdict<CloudRunProbeInvokeParams> {
   return validateCloudRunServiceRef(raw, "probe");
+}
+
+// ── workers-route-upsert / workers-route-delete ──────────────────────────────────────
+// The Workers route that puts the edge gate in front of ONE session host in the agency's OWN zone
+// (planning/49 §3.2, §8; hub#93 §2: the agency site delete removes it after its service is gone). Two
+// REQUIRED strings each:
+//   1. `zone` — the agency zone NAME (the actuator resolves it to a zone id with the agency's own token).
+//   2. `host` — EXACTLY `<session service name>.<zone>`: a session prefix + the site slug as ONE label,
+//               then the zone. The route pattern is DERIVED, `<host>/*`, so it is always an exact host.
+// THE SHARP EDGE (planning/49 §8): `*.<zone>/*` would route every site in the zone through the gate.
+// So no wildcard, no bare zone, no extra label, and no host that is not
+// {term,pma,staging,sterm,spma}-<slug>.<zone> can be signed. The script is not a parameter either: the
+// actuator routes to EDGE_GATE_SCRIPT_NAME only, and never takes over a route that points elsewhere.
+// app also checks, before signing (agency-dispatch-site-binding.ts), that the zone is the slug's own
+// cell's Cell.cfZone and that the cell belongs to the dispatching account; the twin holds no DB.
+//
+// IDEMPOTENT: upsert creates an absent route and leaves a correct one alone; delete treats an absent
+// route as "already-absent".
+
+/** The ONE Worker script a session route may point at: the edge gate (planning/49 §5.1). */
+export const EDGE_GATE_SCRIPT_NAME = "dy-edge-gate";
+
+export interface WorkersRouteParams {
+  /** The agency's Cloudflare zone NAME, e.g. "sbmstudio.com.au". */
+  zone: string;
+  /** EXACTLY `<prefix>-<slug>.<zone>`. */
+  host: string;
+}
+
+export type WorkersRouteUpsertParams = WorkersRouteParams;
+export type WorkersRouteDeleteParams = WorkersRouteParams;
+
+/** The Workers route pattern for a validated session host: `<host>/*`. */
+export function workersRoutePatternFor(host: string): string {
+  return `${host}/*`;
+}
+
+/** The shared validator body for the two route ops. */
+function validateWorkersRouteParams(raw: unknown): ParamsVerdict<WorkersRouteParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { zone, host } = raw;
+
+  if (typeof zone !== "string" || zone.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a lowercase DNS zone name (e.g. example.com)" };
+  }
+  const hostRule = `host must be exactly <session service name>.${zone}, e.g. term-<slug>.${zone} (one label before the zone, no wildcard)`;
+  if (typeof host !== "string" || host.length > DNS_NAME_MAX_LENGTH || !host.endsWith(`.${zone}`)) {
+    return { ok: false, reason: hostRule };
+  }
+  const label = host.slice(0, host.length - zone.length - 1);
+  if (label.includes(".") || splitCloudRunSessionServiceName(label) === null) {
+    return { ok: false, reason: hostRule };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { zone, host } };
+}
+
+export function validateWorkersRouteUpsertParams(raw: unknown): ParamsVerdict<WorkersRouteUpsertParams> {
+  return validateWorkersRouteParams(raw);
+}
+
+export function validateWorkersRouteDeleteParams(raw: unknown): ParamsVerdict<WorkersRouteDeleteParams> {
+  return validateWorkersRouteParams(raw);
 }
 
 // ── shared ─────────────────────────────────────────────────────────────────────────

@@ -79,6 +79,13 @@ export const DISPATCH_OPS = [
   "cloudrun-service-get",
   "cloudrun-service-delete",
   "cloudrun-probe-invoke",
+  // hub#93 — READ every per-site Run subnet of a cell (`dy-cell-<region>-run-s*`), so the cell
+  // teardown finds them all, orphans included. The subnet ops above also gained a SITE form.
+  "gcp-subnets-list",
+  // planning/49 §8 + hub#93 — the edge-gate Workers route for ONE exact session host in the agency's
+  // own zone. The agency site delete removes it after the session service is gone.
+  "workers-route-upsert",
+  "workers-route-delete",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 

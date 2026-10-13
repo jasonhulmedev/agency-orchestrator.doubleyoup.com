@@ -59,8 +59,25 @@ import type {
   CloudRunServiceGetParams,
   CloudRunServiceDeleteParams,
   CloudRunProbeInvokeParams,
+  GcpSiteSubnetRef,
+  GcpSubnetsListParams,
+  WorkersRouteUpsertParams,
+  WorkersRouteDeleteParams,
 } from "./dispatch-params.js";
-import { edgeCacheZoneFromHostSuffix } from "./dispatch-params.js";
+import {
+  edgeCacheZoneFromHostSuffix,
+  EDGE_GATE_SCRIPT_NAME,
+  cellNetworkNameFor,
+  cellSiteRunSubnetNameFor,
+  cellSiteRunSubnetNamePrefixFor,
+  isGcpSiteSubnetRef,
+  siteRunSlotFromSubnetName,
+  siteRunSubnetCidrForSlot,
+  siteSlugFromSubnetDescription,
+  siteSubnetDescriptionFor,
+  splitCloudRunSessionServiceName,
+  workersRoutePatternFor,
+} from "./dispatch-params.js";
 import {
   EDGE_CACHE_PHASE,
   EDGE_CACHE_RULE_DESCRIPTIONS,
@@ -460,23 +477,82 @@ export type GcpInstanceGetResult =
   | { ok: false; op: "gcp-instance-get"; instanceName: string; detail: string };
 
 // planning/49 Phase 2 — the Cloud Run subnet. "created" means the Worker WAITED for the insert to
-// reach DONE, so the subnet exists on return. "already-existed" is Google's 409 alreadyExists.
+// reach DONE, so the subnet exists on return. "already-existed" is Google's 409 alreadyExists; for the
+// SITE form (hub#93) it is reported only after a read-back found the derived range AND this site's
+// description on it.
+//
+// `outcome` (ok:false, SITE form ONLY) is what the platform's slot release rule (hub#93 M5) keys on,
+// a DISCRIMINABLE field, never a detail-string match:
+//   refused  — DEFINITE: no subnet was made by this call (a 4xx from Google, an operation that finished
+//              with errors, or a call that was never sent). The caller may release the slot.
+//   unknown  — the create may still land (Google unreachable, a 5xx, an accepted insert whose wait did
+//              not finish). The caller KEEPS the slot and reconciles with gcp-subnet-get.
+//   conflict — a subnet of the derived name already exists with another range or description. It is
+//              not adopted and not changed.
+export type GcpSiteSubnetCreateOutcome = "refused" | "unknown" | "conflict";
 export type GcpSubnetCreateResult =
   | { ok: true; op: "gcp-subnet-create"; subnetName: string; status: GcpResourceStatus }
-  | { ok: false; op: "gcp-subnet-create"; subnetName: string; detail: string };
+  | { ok: false; op: "gcp-subnet-create"; subnetName: string; detail: string; outcome?: GcpSiteSubnetCreateOutcome };
 
-// READ-ONLY. `ipCidrRange` is the primary range (null when not found). Idempotence of the create is
-// by NAME, so this is how a caller sees a same-named subnet with a different range.
+// READ-ONLY. `ipCidrRange` is the primary range (null when not found). Idempotence of the probe-form
+// create is by NAME, so this is how a caller sees a same-named subnet with a different range.
+// The SITE form (hub#93) also reports the subnet's `description`, the slot it was asked about, and
+// `matchesSite`: true only when the subnet exists with the range derived from the slot AND the exact
+// description of this site. That is the read the platform's slot reconcile uses (M5).
 export type GcpSubnetGetResult =
   | { ok: true; op: "gcp-subnet-get"; subnetName: string; found: boolean; ipCidrRange: string | null }
+  | {
+      ok: true;
+      op: "gcp-subnet-get";
+      subnetName: string;
+      found: boolean;
+      ipCidrRange: string | null;
+      description: string | null;
+      slot: number;
+      siteSlug: string;
+      matchesSite: boolean;
+    }
   | { ok: false; op: "gcp-subnet-get"; subnetName: string; detail: string };
 
 // "deleted" means the Worker WAITED for the delete to reach DONE. "already-absent" is a 404. On a
 // failure, `inUse` is true when Google refused because another resource still uses the subnet (review
 // L4: Direct VPC egress can hold addresses after the last service is gone). That is "retry later".
+// `foreign` (SITE form ONLY) is true when the subnet exists but its description does not name THIS
+// site exactly: it is left in place (hub#93 §2).
 export type GcpSubnetDeleteResult =
   | { ok: true; op: "gcp-subnet-delete"; subnetName: string; status: GcpDeleteStatus }
-  | { ok: false; op: "gcp-subnet-delete"; subnetName: string; detail: string; inUse: boolean };
+  | { ok: false; op: "gcp-subnet-delete"; subnetName: string; detail: string; inUse: boolean; foreign?: true };
+
+/** One per-site subnet as gcp-subnets-list reports it. */
+export interface GcpSiteSubnetListEntry {
+  name: string;
+  /** The slot the name encodes, or null when the suffix is not a canonical 000-127. */
+  slot: number | null;
+  ipCidrRange: string | null;
+  description: string | null;
+  /** The site the description binds the subnet to, or null when it is not a doubleyoup site description. */
+  siteSlug: string | null;
+  /** The SHORT name of the subnet's network, e.g. "dy-cell-australia-southeast2", or null. */
+  network: string | null;
+}
+
+// hub#93 — READ-ONLY. Every subnet in the region whose name starts with `dy-cell-<region>-run-s`, from
+// EVERY page. ok:false on any read failure or an incomplete paged read: a teardown relying on a partial
+// list would leave a subnet behind, so it must fail closed, never read as "no subnets".
+export type GcpSubnetsListResult =
+  | { ok: true; op: "gcp-subnets-list"; subnets: GcpSiteSubnetListEntry[] }
+  | { ok: false; op: "gcp-subnets-list"; detail: string };
+
+// planning/49 §8 + hub#93 — ONE exact-host Workers route to the edge gate. "unchanged" means a route
+// with this exact pattern already points at the gate. `foreign` (ok:false) means a route with this
+// exact pattern points at ANOTHER script: it is left alone, never taken over or removed.
+export type WorkersRouteUpsertResult =
+  | { ok: true; op: "workers-route-upsert"; pattern: string; routeId: string; status: "created" | "unchanged" }
+  | { ok: false; op: "workers-route-upsert"; pattern: string; detail: string; foreign?: true };
+
+export type WorkersRouteDeleteResult =
+  | { ok: true; op: "workers-route-delete"; pattern: string; status: GcpDeleteStatus }
+  | { ok: false; op: "workers-route-delete"; pattern: string; detail: string; foreign?: true };
 
 // planning/49 §4.3 — "created" / "updated" says which half of create-else-patch ran. The Worker WAITS
 // for the operation and re-reads the service, so `uri` and `urls` are the service's real URLs (the
@@ -579,7 +655,10 @@ export type ActuateResult =
   | CloudRunServiceUpsertResult
   | CloudRunServiceGetResult
   | CloudRunServiceDeleteResult
-  | CloudRunProbeInvokeResult;
+  | CloudRunProbeInvokeResult
+  | GcpSubnetsListResult
+  | WorkersRouteUpsertResult
+  | WorkersRouteDeleteResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -3162,10 +3241,13 @@ export async function actuateGcpInstanceCreate(
 // a VM is stateful compute, a network/rule/address is declarative configuration.
 
 /** How a Compute Engine insert of an idempotent resource ended. */
+// `definite` (failed only, hub#93 M5) says whether Google DEFINITELY did not create the resource: true
+// for a 4xx answer or an operation that already carries errors, false when the create may still land
+// (Google unreachable, a 5xx, a 2xx without an operation). Callers that do not need it ignore it.
 type ComputeInsertOutcome =
   | { kind: "created"; operationName: string }
   | { kind: "already-existed" }
-  | { kind: "failed"; detail: string };
+  | { kind: "failed"; detail: string; definite: boolean };
 
 /** The `message`s of an Operation's error entries, joined for a detail string. */
 function operationErrorMessages(entries: Array<{ code?: string; message?: string }>): string {
@@ -3213,7 +3295,12 @@ async function insertComputeResource(input: {
       body: JSON.stringify(input.body),
     });
   } catch (err) {
-    return { kind: "failed", detail: `could not reach Google Compute Engine to create ${what}: ${errorMessage(err)}` };
+    // The request may have reached Google before the connection failed, so this is NOT definite.
+    return {
+      kind: "failed",
+      detail: `could not reach Google Compute Engine to create ${what}: ${errorMessage(err)}`,
+      definite: false,
+    };
   }
 
   const body = (await response.json().catch(() => null)) as ComputeInsertResponse | null;
@@ -3225,6 +3312,7 @@ async function insertComputeResource(input: {
       return {
         kind: "failed",
         detail: `Compute Engine returned HTTP ${response.status} but no operation — cannot confirm the ${what} create was accepted.`,
+        definite: false,
       };
     }
     const operationErrors = body?.error?.errors ?? [];
@@ -3232,6 +3320,7 @@ async function insertComputeResource(input: {
       return {
         kind: "failed",
         detail: `${what} create operation ${operationName} failed: ${operationErrorMessages(operationErrors)}.`,
+        definite: true,
       };
     }
     return { kind: "created", operationName };
@@ -3246,9 +3335,13 @@ async function insertComputeResource(input: {
       detail:
         `Google Cloud denied the ${what} create (HTTP ${response.status})${googleErrorMessage(body)} — the service account ` +
         `needs ${permissionHint} on project "${project}".`,
+      definite: true,
     };
   }
-  return { kind: "failed", detail: `${what} create failed with HTTP ${response.status}${googleErrorMessage(body)}.` };
+  // A 4xx names the request as the fault (bad input, quota exceeded): nothing was created. A 5xx is a
+  // fault on Google's side, after which the create may or may not have happened.
+  const definite = response.status >= 400 && response.status < 500;
+  return { kind: "failed", detail: `${what} create failed with HTTP ${response.status}${googleErrorMessage(body)}.`, definite };
 }
 
 // globalOperations.wait / regionOperations.wait / zoneOperations.wait hold the request until the
@@ -5255,12 +5348,118 @@ export async function readComputeInstanceAddress(params: GcpInstanceGetParams, e
   };
 }
 
-// ── planning/49 Phase 2: gcp-subnet-create / -get / -delete (the Cloud Run range) ─────────────
-// A SECOND subnet on a cell's EXISTING VPC: the range the Cloud Run services take their
-// Direct-VPC-egress addresses from (planning/49 §4.1). gcp-network-create stays the "build the VPC" op.
-// The names this touches are PINNED upstream (validateGcpSubnetCreateParams / -DeleteParams).
+// ── planning/49 Phase 2 + hub#93: gcp-subnet-create / -get / -delete / gcp-subnets-list ─────────
+// A SECOND subnet (or, per site, a THIRD and more) on a cell's EXISTING VPC: the ranges the Cloud Run
+// services take their Direct-VPC-egress addresses from (planning/49 §4.1). gcp-network-create stays the
+// "build the VPC" op. The names this touches are PINNED upstream (dispatch-params.ts): the probe form
+// names exactly `dy-cell-<region>-run`; the SITE form (hub#93) names nothing — the name, the range and
+// the description are derived here from the validated slot and slug, by the twin's own helpers.
+
+/** What subnetworks.get / .list answer with (the fields these ops read). */
+interface ComputeSubnetworkResponse {
+  name?: string;
+  ipCidrRange?: string;
+  description?: string;
+  /** The network's URL, e.g. ".../global/networks/dy-cell-australia-southeast2". */
+  network?: string;
+  error?: ComputeInsertResponse["error"];
+}
+
+/** The outcome of reading one subnet: present, absent (404), or a read failure. */
+type ComputeSubnetReadOutcome =
+  | { kind: "found"; subnet: ComputeSubnetworkResponse }
+  | { kind: "absent" }
+  | { kind: "failed"; detail: string };
+
+/** The `projects/<p>/regions/<r>` URL prefix for a validated project + region. */
+function computeRegionPath(project: string, region: string): string {
+  return `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}/regions/${encodeURIComponent(region)}`;
+}
+
+/**
+ * GET one subnet. A 404 is "absent". Any other non-2xx (and an unreachable API) is a failure with
+ * Google's own message. Shared by gcp-subnet-get, the site-form create and delete, and the session
+ * upsert's subnet bind.
+ */
+async function readComputeSubnetRaw(input: {
+  project: string;
+  region: string;
+  subnetName: string;
+  accessToken: string;
+}): Promise<ComputeSubnetReadOutcome> {
+  const { project, region, subnetName, accessToken } = input;
+  const url = `${computeRegionPath(project, region)}/subnetworks/${encodeURIComponent(subnetName)}`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: gcpHeaders(accessToken) });
+  } catch (err) {
+    return { kind: "failed", detail: `could not reach Google Compute Engine to read subnetwork "${subnetName}": ${errorMessage(err)}` };
+  }
+  const body = (await response.json().catch(() => null)) as ComputeSubnetworkResponse | null;
+
+  if (response.status === 404) {
+    return { kind: "absent" };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return {
+      kind: "failed",
+      detail:
+        `Google Cloud denied reading subnetwork "${subnetName}" (HTTP ${response.status})${googleErrorMessage(body)} — the ` +
+        `service account needs compute.subnetworks.get (e.g. roles/compute.viewer) on project "${project}".`,
+    };
+  }
+  if (!response.ok || body === null) {
+    return { kind: "failed", detail: `reading subnetwork "${subnetName}" failed with HTTP ${response.status}${googleErrorMessage(body)}.` };
+  }
+  return { kind: "found", subnet: body };
+}
+
+/** A non-empty string field of a Google body, or null. */
+function nonEmptyStringOrNull(value: unknown): string | null {
+  if (typeof value === "string" && value.length > 0) {
+    return value;
+  }
+  return null;
+}
+
+/** The short last segment of a Compute resource URL (".../networks/dy-cell-x" -> "dy-cell-x"), or null. */
+function lastUrlSegment(url: unknown): string | null {
+  if (typeof url !== "string" || url.length === 0) {
+    return null;
+  }
+  const last = url.slice(url.lastIndexOf("/") + 1);
+  if (last.length === 0) {
+    return null;
+  }
+  return last;
+}
+
+/** What a site subnet must look like on read-back: the derived name, range and description. */
+interface ExpectedSiteSubnet {
+  subnetName: string;
+  ipCidrRange: string;
+  description: string;
+}
+
+/** The derived name, range and description of a validated site-form ref (hub#93 §1). */
+function expectedSiteSubnet(params: GcpSiteSubnetRef): ExpectedSiteSubnet {
+  return {
+    subnetName: cellSiteRunSubnetNameFor(params.region, params.slot),
+    ipCidrRange: siteRunSubnetCidrForSlot(params.slot),
+    description: siteSubnetDescriptionFor(params.siteSlug),
+  };
+}
+
+/** True when a read-back subnet carries EXACTLY the expected range and description. */
+function siteSubnetMatches(subnet: ComputeSubnetworkResponse, expected: ExpectedSiteSubnet): boolean {
+  return subnet.ipCidrRange === expected.ipCidrRange && subnet.description === expected.description;
+}
 
 export async function actuateGcpSubnetCreate(params: GcpSubnetCreateParams, env: Env): Promise<GcpSubnetCreateResult> {
+  if (isGcpSiteSubnetRef(params)) {
+    return actuateGcpSiteSubnetCreate(params, env);
+  }
   const { project, region, subnetName } = params;
   const failure = (detail: string): GcpSubnetCreateResult => ({ ok: false, op: "gcp-subnet-create", subnetName, detail });
 
@@ -5270,7 +5469,7 @@ export async function actuateGcpSubnetCreate(params: GcpSubnetCreateParams, env:
   }
   const accessToken = token.accessToken;
   // Path segments are grammar-checked upstream AND URL-encoded here.
-  const regionPath = `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}/regions/${encodeURIComponent(region)}`;
+  const regionPath = computeRegionPath(project, region);
 
   const outcome = await insertComputeResource({
     url: `${regionPath}/subnetworks`,
@@ -5303,14 +5502,99 @@ export async function actuateGcpSubnetCreate(params: GcpSubnetCreateParams, env:
   return { ok: true, op: "gcp-subnet-create", subnetName, status: outcome.kind };
 }
 
-/** What subnetworks.get answers with (the fields this op reads). */
-interface ComputeSubnetworkResponse {
-  name?: string;
-  ipCidrRange?: string;
-  error?: ComputeInsertResponse["error"];
+/**
+ * The SITE form of gcp-subnet-create (hub#93 §2). Creates `dy-cell-<region>-run-s<NNN>` on the cell's
+ * own VPC with the range derived from the slot and the description `doubleyoup site subnet: <slug>` —
+ * the only moment the description can be set (Google refuses to patch it later, hub#93 G4). A 409 is
+ * success ONLY after a read-back finds the derived range AND this site's description; anything else is
+ * a conflict and the subnet is left exactly as it is. Every failure says whether it is DEFINITE, so the
+ * platform releases a slot only when no subnet can have been made (M5).
+ */
+async function actuateGcpSiteSubnetCreate(params: GcpSiteSubnetRef, env: Env): Promise<GcpSubnetCreateResult> {
+  const { project, region } = params;
+  const expected = expectedSiteSubnet(params);
+  const subnetName = expected.subnetName;
+  const what = `subnetwork "${subnetName}"`;
+  const failure = (detail: string, outcome: GcpSiteSubnetCreateOutcome): GcpSubnetCreateResult => ({
+    ok: false,
+    op: "gcp-subnet-create",
+    subnetName,
+    detail,
+    outcome,
+  });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    // Nothing was sent to Google, so no subnet can have been made.
+    return failure(token.detail, "refused");
+  }
+  const accessToken = token.accessToken;
+  const regionPath = computeRegionPath(project, region);
+
+  const inserted = await insertComputeResource({
+    url: `${regionPath}/subnetworks`,
+    accessToken,
+    // Project-relative references and DERIVED values only. Never a caller-supplied name or range.
+    body: {
+      name: subnetName,
+      network: `global/networks/${cellNetworkNameFor(region)}`,
+      ipCidrRange: expected.ipCidrRange,
+      region: `regions/${region}`,
+      description: expected.description,
+    },
+    what,
+    project,
+    permissionHint: "compute.subnetworks.create (e.g. roles/compute.networkAdmin)",
+  });
+  if (inserted.kind === "failed") {
+    if (inserted.definite) {
+      return failure(inserted.detail, "refused");
+    }
+    return failure(`${inserted.detail} The subnet may still be created: read it back before releasing its slot.`, "unknown");
+  }
+
+  if (inserted.kind === "created") {
+    const waited = await waitForComputeOperation({
+      waitUrl: `${regionPath}/operations/${encodeURIComponent(inserted.operationName)}/wait`,
+      accessToken,
+      what,
+    });
+    if (waited.ok) {
+      return { ok: true, op: "gcp-subnet-create", subnetName, status: "created" };
+    }
+    // completed:true = the operation FINISHED with errors: an observed failure, no subnet.
+    // completed:false = the outcome could not be observed: the subnet may still appear.
+    if (waited.completed) {
+      return failure(waited.detail, "refused");
+    }
+    return failure(`${waited.detail} The subnet may still be created: read it back before releasing its slot.`, "unknown");
+  }
+
+  // 409: a subnet of this name exists. Adopt it ONLY if it is exactly this site's subnet.
+  const existing = await readComputeSubnetRaw({ project, region, subnetName, accessToken });
+  if (existing.kind === "failed") {
+    return failure(`${what} already exists, but reading it back failed: ${existing.detail}`, "unknown");
+  }
+  if (existing.kind === "absent") {
+    // Gone between the 409 and the read (another delete raced this create). Nothing is ours to report.
+    return failure(`${what} was reported as existing but is not present on read-back — re-run to resume.`, "unknown");
+  }
+  if (!siteSubnetMatches(existing.subnet, expected)) {
+    const foundRange = nonEmptyStringOrNull(existing.subnet.ipCidrRange) ?? "(none)";
+    const foundDescription = nonEmptyStringOrNull(existing.subnet.description) ?? "(none)";
+    return failure(
+      `${what} already exists with range ${foundRange} and description "${foundDescription}", not ` +
+        `${expected.ipCidrRange} and "${expected.description}". It is not this site's subnet and was left unchanged.`,
+      "conflict",
+    );
+  }
+  return { ok: true, op: "gcp-subnet-create", subnetName, status: "already-existed" };
 }
 
 export async function readComputeSubnet(params: GcpSubnetGetParams, env: Env): Promise<GcpSubnetGetResult> {
+  if (isGcpSiteSubnetRef(params)) {
+    return readComputeSiteSubnet(params, env);
+  }
   const { project, region, subnetName } = params;
   const failure = (detail: string): GcpSubnetGetResult => ({ ok: false, op: "gcp-subnet-get", subnetName, detail });
 
@@ -5318,46 +5602,103 @@ export async function readComputeSubnet(params: GcpSubnetGetParams, env: Env): P
   if (!token.ok) {
     return failure(token.detail);
   }
-  const url =
-    `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}` +
-    `/regions/${encodeURIComponent(region)}/subnetworks/${encodeURIComponent(subnetName)}`;
-
-  let response: Response;
-  try {
-    response = await fetch(url, { headers: gcpHeaders(token.accessToken) });
-  } catch (err) {
-    return failure(`could not reach Google Compute Engine to read subnetwork "${subnetName}": ${errorMessage(err)}`);
+  const read = await readComputeSubnetRaw({ project, region, subnetName, accessToken: token.accessToken });
+  if (read.kind === "failed") {
+    return failure(read.detail);
   }
-  const body = (await response.json().catch(() => null)) as ComputeSubnetworkResponse | null;
-
-  if (response.status === 404) {
+  if (read.kind === "absent") {
     return { ok: true, op: "gcp-subnet-get", subnetName, found: false, ipCidrRange: null };
   }
-  if (response.status === 401 || response.status === 403) {
-    return failure(
-      `Google Cloud denied reading subnetwork "${subnetName}" (HTTP ${response.status})${googleErrorMessage(body)} — the ` +
-        `service account needs compute.subnetworks.get (e.g. roles/compute.viewer) on project "${project}".`,
-    );
-  }
-  if (!response.ok) {
-    return failure(`reading subnetwork "${subnetName}" failed with HTTP ${response.status}${googleErrorMessage(body)}.`);
-  }
+  return { ok: true, op: "gcp-subnet-get", subnetName, found: true, ipCidrRange: nonEmptyStringOrNull(read.subnet.ipCidrRange) };
+}
 
-  let range: string | null = null;
-  if (typeof body?.ipCidrRange === "string" && body.ipCidrRange.length > 0) {
-    range = body.ipCidrRange;
+/**
+ * The SITE form of gcp-subnet-get (hub#93): read the DERIVED subnet and say whether it is exactly this
+ * site's — the derived range AND the site's own description. The platform's slot reconcile keys on
+ * `matchesSite` after an unknown create outcome (M5): found and matching -> confirmed; not found ->
+ * the slot may be released.
+ */
+async function readComputeSiteSubnet(params: GcpSiteSubnetRef, env: Env): Promise<GcpSubnetGetResult> {
+  const { project, region } = params;
+  const expected = expectedSiteSubnet(params);
+  const subnetName = expected.subnetName;
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return { ok: false, op: "gcp-subnet-get", subnetName, detail: token.detail };
   }
-  return { ok: true, op: "gcp-subnet-get", subnetName, found: true, ipCidrRange: range };
+  const read = await readComputeSubnetRaw({ project, region, subnetName, accessToken: token.accessToken });
+  if (read.kind === "failed") {
+    return { ok: false, op: "gcp-subnet-get", subnetName, detail: read.detail };
+  }
+  if (read.kind === "absent") {
+    return {
+      ok: true,
+      op: "gcp-subnet-get",
+      subnetName,
+      found: false,
+      ipCidrRange: null,
+      description: null,
+      slot: params.slot,
+      siteSlug: params.siteSlug,
+      matchesSite: false,
+    };
+  }
+  return {
+    ok: true,
+    op: "gcp-subnet-get",
+    subnetName,
+    found: true,
+    ipCidrRange: nonEmptyStringOrNull(read.subnet.ipCidrRange),
+    description: nonEmptyStringOrNull(read.subnet.description),
+    slot: params.slot,
+    siteSlug: params.siteSlug,
+    matchesSite: siteSubnetMatches(read.subnet, expected),
+  };
 }
 
 export async function actuateGcpSubnetDelete(params: GcpSubnetDeleteParams, env: Env): Promise<GcpSubnetDeleteResult> {
-  const { project, region, subnetName } = params;
+  let subnetName: string;
+  let expectedDescription: string | null = null;
+  if (isGcpSiteSubnetRef(params)) {
+    const expected = expectedSiteSubnet(params);
+    subnetName = expected.subnetName;
+    expectedDescription = expected.description;
+  } else {
+    subnetName = params.subnetName;
+  }
+  const { project, region } = params;
 
   const token = await mintPinnedGcpAccessToken(env, project);
   if (!token.ok) {
     return { ok: false, op: "gcp-subnet-delete", subnetName, detail: token.detail, inUse: false };
   }
-  const regionPath = `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}/regions/${encodeURIComponent(region)}`;
+  const regionPath = computeRegionPath(project, region);
+
+  // SITE form: read first, and delete ONLY a subnet whose description names THIS site exactly (hub#93
+  // §2). A subnet of the derived name that some other process made, or another site's, is left alone.
+  if (expectedDescription !== null) {
+    const existing = await readComputeSubnetRaw({ project, region, subnetName, accessToken: token.accessToken });
+    if (existing.kind === "failed") {
+      return { ok: false, op: "gcp-subnet-delete", subnetName, detail: existing.detail, inUse: false };
+    }
+    if (existing.kind === "absent") {
+      return { ok: true, op: "gcp-subnet-delete", subnetName, status: "already-absent" };
+    }
+    if (existing.subnet.description !== expectedDescription) {
+      const foundDescription = nonEmptyStringOrNull(existing.subnet.description) ?? "(none)";
+      return {
+        ok: false,
+        op: "gcp-subnet-delete",
+        subnetName,
+        detail:
+          `subnetwork "${subnetName}" has the description "${foundDescription}", not "${expectedDescription}", so it is ` +
+          "not this site's subnet. It was left in place.",
+        inUse: false,
+        foreign: true,
+      };
+    }
+  }
 
   // The shared delete: a 404 is SUCCESS ("already-absent"), and the delete is WAITED to DONE, so the
   // network delete that runs next can assume this subnet is really gone.
@@ -5380,6 +5721,93 @@ export async function actuateGcpSubnetDelete(params: GcpSubnetDeleteParams, env:
     return { ok: false, op: "gcp-subnet-delete", subnetName, detail, inUse };
   }
   return { ok: true, op: "gcp-subnet-delete", subnetName, status: outcome.kind };
+}
+
+// ── hub#93: gcp-subnets-list ─────────────────────────────────────────────────────────────────
+// READ-ONLY: every subnet in the cell's region whose name starts with `dy-cell-<region>-run-s` (the
+// per-site Run subnets, orphans included), so the cell teardown can delete each one BEFORE any VM
+// without 128 reads. Every page is read; an incomplete read is ok:false, never a short list.
+
+/** Google's max page size for subnetworks.list, and a page bound (128 slots fit in one page). */
+const GCP_SUBNETWORKS_LIST_PAGE_SIZE = 500;
+const GCP_SUBNETWORKS_LIST_MAX_PAGES = 10;
+
+/** What subnetworks.list answers with (the fields this op reads). */
+interface ComputeSubnetworkListResponse {
+  items?: ComputeSubnetworkResponse[];
+  nextPageToken?: string;
+  error?: ComputeInsertResponse["error"];
+}
+
+export async function readComputeSubnetsList(params: GcpSubnetsListParams, env: Env): Promise<GcpSubnetsListResult> {
+  const { project, region } = params;
+  const failure = (detail: string): GcpSubnetsListResult => ({ ok: false, op: "gcp-subnets-list", detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const namePrefix = cellSiteRunSubnetNamePrefixFor(region);
+
+  const subnets: GcpSiteSubnetListEntry[] = [];
+  let pageToken: string | undefined;
+  for (let page = 1; page <= GCP_SUBNETWORKS_LIST_MAX_PAGES; page += 1) {
+    // Server-side name filter in Compute Engine's regex form, `name eq <RE2>` matching the WHOLE name.
+    // The prefix is derived from a grammar-checked region ([a-z0-9-] only), so it carries no regex
+    // metacharacter, and it goes through URLSearchParams. The prefix is re-checked on every entry below.
+    const query = new URLSearchParams();
+    query.set("filter", `name eq "${namePrefix}.*"`);
+    query.set("maxResults", String(GCP_SUBNETWORKS_LIST_PAGE_SIZE));
+    if (pageToken !== undefined) {
+      query.set("pageToken", pageToken);
+    }
+    const url = `${computeRegionPath(project, region)}/subnetworks?${query.toString()}`;
+
+    let response: Response;
+    try {
+      response = await fetch(url, { headers: gcpHeaders(token.accessToken) });
+    } catch (err) {
+      return failure(`could not reach Google Compute Engine to list subnetworks in "${region}": ${errorMessage(err)}`);
+    }
+    const body = (await response.json().catch(() => null)) as ComputeSubnetworkListResponse | null;
+
+    if (response.status === 401 || response.status === 403) {
+      return failure(
+        `Google Cloud denied listing subnetworks (HTTP ${response.status})${googleErrorMessage(body)} — the service account ` +
+          `needs compute.subnetworks.list (e.g. roles/compute.viewer) on project "${project}".`,
+      );
+    }
+    if (!response.ok || body === null) {
+      return failure(`listing subnetworks failed with HTTP ${response.status}${googleErrorMessage(body)}.`);
+    }
+    if (body.error) {
+      return failure(`listing subnetworks returned a body-level error${googleErrorMessage(body)} — incomplete; re-run to resume`);
+    }
+
+    for (const subnet of body.items ?? []) {
+      const name = subnet?.name;
+      if (typeof name !== "string" || !name.startsWith(namePrefix)) {
+        continue;
+      }
+      subnets.push({
+        name,
+        slot: siteRunSlotFromSubnetName(region, name),
+        ipCidrRange: nonEmptyStringOrNull(subnet.ipCidrRange),
+        description: nonEmptyStringOrNull(subnet.description),
+        siteSlug: siteSlugFromSubnetDescription(subnet.description),
+        network: lastUrlSegment(subnet.network),
+      });
+    }
+
+    if (!body.nextPageToken) {
+      return { ok: true, op: "gcp-subnets-list", subnets };
+    }
+    pageToken = body.nextPageToken;
+  }
+
+  return failure(
+    `listing subnetworks did not finish within ${GCP_SUBNETWORKS_LIST_MAX_PAGES} pages — the list is incomplete; re-run to resume`,
+  );
 }
 
 // ── planning/49 Phase 2: the Cloud Run ops ────────────────────────────────────────────────────
@@ -5828,6 +6256,53 @@ async function existingServicePatchRefusal(input: {
   return null;
 }
 
+/**
+ * The reason a SESSION upsert must not run, or null when its subnet is this site's (hub#93 §2, D7).
+ * The subnet must exist, its range must be the one derived from the slot, and its description must
+ * bind it to the slug the service name carries. A failed read refuses too: an unconfirmed binding is
+ * never treated as a good one.
+ */
+async function sessionSubnetBindRefusal(input: {
+  params: CloudRunServiceUpsertParams;
+  accessToken: string;
+}): Promise<string | null> {
+  const { params, accessToken } = input;
+  if (params.slot === undefined) {
+    return "a session service must carry its site's Run slot";
+  }
+  const sessionName = splitCloudRunSessionServiceName(params.serviceName);
+  if (sessionName === null) {
+    return `"${params.serviceName}" is not a session service name`;
+  }
+  const expectedRange = siteRunSubnetCidrForSlot(params.slot);
+
+  const read = await readComputeSubnetRaw({
+    project: params.project,
+    region: params.region,
+    subnetName: params.subnet,
+    accessToken,
+  });
+  if (read.kind === "failed") {
+    return `could not confirm that subnetwork "${params.subnet}" belongs to "${sessionName.slug}": ${read.detail}`;
+  }
+  if (read.kind === "absent") {
+    return `subnetwork "${params.subnet}" does not exist — create the site's subnet before its session service`;
+  }
+  if (read.subnet.ipCidrRange !== expectedRange) {
+    const foundRange = nonEmptyStringOrNull(read.subnet.ipCidrRange) ?? "(none)";
+    return `subnetwork "${params.subnet}" has the range ${foundRange}, not ${expectedRange} for slot ${params.slot} — refusing to deploy onto it`;
+  }
+  const boundSlug = siteSlugFromSubnetDescription(read.subnet.description);
+  if (boundSlug !== sessionName.slug) {
+    const foundDescription = nonEmptyStringOrNull(read.subnet.description) ?? "(none)";
+    return (
+      `subnetwork "${params.subnet}" is described "${foundDescription}", which does not bind it to "${sessionName.slug}" — ` +
+      "refusing to deploy one site's session onto another site's subnet"
+    );
+  }
+  return null;
+}
+
 export async function actuateCloudRunServiceUpsert(params: CloudRunServiceUpsertParams, env: Env): Promise<CloudRunServiceUpsertResult> {
   const { project, region, serviceName } = params;
   const failure = (detail: string): CloudRunServiceUpsertResult => ({ ok: false, op: "cloudrun-service-upsert", serviceName, detail });
@@ -5840,6 +6315,17 @@ export async function actuateCloudRunServiceUpsert(params: CloudRunServiceUpsert
   const collectionUrl = cloudRunServicesUrl(project, region);
   const serviceUrl = `${collectionUrl}/${encodeURIComponent(serviceName)}`;
   const what = `Cloud Run service "${serviceName}"`;
+
+  // hub#93 D7: a SESSION service is bound to its site's subnet on THIS side too, because the Worker
+  // cannot see the platform's database. Read the subnet and refuse, before any Cloud Run call, unless
+  // it exists with the range derived from the job's slot AND a description naming the SAME slug as the
+  // service. One extra read per upsert.
+  if (params.slot !== undefined) {
+    const bindRefusal = await sessionSubnetBindRefusal({ params, accessToken });
+    if (bindRefusal !== null) {
+      return failure(bindRefusal);
+    }
+  }
 
   // CREATE or PATCH is decided by a read, not by trying one and reading the error.
   const existing = await readCloudRunServiceRaw({ url: serviceUrl, accessToken, serviceName, project });
@@ -6253,4 +6739,167 @@ export async function actuateCloudRunProbeInvoke(params: CloudRunProbeInvokePara
     return failure("the probe answered HTTP 200, but the body is not the probe's results for exactly the targets it was deployed with");
   }
   return { ok: true, op: "cloudrun-probe-invoke", serviceName, uri, unauthenticatedStatus, authenticatedStatus, results };
+}
+
+// ── planning/49 §8 + hub#93: workers-route-upsert / workers-route-delete ─────────────────────────
+// The edge gate's Workers route for ONE exact session host in the agency's OWN zone, with the agency's
+// own CF_DNS_API_TOKEN (which gains Zone → Workers Routes: Edit — a scope add, not a new secret). The
+// pattern is DERIVED from the validated host (`<host>/*`) and the script is ALWAYS the edge gate
+// (EDGE_GATE_SCRIPT_NAME), so a signed job can neither widen a route nor point one at another script.
+// A route with the same pattern that points ELSEWHERE is not ours: the upsert never repoints it and
+// the delete never removes it (the same "never take over" rule as the Cloud Run managed-by label).
+//   1. GET  /zones?name=<zone>                    -> exactly one zone id (resolveZoneId)
+//   2. GET  /zones/:zid/workers/routes            -> the routes with this EXACT pattern
+//   3. upsert: none -> POST {pattern, script}; one on the gate -> unchanged; one elsewhere -> refused
+//      delete: none -> already-absent; one on the gate -> DELETE; one elsewhere -> refused
+// Two or more routes with one pattern is ambiguous and refused (Cloudflare should not allow it).
+
+/** A Workers route row (only the fields these ops read). */
+interface CloudflareWorkerRoute {
+  id?: string;
+  pattern?: string;
+  script?: string;
+}
+
+const WORKERS_ROUTE_UNAUTHORIZED_HINT =
+  "Cloudflare denied the Workers route call — CF_DNS_API_TOKEN needs Zone → Workers Routes: Edit on this zone.";
+
+/** The routes in a zone whose pattern is EXACTLY `pattern`, or the reason the list failed. */
+async function findWorkerRoutesByPattern(
+  token: string,
+  zoneId: string,
+  pattern: string,
+): Promise<{ routes: CloudflareWorkerRoute[] } | { error: string }> {
+  let response: Response;
+  try {
+    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zoneId)}/workers/routes`, {
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+    });
+  } catch (err) {
+    return { error: `could not reach Cloudflare to list Workers routes: ${errorMessage(err)}` };
+  }
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  if (response.status === 401 || response.status === 403) {
+    return { error: WORKERS_ROUTE_UNAUTHORIZED_HINT };
+  }
+  if (!body?.success || !Array.isArray(body.result)) {
+    return { error: `Workers route lookup failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
+  }
+  // Exact pattern only: a route like `*.<zone>/*` or `<host>/admin*` is a DIFFERENT route.
+  const routes = (body.result as CloudflareWorkerRoute[]).filter((route) => route.id && route.pattern === pattern);
+  return { routes };
+}
+
+export async function actuateWorkersRouteUpsert(params: WorkersRouteUpsertParams, env: Env): Promise<WorkersRouteUpsertResult> {
+  const pattern = workersRoutePatternFor(params.host);
+  const failure = (detail: string): WorkersRouteUpsertResult => ({ ok: false, op: "workers-route-upsert", pattern, detail });
+
+  const token = env.CF_DNS_API_TOKEN;
+  if (!token) {
+    return failure("CF_DNS_API_TOKEN is not configured on this Worker.");
+  }
+  const zone = await resolveZoneId(token, params.zone);
+  if ("error" in zone) {
+    return failure(zone.error);
+  }
+  const existing = await findWorkerRoutesByPattern(token, zone.id, pattern);
+  if ("error" in existing) {
+    return failure(existing.error);
+  }
+  if (existing.routes.length > 1) {
+    return failure(`${existing.routes.length} Workers routes already match "${pattern}" — ambiguous, refusing to change any of them.`);
+  }
+
+  const existingRoute = existing.routes[0];
+  if (existingRoute) {
+    if (existingRoute.script === EDGE_GATE_SCRIPT_NAME) {
+      return { ok: true, op: "workers-route-upsert", pattern, routeId: existingRoute.id as string, status: "unchanged" };
+    }
+    const otherScript = existingRoute.script ?? "(no script)";
+    return {
+      ok: false,
+      op: "workers-route-upsert",
+      pattern,
+      detail: `a Workers route for "${pattern}" already points at "${otherScript}", not "${EDGE_GATE_SCRIPT_NAME}". It was left unchanged.`,
+      foreign: true,
+    };
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zone.id)}/workers/routes`, {
+      method: "POST",
+      headers: cloudflareHeaders(token),
+      body: JSON.stringify({ pattern, script: EDGE_GATE_SCRIPT_NAME }),
+    });
+  } catch (err) {
+    return failure(`could not reach Cloudflare to create the Workers route: ${errorMessage(err)}`);
+  }
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  if (response.status === 401 || response.status === 403) {
+    return failure(WORKERS_ROUTE_UNAUTHORIZED_HINT);
+  }
+  const created = body?.success ? (body.result as CloudflareWorkerRoute | undefined) : undefined;
+  if (!created?.id) {
+    return failure(`Workers route create failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.`);
+  }
+  return { ok: true, op: "workers-route-upsert", pattern, routeId: created.id, status: "created" };
+}
+
+export async function actuateWorkersRouteDelete(params: WorkersRouteDeleteParams, env: Env): Promise<WorkersRouteDeleteResult> {
+  const pattern = workersRoutePatternFor(params.host);
+  const failure = (detail: string): WorkersRouteDeleteResult => ({ ok: false, op: "workers-route-delete", pattern, detail });
+
+  const token = env.CF_DNS_API_TOKEN;
+  if (!token) {
+    return failure("CF_DNS_API_TOKEN is not configured on this Worker.");
+  }
+  const zone = await resolveZoneId(token, params.zone);
+  if ("error" in zone) {
+    return failure(zone.error);
+  }
+  const existing = await findWorkerRoutesByPattern(token, zone.id, pattern);
+  if ("error" in existing) {
+    return failure(existing.error);
+  }
+  if (existing.routes.length === 0) {
+    return { ok: true, op: "workers-route-delete", pattern, status: "already-absent" };
+  }
+  if (existing.routes.length > 1) {
+    return failure(`${existing.routes.length} Workers routes match "${pattern}" — ambiguous, refusing to delete one.`);
+  }
+
+  const route = existing.routes[0];
+  if (route.script !== EDGE_GATE_SCRIPT_NAME) {
+    const otherScript = route.script ?? "(no script)";
+    return {
+      ok: false,
+      op: "workers-route-delete",
+      pattern,
+      detail: `the Workers route for "${pattern}" points at "${otherScript}", not "${EDGE_GATE_SCRIPT_NAME}", so this platform did not make it. It was left in place.`,
+      foreign: true,
+    };
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zone.id)}/workers/routes/${encodeURIComponent(route.id as string)}`, {
+      method: "DELETE",
+      headers: cloudflareHeaders(token),
+    });
+  } catch (err) {
+    return failure(`could not reach Cloudflare to delete the Workers route: ${errorMessage(err)}`);
+  }
+  // A delete CONVERGES: gone between the list and the delete is still the desired state.
+  if (response.status === 404) {
+    return { ok: true, op: "workers-route-delete", pattern, status: "already-absent" };
+  }
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  if (response.status === 401 || response.status === 403) {
+    return failure(WORKERS_ROUTE_UNAUTHORIZED_HINT);
+  }
+  if (!body?.success) {
+    return failure(`Workers route delete failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.`);
+  }
+  return { ok: true, op: "workers-route-delete", pattern, status: "deleted" };
 }
