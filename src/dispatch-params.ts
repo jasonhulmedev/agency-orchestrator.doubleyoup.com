@@ -2625,6 +2625,44 @@ export function validateGcpSubnetsListParams(raw: unknown): ParamsVerdict<GcpSub
   return { ok: true, params: { project, region } };
 }
 
+// ── gcp-project-quota-get ────────────────────────────────────────────────────────────
+// READ-ONLY (hub#93 §1 "Quota", §6): the AGENCY project's live SUBNETWORKS quota — how many subnets the
+// project holds now (`usage`) and how many it may hold (`limit`). The per-site Run slot allocator needs
+// this LIVE read just before it allocates, because the quota is per PROJECT: every cell's node subnet,
+// probe subnet and site subnets, and any subnet the agency made itself, share it. A "two per cell"
+// formula would miss the subnets the platform does not know about (hub#93 L5).
+//
+// ONE REQUIRED string, `project` (pinned to the SA key's own project by the actuator). The metric is
+// NOT a parameter: this op reads SUBNETWORKS and nothing else. The actuator reads Compute
+// `projects.get` and its `quotas[]` list (the list `gcloud compute project-info describe` prints), and
+// fails closed when the SUBNETWORKS entry is missing or repeated, or when its `usage` or `limit` is not
+// a whole number of at least 0. A failed read is never "zero subnets in use".
+//
+// IDEMPOTENT: a read has no side effect.
+
+/** The ONE Compute quota metric gcp-project-quota-get reads. */
+export const GCP_PROJECT_QUOTA_METRIC = "SUBNETWORKS";
+
+export interface GcpProjectQuotaGetParams {
+  /** The agency's GCP project id whose SUBNETWORKS quota is read. */
+  project: string;
+}
+
+export function validateGcpProjectQuotaGetParams(raw: unknown): ParamsVerdict<GcpProjectQuotaGetParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+
+  // A FRESH object of only the known key — never the caller's object. Any other key (a `metric`, for
+  // one) is dropped, not honoured: the metric is fixed.
+  return { ok: true, params: { project } };
+}
+
 // ── Cloud Run: service names, the premise probe, and the shared grammars ─────────────
 // ONE Cloud Run (v2) service in the AGENCY's own project and region, on the cell's own VPC
 // (planning/49 §4.3). The upsert carries what the three on-cell `provision-*.sh` recipes set today,

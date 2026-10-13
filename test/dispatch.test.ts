@@ -65,6 +65,8 @@ import {
   CLOUD_RUN_PROBE_IMAGE,
   CLOUD_RUN_PROBE_SERVICE_NAME,
   validateGcpSubnetsListParams,
+  validateGcpProjectQuotaGetParams,
+  GCP_PROJECT_QUOTA_METRIC,
   validateWorkersRouteUpsertParams,
   validateWorkersRouteDeleteParams,
   isSiteRunSlot,
@@ -524,7 +526,7 @@ const CLOUD_RUN_PROBE_REF_PARAMS = { project: "dy-agency-proof", region: "austra
 // this marker up to, not including, the next section rule after it). Changing the block means changing
 // BOTH twins and BOTH pins in one go.
 const TWIN_BLOCK_START_MARKER = "// ── planning/49: the agency-side ephemeral-compute ops";
-const TWIN_BLOCK_SHA256 = "32af709283e582162477ac47a3fff34953af7f6c61838fb1a4af207eaceeb9d6";
+const TWIN_BLOCK_SHA256 = "47a01de5723413a41f971849af79af208fff9b2d8ce5ebd9ca78bb9a52eedcb1";
 
 function planning49Job(op: DispatchJob["op"], params: unknown, nonce: string): DispatchJob {
   return sampleJob({ op, params: JSON.stringify(params), nonce });
@@ -1126,6 +1128,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-instances-list",
       "gcp-network-create",
       "gcp-network-delete",
+      "gcp-project-quota-get",
       "gcp-router-delete",
       "gcp-router-get",
       "gcp-router-nat-create",
@@ -3324,6 +3327,15 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(validateGcpSubnetsListParams({ ...params, namePrefix: "dy-" })).toEqual({ ok: true, params });
     expectRefused(validateGcpSubnetsListParams({ ...params, region: "australia-southeast2-a" }), /^region must be/);
     expectRefused(validateGcpSubnetsListParams({ ...params, project: "Bad" }), /^project must be/);
+  });
+
+  it("gcp-project-quota-get: project only; the metric is fixed, never a parameter", () => {
+    expect(GCP_PROJECT_QUOTA_METRIC).toBe("SUBNETWORKS");
+    const params = { project: "dy-agency-proof" };
+    expect(validateGcpProjectQuotaGetParams({ ...params, metric: "FIREWALLS" })).toEqual({ ok: true, params });
+    expectRefused(validateGcpProjectQuotaGetParams({ project: "Bad" }), /^project must be/);
+    expectRefused(validateGcpProjectQuotaGetParams({}), /^project must be/);
+    expectRefused(validateGcpProjectQuotaGetParams(["dy-agency-proof"]), /^params must be a JSON object/);
   });
 
   it("cloudrun-service-upsert SESSION (hub#93 M4): accepted only on the subnet derived from its slot, with ONLY the known keys", () => {
@@ -7711,6 +7723,62 @@ describe("POST /actuate route", () => {
     const denied = await actuate(planning49Job("gcp-subnets-list", { project: "dy-agency-proof", region: "australia-southeast1" }, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"));
     expect(denied.ok).toBe(false);
     expect(denied.detail).toMatch(/compute\.subnetworks\.list/);
+  });
+
+  it("gcp-project-quota-get: reads projects.get and reports the ONE SUBNETWORKS entry's usage and limit", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockGcpApiQueue([
+      {
+        body: {
+          name: "dy-agency-proof",
+          quotas: [
+            { metric: "FIREWALLS", limit: 100, usage: 9 },
+            { metric: "SUBNETWORKS", limit: 100, usage: 3 },
+            { metric: "NETWORKS", limit: 5, usage: 2 },
+          ],
+        },
+      },
+    ]);
+    const body = await actuate(planning49Job("gcp-project-quota-get", { project: "dy-agency-proof" }, "c0ffee00c0ffee00c0ffee00c0ffee00"));
+    expect(body).toEqual({ ok: true, op: "gcp-project-quota-get", project: "dy-agency-proof", metric: "SUBNETWORKS", usage: 3, limit: 100 });
+    const [read] = googleCalls(calls);
+    expect(read.method).toBe("GET");
+    expect(read.url).toBe(GCP_PROJECT_URL);
+    expect(read.auth).toMatch(/^Bearer /);
+  });
+
+  it("gcp-project-quota-get: fails CLOSED on a missing, repeated or malformed SUBNETWORKS entry, and on a denied read", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const badQuotaLists: unknown[] = [
+      undefined,
+      [],
+      [{ metric: "FIREWALLS", limit: 100, usage: 9 }],
+      [
+        { metric: "SUBNETWORKS", limit: 100, usage: 3 },
+        { metric: "SUBNETWORKS", limit: 100, usage: 4 },
+      ],
+      [{ metric: "SUBNETWORKS", limit: 100.5, usage: 3 }],
+      [{ metric: "SUBNETWORKS", limit: 100, usage: -1 }],
+      [{ metric: "SUBNETWORKS", limit: "100", usage: 3 }],
+      [{ metric: "SUBNETWORKS", limit: 100 }],
+    ];
+    let nonceIndex = 0;
+    for (const quotas of badQuotaLists) {
+      nonceIndex += 1;
+      mockGcpApiQueue([{ body: { name: "dy-agency-proof", quotas } }]);
+      // A fresh 32-hex-digit nonce per case: c2ffee01c2ffee01..., c2ffee02c2ffee02..., and so on.
+      const nonce = `c2ffee${String(nonceIndex).padStart(2, "0")}`.repeat(4);
+      const body = await actuate(planning49Job("gcp-project-quota-get", { project: "dy-agency-proof" }, nonce));
+      expect(body.ok).toBe(false);
+      expect(body.op).toBe("gcp-project-quota-get");
+      expect(String(body.detail)).toMatch(/SUBNETWORKS/);
+      vi.restoreAllMocks();
+    }
+
+    mockGcpApiQueue([denied403("compute.projects.get")]);
+    const denied = await actuate(planning49Job("gcp-project-quota-get", { project: "dy-agency-proof" }, "c0ffee01c0ffee01c0ffee01c0ffee01"));
+    expect(denied.ok).toBe(false);
+    expect(denied.detail).toMatch(/compute\.projects\.get/);
   });
 
   /** A session upsert of term-docs-892769 on its own subnet (slot 7). */

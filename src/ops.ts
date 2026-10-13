@@ -47,6 +47,7 @@
 // `cloudrun-service-delete` and `workers-route-delete` treat an absent resource as "already-absent".
 // `cloudrun-service-upsert` READS the service first and then creates or patches ONE named service, and
 // `workers-route-upsert` creates an absent route and leaves a correct one alone, so a re-run converges.
+// `gcp-project-quota-get` (hub#93) is a read of the project's SUBNETWORKS quota.
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -91,6 +92,7 @@ import {
   type GcpSubnetsListParams,
   type WorkersRouteUpsertParams,
   type WorkersRouteDeleteParams,
+  type GcpProjectQuotaGetParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
   validateCachePurgeParams,
@@ -130,6 +132,7 @@ import {
   validateGcpSubnetsListParams,
   validateWorkersRouteUpsertParams,
   validateWorkersRouteDeleteParams,
+  validateGcpProjectQuotaGetParams,
 } from "./dispatch-params.js";
 import {
   type ActuateResult,
@@ -172,6 +175,7 @@ import {
   readComputeSubnetsList,
   actuateWorkersRouteUpsert,
   actuateWorkersRouteDelete,
+  readComputeProjectSubnetQuota,
 } from "./actuate.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
@@ -354,6 +358,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "workers-route-delete": defineOp<WorkersRouteDeleteParams>({
     validateParams: validateWorkersRouteDeleteParams,
     actuate: (params, env) => actuateWorkersRouteDelete(params, env),
+  }),
+  "gcp-project-quota-get": defineOp<GcpProjectQuotaGetParams>({
+    validateParams: validateGcpProjectQuotaGetParams,
+    actuate: (params, env) => readComputeProjectSubnetQuota(params, env),
   }),
 };
 

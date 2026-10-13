@@ -86,6 +86,9 @@ export const DISPATCH_OPS = [
   // own zone. The agency site delete removes it after the session service is gone.
   "workers-route-upsert",
   "workers-route-delete",
+  // hub#93 §1 "Quota", §6 — READ the agency project's live SUBNETWORKS usage and limit, which the
+  // per-site Run slot allocator checks just before it allocates (the quota is per project).
+  "gcp-project-quota-get",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 

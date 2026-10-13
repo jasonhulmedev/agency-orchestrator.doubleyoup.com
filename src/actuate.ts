@@ -63,10 +63,12 @@ import type {
   GcpSubnetsListParams,
   WorkersRouteUpsertParams,
   WorkersRouteDeleteParams,
+  GcpProjectQuotaGetParams,
 } from "./dispatch-params.js";
 import {
   edgeCacheZoneFromHostSuffix,
   EDGE_GATE_SCRIPT_NAME,
+  GCP_PROJECT_QUOTA_METRIC,
   cellNetworkNameFor,
   cellSiteRunSubnetNameFor,
   cellSiteRunSubnetNamePrefixFor,
@@ -543,6 +545,13 @@ export type GcpSubnetsListResult =
   | { ok: true; op: "gcp-subnets-list"; subnets: GcpSiteSubnetListEntry[] }
   | { ok: false; op: "gcp-subnets-list"; detail: string };
 
+// hub#93 — READ-ONLY. The project's live SUBNETWORKS quota: `usage` (subnets the project holds now) and
+// `limit`, both whole numbers as Google reports them. ok:false on any read failure or a quota list that
+// does not carry exactly one well-formed SUBNETWORKS entry — never a guessed zero.
+export type GcpProjectQuotaGetResult =
+  | { ok: true; op: "gcp-project-quota-get"; project: string; metric: typeof GCP_PROJECT_QUOTA_METRIC; usage: number; limit: number }
+  | { ok: false; op: "gcp-project-quota-get"; project: string; detail: string };
+
 // planning/49 §8 + hub#93 — ONE exact-host Workers route to the edge gate. "unchanged" means a route
 // with this exact pattern already points at the gate. `foreign` (ok:false) means a route with this
 // exact pattern points at ANOTHER script: it is left alone, never taken over or removed.
@@ -658,7 +667,8 @@ export type ActuateResult =
   | CloudRunProbeInvokeResult
   | GcpSubnetsListResult
   | WorkersRouteUpsertResult
-  | WorkersRouteDeleteResult;
+  | WorkersRouteDeleteResult
+  | GcpProjectQuotaGetResult;
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -5808,6 +5818,90 @@ export async function readComputeSubnetsList(params: GcpSubnetsListParams, env: 
   return failure(
     `listing subnetworks did not finish within ${GCP_SUBNETWORKS_LIST_MAX_PAGES} pages — the list is incomplete; re-run to resume`,
   );
+}
+
+// ── hub#93: gcp-project-quota-get ─────────────────────────────────────────────────────────────
+// READ-ONLY: the project's live SUBNETWORKS usage and limit, from Compute `projects.get` `quotas[]`. The
+// platform's Run slot allocator refuses a new slot when usage + pending + 1 would exceed the limit, so a
+// wrong number here is either a refused slot or a subnet create that fails on quota after the slot is
+// taken. That is why every doubtful answer is ok:false rather than a best guess.
+
+/** One `quotas[]` entry as Compute `projects.get` answers it (the fields this op reads). */
+interface ComputeQuotaEntry {
+  metric?: unknown;
+  limit?: unknown;
+  usage?: unknown;
+}
+
+/** What Compute `projects.get` answers with (the fields this op reads). */
+interface ComputeProjectResponse {
+  quotas?: unknown;
+  error?: ComputeInsertResponse["error"];
+}
+
+/** True when `value` is a whole number of at least 0 — the only shape a subnet count or limit can have. */
+function isWholeQuotaFigure(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+export async function readComputeProjectSubnetQuota(params: GcpProjectQuotaGetParams, env: Env): Promise<GcpProjectQuotaGetResult> {
+  const { project } = params;
+  const failure = (detail: string): GcpProjectQuotaGetResult => ({ ok: false, op: "gcp-project-quota-get", project, detail });
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail);
+  }
+  const url = `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: gcpHeaders(token.accessToken) });
+  } catch (err) {
+    return failure(`could not reach Google Compute Engine to read project "${project}": ${errorMessage(err)}`);
+  }
+  const body = (await response.json().catch(() => null)) as ComputeProjectResponse | null;
+
+  if (response.status === 401 || response.status === 403) {
+    return failure(
+      `Google Cloud denied reading project "${project}" (HTTP ${response.status})${googleErrorMessage(body)} — the service ` +
+        `account needs compute.projects.get (e.g. roles/compute.viewer) on project "${project}".`,
+    );
+  }
+  if (!response.ok || body === null) {
+    return failure(`reading project "${project}" failed with HTTP ${response.status}${googleErrorMessage(body)}.`);
+  }
+  if (body.error) {
+    return failure(`reading project "${project}" returned a body-level error${googleErrorMessage(body)}.`);
+  }
+  if (!Array.isArray(body.quotas)) {
+    return failure(`project "${project}" answered without a quotas list, so its ${GCP_PROJECT_QUOTA_METRIC} usage is unknown.`);
+  }
+
+  const matching: ComputeQuotaEntry[] = [];
+  for (const entry of body.quotas as unknown[]) {
+    if (typeof entry !== "object" || entry === null) {
+      continue;
+    }
+    const quota = entry as ComputeQuotaEntry;
+    if (quota.metric === GCP_PROJECT_QUOTA_METRIC) {
+      matching.push(quota);
+    }
+  }
+  if (matching.length !== 1) {
+    return failure(
+      `project "${project}" lists ${matching.length} ${GCP_PROJECT_QUOTA_METRIC} quota entries, not exactly one, so its ` +
+        "subnet usage cannot be read safely.",
+    );
+  }
+  const { usage, limit } = matching[0];
+  if (!isWholeQuotaFigure(usage) || !isWholeQuotaFigure(limit)) {
+    return failure(
+      `project "${project}"'s ${GCP_PROJECT_QUOTA_METRIC} quota entry does not carry a whole-number usage and limit, so ` +
+        "its subnet usage cannot be read safely.",
+    );
+  }
+  return { ok: true, op: "gcp-project-quota-get", project, metric: GCP_PROJECT_QUOTA_METRIC, usage, limit };
 }
 
 // ── planning/49 Phase 2: the Cloud Run ops ────────────────────────────────────────────────────
