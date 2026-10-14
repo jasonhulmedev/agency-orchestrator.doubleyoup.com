@@ -9,6 +9,7 @@ import {
   validateAI,
   validateGCP,
   REQUIRED_GCP_PERMISSIONS,
+  UPDATE_GCP_PERMISSIONS,
   validateR2Provision,
   validateCfDns,
   validateAll,
@@ -682,8 +683,70 @@ describe("validateGCP", () => {
     expect(new Headers(projectInit.headers).get("authorization")).toBe("Bearer ya29.test");
     expect(projectInit.method).toBe("POST");
     const requestedPermissions = JSON.parse(String(projectInit.body)).permissions as string[];
-    expect(requestedPermissions).toEqual(REQUIRED_GCP_PERMISSIONS);
+    // planning/51: the SAME call also asks for the advisory update-path permissions, after the required set.
+    expect(requestedPermissions).toEqual([...REQUIRED_GCP_PERMISSIONS, ...UPDATE_GCP_PERMISSIONS]);
     expect(requestedPermissions).toContain("compute.instances.create");
+  });
+
+  it("planning/51: the update-path permissions are ADVISORY — missing ones are named but never change ok", async () => {
+    const key = await makeServiceAccountKey();
+    vi.stubGlobal(
+      "fetch",
+      routedFetch([
+        { match: (u) => u.includes("oauth2.googleapis.com/token"), respond: () => jsonResponse({ access_token: "ya29.test" }) },
+        // Every REQUIRED create permission, and only two of the update ones (e.g. roles/compute.admin
+        // granted long ago, then narrowed; or a grant scoped to named VMs by IAM Conditions).
+        {
+          match: (u) => u.includes("cloudresourcemanager.googleapis.com"),
+          respond: () => jsonResponse({ permissions: [...REQUIRED_GCP_PERMISSIONS, "compute.instances.list", "compute.instances.get"] }),
+        },
+      ]),
+    );
+    const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+    expect(result.ok).toBe(true);
+    expect(result.missingUpdatePermissions).toEqual([
+      "compute.instances.setMetadata",
+      "compute.instances.stop",
+      "compute.instances.start",
+      "compute.disks.createSnapshot",
+      "compute.snapshots.create",
+      "compute.snapshots.get",
+    ]);
+    expect(result.detail).toMatch(/Update path \(advisory, does not affect this check\): 6 of 8/);
+    expect(result.detail).toMatch(/IAM Conditions does not show at project level/);
+  });
+
+  it("planning/51: every update permission held => the advisory says so, and nothing is listed missing", async () => {
+    const key = await makeServiceAccountKey();
+    vi.stubGlobal(
+      "fetch",
+      routedFetch([
+        { match: (u) => u.includes("oauth2.googleapis.com/token"), respond: () => jsonResponse({ access_token: "ya29.test" }) },
+        {
+          match: (u) => u.includes("cloudresourcemanager.googleapis.com"),
+          respond: () => jsonResponse({ permissions: [...REQUIRED_GCP_PERMISSIONS, ...UPDATE_GCP_PERMISSIONS] }),
+        },
+      ]),
+    );
+    const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+    expect(result.ok).toBe(true);
+    expect(result.missingUpdatePermissions).toEqual([]);
+    expect(result.detail).toMatch(/all 8 update permission\(s\) held at project level/);
+  });
+
+  it("planning/51: a missing REQUIRED permission still fails, and the update advisory rides along", async () => {
+    const key = await makeServiceAccountKey();
+    vi.stubGlobal(
+      "fetch",
+      routedFetch([
+        { match: (u) => u.includes("oauth2.googleapis.com/token"), respond: () => jsonResponse({ access_token: "ya29.test" }) },
+        { match: (u) => u.includes("cloudresourcemanager.googleapis.com"), respond: () => jsonResponse({ permissions: [...UPDATE_GCP_PERMISSIONS] }) },
+      ]),
+    );
+    const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/missing 6 required permission/);
+    expect(result.missingUpdatePermissions).toEqual([]);
   });
 
   it("reports missing permissions when testIamPermissions returns a smaller set", async () => {

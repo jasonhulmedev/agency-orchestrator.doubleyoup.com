@@ -15,6 +15,11 @@ import { errorMessage, extractXmlTag, stripTrailingSlash } from "./util.js";
 export interface ValidationResult {
   ok: boolean;
   detail: string;
+  /**
+   * GCP only (planning/51): the update-path permissions testIamPermissions did NOT report at project
+   * level. ADVISORY — it never changes `ok`. Absent for every other credential.
+   */
+  missingUpdatePermissions?: string[];
 }
 
 export interface AllValidations {
@@ -870,8 +875,41 @@ export const REQUIRED_GCP_PERMISSIONS = [
   "compute.instances.create",
 ];
 
+// planning/51 (hub#58): the permissions the in-place UPDATE path and its reads use — discover a cell's
+// VMs (gcp-instances-list), read one (gcp-instance-get), publish its boot script and reboot it
+// (gcp-instance-set-metadata / gcp-instance-restart), and take a boot-disk revert point first
+// (gcp-disk-snapshot-create). Onboarding never needed them, so an agency could pass /validate and still
+// fail every update op. They are tested in the SAME testIamPermissions call and reported, but they are
+// ADVISORY: they never change `ok`. Two reasons. Onboarding must not start failing for an agency that
+// has not used an update yet. And a grant scoped to named VMs with IAM Conditions (planning/51 decision
+// A, the syd cell) does not show at project level at all, so a project-level miss is not proof of a
+// missing grant. Test such a grant on the instance itself.
+export const UPDATE_GCP_PERMISSIONS = [
+  "compute.instances.list",
+  "compute.instances.get",
+  "compute.instances.setMetadata",
+  "compute.instances.stop",
+  "compute.instances.start",
+  "compute.disks.createSnapshot",
+  "compute.snapshots.create",
+  "compute.snapshots.get",
+];
+
+/** The advisory sentence /validate appends about the update-path permissions. */
+function updatePermissionsNote(missing: string[]): string {
+  if (missing.length === 0) {
+    return ` Update path (advisory): all ${UPDATE_GCP_PERMISSIONS.length} update permission(s) held at project level.`;
+  }
+  return (
+    ` Update path (advisory, does not affect this check): ${missing.length} of ${UPDATE_GCP_PERMISSIONS.length} update ` +
+    `permission(s) not held at project level: ${missing.join(", ")}. A grant scoped to named VMs with IAM Conditions ` +
+    `does not show at project level — test it on the instance.`
+  );
+}
+
 // Parse the SA-key JSON, mint an access token, then check the service account holds every
 // REQUIRED_GCP_PERMISSIONS via testIamPermissions. ok when the token mints AND none are missing.
+// The same call also reports the UPDATE_GCP_PERMISSIONS, as an advisory only (see above).
 export async function validateGCP(env: Env): Promise<ValidationResult> {
   if (!env.GCP_SERVICE_ACCOUNT_KEY) {
     return {
@@ -926,7 +964,7 @@ export async function validateGCP(env: Env): Promise<ValidationResult> {
           "content-type": "application/json",
           accept: "application/json",
         },
-        body: JSON.stringify({ permissions: REQUIRED_GCP_PERMISSIONS }),
+        body: JSON.stringify({ permissions: [...REQUIRED_GCP_PERMISSIONS, ...UPDATE_GCP_PERMISSIONS] }),
       },
     );
 
@@ -934,15 +972,19 @@ export async function validateGCP(env: Env): Promise<ValidationResult> {
       const heldBody = (await response.json().catch(() => null)) as { permissions?: string[] } | null;
       const held = new Set(heldBody?.permissions ?? []);
       const missing = REQUIRED_GCP_PERMISSIONS.filter((permission) => !held.has(permission));
+      const missingUpdatePermissions = UPDATE_GCP_PERMISSIONS.filter((permission) => !held.has(permission));
+      const updateNote = updatePermissionsNote(missingUpdatePermissions);
       if (missing.length === 0) {
         return {
           ok: true,
-          detail: `Google Cloud authenticated as ${clientEmail}; project "${projectId}" accessible with all ${REQUIRED_GCP_PERMISSIONS.length} required permission(s).`,
+          detail: `Google Cloud authenticated as ${clientEmail}; project "${projectId}" accessible with all ${REQUIRED_GCP_PERMISSIONS.length} required permission(s).${updateNote}`,
+          missingUpdatePermissions,
         };
       }
       return {
         ok: false,
-        detail: `Google Cloud authenticated as ${clientEmail}, but the service account is missing ${missing.length} required permission(s): ${missing.join(", ")}. Grant the service account "roles/compute.admin" on the project — it covers every permission the cell provisioner needs.`,
+        detail: `Google Cloud authenticated as ${clientEmail}, but the service account is missing ${missing.length} required permission(s): ${missing.join(", ")}. Grant the service account "roles/compute.admin" on the project — it covers every permission the cell provisioner needs.${updateNote}`,
+        missingUpdatePermissions,
       };
     }
     if (response.status === 403) {
