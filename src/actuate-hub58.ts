@@ -284,6 +284,12 @@ export type GcpDiskSnapshotCreateResult =
       status: "created" | "already-existed";
       /** Google's snapshot status (READY, CREATING, UPLOADING, FAILED, DELETING), or null when unread. */
       snapshotStatus: string | null;
+      /**
+       * When Google created the snapshot (its creationTimestamp, RFC 3339), or null when it was not read
+       * or not a date. A caller uses it to tell a snapshot of THIS run from an old one under a reused
+       * label: an old snapshot is not the revert point of a new window (planning/51 review finding 16).
+       */
+      createdAt: string | null;
     }
   | { ok: false; op: "gcp-disk-snapshot-create"; instanceName: string; snapshotName: string; detail: string };
 
@@ -297,6 +303,7 @@ interface ComputeInstanceDisksResponse {
 interface ComputeSnapshotResponse {
   status?: unknown;
   sourceDisk?: unknown;
+  creationTimestamp?: unknown;
   error?: ComputeInsertResponse["error"];
 }
 
@@ -364,7 +371,7 @@ export function bootDiskOf(
 /** How reading the snapshot of the derived name ended. */
 type SnapshotRead =
   | { kind: "absent" }
-  | { kind: "same-disk"; status: string | null }
+  | { kind: "same-disk"; status: string | null; createdAt: string | null }
   | { kind: "other-disk" }
   | { kind: "failed"; detail: string };
 
@@ -409,7 +416,22 @@ async function readSnapshotFor(input: {
   if (typeof body.status === "string" && body.status.length > 0 && body.status.length <= 32) {
     status = body.status;
   }
-  return { kind: "same-disk", status };
+  return { kind: "same-disk", status, createdAt: snapshotCreatedAt(body.creationTimestamp) };
+}
+
+/**
+ * A snapshot's creationTimestamp when it is a date string of a sane length, else null. A value this
+ * op cannot read as a date is reported as null, never passed through, so the caller fails closed.
+ * PURE and exported for the unit tests.
+ */
+export function snapshotCreatedAt(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0 || value.length > 64) {
+    return null;
+  }
+  if (Number.isNaN(Date.parse(value))) {
+    return null;
+  }
+  return value;
 }
 
 /**
@@ -490,6 +512,7 @@ export async function actuateGcpDiskSnapshotCreate(
       snapshotName,
       status: "already-existed",
       snapshotStatus: existing.status,
+      createdAt: existing.createdAt,
     };
   }
 
@@ -525,6 +548,7 @@ export async function actuateGcpDiskSnapshotCreate(
         snapshotName,
         status: "already-existed",
         snapshotStatus: raced.status,
+        createdAt: raced.createdAt,
       };
     }
     return failure(`Google reports a snapshot named "${snapshotName}" already exists, but it is not a snapshot of disk "${disk}".`);
@@ -557,8 +581,10 @@ export async function actuateGcpDiskSnapshotCreate(
 
   const afterCreate = await readSnapshotFor({ project, zone, disk, snapshotName, accessToken: token.accessToken });
   let snapshotStatus: string | null = null;
+  let createdAt: string | null = null;
   if (afterCreate.kind === "same-disk") {
     snapshotStatus = afterCreate.status;
+    createdAt = afterCreate.createdAt;
   }
   return {
     ok: true,
@@ -568,5 +594,6 @@ export async function actuateGcpDiskSnapshotCreate(
     snapshotName,
     status: "created",
     snapshotStatus,
+    createdAt,
   };
 }

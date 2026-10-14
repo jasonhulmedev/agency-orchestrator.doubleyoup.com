@@ -34,6 +34,7 @@ import {
   parseTunnelConfiguration,
   parseZonalDiskUrl,
   regionOfZone,
+  snapshotCreatedAt,
 } from "../src/actuate-hub58.js";
 
 const dispatchParamsSource: string = rawDispatchParamsSource as string;
@@ -448,7 +449,7 @@ describe("actuateGcpDiskSnapshotCreate", () => {
         if (snapshotReads === 1) {
           return { status: 404, body: { error: { code: 404, message: "not found" } } };
         }
-        return { body: { status: "READY", sourceDisk: BOOT_DISK_URL } };
+        return { body: { status: "READY", sourceDisk: BOOT_DISK_URL, creationTimestamp: "2026-10-20T09:00:01.123-07:00" } };
       }
       if (call.url === CREATE_URL) {
         return { body: { name: "operation-123", status: "RUNNING" } };
@@ -468,6 +469,7 @@ describe("actuateGcpDiskSnapshotCreate", () => {
       snapshotName: "dy-data-syd-1-boot-20261020",
       status: "created",
       snapshotStatus: "READY",
+      createdAt: "2026-10-20T09:00:01.123-07:00",
     });
 
     const calls = googleCalls();
@@ -494,13 +496,30 @@ describe("actuateGcpDiskSnapshotCreate", () => {
   it("an existing snapshot of the SAME disk is already-existed (this is how a caller polls) — no create", async () => {
     const { env, googleCalls } = await setUp((call) => {
       if (call.url === SNAPSHOT_URL) {
-        return { body: { status: "CREATING", sourceDisk: BOOT_DISK_URL } };
+        return { body: { status: "CREATING", sourceDisk: BOOT_DISK_URL, creationTimestamp: "2026-09-01T00:00:00.000-07:00" } };
       }
       return null;
     });
     const result = await actuateGcpDiskSnapshotCreate(SNAPSHOT_PARAMS, env);
-    expect(result).toMatchObject({ ok: true, status: "already-existed", snapshotStatus: "CREATING" });
+    // createdAt is reported, so the caller can refuse an OLD snapshot under a reused label (finding 16).
+    expect(result).toMatchObject({ ok: true, status: "already-existed", snapshotStatus: "CREATING", createdAt: "2026-09-01T00:00:00.000-07:00" });
     expect(googleCalls().some((call) => call.method === "POST")).toBe(false);
+  });
+
+  it("a creationTimestamp that is missing or not a date is reported as null (the caller fails closed)", async () => {
+    expect(snapshotCreatedAt(undefined)).toBeNull();
+    expect(snapshotCreatedAt("")).toBeNull();
+    expect(snapshotCreatedAt("not a date")).toBeNull();
+    expect(snapshotCreatedAt(1760000000)).toBeNull();
+    expect(snapshotCreatedAt(`2026-10-20T00:00:00Z${"x".repeat(64)}`)).toBeNull();
+    expect(snapshotCreatedAt("2026-10-20T00:00:00.000-07:00")).toBe("2026-10-20T00:00:00.000-07:00");
+    const { env } = await setUp((call) => {
+      if (call.url === SNAPSHOT_URL) {
+        return { body: { status: "READY", sourceDisk: BOOT_DISK_URL } };
+      }
+      return null;
+    });
+    expect(await actuateGcpDiskSnapshotCreate(SNAPSHOT_PARAMS, env)).toMatchObject({ ok: true, status: "already-existed", createdAt: null });
   });
 
   it("an existing snapshot of ANOTHER disk under the name is refused — no create", async () => {
