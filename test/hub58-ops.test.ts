@@ -33,6 +33,7 @@ import {
   bootDiskOf,
   parseTunnelConfiguration,
   parseZonalDiskUrl,
+  regionOfZone,
 } from "../src/actuate-hub58.js";
 
 const dispatchParamsSource: string = rawDispatchParamsSource as string;
@@ -389,6 +390,14 @@ const INSTANCE_BODY = {
   ],
 };
 
+describe("regionOfZone", () => {
+  it("drops the zone letter only", () => {
+    expect(regionOfZone("australia-southeast1-a")).toBe("australia-southeast1");
+    expect(regionOfZone("australia-southeast2-c")).toBe("australia-southeast2");
+    expect(regionOfZone("us-central1-f")).toBe("us-central1");
+  });
+});
+
 describe("bootDiskOf / parseZonalDiskUrl", () => {
   it("finds the ONE boot disk in the instance's own project and zone", () => {
     expect(bootDiskOf(INSTANCE_BODY, PROJECT, ZONE)).toEqual({ ok: true, disk: "dy-data-syd-1" });
@@ -470,8 +479,10 @@ describe("actuateGcpDiskSnapshotCreate", () => {
       `GET ${SNAPSHOT_URL}`,
     ]);
     const createBody = JSON.parse(calls[2]?.body ?? "{}") as Record<string, unknown>;
-    expect(Object.keys(createBody).sort()).toEqual(["description", "name"]);
+    expect(Object.keys(createBody).sort()).toEqual(["description", "name", "storageLocations"]);
     expect(createBody.name).toBe("dy-data-syd-1-boot-20261020");
+    // Review finding 15: the snapshot stays in the disk's own region, never a multi-region.
+    expect(createBody.storageLocations).toEqual(["australia-southeast1"]);
     // Never the data disk, whatever the instance reports.
     expect(calls.some((call) => call.url.includes("dy-file-syd-1-data"))).toBe(false);
     for (const call of calls) {

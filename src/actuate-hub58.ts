@@ -412,6 +412,15 @@ async function readSnapshotFor(input: {
   return { kind: "same-disk", status };
 }
 
+/**
+ * The REGION of a zone ("australia-southeast1-a" -> "australia-southeast1"). The zone is grammar-checked
+ * upstream (GCP_ZONE_RE: <region>-<letter>), so dropping the last "-<part>" is exact. PURE and exported
+ * for the unit tests.
+ */
+export function regionOfZone(zone: string): string {
+  return zone.slice(0, zone.lastIndexOf("-"));
+}
+
 // A first snapshot of a ~10-20 GB boot disk can take minutes. One operations.wait call (up to about
 // two minutes) keeps this sync op bounded; a caller polls for READY by sending the same params again.
 const DISK_SNAPSHOT_WAIT_ATTEMPTS = 1;
@@ -490,9 +499,13 @@ export async function actuateGcpDiskSnapshotCreate(
     createResponse = await fetch(`${zonePath}/disks/${encodeURIComponent(disk)}/createSnapshot`, {
       method: "POST",
       headers: gcpHeaders(token.accessToken),
+      // storageLocations: the snapshot stays in the disk's own REGION. Without it Google stores a
+      // snapshot in the nearest MULTI-region, which for an Australian zone is outside Australia; a boot
+      // disk can hold site data and credentials (planning/51 review finding 15).
       body: JSON.stringify({
         name: snapshotName,
         description: `doubleyoup revert point: the boot disk of ${instance} before a startup-script reboot (planning/51).`,
+        storageLocations: [regionOfZone(zone)],
       }),
     });
   } catch (err) {
