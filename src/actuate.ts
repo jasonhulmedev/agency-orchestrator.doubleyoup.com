@@ -476,6 +476,13 @@ export type GcpInstanceGetResult =
       network: string | null;
       /** PROVISIONING | STAGING | RUNNING | STOPPING | TERMINATED | … , or null when not found. */
       status: string | null;
+      /**
+       * hub#58 review finding 4: the e-mails of the service accounts the VM runs as ([] = none), or null
+       * when not found or when Google answered a shape this op does not understand (the caller then
+       * treats the account as UNKNOWN). Setting the metadata of a VM that runs as an account needs
+       * iam.serviceAccounts.actAs on it, which the agency's key never holds.
+       */
+      serviceAccounts: string[] | null;
     }
   | { ok: false; op: "gcp-instance-get"; instanceName: string; detail: string };
 
@@ -5280,7 +5287,38 @@ interface ComputeInstanceAddressResponse {
   status?: string;
   /** Each interface's `networkIP` is its in-VPC private IPv4, on `network` (a URL). A cell node has one. */
   networkInterfaces?: Array<{ networkIP?: string; network?: string }>;
+  /** The accounts the VM runs as; absent when it runs as none. */
+  serviceAccounts?: unknown;
   error?: ComputeInsertResponse["error"];
+}
+
+/** A service-account e-mail as Google reports one (e.g. 123-compute@developer.gserviceaccount.com). */
+const SERVICE_ACCOUNT_EMAIL_RE = /^[a-z0-9][a-z0-9._-]{0,99}@[a-z0-9][a-z0-9.-]{0,199}[a-z]$/;
+
+/**
+ * The e-mails of an instance's `serviceAccounts[]`: [] when the field is absent (the VM runs as no
+ * account), null when it is present in any shape this code does not understand. FAIL CLOSED: a null is
+ * never read as "none". PURE and exported for gcp-instance-remove-service-account and the unit tests.
+ */
+export function serviceAccountEmailsOf(value: unknown): string[] | null {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const emails: string[] = [];
+  for (const entry of value) {
+    if (entry === null || typeof entry !== "object") {
+      return null;
+    }
+    const email = (entry as { email?: unknown }).email;
+    if (typeof email !== "string" || !SERVICE_ACCOUNT_EMAIL_RE.test(email)) {
+      return null;
+    }
+    emails.push(email);
+  }
+  return emails;
 }
 
 /**
@@ -5332,7 +5370,7 @@ export async function readComputeInstanceAddress(params: GcpInstanceGetParams, e
   const body = (await response.json().catch(() => null)) as ComputeInstanceAddressResponse | null;
 
   if (response.status === 404) {
-    return { ok: true, op: "gcp-instance-get", instanceName, found: false, privateIp: null, network: null, status: null };
+    return { ok: true, op: "gcp-instance-get", instanceName, found: false, privateIp: null, network: null, status: null, serviceAccounts: null };
   }
   if (response.status === 401 || response.status === 403) {
     return failure(
@@ -5359,6 +5397,7 @@ export async function readComputeInstanceAddress(params: GcpInstanceGetParams, e
     privateIp: firstInterface.address,
     network: firstInterface.network,
     status,
+    serviceAccounts: serviceAccountEmailsOf(body?.serviceAccounts),
   };
 }
 

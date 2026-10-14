@@ -7352,6 +7352,8 @@ describe("POST /actuate route", () => {
       privateIp: "10.20.0.4",
       network: "dy-cell-australia-southeast1",
       status: "RUNNING",
+      // No serviceAccounts field in Google's answer = the VM runs as no account (hub#58 finding 4).
+      serviceAccounts: [],
     });
 
     const [getCall] = computeCalls(calls);
@@ -7378,6 +7380,7 @@ describe("POST /actuate route", () => {
       privateIp: null,
       network: null,
       status: null,
+      serviceAccounts: null,
     });
   });
 
@@ -7397,7 +7400,31 @@ describe("POST /actuate route", () => {
         privateIp: null,
         network: null,
         status: "TERMINATED",
+        serviceAccounts: [],
       });
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("gcp-instance-get: reports the service accounts the VM runs as, and null for a shape it does not understand (hub#58 finding 4)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const cases: Array<{ serviceAccounts: unknown; expected: string[] | null }> = [
+      {
+        serviceAccounts: [{ email: "123456789-compute@developer.gserviceaccount.com", scopes: ["https://www.googleapis.com/auth/cloud-platform"] }],
+        expected: ["123456789-compute@developer.gserviceaccount.com"],
+      },
+      { serviceAccounts: "not-an-array", expected: null },
+      { serviceAccounts: [{ scopes: [] }], expected: null },
+      { serviceAccounts: [{ email: "NOT AN EMAIL" }], expected: null },
+    ];
+    for (const { serviceAccounts, expected } of cases) {
+      const job = gcpInstanceGetJob();
+      const signature = await signAsApp(job, privateKey);
+      mockGcpApiQueue([{ body: { name: "dy-file-australia-southeast1-1", status: "RUNNING", networkInterfaces: [], serviceAccounts } }]);
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey }));
+      const body = (await response.json()) as { ok: boolean; serviceAccounts: string[] | null };
+      expect(body.ok).toBe(true);
+      expect(body.serviceAccounts).toEqual(expected);
       vi.restoreAllMocks();
     }
   });
