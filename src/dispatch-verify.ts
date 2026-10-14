@@ -94,6 +94,9 @@ export const DISPATCH_OPS = [
   // a reboot). Neither changes a running resource.
   "cf-tunnel-get",
   "gcp-disk-snapshot-create",
+  // hub#58 review finding 4: STOP one cell node and take its service account off (it can only remove
+  // one, never attach one), so its startup-script can be set without iam.serviceAccounts.actAs.
+  "gcp-instance-remove-service-account",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 

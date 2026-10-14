@@ -49,10 +49,11 @@
 // `workers-route-upsert` creates an absent route and leaves a correct one alone, so a re-run converges.
 // `gcp-project-quota-get` (hub#93) is a read of the project's SUBNETWORKS quota.
 //
-// The two hub#58 ops (planning/51, actuate-hub58.ts) are idempotent too. `cf-tunnel-get` is a read.
+// Two hub#58 ops (planning/51, actuate-hub58.ts) are idempotent too. `cf-tunnel-get` is a read.
 // `gcp-disk-snapshot-create` derives ONE snapshot name from its params and reports a snapshot of the
 // same boot disk under that name as "already-existed", so a re-run (or a caller polling for READY)
-// converges on one snapshot.
+// converges on one snapshot. The third, `gcp-instance-remove-service-account`, is NOT: its first call
+// stops a running VM, so it runs exactly once under F1, like gcp-instance-restart.
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -185,10 +186,12 @@ import {
 import {
   type CfTunnelGetParams,
   type GcpDiskSnapshotCreateParams,
+  type GcpInstanceRemoveServiceAccountParams,
   validateCfTunnelGetParams,
   validateGcpDiskSnapshotCreateParams,
+  validateGcpInstanceRemoveServiceAccountParams,
 } from "./dispatch-params.js";
-import { actuateCfTunnelGet, actuateGcpDiskSnapshotCreate } from "./actuate-hub58.js";
+import { actuateCfTunnelGet, actuateGcpDiskSnapshotCreate, actuateGcpInstanceRemoveServiceAccount } from "./actuate-hub58.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
 interface OpDefinition<P> {
@@ -382,6 +385,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "gcp-disk-snapshot-create": defineOp<GcpDiskSnapshotCreateParams>({
     validateParams: validateGcpDiskSnapshotCreateParams,
     actuate: (params, env) => actuateGcpDiskSnapshotCreate(params, env),
+  }),
+  "gcp-instance-remove-service-account": defineOp<GcpInstanceRemoveServiceAccountParams>({
+    validateParams: validateGcpInstanceRemoveServiceAccountParams,
+    actuate: (params, env) => actuateGcpInstanceRemoveServiceAccount(params, env),
   }),
 };
 

@@ -26,10 +26,12 @@ import {
   diskSnapshotNameFor,
   validateCfTunnelGetParams,
   validateGcpDiskSnapshotCreateParams,
+  validateGcpInstanceRemoveServiceAccountParams,
 } from "../src/dispatch-params.js";
 import {
   actuateCfTunnelGet,
   actuateGcpDiskSnapshotCreate,
+  actuateGcpInstanceRemoveServiceAccount,
   bootDiskOf,
   parseTunnelConfiguration,
   parseZonalDiskUrl,
@@ -44,7 +46,7 @@ const dispatchParamsSource: string = rawDispatchParamsSource as string;
 const TWIN_BLOCK_START_MARKER = "// ── hub#58: syd through its Worker";
 const TWIN_BLOCK_END_MARKER = "\n// ── planning/49: the agency-side ephemeral-compute ops";
 // The app's src/server/services/agency-dispatch-params-hub58.test.ts pins the SAME value.
-const TWIN_BLOCK_SHA256 = "5a4af8600bcb162ce51d0d20325c1d8ece9507940ae361ad391cea94b0be17dc";
+const TWIN_BLOCK_SHA256 = "633477eb4fddc3fa21cb4549de7dc1cc1451c022195d60162a68f170b0f014eb";
 
 const TUNNEL_ID = "025cb230-c588-43f3-ad76-cce2869aefdd";
 const CF_ACCOUNT_ID = "acct-cf-1";
@@ -634,5 +636,219 @@ describe("actuateGcpDiskSnapshotCreate", () => {
       expect(result.detail).toMatch(/does not match the service-account key's own project/);
     }
     expect(calls).toEqual([]);
+  });
+});
+
+// ── gcp-instance-remove-service-account (review finding 4) ──────────────────────────
+
+describe("gcp-instance-remove-service-account params (twin of the app's rules)", () => {
+  const good = { project: PROJECT, zone: ZONE, name: "dy-data-syd-1" };
+
+  it("accepts a cell node and returns ONLY the known keys", () => {
+    expect(validateGcpInstanceRemoveServiceAccountParams({ ...good, email: "x@y.iam.gserviceaccount.com", scopes: ["all"] })).toEqual({
+      ok: true,
+      params: good,
+    });
+    for (const name of ["dy-web-syd-1", "dy-file-syd-1", "dy-gw-syd-1", "dy-web-australia-southeast2-1"]) {
+      expect(validateGcpInstanceRemoveServiceAccountParams({ ...good, name }).ok).toBe(true);
+    }
+  });
+
+  it("refuses the control-plane VM, any non-node name, and malformed fields", () => {
+    for (const name of ["dy-cp-1", "gitea", "dy-web-syd", "DY-WEB-SYD-1", ""]) {
+      expect(errorText(validateGcpInstanceRemoveServiceAccountParams({ ...good, name }))).toMatch(/^name must be a cell node VM name/);
+    }
+    expect(validateGcpInstanceRemoveServiceAccountParams({ ...good, project: "Bad" }).ok).toBe(false);
+    expect(validateGcpInstanceRemoveServiceAccountParams({ ...good, zone: "australia-southeast1" }).ok).toBe(false);
+    expect(validateGcpInstanceRemoveServiceAccountParams(null).ok).toBe(false);
+  });
+
+  it("is allowlisted and registered", () => {
+    expect(DISPATCH_OPS).toContain("gcp-instance-remove-service-account");
+    expect(typeof DISPATCH_OP_REGISTRY["gcp-instance-remove-service-account"].actuate).toBe("function");
+  });
+});
+
+describe("actuateGcpInstanceRemoveServiceAccount", () => {
+  const PARAMS = { project: PROJECT, zone: ZONE, name: "dy-data-syd-1" };
+  const DEFAULT_SA = "123456789-compute@developer.gserviceaccount.com";
+  const OPERATIONS = `${COMPUTE}/projects/${PROJECT}/zones/${ZONE}/operations`;
+
+  /** The token mint, then a scripted answer per Google call; every call is recorded. */
+  async function setUp(routes: (call: RecordedCall, readCount: number) => { status?: number; body: unknown } | null) {
+    const env = { GCP_SERVICE_ACCOUNT_KEY: await makeServiceAccountKey(PROJECT) } as Env;
+    let reads = 0;
+    const calls = mockFetch((call) => {
+      if (call.url === "https://oauth2.googleapis.com/token") {
+        return { body: { access_token: GCP_ACCESS_TOKEN, expires_in: 3600, token_type: "Bearer" } };
+      }
+      if (call.url === INSTANCE_URL && call.method === "GET") {
+        reads += 1;
+      }
+      const routed = routes(call, reads);
+      if (routed !== null) {
+        return routed;
+      }
+      return { status: 500, body: { error: { message: `unexpected ${call.method} ${call.url}` } } };
+    });
+    const googleCalls = () => calls.filter((call) => call.url !== "https://oauth2.googleapis.com/token");
+    return { env, googleCalls };
+  }
+
+  it("stops a RUNNING node, removes the account with a body that names none, reads it back, and leaves it STOPPED", async () => {
+    const { env, googleCalls } = await setUp((call, reads) => {
+      if (call.url === INSTANCE_URL && call.method === "GET") {
+        if (reads === 1) {
+          return { body: { status: "RUNNING", serviceAccounts: [{ email: DEFAULT_SA, scopes: ["https://www.googleapis.com/auth/cloud-platform"] }] } };
+        }
+        return { body: { status: "TERMINATED" } };
+      }
+      if (call.url === `${INSTANCE_URL}/stop`) {
+        return { body: { name: "op-stop" } };
+      }
+      if (call.url === `${OPERATIONS}/op-stop/wait`) {
+        return { body: { name: "op-stop", status: "DONE" } };
+      }
+      if (call.url === `${INSTANCE_URL}/setServiceAccount`) {
+        return { body: { name: "op-sa" } };
+      }
+      if (call.url === `${OPERATIONS}/op-sa/wait`) {
+        return { body: { name: "op-sa", status: "DONE" } };
+      }
+      return null;
+    });
+
+    const result = await actuateGcpInstanceRemoveServiceAccount(PARAMS, env);
+    expect(result).toEqual({
+      ok: true,
+      op: "gcp-instance-remove-service-account",
+      instanceName: "dy-data-syd-1",
+      serviceAccountStatus: "removed",
+      removedServiceAccounts: [DEFAULT_SA],
+      stopStatus: "stopped",
+      vmStatus: "TERMINATED",
+    });
+    const calls = googleCalls();
+    expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
+      `GET ${INSTANCE_URL}`,
+      `POST ${INSTANCE_URL}/stop`,
+      `POST ${OPERATIONS}/op-stop/wait`,
+      `POST ${INSTANCE_URL}/setServiceAccount`,
+      `POST ${OPERATIONS}/op-sa/wait`,
+      `GET ${INSTANCE_URL}`,
+    ]);
+    // It can only REMOVE: the request names no account and no scope. Never a start.
+    expect(JSON.parse(calls[3]?.body ?? "null")).toEqual({});
+    expect(calls.some((call) => call.url.endsWith("/start"))).toBe(false);
+    expect(JSON.stringify(result)).not.toContain(GCP_ACCESS_TOKEN);
+  });
+
+  it("a VM that runs as no account is already-none, and nothing is called after the read", async () => {
+    const { env, googleCalls } = await setUp((call) => {
+      if (call.url === INSTANCE_URL) {
+        return { body: { status: "RUNNING" } };
+      }
+      return null;
+    });
+    const result = await actuateGcpInstanceRemoveServiceAccount(PARAMS, env);
+    expect(result).toMatchObject({ ok: true, serviceAccountStatus: "already-none", stopStatus: "not-stopped", vmStatus: "RUNNING" });
+    expect(googleCalls().map((call) => call.method)).toEqual(["GET"]);
+  });
+
+  it("a TERMINATED VM is not stopped again; an account shape it does not understand is refused untouched", async () => {
+    {
+      const { env, googleCalls } = await setUp((call, reads) => {
+        if (call.url === INSTANCE_URL) {
+          return reads === 1 ? { body: { status: "TERMINATED", serviceAccounts: [{ email: DEFAULT_SA }] } } : { body: { status: "TERMINATED" } };
+        }
+        if (call.url === `${INSTANCE_URL}/setServiceAccount`) {
+          return { body: { name: "op-sa" } };
+        }
+        if (call.url === `${OPERATIONS}/op-sa/wait`) {
+          return { body: { name: "op-sa", status: "DONE" } };
+        }
+        return null;
+      });
+      expect(await actuateGcpInstanceRemoveServiceAccount(PARAMS, env)).toMatchObject({ ok: true, stopStatus: "already-stopped" });
+      expect(googleCalls().some((call) => call.url.endsWith("/stop"))).toBe(false);
+      vi.restoreAllMocks();
+    }
+    {
+      const { env, googleCalls } = await setUp((call) => {
+        if (call.url === INSTANCE_URL) {
+          return { body: { status: "RUNNING", serviceAccounts: "weird" } };
+        }
+        return null;
+      });
+      expect(await actuateGcpInstanceRemoveServiceAccount(PARAMS, env)).toMatchObject({ ok: false, phase: "read", stopped: false });
+      expect(googleCalls().map((call) => call.method)).toEqual(["GET"]);
+    }
+  });
+
+  it("a transitional VM is refused before any change", async () => {
+    const { env, googleCalls } = await setUp((call) => {
+      if (call.url === INSTANCE_URL) {
+        return { body: { status: "STOPPING", serviceAccounts: [{ email: DEFAULT_SA }] } };
+      }
+      return null;
+    });
+    expect(await actuateGcpInstanceRemoveServiceAccount(PARAMS, env)).toMatchObject({ ok: false, phase: "stop", stopped: false });
+    expect(googleCalls().map((call) => call.method)).toEqual(["GET"]);
+  });
+
+  it("a denied account change says the VM is STOPPED and names the permission", async () => {
+    const { env } = await setUp((call) => {
+      if (call.url === INSTANCE_URL) {
+        return { body: { status: "TERMINATED", serviceAccounts: [{ email: DEFAULT_SA }] } };
+      }
+      if (call.url === `${INSTANCE_URL}/setServiceAccount`) {
+        return { status: 403, body: { error: { code: 403, message: "Required 'compute.instances.setServiceAccount' permission" } } };
+      }
+      return null;
+    });
+    const result = await actuateGcpInstanceRemoveServiceAccount(PARAMS, env);
+    expect(result).toMatchObject({ ok: false, phase: "set-service-account", stopped: true });
+    if (!result.ok) {
+      expect(result.detail).toMatch(/compute\.instances\.setServiceAccount/);
+      expect(result.detail).toMatch(/The VM is STOPPED/);
+    }
+  });
+
+  it("a read-back that still lists an account is a failure, whatever Google answered", async () => {
+    const { env } = await setUp((call) => {
+      if (call.url === INSTANCE_URL) {
+        return { body: { status: "TERMINATED", serviceAccounts: [{ email: DEFAULT_SA }] } };
+      }
+      if (call.url === `${INSTANCE_URL}/setServiceAccount`) {
+        return { body: { name: "op-sa" } };
+      }
+      if (call.url === `${OPERATIONS}/op-sa/wait`) {
+        return { body: { name: "op-sa", status: "DONE" } };
+      }
+      return null;
+    });
+    const result = await actuateGcpInstanceRemoveServiceAccount(PARAMS, env);
+    expect(result).toMatchObject({ ok: false, phase: "verify", stopped: true });
+    if (!result.ok) {
+      expect(result.detail).toMatch(new RegExp(`still reports the account\\(s\\) ${DEFAULT_SA.replace(/[.]/g, "\\.")}`));
+    }
+  });
+
+  it("an unconfirmed stop is reported unconfirmed and stops before the account change", async () => {
+    const { env, googleCalls } = await setUp((call) => {
+      if (call.url === INSTANCE_URL) {
+        return { body: { status: "RUNNING", serviceAccounts: [{ email: DEFAULT_SA }] } };
+      }
+      if (call.url === `${INSTANCE_URL}/stop`) {
+        return { body: { name: "op-stop" } };
+      }
+      if (call.url === `${OPERATIONS}/op-stop/wait`) {
+        return { body: { name: "op-stop", status: "RUNNING" } };
+      }
+      return null;
+    });
+    const result = await actuateGcpInstanceRemoveServiceAccount(PARAMS, env);
+    expect(result).toMatchObject({ ok: false, phase: "stop", stopped: false, unconfirmed: true });
+    expect(googleCalls().some((call) => call.url.endsWith("/setServiceAccount"))).toBe(false);
   });
 });

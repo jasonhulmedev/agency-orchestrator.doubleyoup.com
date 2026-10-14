@@ -877,8 +877,9 @@ export const REQUIRED_GCP_PERMISSIONS = [
 
 // planning/51 (hub#58): the permissions the in-place UPDATE path and its reads use — discover a cell's
 // VMs (gcp-instances-list), read one (gcp-instance-get), publish its boot script and reboot it
-// (gcp-instance-set-metadata / gcp-instance-restart), and take a boot-disk revert point first
-// (gcp-disk-snapshot-create). Onboarding never needed them, so an agency could pass /validate and still
+// (gcp-instance-set-metadata / gcp-instance-restart), take a boot-disk revert point first
+// (gcp-disk-snapshot-create), and take a hand-built node's service account off before its metadata is
+// set (gcp-instance-remove-service-account, review finding 4). Onboarding never needed them, so an agency could pass /validate and still
 // fail every update op. They are tested in the SAME testIamPermissions call and reported, but they are
 // ADVISORY: they never change `ok`. Two reasons. Onboarding must not start failing for an agency that
 // has not used an update yet. And a grant scoped to named VMs with IAM Conditions (planning/51 decision
@@ -890,6 +891,7 @@ export const UPDATE_GCP_PERMISSIONS = [
   "compute.instances.setMetadata",
   "compute.instances.stop",
   "compute.instances.start",
+  "compute.instances.setServiceAccount",
   "compute.disks.createSnapshot",
   "compute.snapshots.create",
   "compute.snapshots.get",

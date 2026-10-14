@@ -105,7 +105,7 @@ import {
 import { presignS3Put, presignS3Get } from "./sigv4.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken, mintGoogleIdToken } from "./validators.js";
 import { errorMessage, stripTrailingSlash } from "./util.js";
-import type { CfTunnelGetResult, GcpDiskSnapshotCreateResult } from "./actuate-hub58.js";
+import type { CfTunnelGetResult, GcpDiskSnapshotCreateResult, GcpInstanceRemoveServiceAccountResult } from "./actuate-hub58.js";
 
 export const CF_API = "https://api.cloudflare.com/client/v4";
 
@@ -679,7 +679,8 @@ export type ActuateResult =
   | GcpProjectQuotaGetResult
   // hub#58 / planning/51 (actuate-hub58.ts).
   | CfTunnelGetResult
-  | GcpDiskSnapshotCreateResult;
+  | GcpDiskSnapshotCreateResult
+  | GcpInstanceRemoveServiceAccountResult;
 
 export interface CloudflareEnvelope {
   success?: boolean;
@@ -3271,7 +3272,7 @@ type ComputeInsertOutcome =
   | { kind: "failed"; detail: string; definite: boolean };
 
 /** The `message`s of an Operation's error entries, joined for a detail string. */
-function operationErrorMessages(entries: Array<{ code?: string; message?: string }>): string {
+export function operationErrorMessages(entries: Array<{ code?: string; message?: string }>): string {
   return entries.map((entry) => entry.message ?? entry.code ?? "unknown error").join("; ");
 }
 
@@ -5081,7 +5082,7 @@ export async function actuateGcpInstanceSetMetadata(
 // operation may outlast one ~2-minute wait call on a busy node — two calls bound it at ~4 minutes. A
 // start's operation reaches DONE as soon as the VM is powered on (tens of seconds), so one call is
 // ample. Both small and fixed, like gcp-instance-create's bound: this feeds a sync endpoint.
-const INSTANCE_RESTART_STOP_WAIT_ATTEMPTS = 2;
+export const INSTANCE_RESTART_STOP_WAIT_ATTEMPTS = 2;
 const INSTANCE_RESTART_START_WAIT_ATTEMPTS = 1;
 
 /**
@@ -5090,7 +5091,7 @@ const INSTANCE_RESTART_START_WAIT_ATTEMPTS = 1;
  * restarted). `unconfirmed` is true ONLY when Google ACCEPTED the action but the wait could not confirm
  * DONE — the transition may still complete on its own.
  */
-async function runInstanceLifecycleOperation(input: {
+export async function runInstanceLifecycleOperation(input: {
   url: string;
   waitUrlBase: string;
   accessToken: string;

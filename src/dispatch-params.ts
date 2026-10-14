@@ -2072,9 +2072,10 @@ export function validateProvisionSshKeysParams(raw: unknown): ParamsVerdict<Prov
 
 // ── hub#58: syd through its Worker — cf-tunnel-get and gcp-disk-snapshot-create ──────
 // planning/51 (hub#58) moves the syd cell onto the path every agency cell already uses: signed jobs
-// through the agency's own Worker, on the agency's own credentials. Two ops are new for that. Both
-// are narrow on purpose. One READS a tunnel's ingress config. The other takes a SNAPSHOT of one cell
-// node's boot disk. Neither changes a running resource, and neither deletes anything.
+// through the agency's own Worker, on the agency's own credentials. Three ops are new for that. All
+// are narrow on purpose. One READS a tunnel's ingress config. One takes a SNAPSHOT of one cell node's
+// boot disk. One REMOVES the service account a cell node runs as (it can only take one away, never
+// attach one). None of them deletes anything.
 //
 // THIS BLOCK IS A PINNED TWIN. The app and the agency Worker carry it byte for byte, and each repo's
 // test suite pins the sha256 of the block (from this marker up to the next section marker, the
@@ -2190,6 +2191,57 @@ export function validateGcpDiskSnapshotCreateParams(raw: unknown): ParamsVerdict
 
   // A FRESH object of only the known keys — never the caller's object.
   return { ok: true, params: { project, zone, instance, label } };
+}
+
+// ── gcp-instance-remove-service-account ──────────────────────────────────────────────
+// Take the SERVICE ACCOUNT off ONE cell node, and leave the VM STOPPED (planning/51 review finding 4).
+//
+// WHY. syd's VMs were built by hand and run as the project's default Compute service account. Google
+// requires iam.serviceAccounts.actAs on a VM's attached account to set its metadata, because a
+// startup-script runs as root with that account's token. The agency's key must never hold actAs, so
+// the account comes off first; then the startup-script can be published, and the VM starts on it.
+// Changing a VM's account needs the VM stopped, so this op stops it and does NOT start it: the
+// caller publishes and then starts it with gcp-instance-restart (which only starts a stopped VM).
+//
+// It can only REMOVE: the request names no account and no scope, so no signed job can attach one.
+//
+// Three REQUIRED strings, the same grammars as gcp-instance-restart, with the name PINNED to the
+// cell-node shape (as gcp-disk-snapshot-create): the control-plane VM dy-cp-1 shares syd's project,
+// and its name does not match. app signs the op only for a CellNode of one of the account's own cells.
+//
+// NOT IDEMPOTENT for a retry: the first call stops a running VM. A VM that already runs as no account
+// is reported "already-none" and nothing is changed.
+
+export interface GcpInstanceRemoveServiceAccountParams {
+  /** The agency's GCP project id the VM lives in. */
+  project: string;
+  /** The Compute Engine zone of the VM, e.g. "australia-southeast1-a". */
+  zone: string;
+  /** The cell node, e.g. "dy-data-syd-1". */
+  name: string;
+}
+
+export function validateGcpInstanceRemoveServiceAccountParams(raw: unknown): ParamsVerdict<GcpInstanceRemoveServiceAccountParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, zone, name } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof zone !== "string" || zone.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a Compute Engine zone name (e.g. australia-southeast1-a)" };
+  }
+  if (typeof name !== "string" || !GCP_RESOURCE_NAME_RE.test(name) || !CELL_NODE_INSTANCE_NAME_RE.test(name)) {
+    return {
+      ok: false,
+      reason: "name must be a cell node VM name: dy-<web|file|data|gw|gateway>-<cell>-<n> (e.g. dy-data-syd-1)",
+    };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, zone, name } };
 }
 
 // ── planning/49: the agency-side ephemeral-compute ops ───────────────────────────────

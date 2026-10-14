@@ -708,11 +708,12 @@ describe("validateGCP", () => {
       "compute.instances.setMetadata",
       "compute.instances.stop",
       "compute.instances.start",
+      "compute.instances.setServiceAccount",
       "compute.disks.createSnapshot",
       "compute.snapshots.create",
       "compute.snapshots.get",
     ]);
-    expect(result.detail).toMatch(/Update path \(advisory, does not affect this check\): 6 of 8/);
+    expect(result.detail).toMatch(/Update path \(advisory, does not affect this check\): 7 of 9/);
     expect(result.detail).toMatch(/IAM Conditions does not show at project level/);
   });
 
@@ -731,7 +732,7 @@ describe("validateGCP", () => {
     const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
     expect(result.ok).toBe(true);
     expect(result.missingUpdatePermissions).toEqual([]);
-    expect(result.detail).toMatch(/all 8 update permission\(s\) held at project level/);
+    expect(result.detail).toMatch(/all 9 update permission\(s\) held at project level/);
   });
 
   it("planning/51: a missing REQUIRED permission still fails, and the update advisory rides along", async () => {

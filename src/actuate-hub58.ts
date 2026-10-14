@@ -1,10 +1,13 @@
-// hub#58 / planning/51 ACTUATION (agency Worker side) — the two ops that let the platform manage the
-// syd cell through this Worker instead of over SSH:
+// hub#58 / planning/51 ACTUATION (agency Worker side) — the ops that let the platform manage the syd
+// cell through this Worker instead of over SSH:
 //
 //   cf-tunnel-get             READ one tunnel's remotely-managed ingress config, so the orchestrator
 //                             can keep every rule it does not own before it writes (decision E);
 //   gcp-disk-snapshot-create  SNAPSHOT one cell node's boot disk, the revert point before that node
-//                             reboots onto a new startup script (decision H).
+//                             reboots onto a new startup script (decision H);
+//   gcp-instance-remove-service-account
+//                             STOP one cell node and take its service account off, so its metadata
+//                             can be set without iam.serviceAccounts.actAs (review finding 4).
 //
 // Both run with the AGENCY's own credentials only — CF_DNS_API_TOKEN and GCP_SERVICE_ACCOUNT_KEY —
 // through the same helpers every other op in actuate.ts uses, so the account resolution, the project
@@ -24,17 +27,22 @@ import {
   diskSnapshotNameFor,
   type CfTunnelGetParams,
   type GcpDiskSnapshotCreateParams,
+  type GcpInstanceRemoveServiceAccountParams,
 } from "./dispatch-params.js";
 import {
   CF_API,
   CF_TUNNEL_UNAUTHORIZED_HINT,
   GCP_COMPUTE_API,
+  INSTANCE_RESTART_STOP_WAIT_ATTEMPTS,
   cloudflareErrorMessage,
   gcpHeaders,
   googleErrorMessage,
   isAlreadyExists,
   mintPinnedGcpAccessToken,
+  operationErrorMessages,
   resolveAccountId,
+  runInstanceLifecycleOperation,
+  serviceAccountEmailsOf,
   waitForComputeOperation,
   type CloudflareEnvelope,
   type ComputeInsertResponse,
@@ -595,5 +603,243 @@ export async function actuateGcpDiskSnapshotCreate(
     status: "created",
     snapshotStatus,
     createdAt,
+  };
+}
+
+// ── gcp-instance-remove-service-account ─────────────────────────────────────────────
+
+export type GcpInstanceRemoveServiceAccountResult =
+  | {
+      ok: true;
+      op: "gcp-instance-remove-service-account";
+      instanceName: string;
+      /** "removed" = this call took the account(s) off; "already-none" = the VM ran as no account, nothing changed. */
+      serviceAccountStatus: "removed" | "already-none";
+      /** The account e-mails the VM ran as before this call ([] when already-none). */
+      removedServiceAccounts: string[];
+      /** "stopped" = this call stopped it; "already-stopped" = it was TERMINATED; "not-stopped" = already-none, untouched. */
+      stopStatus: "stopped" | "already-stopped" | "not-stopped";
+      /** The VM's status as read at the end (TERMINATED after a removal). */
+      vmStatus: string | null;
+    }
+  | {
+      ok: false;
+      op: "gcp-instance-remove-service-account";
+      instanceName: string;
+      detail: string;
+      /** Where it stopped: the first read, the stop, the account change, or the read-back. */
+      phase: "read" | "stop" | "set-service-account" | "verify";
+      /** True when the VM is CONFIRMED stopped (by this call's stop, or it was already TERMINATED). */
+      stopped: boolean;
+      /** Google accepted a change but its completion was not confirmed: the VM's state is UNKNOWN. */
+      unconfirmed?: true;
+    };
+
+/** The instance fields this op reads. */
+interface ComputeInstanceIdentityResponse {
+  status?: unknown;
+  serviceAccounts?: unknown;
+  error?: ComputeInsertResponse["error"];
+}
+
+/** Google's error message from an identity read (the fields are typed loosely, so wrap them). */
+function identityErrorMessage(body: ComputeInstanceIdentityResponse | null): string {
+  if (body === null) {
+    return "";
+  }
+  return googleErrorMessage({ error: body.error });
+}
+
+/** One read of the instance: its status and its service accounts (null = a shape this op refuses). */
+async function readInstanceIdentity(input: {
+  url: string;
+  accessToken: string;
+  instance: string;
+  project: string;
+}): Promise<{ ok: true; status: string | null; serviceAccounts: string[] | null } | { ok: false; detail: string }> {
+  const { url, accessToken, instance, project } = input;
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: gcpHeaders(accessToken) });
+  } catch (err) {
+    return { ok: false, detail: `could not reach Google Compute Engine to read instance "${instance}": ${errorMessage(err)}` };
+  }
+  const body = (await response.json().catch(() => null)) as ComputeInstanceIdentityResponse | null;
+  if (response.status === 404) {
+    return { ok: false, detail: `instance "${instance}" was not found in project "${project}" — nothing to change.` };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return {
+      ok: false,
+      detail:
+        `Google Cloud denied reading instance "${instance}" (HTTP ${response.status})${identityErrorMessage(body)} — the ` +
+        "service account needs compute.instances.get on it.",
+    };
+  }
+  if (!response.ok || body === null) {
+    return { ok: false, detail: `reading instance "${instance}" failed with HTTP ${response.status}${identityErrorMessage(body)}.` };
+  }
+  let status: string | null = null;
+  if (typeof body.status === "string" && body.status.length > 0 && body.status.length <= 32) {
+    status = body.status;
+  }
+  return { ok: true, status, serviceAccounts: serviceAccountEmailsOf(body.serviceAccounts) };
+}
+
+/**
+ * planning/51 review finding 4: stop ONE cell node if it runs, take every service account off it, read
+ * it back, and leave it STOPPED. The caller then publishes the startup-script (now allowed without
+ * actAs) and starts the VM with gcp-instance-restart, so the node goes down once, not twice.
+ *
+ * The request body names no account and no scope (`{}`, the body gcloud's `--no-service-account
+ * --no-scopes` sends — inference: Google's reference does not show the removal body), so this op can
+ * only take an account away. The read-back is the proof: a VM that still lists an account is a
+ * failure, whatever Google answered to the change.
+ */
+export async function actuateGcpInstanceRemoveServiceAccount(
+  params: GcpInstanceRemoveServiceAccountParams,
+  env: Env,
+): Promise<GcpInstanceRemoveServiceAccountResult> {
+  const { project, zone } = params;
+  const instanceName = params.name;
+  const failure = (
+    detail: string,
+    phase: "read" | "stop" | "set-service-account" | "verify",
+    stopped: boolean,
+    unconfirmed = false,
+  ): GcpInstanceRemoveServiceAccountResult => {
+    const result: GcpInstanceRemoveServiceAccountResult = {
+      ok: false,
+      op: "gcp-instance-remove-service-account",
+      instanceName,
+      detail,
+      phase,
+      stopped,
+    };
+    if (unconfirmed) {
+      result.unconfirmed = true;
+    }
+    return result;
+  };
+
+  const token = await mintPinnedGcpAccessToken(env, project);
+  if (!token.ok) {
+    return failure(token.detail, "read", false);
+  }
+  const accessToken = token.accessToken;
+  const zonePath = `${GCP_COMPUTE_API}/projects/${encodeURIComponent(project)}/zones/${encodeURIComponent(zone)}`;
+  const instanceUrl = `${zonePath}/instances/${encodeURIComponent(instanceName)}`;
+  const waitUrlBase = `${zonePath}/operations`;
+  const what = `instance "${instanceName}"`;
+
+  // 1. What it runs as now. A shape this op does not understand is refused before anything changes.
+  const before = await readInstanceIdentity({ url: instanceUrl, accessToken, instance: instanceName, project });
+  if (!before.ok) {
+    return failure(before.detail, "read", false);
+  }
+  if (before.serviceAccounts === null) {
+    return failure(`${what} reports its service accounts in a shape this op does not understand — refusing to change it.`, "read", false);
+  }
+  if (before.serviceAccounts.length === 0) {
+    return {
+      ok: true,
+      op: "gcp-instance-remove-service-account",
+      instanceName,
+      serviceAccountStatus: "already-none",
+      removedServiceAccounts: [],
+      stopStatus: "not-stopped",
+      vmStatus: before.status,
+    };
+  }
+
+  // 2. The account can only change on a stopped VM.
+  let stopStatus: "stopped" | "already-stopped";
+  if (before.status === "RUNNING") {
+    const stop = await runInstanceLifecycleOperation({
+      url: `${instanceUrl}/stop`,
+      waitUrlBase,
+      accessToken,
+      what,
+      verb: "stop",
+      maxWaitAttempts: INSTANCE_RESTART_STOP_WAIT_ATTEMPTS,
+      project,
+      permissionHint: "compute.instances.stop",
+    });
+    if (!stop.ok) {
+      return failure(stop.detail, "stop", false, stop.unconfirmed);
+    }
+    stopStatus = "stopped";
+  } else if (before.status === "TERMINATED") {
+    stopStatus = "already-stopped";
+  } else {
+    return failure(
+      `${what} is ${before.status ?? "in an unknown state"} — the account can change only on a RUNNING VM (stopped first) or a TERMINATED one; re-run once it settles.`,
+      "stop",
+      false,
+    );
+  }
+
+  // 3. The change. From here on the VM IS stopped (confirmed above).
+  let response: Response;
+  try {
+    response = await fetch(`${instanceUrl}/setServiceAccount`, {
+      method: "POST",
+      headers: gcpHeaders(accessToken),
+      body: JSON.stringify({}),
+    });
+  } catch (err) {
+    return failure(`could not reach Google Compute Engine to remove the service account of ${what}: ${errorMessage(err)}. The VM is STOPPED.`, "set-service-account", true);
+  }
+  const body = (await response.json().catch(() => null)) as ComputeInsertResponse | null;
+  if (response.status === 401 || response.status === 403) {
+    return failure(
+      `Google Cloud denied removing the service account of ${what} (HTTP ${response.status})${googleErrorMessage(body)} — the ` +
+        `service account needs compute.instances.setServiceAccount on it. The VM is STOPPED.`,
+      "set-service-account",
+      true,
+    );
+  }
+  if (!response.ok) {
+    return failure(`removing the service account of ${what} failed with HTTP ${response.status}${googleErrorMessage(body)}. The VM is STOPPED.`, "set-service-account", true);
+  }
+  const operationName = typeof body?.name === "string" ? body.name : "";
+  if (operationName === "") {
+    return failure(`Compute Engine returned HTTP ${response.status} but no operation for the account change of ${what}. The VM is STOPPED.`, "set-service-account", true, true);
+  }
+  const operationErrors = body?.error?.errors ?? [];
+  if (operationErrors.length > 0) {
+    return failure(`the account change of ${what} failed: ${operationErrorMessages(operationErrors)}. The VM is STOPPED.`, "set-service-account", true);
+  }
+  const waited = await waitForComputeOperation({
+    waitUrl: `${waitUrlBase}/${encodeURIComponent(operationName)}/wait`,
+    accessToken,
+    what,
+    maxAttempts: 1,
+    verb: "service-account change",
+  });
+  if (!waited.ok) {
+    return failure(`${waited.detail} The VM is STOPPED.`, "set-service-account", true, !waited.completed);
+  }
+
+  // 4. The proof: read it back.
+  const after = await readInstanceIdentity({ url: instanceUrl, accessToken, instance: instanceName, project });
+  if (!after.ok) {
+    return failure(`the account change was accepted but the read-back failed: ${after.detail} The VM is STOPPED.`, "verify", true, true);
+  }
+  if (after.serviceAccounts === null || after.serviceAccounts.length > 0) {
+    return failure(
+      `Google accepted the change, but ${what} still reports ${after.serviceAccounts === null ? "an account shape this op does not understand" : `the account(s) ${after.serviceAccounts.join(", ")}`}. The VM is STOPPED.`,
+      "verify",
+      true,
+    );
+  }
+  return {
+    ok: true,
+    op: "gcp-instance-remove-service-account",
+    instanceName,
+    serviceAccountStatus: "removed",
+    removedServiceAccounts: before.serviceAccounts,
+    stopStatus,
+    vmStatus: after.status,
   };
 }
