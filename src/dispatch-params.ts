@@ -2070,6 +2070,128 @@ export function validateProvisionSshKeysParams(raw: unknown): ParamsVerdict<Prov
   return { ok: true, params: { project, slug, authorizedKeys: cleanKeys } };
 }
 
+// ── hub#58: syd through its Worker — cf-tunnel-get and gcp-disk-snapshot-create ──────
+// planning/51 (hub#58) moves the syd cell onto the path every agency cell already uses: signed jobs
+// through the agency's own Worker, on the agency's own credentials. Two ops are new for that. Both
+// are narrow on purpose. One READS a tunnel's ingress config. The other takes a SNAPSHOT of one cell
+// node's boot disk. Neither changes a running resource, and neither deletes anything.
+//
+// THIS BLOCK IS A PINNED TWIN. The app and the agency Worker carry it byte for byte, and each repo's
+// test suite pins the sha256 of the block (from this marker up to the next section marker, the
+// planning/49 block). A change on one side only fails that side's suite. Change both twins and both
+// pins together.
+
+// ── cf-tunnel-get ────────────────────────────────────────────────────────────────────
+// READ-ONLY: GET one Cloudflare tunnel's remotely-managed ingress config (planning/51 decision E).
+//
+// WHY A READ IS NEEDED. cf-tunnel-config is a FULL-config PUT: every rule the caller does not send is
+// deleted. syd's tunnel has other writers (the session runner's routes, the custom-domain routes), so
+// a writer that cannot see the live config would delete their rules. The orchestrator reads the
+// config with this op, keeps every rule it does not own, and only then PUTs.
+//
+// One REQUIRED string, `tunnelId`, with the same grammar cf-tunnel-config and cf-tunnel-delete use.
+// The Worker reads the tunnel in the account its own CF_DNS_API_TOKEN belongs to, and app signs this
+// op only for a tunnel that one of the account's own cells records (app agency-dispatch.ts).
+//
+// IDEMPOTENT: a read has no side effect. Registered `true` in AGENCY_OP_IDEMPOTENT.
+
+export interface CfTunnelGetParams {
+  /** The cfd_tunnel id whose ingress config is read. */
+  tunnelId: string;
+}
+
+export function validateCfTunnelGetParams(raw: unknown): ParamsVerdict<CfTunnelGetParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { tunnelId } = raw;
+  if (typeof tunnelId !== "string" || !CF_TUNNEL_ID_RE.test(tunnelId)) {
+    return { ok: false, reason: "tunnelId must be a lowercase-hex Cloudflare tunnel id (a 36-char UUID, or 32 hex chars)" };
+  }
+
+  // A FRESH object of only the known key — never the caller's object.
+  return { ok: true, params: { tunnelId } };
+}
+
+// ── gcp-disk-snapshot-create ─────────────────────────────────────────────────────────
+// SNAPSHOT-ONLY: take a snapshot of ONE cell node's BOOT disk in the AGENCY's own project
+// (planning/51 decision H). It is the revert point before a node reboots onto a new startup script:
+// if the node does not come back, its boot disk is restored from this snapshot.
+//
+// Four REQUIRED strings:
+//   1. `project`  — the project id (the Worker pins it to the SA key's own project);
+//   2. `zone`     — the zone of the VM (a URL path segment);
+//   3. `instance` — the VM, PINNED to the cell-node name shape dy-<web|file|data|gw|gateway>-<cell>-<n>.
+//                   syd shares its project with the control plane, so the project pin alone does not
+//                   keep this op away from the control-plane VM. The name pin does (dy-cp-1 does not
+//                   match), and app signs the op only for a CellNode of one of the account's own cells;
+//   4. `label`    — 1-16 lowercase letters and digits, e.g. the window date "20261020".
+//
+// THE SNAPSHOT NAME IS DERIVED, never free-form: `<instance>-boot-<label>` (diskSnapshotNameFor). So a
+// signed job cannot name, and therefore cannot collide with, a snapshot this op did not make. The
+// Worker snapshots the instance's ONE boot disk only. It never takes a disk name from the job.
+//
+// IDEMPOTENT: a snapshot that already exists under the derived name, of this same boot disk, is
+// reported "already-existed" with its current status. That is also how a caller polls for READY: it
+// sends the same params again. Registered `true` in AGENCY_OP_IDEMPOTENT.
+
+export interface GcpDiskSnapshotCreateParams {
+  /** The agency's GCP project id the VM lives in. */
+  project: string;
+  /** The Compute Engine zone of the VM, e.g. "australia-southeast1-a". */
+  zone: string;
+  /** The cell node whose boot disk is snapshotted, e.g. "dy-data-syd-1". */
+  instance: string;
+  /** The suffix that makes the snapshot name unique per window, e.g. "20261020". */
+  label: string;
+}
+
+/**
+ * A cell node's VM name: `dy-` + a node role + `-` + the cell part + `-` + an index. The role list
+ * covers both naming schemes in use: the saga's `dy-gateway-<region>-1` and syd's `dy-gw-syd-1`. The
+ * control-plane VM (`dy-cp-1`) does not match, by design.
+ */
+const CELL_NODE_INSTANCE_NAME_RE = /^dy-(?:web|file|data|gw|gateway)-[a-z0-9](?:[a-z0-9-]{0,48}[a-z0-9])?-[0-9]{1,3}$/;
+const DISK_SNAPSHOT_LABEL_RE = /^[a-z0-9]{1,16}$/;
+
+/** The ONE snapshot name this op may create for `instance` and `label` (the caller validates both). */
+export function diskSnapshotNameFor(instance: string, label: string): string {
+  return `${instance}-boot-${label}`;
+}
+
+export function validateGcpDiskSnapshotCreateParams(raw: unknown): ParamsVerdict<GcpDiskSnapshotCreateParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, zone, instance, label } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof zone !== "string" || zone.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a Compute Engine zone name (e.g. australia-southeast1-a)" };
+  }
+  if (typeof instance !== "string" || !GCP_RESOURCE_NAME_RE.test(instance) || !CELL_NODE_INSTANCE_NAME_RE.test(instance)) {
+    return {
+      ok: false,
+      reason: "instance must be a cell node VM name: dy-<web|file|data|gw|gateway>-<cell>-<n> (e.g. dy-data-syd-1)",
+    };
+  }
+  if (typeof label !== "string" || !DISK_SNAPSHOT_LABEL_RE.test(label)) {
+    return { ok: false, reason: "label must be 1-16 lowercase letters and digits (e.g. 20261020)" };
+  }
+  const snapshotName = diskSnapshotNameFor(instance, label);
+  if (!GCP_RESOURCE_NAME_RE.test(snapshotName)) {
+    return {
+      ok: false,
+      reason: `the snapshot name ${snapshotName} would not be a valid Compute Engine resource name (max 63 characters) — use a shorter label`,
+    };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, zone, instance, label } };
+}
+
 // ── planning/49: the agency-side ephemeral-compute ops ───────────────────────────────
 // planning/49 places the terminal / phpMyAdmin / staging runner in the AGENCY's own GCP project, as
 // a Cloud Run service with Direct VPC egress onto that cell's own VPC. In the agency's own project,

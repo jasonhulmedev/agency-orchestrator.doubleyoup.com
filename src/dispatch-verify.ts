@@ -89,6 +89,11 @@ export const DISPATCH_OPS = [
   // hub#93 §1 "Quota", §6 — READ the agency project's live SUBNETWORKS usage and limit, which the
   // per-site Run slot allocator checks just before it allocates (the quota is per project).
   "gcp-project-quota-get",
+  // hub#58 / planning/51 — manage syd through its Worker. READ one tunnel's ingress config (so a writer
+  // keeps the rules it does not own), and SNAPSHOT one cell node's boot disk (the revert point before
+  // a reboot). Neither changes a running resource.
+  "cf-tunnel-get",
+  "gcp-disk-snapshot-create",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 

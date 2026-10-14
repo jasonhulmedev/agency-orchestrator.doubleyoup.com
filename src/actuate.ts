@@ -105,8 +105,9 @@ import {
 import { presignS3Put, presignS3Get } from "./sigv4.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken, mintGoogleIdToken } from "./validators.js";
 import { errorMessage, stripTrailingSlash } from "./util.js";
+import type { CfTunnelGetResult, GcpDiskSnapshotCreateResult } from "./actuate-hub58.js";
 
-const CF_API = "https://api.cloudflare.com/client/v4";
+export const CF_API = "https://api.cloudflare.com/client/v4";
 
 export type ProvisionR2Result =
   | { ok: true; op: "provision-r2"; bucket: string; status: "created" | "already-existed"; accountId: string }
@@ -668,9 +669,12 @@ export type ActuateResult =
   | GcpSubnetsListResult
   | WorkersRouteUpsertResult
   | WorkersRouteDeleteResult
-  | GcpProjectQuotaGetResult;
+  | GcpProjectQuotaGetResult
+  // hub#58 / planning/51 (actuate-hub58.ts).
+  | CfTunnelGetResult
+  | GcpDiskSnapshotCreateResult;
 
-interface CloudflareEnvelope {
+export interface CloudflareEnvelope {
   success?: boolean;
   errors?: Array<{ code?: number; message?: string }>;
   result?: unknown;
@@ -694,7 +698,7 @@ function cloudflareHeaders(token: string): Record<string, string> {
  * scoped to exactly one account, so GET /accounts?per_page=1 returns it — the same cheap,
  * account-scoped read the R2 validator already uses. Avoids a separate account-id secret.
  */
-async function resolveAccountId(
+export async function resolveAccountId(
   token: string,
   unauthorizedHint?: string,
 ): Promise<{ id: string } | { error: string }> {
@@ -834,7 +838,7 @@ interface CloudflareDnsRecordSummary {
 }
 
 /** First Cloudflare error message from a response body, if any (for detail strings). */
-function cloudflareErrorMessage(body: CloudflareEnvelope | null): string {
+export function cloudflareErrorMessage(body: CloudflareEnvelope | null): string {
   const message = body?.errors?.[0]?.message;
   return message ? `: ${message}` : "";
 }
@@ -1056,7 +1060,7 @@ export async function actuateDnsRecordDelete(params: DnsRecordDeleteParams, env:
 // cheap read the R2 path uses) — the account-level scope is what makes that read succeed for a token
 // that was previously zone-only. NEVER falls back to a platform credential (there is none).
 
-const CF_TUNNEL_UNAUTHORIZED_HINT =
+export const CF_TUNNEL_UNAUTHORIZED_HINT =
   "Cloudflare rejected CF_DNS_API_TOKEN for tunnel management — it needs account-level Cloudflare Tunnel: Edit (Manage Account → Account API Tokens).";
 
 /** A cfd_tunnel summary row (only the fields we read). */
@@ -2850,7 +2854,7 @@ export async function actuateDbImport(params: DbImportParams, env: Env): Promise
 // have created the VM. The orchestrator registers this op `false` in AGENCY_OP_IDEMPOTENT, so
 // dispatchWithRetry runs it exactly once and never auto-retries a transient failure (like db-import).
 
-const GCP_COMPUTE_API = "https://compute.googleapis.com/compute/v1";
+export const GCP_COMPUTE_API = "https://compute.googleapis.com/compute/v1";
 // The boot image every proof VM is created from: Debian 12 from Google's public debian-cloud
 // project, addressed by image FAMILY so it always resolves to the current patched image.
 const GCP_INSTANCE_BOOT_IMAGE = "projects/debian-cloud/global/images/family/debian-12";
@@ -2871,7 +2875,7 @@ const INSTANCE_CREATE_WAIT_ATTEMPTS = 1;
  * DONE with a failure — `error.errors`); a non-2xx is Google's standard error envelope
  * (`error.message`). One shape covers both so a single parse serves both paths.
  */
-interface ComputeInsertResponse {
+export interface ComputeInsertResponse {
   name?: string;
   status?: string;
   error?: {
@@ -2885,13 +2889,13 @@ function gcpInstanceCreateFailure(instanceName: string, detail: string): GcpInst
 }
 
 /** Google's top-level error message from a response body, if any (for detail strings). */
-function googleErrorMessage(body: ComputeInsertResponse | null): string {
+export function googleErrorMessage(body: ComputeInsertResponse | null): string {
   const message = body?.error?.message;
   return message ? `: ${message}` : "";
 }
 
 /** The request headers for a Compute Engine call: the minted bearer token + JSON in/out. */
-function gcpHeaders(accessToken: string): Record<string, string> {
+export function gcpHeaders(accessToken: string): Record<string, string> {
   return {
     authorization: `Bearer ${accessToken}`,
     "content-type": "application/json",
@@ -2923,7 +2927,7 @@ type GcpTokenOutcome = { ok: true; accessToken: string } | { ok: false; detail: 
  * after the pin passes. The token goes back to the caller alone, who places it in an Authorization
  * header and never logs or echoes it.
  */
-async function mintPinnedGcpAccessToken(env: Env, project: string): Promise<GcpTokenOutcome> {
+export async function mintPinnedGcpAccessToken(env: Env, project: string): Promise<GcpTokenOutcome> {
   const key = readPinnedServiceAccountKey(env, project);
   if (!key.ok) {
     return { ok: false, detail: key.detail };
@@ -3269,7 +3273,7 @@ function operationErrorMessages(entries: Array<{ code?: string; message?: string
  * entries is taken as alreadyExists too (the only 409 an insert produces); a 409 whose entries name
  * a DIFFERENT reason is not, and falls through to a failure carrying Google's message.
  */
-function isAlreadyExists(body: ComputeInsertResponse | null): boolean {
+export function isAlreadyExists(body: ComputeInsertResponse | null): boolean {
   const entries = body?.error?.errors ?? [];
   if (entries.length === 0) {
     return true;
@@ -3385,7 +3389,7 @@ type ComputeOperationWaitOutcome =
  * `verb` only names the ACTION in the detail strings ("create" by default, "delete" for the teardown
  * ops) so a teardown failure reads as a delete failure. It changes no behaviour.
  */
-async function waitForComputeOperation(input: {
+export async function waitForComputeOperation(input: {
   waitUrl: string;
   accessToken: string;
   what: string;
