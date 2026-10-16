@@ -22,14 +22,14 @@ import {
   validateR2SiteKeyInstallParams,
   validateR2SiteKeyRevokeParams,
 } from "../src/dispatch-params.js";
-import { actuateR2SiteKeyInstall, actuateR2SiteKeyRevoke, readR2MediaState, R2_BUCKET_ITEM_WRITE_PERMISSION_GROUP_ID } from "../src/actuate-r2-media.js";
+import { actuateR2SiteKeyInstall, actuateR2SiteKeyRevoke, readR2MediaBuckets, readR2MediaState, R2_BUCKET_ITEM_WRITE_PERMISSION_GROUP_ID } from "../src/actuate-r2-media.js";
 
 const dispatchParamsSource: string = rawDispatchParamsSource as string;
 
 const TWIN_BLOCK_START_MARKER = "// ── hub#43: agency-owned media";
 const TWIN_BLOCK_END_MARKER = "\n// ── hub#58: syd through its Worker";
 // The app's src/server/services/agency-dispatch-params-hub43.test.ts pins the SAME value.
-const TWIN_BLOCK_SHA256 = "90df6910cc68bec278d8c76a203fd70250b0a29d1cd11e1c87662ff5c85f8767";
+const TWIN_BLOCK_SHA256 = "f2b700d3ef4e712143ed625abb15a9aca3a6c2ef9712ae8115e1f364a4eea2cc";
 
 const ACCOUNT_ID = "043e3bdaf4a6849a2d745269084c0e5f";
 const R2_TOKEN = "r2-provision-token-must-not-be-echoed";
@@ -97,7 +97,7 @@ describe("hub#43 twin block", () => {
   });
 
   it("the three ops are allowlisted and registered", () => {
-    for (const op of ["r2-media-state", "r2-site-key-install", "r2-site-key-revoke"] as const) {
+    for (const op of ["r2-media-buckets", "r2-media-state", "r2-site-key-install", "r2-site-key-revoke"] as const) {
       expect(DISPATCH_OPS).toContain(op);
       expect(typeof DISPATCH_OP_REGISTRY[op].actuate).toBe("function");
     }
@@ -378,5 +378,48 @@ describe("actuateR2SiteKeyRevoke", () => {
       return { status: 404, body: { success: false } };
     });
     expect(await actuateR2SiteKeyRevoke(params, env())).toMatchObject({ ok: true, status: "already-absent" });
+  });
+});
+
+describe("r2-media-buckets", () => {
+  it("is allowlisted, registered, takes no params, and lists names only (sorted, de-duplicated)", async () => {
+    expect(DISPATCH_OPS).toContain("r2-media-buckets");
+    expect(typeof DISPATCH_OP_REGISTRY["r2-media-buckets"].actuate).toBe("function");
+    expect(DISPATCH_OP_REGISTRY["r2-media-buckets"].validateParams({})).toEqual({ ok: true, params: {} });
+    expect(DISPATCH_OP_REGISTRY["r2-media-buckets"].validateParams({ bucket: BUCKET }).ok).toBe(false);
+    const calls = mockFetch((call) => {
+      if (call.url === ACCOUNTS_URL) return { body: { success: true, result: [{ id: ACCOUNT_ID }] } };
+      if (call.url.startsWith(`${CF}/accounts/${ACCOUNT_ID}/r2/buckets?`)) {
+        return { body: { success: true, result: { buckets: [{ name: "sbmstudio", creation_date: "x" }, { name: BUCKET }, { name: BUCKET }, { nope: 1 }] } } };
+      }
+      return { status: 500, body: { success: false } };
+    });
+    const result = await readR2MediaBuckets({}, env());
+    expect(result).toEqual({
+      ok: true,
+      op: "r2-media-buckets",
+      accountId: ACCOUNT_ID,
+      endpointHost: `${ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      buckets: [BUCKET, "sbmstudio"],
+      truncated: false,
+    });
+    expect(JSON.stringify(result)).not.toContain(R2_TOKEN);
+    expect(calls.every((call) => call.method === "GET")).toBe(true);
+  });
+
+  it("follows the cursor, and a denied token or a missing token is a plain failure", async () => {
+    let page = 0;
+    mockFetch((call) => {
+      if (call.url === ACCOUNTS_URL) return { body: { success: true, result: [{ id: ACCOUNT_ID }] } };
+      page += 1;
+      if (page === 1) return { body: { success: true, result: { buckets: [{ name: "a-one" }] }, result_info: { cursor: "next" } } };
+      return { body: { success: true, result: { buckets: [{ name: "b-two" }] } } };
+    });
+    const paged = await readR2MediaBuckets({}, env());
+    expect(paged.ok && paged.buckets).toEqual(["a-one", "b-two"]);
+
+    mockFetch((call) => (call.url === ACCOUNTS_URL ? { body: { success: true, result: [{ id: ACCOUNT_ID }] } } : { status: 403, body: { success: false } }));
+    expect((await readR2MediaBuckets({}, env())).ok).toBe(false);
+    expect((await readR2MediaBuckets({}, env({ R2_PROVISION_API_TOKEN: undefined }))).ok).toBe(false);
   });
 });

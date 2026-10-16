@@ -190,12 +190,14 @@ import {
 } from "./actuate.js";
 import {
   type CfTunnelGetParams,
+  type R2MediaBucketsParams,
   type R2MediaStateParams,
   type R2SiteKeyInstallParams,
   type R2SiteKeyRevokeParams,
   type GcpDiskSnapshotCreateParams,
   type GcpInstanceRemoveServiceAccountParams,
   validateCfTunnelGetParams,
+  validateR2MediaBucketsParams,
   validateR2MediaStateParams,
   validateR2SiteKeyInstallParams,
   validateR2SiteKeyRevokeParams,
@@ -203,7 +205,7 @@ import {
   validateGcpInstanceRemoveServiceAccountParams,
 } from "./dispatch-params.js";
 import { actuateCfTunnelGet, actuateGcpDiskSnapshotCreate, actuateGcpInstanceRemoveServiceAccount } from "./actuate-hub58.js";
-import { actuateR2SiteKeyInstall, actuateR2SiteKeyRevoke, readR2MediaState } from "./actuate-r2-media.js";
+import { actuateR2SiteKeyInstall, actuateR2SiteKeyRevoke, readR2MediaBuckets, readR2MediaState } from "./actuate-r2-media.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
 interface OpDefinition<P> {
@@ -401,6 +403,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "gcp-instance-remove-service-account": defineOp<GcpInstanceRemoveServiceAccountParams>({
     validateParams: validateGcpInstanceRemoveServiceAccountParams,
     actuate: (params, env) => actuateGcpInstanceRemoveServiceAccount(params, env),
+  }),
+  "r2-media-buckets": defineOp<R2MediaBucketsParams>({
+    validateParams: validateR2MediaBucketsParams,
+    actuate: (params, env) => readR2MediaBuckets(params, env),
   }),
   "r2-media-state": defineOp<R2MediaStateParams>({
     validateParams: validateR2MediaStateParams,

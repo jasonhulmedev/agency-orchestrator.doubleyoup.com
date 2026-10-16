@@ -106,7 +106,7 @@ import { presignS3Put, presignS3Get } from "./sigv4.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken, mintGoogleIdToken } from "./validators.js";
 import { errorMessage, stripTrailingSlash } from "./util.js";
 import type { CfTunnelGetResult, GcpDiskSnapshotCreateResult, GcpInstanceRemoveServiceAccountResult } from "./actuate-hub58.js";
-import type { R2MediaStateResult, R2SiteKeyInstallResult, R2SiteKeyRevokeResult } from "./actuate-r2-media.js";
+import type { R2MediaBucketsResult, R2MediaStateResult, R2SiteKeyInstallResult, R2SiteKeyRevokeResult } from "./actuate-r2-media.js";
 
 export const CF_API = "https://api.cloudflare.com/client/v4";
 
@@ -683,6 +683,7 @@ export type ActuateResult =
   | GcpDiskSnapshotCreateResult
   | GcpInstanceRemoveServiceAccountResult
   // hub#43 (actuate-r2-media.ts): agency-owned media.
+  | R2MediaBucketsResult
   | R2MediaStateResult
   | R2SiteKeyInstallResult
   | R2SiteKeyRevokeResult;

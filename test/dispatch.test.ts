@@ -1141,6 +1141,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-subnets-list",
       "provision-r2",
       "provision-ssh-keys",
+      "r2-media-buckets",
       "r2-media-state",
       "r2-site-key-install",
       "r2-site-key-revoke",

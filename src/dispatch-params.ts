@@ -2093,7 +2093,7 @@ export function validateProvisionSshKeysParams(raw: unknown): ParamsVerdict<Prov
   return { ok: true, params: { project, slug, authorizedKeys: cleanKeys } };
 }
 
-// ── hub#43: agency-owned media — r2-media-state, r2-site-key-install, r2-site-key-revoke ─────────
+// ── hub#43: agency-owned media — r2-media-buckets, r2-media-state, r2-site-key-install, r2-site-key-revoke ──
 // hub#43 moves an agency's sites off the PLATFORM's R2 account and onto the agency's own. The platform
 // must never hold a write key to the agency's account, so the per-site write key is minted by THIS Worker
 // with the agency's own R2_PROVISION_API_TOKEN and sent straight to the agency's own FILE-NODE cell-agent,
@@ -2103,7 +2103,8 @@ export function validateProvisionSshKeysParams(raw: unknown): ParamsVerdict<Prov
 // suite pins the sha256 of the block (from this marker up to the next section marker, the hub#58 block).
 // A change on one side only fails that side's suite. Change both twins and both pins together.
 //
-// Three ops, all narrow on purpose:
+// Four ops, all narrow on purpose:
+//   r2-media-buckets      READ the NAMES of the buckets in the agency's R2 account (names only, no objects, no keys).
 //   r2-media-state        READ one media bucket (does it exist?) and the keys this op family minted for it.
 //   r2-site-key-install   MINT one bucket-scoped read-write key and STAGE it on the file node. NOT idempotent:
 //                         every run mints a NEW key. It runs once under F1, and a lost answer is settled by
@@ -2112,6 +2113,9 @@ export function validateProvisionSshKeysParams(raw: unknown): ParamsVerdict<Prov
 //
 // Every bucket these ops touch is named `doubleyoup-media-<prefix>`, the shape the media Worker derives from
 // the site's key prefix. They cannot name an agency's backup bucket, a database dump bucket or any other.
+
+/** r2-media-buckets takes no parameters: it lists the bucket names of the account the Worker's token belongs to. */
+export type R2MediaBucketsParams = Record<string, never>;
 
 export interface R2MediaStateParams {
   /** The media bucket, `doubleyoup-media-<prefix>`. */
@@ -2160,6 +2164,16 @@ export function r2SiteKeyNameFor(bucket: string, label: string): string {
 
 const R2_MEDIA_BUCKET_RULE =
   "bucket must be doubleyoup-media-<prefix> (prefix: 1-46 characters, lowercase letters, digits and hyphens, starting with a letter or digit)";
+
+export function validateR2MediaBucketsParams(raw: unknown): ParamsVerdict<R2MediaBucketsParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  if (Object.keys(raw).length !== 0) {
+    return { ok: false, reason: "r2-media-buckets takes no parameters" };
+  }
+  return { ok: true, params: {} };
+}
 
 export function validateR2MediaStateParams(raw: unknown): ParamsVerdict<R2MediaStateParams> {
   if (!isPlainObject(raw)) {

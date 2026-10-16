@@ -1,5 +1,6 @@
 // hub#43 ACTUATION (agency Worker side) — agency-owned media.
 //
+//   r2-media-buckets      READ the names of the buckets in this account (names only).
 //   r2-media-state        READ whether one media bucket exists, and the keys this op family minted for it.
 //   r2-site-key-install   MINT one bucket-scoped read-write key in the agency's own Cloudflare account and
 //                         STAGE it on the site's file node, straight from this Worker to the agency's own
@@ -33,6 +34,7 @@
 import type { Env } from "./env.js";
 import {
   r2SiteKeyNameFor,
+  type R2MediaBucketsParams,
   type R2MediaStateParams,
   type R2SiteKeyInstallParams,
   type R2SiteKeyRevokeParams,
@@ -67,6 +69,18 @@ export type R2MediaStateResult =
       keys: R2MediaKeySummary[];
     }
   | { ok: false; op: "r2-media-state"; bucket: string; detail: string };
+
+export type R2MediaBucketsResult =
+  | {
+      ok: true;
+      op: "r2-media-buckets";
+      accountId: string;
+      endpointHost: string;
+      /** Bucket names only, sorted. True when the list was cut at the cap: it may be incomplete. */
+      buckets: string[];
+      truncated: boolean;
+    }
+  | { ok: false; op: "r2-media-buckets"; detail: string };
 
 export type R2SiteKeyInstallResult =
   | {
@@ -375,4 +389,72 @@ export async function actuateR2SiteKeyRevoke(params: R2SiteKeyRevokeParams, env:
     return failure(`deleting the key failed with HTTP ${deleted.status}${cloudflareErrorMessage(deleted.envelope)}`);
   }
   return { ok: true, op: "r2-site-key-revoke", bucket: params.bucket, tokenId: params.tokenId, status: "revoked" };
+}
+
+const BUCKET_LIST_PAGE_SIZE = 1000;
+const BUCKET_LIST_MAX_PAGES = 5;
+
+/**
+ * READ the names of every bucket in the agency's R2 account. Names only: no object, no key, no size.
+ * [unverified] the exact Cloudflare response shape: the code accepts `result.buckets` (the documented
+ * shape) and a bare array, and pages with `result_info.cursor` when one is returned.
+ */
+export async function readR2MediaBuckets(_params: R2MediaBucketsParams, env: Env): Promise<R2MediaBucketsResult> {
+  const token = env.R2_PROVISION_API_TOKEN;
+  if (!token) {
+    return { ok: false, op: "r2-media-buckets", detail: "R2_PROVISION_API_TOKEN is not configured on this Worker." };
+  }
+  const account = await resolveAccountId(token, TOKEN_UNAUTHORIZED_HINT);
+  if ("error" in account) {
+    return { ok: false, op: "r2-media-buckets", detail: account.error };
+  }
+  const names: string[] = [];
+  let cursor = "";
+  let truncated = false;
+  for (let page = 1; page <= BUCKET_LIST_MAX_PAGES; page += 1) {
+    const query = new URLSearchParams({ per_page: String(BUCKET_LIST_PAGE_SIZE) });
+    if (cursor !== "") {
+      query.set("cursor", cursor);
+    }
+    const reply = await cfJson("GET", `/accounts/${encodeURIComponent(account.id)}/r2/buckets?${query.toString()}`, token);
+    if ("error" in reply) {
+      return { ok: false, op: "r2-media-buckets", detail: reply.error };
+    }
+    if (reply.status === 401 || reply.status === 403) {
+      return { ok: false, op: "r2-media-buckets", detail: TOKEN_UNAUTHORIZED_HINT };
+    }
+    if (reply.status !== 200 || !reply.envelope?.success) {
+      return { ok: false, op: "r2-media-buckets", detail: `listing buckets failed with HTTP ${reply.status}${cloudflareErrorMessage(reply.envelope)}` };
+    }
+    const result = reply.envelope.result as unknown;
+    let records: unknown[] = [];
+    if (Array.isArray(result)) {
+      records = result;
+    } else if (typeof result === "object" && result !== null && Array.isArray((result as { buckets?: unknown }).buckets)) {
+      records = (result as { buckets: unknown[] }).buckets;
+    }
+    for (const record of records) {
+      const name = typeof record === "object" && record !== null ? (record as { name?: unknown }).name : undefined;
+      if (typeof name === "string" && name.length > 0) {
+        names.push(name);
+      }
+    }
+    const info = (reply.envelope as { result_info?: { cursor?: unknown } }).result_info;
+    const nextCursor = typeof info?.cursor === "string" ? info.cursor : "";
+    if (nextCursor === "" || records.length === 0) {
+      break;
+    }
+    cursor = nextCursor;
+    if (page === BUCKET_LIST_MAX_PAGES) {
+      truncated = true;
+    }
+  }
+  return {
+    ok: true,
+    op: "r2-media-buckets",
+    accountId: account.id,
+    endpointHost: endpointHostFor(account.id),
+    buckets: [...new Set(names)].sort(),
+    truncated,
+  };
 }
