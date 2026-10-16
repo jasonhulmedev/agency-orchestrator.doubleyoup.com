@@ -97,6 +97,11 @@ export const DISPATCH_OPS = [
   // hub#58 review finding 4: STOP one cell node and take its service account off (it can only remove
   // one, never attach one), so its startup-script can be set without iam.serviceAccounts.actAs.
   "gcp-instance-remove-service-account",
+  // hub#43 — agency-owned media. READ one media bucket and the keys minted for it; MINT one bucket-scoped
+  // key and stage it straight onto the site's file node (the platform never sees it); DELETE one such key.
+  "r2-media-state",
+  "r2-site-key-install",
+  "r2-site-key-revoke",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 

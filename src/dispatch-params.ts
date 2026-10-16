@@ -2093,6 +2093,124 @@ export function validateProvisionSshKeysParams(raw: unknown): ParamsVerdict<Prov
   return { ok: true, params: { project, slug, authorizedKeys: cleanKeys } };
 }
 
+// ── hub#43: agency-owned media — r2-media-state, r2-site-key-install, r2-site-key-revoke ─────────
+// hub#43 moves an agency's sites off the PLATFORM's R2 account and onto the agency's own. The platform
+// must never hold a write key to the agency's account, so the per-site write key is minted by THIS Worker
+// with the agency's own R2_PROVISION_API_TOKEN and sent straight to the agency's own FILE-NODE cell-agent,
+// which writes it into the site's locked wp-config. The platform sees names, ids and hosts, never a key.
+//
+// THIS BLOCK IS A PINNED TWIN. The app and the agency Worker carry it byte for byte, and each repo's test
+// suite pins the sha256 of the block (from this marker up to the next section marker, the hub#58 block).
+// A change on one side only fails that side's suite. Change both twins and both pins together.
+//
+// Three ops, all narrow on purpose:
+//   r2-media-state        READ one media bucket (does it exist?) and the keys this op family minted for it.
+//   r2-site-key-install   MINT one bucket-scoped read-write key and STAGE it on the file node. NOT idempotent:
+//                         every run mints a NEW key. It runs once under F1, and a lost answer is settled by
+//                         r2-media-state (which lists the keys) and r2-site-key-revoke, never by a resend.
+//   r2-site-key-revoke    DELETE one key, only if its name proves this op family made it for that bucket.
+//
+// Every bucket these ops touch is named `doubleyoup-media-<prefix>`, the shape the media Worker derives from
+// the site's key prefix. They cannot name an agency's backup bucket, a database dump bucket or any other.
+
+export interface R2MediaStateParams {
+  /** The media bucket, `doubleyoup-media-<prefix>`. */
+  bucket: string;
+}
+
+export interface R2SiteKeyInstallParams {
+  /** The media bucket, `doubleyoup-media-<prefix>`. It must already exist (provision-r2 creates it). */
+  bucket: string;
+  /** The site slug: the file-node cell-agent derives the site's config path from it. */
+  slug: string;
+  /** The site's R2 key prefix (DOUBLEYOUP_R2_PREFIX). The bucket name must be `doubleyoup-media-<prefix>`. */
+  prefix: string;
+  /** The public host that serves the bucket (the agency's media Worker host), e.g. media.<agency zone>. */
+  mediaHost: string;
+  /** A short unique tag for this key (lowercase letters and digits). It becomes part of the key's name. */
+  label: string;
+}
+
+export interface R2SiteKeyRevokeParams {
+  /** The media bucket the key was minted for. */
+  bucket: string;
+  /** The Cloudflare API token id (the S3 access key id). 32 lowercase hex characters. */
+  tokenId: string;
+}
+
+const R2_MEDIA_BUCKET_PREFIX = "doubleyoup-media-";
+const R2_MEDIA_PREFIX_RE = /^[a-z0-9][a-z0-9-]{0,45}$/;
+const R2_MEDIA_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,45}$/;
+const R2_MEDIA_LABEL_RE = /^[a-z0-9]{1,16}$/;
+const R2_TOKEN_ID_RE = /^[a-f0-9]{32}$/;
+const R2_MEDIA_HOST_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+
+/** True for `doubleyoup-media-<prefix>` with a valid prefix (R2's 63-character cap is met by the 46-character prefix). */
+export function isR2MediaBucketName(name: unknown): name is string {
+  if (typeof name !== "string" || !name.startsWith(R2_MEDIA_BUCKET_PREFIX)) {
+    return false;
+  }
+  return R2_MEDIA_PREFIX_RE.test(name.slice(R2_MEDIA_BUCKET_PREFIX.length));
+}
+
+/** The name every key of this op family carries: `dy-media-<bucket>-<label>`. The revoke op trusts only this shape. */
+export function r2SiteKeyNameFor(bucket: string, label: string): string {
+  return `dy-media-${bucket}-${label}`;
+}
+
+const R2_MEDIA_BUCKET_RULE =
+  "bucket must be doubleyoup-media-<prefix> (prefix: 1-46 characters, lowercase letters, digits and hyphens, starting with a letter or digit)";
+
+export function validateR2MediaStateParams(raw: unknown): ParamsVerdict<R2MediaStateParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  if (!isR2MediaBucketName(raw.bucket)) {
+    return { ok: false, reason: R2_MEDIA_BUCKET_RULE };
+  }
+  return { ok: true, params: { bucket: raw.bucket } };
+}
+
+export function validateR2SiteKeyInstallParams(raw: unknown): ParamsVerdict<R2SiteKeyInstallParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { bucket, slug, prefix, mediaHost, label } = raw;
+  if (!isR2MediaBucketName(bucket)) {
+    return { ok: false, reason: R2_MEDIA_BUCKET_RULE };
+  }
+  if (typeof slug !== "string" || !R2_MEDIA_SLUG_RE.test(slug)) {
+    return { ok: false, reason: "slug must be 1-46 lowercase letters, digits and hyphens, starting with a letter or digit" };
+  }
+  if (typeof prefix !== "string" || !R2_MEDIA_PREFIX_RE.test(prefix)) {
+    return { ok: false, reason: "prefix must be 1-46 lowercase letters, digits and hyphens, starting with a letter or digit" };
+  }
+  if (bucket !== `${R2_MEDIA_BUCKET_PREFIX}${prefix}`) {
+    return { ok: false, reason: "bucket must be exactly doubleyoup-media-<prefix> for this prefix" };
+  }
+  if (typeof mediaHost !== "string" || mediaHost.length > 253 || !R2_MEDIA_HOST_RE.test(mediaHost)) {
+    return { ok: false, reason: "mediaHost must be a lowercase DNS host name" };
+  }
+  if (typeof label !== "string" || !R2_MEDIA_LABEL_RE.test(label)) {
+    return { ok: false, reason: "label must be 1-16 lowercase letters and digits" };
+  }
+  return { ok: true, params: { bucket, slug, prefix, mediaHost, label } };
+}
+
+export function validateR2SiteKeyRevokeParams(raw: unknown): ParamsVerdict<R2SiteKeyRevokeParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { bucket, tokenId } = raw;
+  if (!isR2MediaBucketName(bucket)) {
+    return { ok: false, reason: R2_MEDIA_BUCKET_RULE };
+  }
+  if (typeof tokenId !== "string" || !R2_TOKEN_ID_RE.test(tokenId)) {
+    return { ok: false, reason: "tokenId must be a 32-character lowercase-hex Cloudflare API token id" };
+  }
+  return { ok: true, params: { bucket, tokenId } };
+}
+
 // ── hub#58: syd through its Worker — cf-tunnel-get and gcp-disk-snapshot-create ──────
 // planning/51 (hub#58) moves the syd cell onto the path every agency cell already uses: signed jobs
 // through the agency's own Worker, on the agency's own credentials. Three ops are new for that. All

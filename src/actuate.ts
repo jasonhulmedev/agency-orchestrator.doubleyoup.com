@@ -106,6 +106,7 @@ import { presignS3Put, presignS3Get } from "./sigv4.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken, mintGoogleIdToken } from "./validators.js";
 import { errorMessage, stripTrailingSlash } from "./util.js";
 import type { CfTunnelGetResult, GcpDiskSnapshotCreateResult, GcpInstanceRemoveServiceAccountResult } from "./actuate-hub58.js";
+import type { R2MediaStateResult, R2SiteKeyInstallResult, R2SiteKeyRevokeResult } from "./actuate-r2-media.js";
 
 export const CF_API = "https://api.cloudflare.com/client/v4";
 
@@ -680,7 +681,11 @@ export type ActuateResult =
   // hub#58 / planning/51 (actuate-hub58.ts).
   | CfTunnelGetResult
   | GcpDiskSnapshotCreateResult
-  | GcpInstanceRemoveServiceAccountResult;
+  | GcpInstanceRemoveServiceAccountResult
+  // hub#43 (actuate-r2-media.ts): agency-owned media.
+  | R2MediaStateResult
+  | R2SiteKeyInstallResult
+  | R2SiteKeyRevokeResult;
 
 export interface CloudflareEnvelope {
   success?: boolean;
@@ -688,7 +693,7 @@ export interface CloudflareEnvelope {
   result?: unknown;
 }
 
-function cloudflareHeaders(token: string): Record<string, string> {
+export function cloudflareHeaders(token: string): Record<string, string> {
   return {
     authorization: `Bearer ${token}`,
     "content-type": "application/json",
@@ -2292,7 +2297,7 @@ function truncateOutput(text: string): string {
  * of OOMing. On success the accumulated bytes (<= cap) are decoded to a UTF-8 string for the
  * caller to JSON.parse.
  */
-async function readBodyCapped(
+export async function readBodyCapped(
   response: Response,
   capBytes: number,
 ): Promise<{ ok: true; text: string } | { ok: false; detail: string }> {

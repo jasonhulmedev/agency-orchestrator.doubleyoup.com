@@ -54,6 +54,11 @@
 // same boot disk under that name as "already-existed", so a re-run (or a caller polling for READY)
 // converges on one snapshot. The third, `gcp-instance-remove-service-account`, is NOT: its first call
 // stops a running VM, so it runs exactly once under F1, like gcp-instance-restart.
+//
+// The three hub#43 ops (actuate-r2-media.ts): `r2-media-state` is a read and `r2-site-key-revoke` deletes
+// one named key (an absent key is "already-absent"), so both converge. `r2-site-key-install` is NOT
+// idempotent: every run mints a NEW key, so it runs exactly once under F1 and a lost answer is settled
+// by r2-media-state, never by a resend.
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -185,13 +190,20 @@ import {
 } from "./actuate.js";
 import {
   type CfTunnelGetParams,
+  type R2MediaStateParams,
+  type R2SiteKeyInstallParams,
+  type R2SiteKeyRevokeParams,
   type GcpDiskSnapshotCreateParams,
   type GcpInstanceRemoveServiceAccountParams,
   validateCfTunnelGetParams,
+  validateR2MediaStateParams,
+  validateR2SiteKeyInstallParams,
+  validateR2SiteKeyRevokeParams,
   validateGcpDiskSnapshotCreateParams,
   validateGcpInstanceRemoveServiceAccountParams,
 } from "./dispatch-params.js";
 import { actuateCfTunnelGet, actuateGcpDiskSnapshotCreate, actuateGcpInstanceRemoveServiceAccount } from "./actuate-hub58.js";
+import { actuateR2SiteKeyInstall, actuateR2SiteKeyRevoke, readR2MediaState } from "./actuate-r2-media.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
 interface OpDefinition<P> {
@@ -389,6 +401,18 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "gcp-instance-remove-service-account": defineOp<GcpInstanceRemoveServiceAccountParams>({
     validateParams: validateGcpInstanceRemoveServiceAccountParams,
     actuate: (params, env) => actuateGcpInstanceRemoveServiceAccount(params, env),
+  }),
+  "r2-media-state": defineOp<R2MediaStateParams>({
+    validateParams: validateR2MediaStateParams,
+    actuate: (params, env) => readR2MediaState(params, env),
+  }),
+  "r2-site-key-install": defineOp<R2SiteKeyInstallParams>({
+    validateParams: validateR2SiteKeyInstallParams,
+    actuate: (params, env) => actuateR2SiteKeyInstall(params, env),
+  }),
+  "r2-site-key-revoke": defineOp<R2SiteKeyRevokeParams>({
+    validateParams: validateR2SiteKeyRevokeParams,
+    actuate: (params, env) => actuateR2SiteKeyRevoke(params, env),
   }),
 };
 
