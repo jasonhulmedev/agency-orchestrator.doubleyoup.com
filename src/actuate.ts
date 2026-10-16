@@ -394,10 +394,21 @@ export type GcpNetworkDeleteResult =
 // the wrong bucket. A placeholder the allowlist does not name is ABSENT from this map — not masked,
 // not truncated.
 //
+// planning/47 boot-script update: `valuesSha256` is the sha256 (hex, of the UTF-8 bytes) of each value
+// AS WRITTEN — after the substitution, so it is the hash gcp-instance-get reports for that key once the
+// write is in place, and the caller's read-back compares the two. A hash, never the value: a file-node
+// script carries the agency's object-store credential once substituted. `unchangedKeys` names the keys
+// whose existing value was already byte-identical (the write still goes out; nothing else differs).
+// `expectedFingerprintChecked` is true when the request carried `expectedFingerprint` and the
+// instance's fingerprint equalled it, false when the request carried none. A caller that SENT one and
+// gets no `true` back is talking to a Worker that ignored it.
+//
 // `staleFingerprint` (ok:false ONLY) is set when Google rejected the write with 412 — the instance's
-// metadata changed between this op's read and its write. A DISCRIMINABLE field (never a detail-string
-// match): the caller re-runs DELIBERATELY (a re-run re-reads and re-merges); the Worker never retries
-// it blindly, because a blind re-write is exactly how a concurrent change gets clobbered.
+// metadata changed between this op's read and its write — and, since planning/47, also when the
+// instance's fingerprint is not the caller's `expectedFingerprint` (then NO write was sent). A
+// DISCRIMINABLE field (never a detail-string match): the caller re-runs DELIBERATELY (a re-run
+// re-reads and re-merges); the Worker never retries it blindly, because a blind re-write is exactly how
+// a concurrent change gets clobbered.
 // `unconfirmed` (ok:false ONLY) is set when Google ACCEPTED the write but its operation did not reach
 // DONE inside the bounded wait — the metadata may well be in place; a re-run converges. Each is absent
 // on every other failure.
@@ -410,6 +421,12 @@ export type GcpInstanceSetMetadataResult =
       placeholdersSubstituted: string[];
       /** Non-secret resolved values only, keyed by placeholder name. See the comment above. */
       placeholderValues: Record<string, string>;
+      /** sha256 hex of each value AS WRITTEN (after substitution), keyed by metadata key. Never a value. */
+      valuesSha256: Record<string, string>;
+      /** The request's keys whose existing value was already byte-identical to the written one. */
+      unchangedKeys: string[];
+      /** True when the request's expectedFingerprint was checked and matched; false when none was sent. */
+      expectedFingerprintChecked: boolean;
       operationName: string;
     }
   | {
@@ -457,7 +474,8 @@ export type ProvisionSshKeysResult =
   | { ok: true; op: "provision-ssh-keys"; slug: string; count: number }
   | { ok: false; op: "provision-ssh-keys"; slug: string; detail: string };
 
-// planning/49 Phase 1 — READ one VM's in-VPC PRIVATE IPv4. `found` is false on a 404 (a clean "that
+// planning/49 Phase 1 — READ one VM's in-VPC PRIVATE IPv4 (and, planning/47, the non-secret facts of
+// its metadata: InstanceBootMetadataFacts). `found` is false on a 404 (a clean "that
 // VM is not there", like gcp-firewall-get), and then `privateIp` and `status` are null. `privateIp` is
 // also null for a found instance with no network interface. Google should never produce that state,
 // and we report it as null, not as an empty string. ok:false is a read failure.
@@ -483,8 +501,34 @@ export type GcpInstanceGetResult =
        * iam.serviceAccounts.actAs on it, which the agency's key never holds.
        */
       serviceAccounts: string[] | null;
+      /**
+       * planning/47: NON-SECRET facts about the VM's metadata, so a boot-script update can show what it
+       * would replace and prove what it wrote. null when not found. See InstanceBootMetadataFacts.
+       */
+      metadata: InstanceBootMetadataFacts | null;
     }
   | { ok: false; op: "gcp-instance-get"; instanceName: string; detail: string };
+
+// planning/47 — what gcp-instance-get reports about a VM's metadata. EVERY field is non-secret by
+// construction: the fingerprint is Google's concurrency token, the script is reported as a sha256 and a
+// byte count (a file-node script carries the agency's object-store credential, so its TEXT never leaves
+// this Worker), and the two bundle facts are the platform's own PUBLIC pin, read from exactly one
+// `readonly DY_BUNDLE_URL='...'` / `readonly DY_BUNDLE_SHA256='...'` line of the injected block and
+// reported only when the line matches its strict grammar. Any other line, value or key is not read.
+export interface InstanceBootMetadataFacts {
+  /** The metadata fingerprint (what gcp-instance-set-metadata's expectedFingerprint names), or null. */
+  fingerprint: string | null;
+  /** The `startup-script` key, or null when the VM has none. */
+  startupScript: {
+    /** sha256 hex of the value's UTF-8 bytes (what gcp-instance-set-metadata reports in valuesSha256). */
+    sha256: string;
+    bytes: number;
+    /** The bundle a boot of this script installs, or null (no such line, several, or another shape). */
+    bundleUrl: string | null;
+    /** That bundle's pinned sha256, or null (no such line, several, an empty pin, or another shape). */
+    bundleSha256: string | null;
+  } | null;
+}
 
 // planning/49 Phase 2 — the Cloud Run subnet. "created" means the Worker WAITED for the insert to
 // reach DONE, so the subnet exists on return. "already-existed" is Google's 409 alreadyExists; for the
@@ -4999,7 +5043,33 @@ export async function actuateGcpInstanceSetMetadata(
     // clobber this op refuses to risk.
     return failure(`${what} returned no metadata fingerprint — refusing to write metadata without the concurrency guard.`);
   }
+  // planning/47: the CALLER's read. A change made after the caller read the metadata (and showed the
+  // operator a diff against it) is refused here, before anything is written — never merged over.
+  const expectedFingerprintChecked = params.expectedFingerprint !== undefined;
+  if (params.expectedFingerprint !== undefined && params.expectedFingerprint !== fingerprint) {
+    return {
+      ok: false,
+      op: "gcp-instance-set-metadata",
+      instanceName,
+      detail:
+        `the metadata of ${what} changed since the caller read it (expected fingerprint ${params.expectedFingerprint}, ` +
+        `found ${fingerprint}) — nothing was written; read it again and decide against the current metadata.`,
+      staleFingerprint: true,
+    };
+  }
   const existingItems = current.instance.metadata?.items ?? [];
+
+  // What the read-back will compare against: the hash of each value AS WRITTEN, and which keys
+  // already held exactly that value. Hashes and key names only — never a value.
+  const valuesSha256: Record<string, string> = {};
+  const unchangedKeys: string[] = [];
+  for (const item of renderedItems) {
+    valuesSha256[item.key] = await utf8Sha256Hex(item.value);
+    const existingEntry = existingItems.find((entry) => entry.key === item.key);
+    if (existingEntry !== undefined && existingEntry.value === item.value) {
+      unchangedKeys.push(item.key);
+    }
+  }
 
   // Step 3 — merge (unrelated keys survive).
   const mergedItems = mergeMetadataItems(existingItems, renderedItems);
@@ -5073,8 +5143,17 @@ export async function actuateGcpInstanceSetMetadata(
     keysSet: renderedItems.map((item) => item.key),
     placeholdersSubstituted,
     placeholderValues,
+    valuesSha256,
+    unchangedKeys,
+    expectedFingerprintChecked,
     operationName,
   };
+}
+
+/** The sha256 of a string's UTF-8 bytes, as lowercase hex (what `sha256sum` prints for the same bytes). */
+async function utf8Sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 // ── gcp-instance-restart ─────────────────────────────────────────────────────────────────────
@@ -5293,6 +5372,11 @@ export async function actuateGcpInstanceRestart(
 // a clean found:false (NOT a failure), and only auth, an unreachable API or an unexpected non-2xx is
 // ok:false. Deliberately NOT built on readComputeInstance(). That helper treats a 404 as a failure,
 // because its callers (set-metadata / restart) have nothing to update when the VM is gone.
+//
+// planning/47 adds the `metadata` facts to the same read (bootMetadataFactsOf): the fingerprint, and
+// the startup-script's sha256, byte count and public bundle pin. A boot-script update reads them to
+// show what it would replace, sends the fingerprint back as expectedFingerprint, and reads them again
+// to prove the write. The script TEXT never leaves this Worker.
 
 /** What instances.get answers with for THIS op (the fields it reads). */
 interface ComputeInstanceAddressResponse {
@@ -5302,7 +5386,58 @@ interface ComputeInstanceAddressResponse {
   networkInterfaces?: Array<{ networkIP?: string; network?: string }>;
   /** The accounts the VM runs as; absent when it runs as none. */
   serviceAccounts?: unknown;
+  /** planning/47: read for InstanceBootMetadataFacts only (fingerprint + the startup-script's facts). */
+  metadata?: { fingerprint?: unknown; items?: unknown };
   error?: ComputeInsertResponse["error"];
+}
+
+/** The platform's injected bundle lines (orchestrator cell-bootstrap.ts renders `readonly KEY='value'`). */
+const BOOT_BUNDLE_URL_LINE_RE = /^readonly DY_BUNDLE_URL='(https:\/\/[A-Za-z0-9.-]{1,253}\/[A-Za-z0-9._/-]{1,200})'$/gm;
+const BOOT_BUNDLE_SHA256_LINE_RE = /^readonly DY_BUNDLE_SHA256='([a-f0-9]{64})'$/gm;
+
+/** The ONE capture of `pattern` in `text`, or null when it matches zero times or more than once. */
+function singleLineCapture(text: string, pattern: RegExp): string | null {
+  const matches = [...text.matchAll(pattern)];
+  if (matches.length !== 1) {
+    return null;
+  }
+  return (matches[0] as RegExpMatchArray)[1] ?? null;
+}
+
+/**
+ * planning/47: the non-secret facts of an instance's metadata (see InstanceBootMetadataFacts). PURE
+ * apart from hashing, and exported for the unit tests. An items list of an unexpected shape reports
+ * no startup-script rather than a guess; a non-string value of the key is treated the same way.
+ */
+export async function bootMetadataFactsOf(metadata: { fingerprint?: unknown; items?: unknown } | undefined): Promise<InstanceBootMetadataFacts> {
+  let fingerprint: string | null = null;
+  if (typeof metadata?.fingerprint === "string" && metadata.fingerprint.length > 0) {
+    fingerprint = metadata.fingerprint;
+  }
+  const items = Array.isArray(metadata?.items) ? (metadata?.items as unknown[]) : [];
+  let scriptText: string | null = null;
+  for (const item of items) {
+    if (item === null || typeof item !== "object") {
+      continue;
+    }
+    const entry = item as { key?: unknown; value?: unknown };
+    if (entry.key === "startup-script" && typeof entry.value === "string") {
+      scriptText = entry.value;
+      break;
+    }
+  }
+  if (scriptText === null) {
+    return { fingerprint, startupScript: null };
+  }
+  return {
+    fingerprint,
+    startupScript: {
+      sha256: await utf8Sha256Hex(scriptText),
+      bytes: new TextEncoder().encode(scriptText).length,
+      bundleUrl: singleLineCapture(scriptText, BOOT_BUNDLE_URL_LINE_RE),
+      bundleSha256: singleLineCapture(scriptText, BOOT_BUNDLE_SHA256_LINE_RE),
+    },
+  };
 }
 
 /** A service-account e-mail as Google reports one (e.g. 123-compute@developer.gserviceaccount.com). */
@@ -5383,7 +5518,17 @@ export async function readComputeInstanceAddress(params: GcpInstanceGetParams, e
   const body = (await response.json().catch(() => null)) as ComputeInstanceAddressResponse | null;
 
   if (response.status === 404) {
-    return { ok: true, op: "gcp-instance-get", instanceName, found: false, privateIp: null, network: null, status: null, serviceAccounts: null };
+    return {
+      ok: true,
+      op: "gcp-instance-get",
+      instanceName,
+      found: false,
+      privateIp: null,
+      network: null,
+      status: null,
+      serviceAccounts: null,
+      metadata: null,
+    };
   }
   if (response.status === 401 || response.status === 403) {
     return failure(
@@ -5411,6 +5556,7 @@ export async function readComputeInstanceAddress(params: GcpInstanceGetParams, e
     network: firstInterface.network,
     status,
     serviceAccounts: serviceAccountEmailsOf(body?.serviceAccounts),
+    metadata: await bootMetadataFactsOf(body?.metadata),
   };
 }
 

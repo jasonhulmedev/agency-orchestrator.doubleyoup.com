@@ -1828,6 +1828,9 @@ export function validateGcpNetworkDeleteParams(raw: unknown): ParamsVerdict<GcpN
 //                  length-capped at Google's 256 KB per-value limit and must be non-empty (an empty
 //                  startup script is always a caller bug, never a desired state). It reaches Google
 //                  only as a JSON.stringify'd body field, never a URL segment.
+// ONE OPTIONAL param (planning/47): `expectedFingerprint`, the fingerprint the caller read. The
+// actuator refuses the write when the instance's fingerprint is no longer that value (see the pinned
+// twin block "the caller's expected metadata fingerprint").
 // Keys NOT named in `items` are PRESERVED: the actuator reads the instance, merges, and writes back
 // with the instance's current metadata FINGERPRINT, which Google rejects when stale (HTTP 412) — the
 // concurrency guard against clobbering a change made between the read and the write.
@@ -1882,6 +1885,12 @@ export interface GcpInstanceSetMetadataParams {
   name: string;
   /** The entries to set (merged into the instance's existing metadata; other keys survive). */
   items: GcpInstanceMetadataItem[];
+  /**
+   * planning/47: the metadata fingerprint the CALLER read before it decided what to write (see the
+   * pinned twin block "the caller's expected metadata fingerprint"). Absent = the op's own
+   * read-then-write guard only.
+   */
+  expectedFingerprint?: string;
 }
 
 // Google's metadata KEY grammar: letters, digits, hyphen, underscore; 1-128 chars. Anchored, so a key
@@ -1949,8 +1958,18 @@ export function validateGcpInstanceSetMetadataParams(raw: unknown): ParamsVerdic
     cleanItems.push({ key, value });
   }
 
-  // A FRESH object of only the known keys — never the caller's object.
-  return { ok: true, params: { project, zone, name, items: cleanItems } };
+  const fingerprint = expectedFingerprintVerdict(raw.expectedFingerprint);
+  if (!fingerprint.ok) {
+    return { ok: false, reason: fingerprint.reason };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object. `expectedFingerprint` is
+  // present only when the caller sent one, so a request without it signs and actuates as before.
+  const params: GcpInstanceSetMetadataParams = { project, zone, name, items: cleanItems };
+  if (fingerprint.expectedFingerprint !== undefined) {
+    params.expectedFingerprint = fingerprint.expectedFingerprint;
+  }
+  return { ok: true, params };
 }
 
 // ── gcp-instance-restart ─────────────────────────────────────────────────────────────
@@ -2091,6 +2110,48 @@ export function validateProvisionSshKeysParams(raw: unknown): ParamsVerdict<Prov
   }
 
   return { ok: true, params: { project, slug, authorizedKeys: cleanKeys } };
+}
+
+// ── planning/47: the boot-script update — the caller's expected metadata fingerprint ─────
+// planning/47 makes an agency cell's nodes boot the CURRENT startup scripts: the orchestrator reads a
+// node's metadata (gcp-instance-get reports its fingerprint and non-secret facts about its boot
+// script), shows the operator what would change, and only then publishes (gcp-instance-set-metadata).
+// The actuator's own read-then-write already refuses a change made between ITS read and ITS write
+// (Google's 412). That is not enough: a change made between the CALLER's read and the op would be
+// merged over, and the operator would have approved a diff against a script that is no longer there.
+//
+// So gcp-instance-set-metadata takes ONE OPTIONAL param more: `expectedFingerprint`, the fingerprint
+// the caller read. The actuator compares it with the fingerprint it reads itself and refuses the
+// write, with nothing written, when they differ (the discriminable `staleFingerprint` result). An
+// absent `expectedFingerprint` keeps the op as it was, for the callers that do not send one.
+//
+// The value is Google's opaque token (base64 of 8 bytes today). It is never parsed, only compared;
+// the grammar bounds it and keeps it a single safe word in a detail string.
+//
+// THIS BLOCK IS A PINNED TWIN. The app and the agency Worker carry it byte for byte, and each repo's
+// test suite pins the sha256 of the block (from this marker up to the next section marker, the
+// hub#58 block). A change on one side only fails that side's suite. Change both twins and both pins
+// together.
+
+/** A Compute Engine metadata fingerprint as gcp-instance-get reports it: 1-64 base64 characters. */
+export const GCP_METADATA_FINGERPRINT_RE = /^[A-Za-z0-9+/=_-]{1,64}$/;
+export const GCP_METADATA_FINGERPRINT_RULE =
+  "expectedFingerprint must be a Compute Engine metadata fingerprint (1-64 base64 characters), as gcp-instance-get reports it";
+
+/**
+ * The verdict on the OPTIONAL `expectedFingerprint` of gcp-instance-set-metadata: absent (the op keeps
+ * its own read-then-write guard only), a valid fingerprint, or the refusal reason.
+ */
+export function expectedFingerprintVerdict(
+  value: unknown,
+): { ok: true; expectedFingerprint: string | undefined } | { ok: false; reason: string } {
+  if (value === undefined) {
+    return { ok: true, expectedFingerprint: undefined };
+  }
+  if (typeof value !== "string" || !GCP_METADATA_FINGERPRINT_RE.test(value)) {
+    return { ok: false, reason: GCP_METADATA_FINGERPRINT_RULE };
+  }
+  return { ok: true, expectedFingerprint: value };
 }
 
 // ── hub#58: syd through its Worker — cf-tunnel-get and gcp-disk-snapshot-create ──────

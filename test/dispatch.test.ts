@@ -7355,6 +7355,8 @@ describe("POST /actuate route", () => {
       status: "RUNNING",
       // No serviceAccounts field in Google's answer = the VM runs as no account (hub#58 finding 4).
       serviceAccounts: [],
+      // planning/47: no metadata in Google's answer = no fingerprint and no startup-script reported.
+      metadata: { fingerprint: null, startupScript: null },
     });
 
     const [getCall] = computeCalls(calls);
@@ -7382,6 +7384,7 @@ describe("POST /actuate route", () => {
       network: null,
       status: null,
       serviceAccounts: null,
+      metadata: null,
     });
   });
 
@@ -7402,6 +7405,7 @@ describe("POST /actuate route", () => {
         network: null,
         status: "TERMINATED",
         serviceAccounts: [],
+        metadata: { fingerprint: null, startupScript: null },
       });
       vi.restoreAllMocks();
     }
@@ -9155,6 +9159,11 @@ describe("POST /actuate route", () => {
       },
     };
   }
+  /** sha256 hex of a string's UTF-8 bytes, with Web Crypto (what the Worker reports as valuesSha256). */
+  async function sha256HexOf(text: string): Promise<string> {
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+    return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
   /** Google's 412 for a setMetadata whose fingerprint is stale. */
   const STALE_FINGERPRINT_412 = {
     status: 412,
@@ -9202,6 +9211,10 @@ describe("POST /actuate route", () => {
         "@@DY_T2_S3_REGION@@": "auto",
         "@@DY_T1_S3_BUCKET@@": "agency-backups",
       },
+      // planning/47: the hash of the script AS WRITTEN (after the substitution), never the script.
+      valuesSha256: { "startup-script": await sha256HexOf(FILE_NODE_BOOT_SCRIPT_RENDERED) },
+      unchangedKeys: [],
+      expectedFingerprintChecked: false,
       operationName: "operation-setmeta",
     });
     // Names only in the result — never the agency's secret, the script's restic line, or the token.
@@ -9284,6 +9297,9 @@ describe("POST /actuate route", () => {
       placeholdersSubstituted: [],
       // Nothing was substituted, so there is nothing to report a value for.
       placeholderValues: {},
+      valuesSha256: { "startup-script": await sha256HexOf(plainScript) },
+      unchangedKeys: [],
+      expectedFingerprintChecked: false,
       operationName: "operation-setmeta-2",
     });
     const [, setCall] = computeCalls(calls);

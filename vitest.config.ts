@@ -38,6 +38,7 @@ export default defineConfig({
             "test/dispatch.test.ts",
             "test/sigv4-presign.test.ts",
             "test/hub58-ops.test.ts",
+            "test/boot-metadata.test.ts",
           ],
         },
       },
