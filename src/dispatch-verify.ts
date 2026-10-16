@@ -97,6 +97,10 @@ export const DISPATCH_OPS = [
   // hub#58 review finding 4: STOP one cell node and take its service account off (it can only remove
   // one, never attach one), so its startup-script can be set without iam.serviceAccounts.actAs.
   "gcp-instance-remove-service-account",
+  // planning/47 decision G — READ one tunnel's connector token, so the CURRENT gateway.sh can be
+  // published on a saga-built cell's gateway (which runs the connector). app binds it to the
+  // account's recorded Cell.tunnelId.
+  "cf-tunnel-token-get",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 

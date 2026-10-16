@@ -2154,6 +2154,40 @@ export function expectedFingerprintVerdict(
   return { ok: true, expectedFingerprint: value };
 }
 
+// ── cf-tunnel-token-get (planning/47 decision G) ─────────────────────────────────────
+// READ-ONLY: the CONNECTOR token of ONE Cloudflare tunnel (`cloudflared tunnel run --token <token>`),
+// in the account the Worker's own CF_DNS_API_TOKEN belongs to. A saga-built cell's gateway runs the
+// cell's tunnel connector, and gateway.sh writes that token from its injected DY_TUNNEL_TOKEN on every
+// boot. To publish the CURRENT gateway.sh, the platform renders it with the token this op returns.
+//
+// THE ONE SECRET THIS OP RETURNS. The orchestrator puts it ONLY into the rendered gateway boot script
+// inside the boot-script publish (gcp-instance-set-metadata), the same way the provision saga uses
+// cf-tunnel-create's token. It never logs it, never prints it, never returns it to an operator and
+// never stores it. app signs this op ONLY for the recorded Cell.tunnelId of one of the account's own
+// saga-built cells (app agency-dispatch-binding.ts), so no other tunnel's token can be read.
+//
+// One REQUIRED string, `tunnelId`, with the grammar cf-tunnel-get uses.
+//
+// IDEMPOTENT: a read has no side effect. Registered `true` in AGENCY_OP_IDEMPOTENT.
+
+export interface CfTunnelTokenGetParams {
+  /** The cfd_tunnel id whose connector token is read. */
+  tunnelId: string;
+}
+
+export function validateCfTunnelTokenGetParams(raw: unknown): ParamsVerdict<CfTunnelTokenGetParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { tunnelId } = raw;
+  if (typeof tunnelId !== "string" || !CF_TUNNEL_ID_RE.test(tunnelId)) {
+    return { ok: false, reason: "tunnelId must be a lowercase-hex Cloudflare tunnel id (a 36-char UUID, or 32 hex chars)" };
+  }
+
+  // A FRESH object of only the known key — never the caller's object.
+  return { ok: true, params: { tunnelId } };
+}
+
 // ── hub#58: syd through its Worker — cf-tunnel-get and gcp-disk-snapshot-create ──────
 // planning/51 (hub#58) moves the syd cell onto the path every agency cell already uses: signed jobs
 // through the agency's own Worker, on the agency's own credentials. Three ops are new for that. All

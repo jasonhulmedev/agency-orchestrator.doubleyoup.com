@@ -19,9 +19,13 @@ import type { Env } from "../src/env.js";
 import {
   GCP_METADATA_FINGERPRINT_RULE,
   expectedFingerprintVerdict,
+  validateCfTunnelTokenGetParams,
   validateGcpInstanceSetMetadataParams,
 } from "../src/dispatch-params.js";
 import { actuateGcpInstanceSetMetadata, bootMetadataFactsOf, readComputeInstanceAddress } from "../src/actuate.js";
+import { actuateCfTunnelTokenGet, isConnectorTokenForTunnel } from "../src/actuate-p47.js";
+import { DISPATCH_OPS } from "../src/dispatch-verify.js";
+import { DISPATCH_OP_REGISTRY } from "../src/ops.js";
 
 const dispatchParamsSource: string = rawDispatchParamsSource as string;
 
@@ -30,7 +34,7 @@ const dispatchParamsSource: string = rawDispatchParamsSource as string;
 const TWIN_BLOCK_START_MARKER = "// ── planning/47: the boot-script update";
 const TWIN_BLOCK_END_MARKER = "\n// ── hub#58: syd through its Worker";
 // The app's src/server/services/agency-dispatch-params-p47.test.ts pins the SAME value.
-const TWIN_BLOCK_SHA256 = "8f2fce91bf9348dd90bace41a88b0acb7049578f950bc571360ba11bc194eaf4";
+const TWIN_BLOCK_SHA256 = "cb64e5617b84e60247187568ed00dc68545208ff92e366a309d87c12620f40a7";
 
 const PROJECT = "sbm-website-272023";
 const ZONE = "australia-southeast2-a";
@@ -300,5 +304,92 @@ describe("readComputeInstanceAddress (gcp-instance-get) reports the boot-metadat
     });
     expect(JSON.stringify(result)).not.toContain(SECRET_TOKEN);
     expect(JSON.stringify(result)).not.toContain(GCP_ACCESS_TOKEN);
+  });
+});
+
+// ── cf-tunnel-token-get (planning/47 decision G) ─────────────────────────────────────
+
+const TUNNEL_ID = "df27359a-2314-466d-a031-3f7fa66c1abe";
+const OTHER_TUNNEL_ID = "025cb230-c588-43f3-ad76-cce2869aefdd";
+const CF_ACCOUNT_ID = "acct-cf-sbm";
+const CF_TOKEN = "cf-dns-token-must-not-be-echoed";
+const TUNNEL_SECRET = "c2VjcmV0LXRoYXQtbXVzdC1uZXZlci1sZWFr";
+
+/** A connector token as Cloudflare makes one: base64 of {"a": account, "t": tunnel, "s": secret}. */
+function connectorTokenFor(tunnelId: string): string {
+  return btoa(JSON.stringify({ a: CF_ACCOUNT_ID, t: tunnelId, s: TUNNEL_SECRET }));
+}
+
+describe("cf-tunnel-token-get params (twin of the app's rules)", () => {
+  it("is allowlisted and registered", () => {
+    expect(DISPATCH_OPS).toContain("cf-tunnel-token-get");
+    expect(typeof DISPATCH_OP_REGISTRY["cf-tunnel-token-get"].actuate).toBe("function");
+  });
+
+  it("accepts a tunnel id in both forms and returns ONLY the known key", () => {
+    expect(validateCfTunnelTokenGetParams({ tunnelId: TUNNEL_ID, extra: "dropped" })).toEqual({ ok: true, params: { tunnelId: TUNNEL_ID } });
+    expect(validateCfTunnelTokenGetParams({ tunnelId: TUNNEL_ID.replace(/-/g, "") }).ok).toBe(true);
+  });
+
+  it("refuses every other shape", () => {
+    for (const raw of [null, [], "x", {}, { tunnelId: "" }, { tunnelId: TUNNEL_ID.toUpperCase() }, { tunnelId: `${TUNNEL_ID}x` }, { tunnelId: 7 }]) {
+      expect(validateCfTunnelTokenGetParams(raw).ok).toBe(false);
+    }
+  });
+});
+
+describe("isConnectorTokenForTunnel", () => {
+  it("accepts a token that names this tunnel, in either id form and in URL-safe base64", () => {
+    expect(isConnectorTokenForTunnel(connectorTokenFor(TUNNEL_ID), TUNNEL_ID)).toBe(true);
+    expect(isConnectorTokenForTunnel(connectorTokenFor(TUNNEL_ID), TUNNEL_ID.replace(/-/g, ""))).toBe(true);
+    const urlSafe = connectorTokenFor(TUNNEL_ID).replace(/\+/g, "-").replace(/\//g, "_");
+    expect(isConnectorTokenForTunnel(urlSafe, TUNNEL_ID)).toBe(true);
+  });
+
+  it("refuses a token of another tunnel, a non-token and junk", () => {
+    expect(isConnectorTokenForTunnel(connectorTokenFor(OTHER_TUNNEL_ID), TUNNEL_ID)).toBe(false);
+    expect(isConnectorTokenForTunnel(btoa(JSON.stringify({ a: CF_ACCOUNT_ID })).padEnd(44, "="), TUNNEL_ID)).toBe(false);
+    expect(isConnectorTokenForTunnel("not a token at all, with spaces", TUNNEL_ID)).toBe(false);
+    expect(isConnectorTokenForTunnel(btoa("[1,2,3]").padEnd(44, "A"), TUNNEL_ID)).toBe(false);
+  });
+});
+
+describe("actuateCfTunnelTokenGet", () => {
+  function cfMock(tokenAnswer: { status?: number; body: unknown }): RecordedCall[] {
+    return mockFetch((call) => {
+      if (call.url.startsWith("https://api.cloudflare.com/client/v4/accounts?")) {
+        return { body: { success: true, result: [{ id: CF_ACCOUNT_ID }] } };
+      }
+      if (call.url === `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/token`) {
+        return tokenAnswer;
+      }
+      return { status: 500, body: { success: false } };
+    });
+  }
+
+  it("reads the token in the Worker token's own account, and returns it only after it proves it names this tunnel", async () => {
+    const calls = cfMock({ body: { success: true, result: connectorTokenFor(TUNNEL_ID) } });
+    const result = await actuateCfTunnelTokenGet({ tunnelId: TUNNEL_ID }, { CF_DNS_API_TOKEN: CF_TOKEN } as Env);
+    expect(result).toEqual({ ok: true, op: "cf-tunnel-token-get", tunnelId: TUNNEL_ID, connectorToken: connectorTokenFor(TUNNEL_ID) });
+    expect(calls.map((call) => call.method)).toEqual(["GET", "GET"]);
+  });
+
+  it("refuses a token that names ANOTHER tunnel, and the detail carries no part of it", async () => {
+    cfMock({ body: { success: true, result: connectorTokenFor(OTHER_TUNNEL_ID) } });
+    const result = await actuateCfTunnelTokenGet({ tunnelId: TUNNEL_ID }, { CF_DNS_API_TOKEN: CF_TOKEN } as Env);
+    expect(result).toMatchObject({ ok: false, op: "cf-tunnel-token-get", tunnelId: TUNNEL_ID });
+    expect(JSON.stringify(result)).not.toContain(TUNNEL_SECRET);
+    expect(JSON.stringify(result)).not.toContain(connectorTokenFor(OTHER_TUNNEL_ID));
+  });
+
+  it("a denied token, a missing token and an unconfigured Worker are ok:false with no secret in the detail", async () => {
+    cfMock({ status: 403, body: { success: false } });
+    const denied = await actuateCfTunnelTokenGet({ tunnelId: TUNNEL_ID }, { CF_DNS_API_TOKEN: CF_TOKEN } as Env);
+    expect(denied.ok).toBe(false);
+    expect(JSON.stringify(denied)).not.toContain(CF_TOKEN);
+    vi.restoreAllMocks();
+    cfMock({ body: { success: true, result: null } });
+    expect((await actuateCfTunnelTokenGet({ tunnelId: TUNNEL_ID }, { CF_DNS_API_TOKEN: CF_TOKEN } as Env)).ok).toBe(false);
+    expect((await actuateCfTunnelTokenGet({ tunnelId: TUNNEL_ID }, {} as Env)).ok).toBe(false);
   });
 });

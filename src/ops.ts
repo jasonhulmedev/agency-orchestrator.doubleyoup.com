@@ -54,6 +54,8 @@
 // same boot disk under that name as "already-existed", so a re-run (or a caller polling for READY)
 // converges on one snapshot. The third, `gcp-instance-remove-service-account`, is NOT: its first call
 // stops a running VM, so it runs exactly once under F1, like gcp-instance-restart.
+//
+// planning/47 decision G (actuate-p47.ts): `cf-tunnel-token-get` is a read, so it is idempotent.
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -185,13 +187,16 @@ import {
 } from "./actuate.js";
 import {
   type CfTunnelGetParams,
+  type CfTunnelTokenGetParams,
   type GcpDiskSnapshotCreateParams,
   type GcpInstanceRemoveServiceAccountParams,
   validateCfTunnelGetParams,
+  validateCfTunnelTokenGetParams,
   validateGcpDiskSnapshotCreateParams,
   validateGcpInstanceRemoveServiceAccountParams,
 } from "./dispatch-params.js";
 import { actuateCfTunnelGet, actuateGcpDiskSnapshotCreate, actuateGcpInstanceRemoveServiceAccount } from "./actuate-hub58.js";
+import { actuateCfTunnelTokenGet } from "./actuate-p47.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
 interface OpDefinition<P> {
@@ -389,6 +394,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "gcp-instance-remove-service-account": defineOp<GcpInstanceRemoveServiceAccountParams>({
     validateParams: validateGcpInstanceRemoveServiceAccountParams,
     actuate: (params, env) => actuateGcpInstanceRemoveServiceAccount(params, env),
+  }),
+  "cf-tunnel-token-get": defineOp<CfTunnelTokenGetParams>({
+    validateParams: validateCfTunnelTokenGetParams,
+    actuate: (params, env) => actuateCfTunnelTokenGet(params, env),
   }),
 };
 

@@ -106,6 +106,7 @@ import { presignS3Put, presignS3Get } from "./sigv4.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken, mintGoogleIdToken } from "./validators.js";
 import { errorMessage, stripTrailingSlash } from "./util.js";
 import type { CfTunnelGetResult, GcpDiskSnapshotCreateResult, GcpInstanceRemoveServiceAccountResult } from "./actuate-hub58.js";
+import type { CfTunnelTokenGetResult } from "./actuate-p47.js";
 
 export const CF_API = "https://api.cloudflare.com/client/v4";
 
@@ -723,6 +724,7 @@ export type ActuateResult =
   | GcpProjectQuotaGetResult
   // hub#58 / planning/51 (actuate-hub58.ts).
   | CfTunnelGetResult
+  | CfTunnelTokenGetResult
   | GcpDiskSnapshotCreateResult
   | GcpInstanceRemoveServiceAccountResult;
 
@@ -1191,7 +1193,7 @@ async function createCfTunnel(
  * returns the token STRING directly as `result`. This is the one secret the op returns; see
  * CfTunnelCreateResult for how the orchestrator handles it.
  */
-async function fetchCfTunnelToken(
+export async function fetchCfTunnelToken(
   token: string,
   accountId: string,
   tunnelId: string,

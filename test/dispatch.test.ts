@@ -1108,6 +1108,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "cf-tunnel-create",
       "cf-tunnel-delete",
       "cf-tunnel-get",
+      "cf-tunnel-token-get",
       "cloudrun-probe-invoke",
       "cloudrun-service-delete",
       "cloudrun-service-get",
