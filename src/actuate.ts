@@ -1230,16 +1230,28 @@ export async function actuateCfTunnelConfig(params: CfTunnelConfigParams, env: E
   // rule (a remotely-managed tunnel config's last rule must be a service-only catch-all). The caller
   // may name the catch-all's service (a cell points it at the web node's nginx so every site host
   // on the cell routes there by server_name); absent => http_status:404, exactly as before.
-  const ingress = [
-    ...params.ingress.map((rule) => ({ hostname: rule.hostname, service: rule.service })),
-    { service: params.catchAllService ?? "http_status:404" },
-  ];
+  // planning/50 integration review M1: a kept session route's originRequest ({ httpHostHeader } only —
+  // the validator admits nothing else) is written back as it was read.
+  const ingress: Array<Record<string, unknown>> = [];
+  for (const rule of params.ingress) {
+    if (rule.originRequest === undefined) {
+      ingress.push({ hostname: rule.hostname, service: rule.service });
+    } else {
+      ingress.push({ hostname: rule.hostname, service: rule.service, originRequest: { httpHostHeader: rule.originRequest.httpHostHeader } });
+    }
+  }
+  ingress.push({ service: params.catchAllService ?? "http_status:404" });
+  // planning/50 integration review M2: the top-level warp-routing key, when the caller read one.
+  const config: Record<string, unknown> = { ingress };
+  if (params.warpRouting !== undefined) {
+    config["warp-routing"] = { enabled: params.warpRouting.enabled };
+  }
 
   let response: Response;
   try {
     response = await fetch(
       `${CF_API}/accounts/${encodeURIComponent(account.id)}/cfd_tunnel/${encodeURIComponent(params.tunnelId)}/configurations`,
-      { method: "PUT", headers: cloudflareHeaders(token), body: JSON.stringify({ config: { ingress } }) },
+      { method: "PUT", headers: cloudflareHeaders(token), body: JSON.stringify({ config }) },
     );
   } catch (err) {
     return {

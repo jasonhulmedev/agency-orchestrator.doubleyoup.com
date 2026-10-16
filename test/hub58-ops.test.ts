@@ -24,10 +24,12 @@ import { DISPATCH_OPS } from "../src/dispatch-verify.js";
 import { DISPATCH_OP_REGISTRY } from "../src/ops.js";
 import {
   diskSnapshotNameFor,
+  validateCfTunnelConfigParams,
   validateCfTunnelGetParams,
   validateGcpDiskSnapshotCreateParams,
   validateGcpInstanceRemoveServiceAccountParams,
 } from "../src/dispatch-params.js";
+import { actuateCfTunnelConfig } from "../src/actuate.js";
 import {
   actuateCfTunnelGet,
   actuateGcpDiskSnapshotCreate,
@@ -46,7 +48,7 @@ const dispatchParamsSource: string = rawDispatchParamsSource as string;
 const TWIN_BLOCK_START_MARKER = "// ── hub#58: syd through its Worker";
 const TWIN_BLOCK_END_MARKER = "\n// ── planning/49: the agency-side ephemeral-compute ops";
 // The app's src/server/services/agency-dispatch-params-hub58.test.ts pins the SAME value.
-const TWIN_BLOCK_SHA256 = "633477eb4fddc3fa21cb4549de7dc1cc1451c022195d60162a68f170b0f014eb";
+const TWIN_BLOCK_SHA256 = "9e9c0b9873876c81166b82b6af192316c282a9583b2479a2b70510ad34ee4dcd";
 
 const TUNNEL_ID = "025cb230-c588-43f3-ad76-cce2869aefdd";
 const CF_ACCOUNT_ID = "acct-cf-1";
@@ -174,23 +176,64 @@ describe("parseTunnelConfiguration: exact report, fail closed on unknown shapes"
       },
       TUNNEL_ID,
     );
+    // planning/50 integration review M2: a warp-routing key of the known shape is reported by value.
     expect(parsed).toEqual({
       ok: true,
       source: "cloudflare",
       version: 41,
-      otherConfigKeys: ["originRequest", "warp-routing"],
+      otherConfigKeys: ["originRequest"],
+      warpRouting: { enabled: false },
       rules: [
-        { hostname: "cell-syd.doubleyoup.com", service: "http://localhost:9440", path: null, originRequestKeys: [] },
-        { hostname: "lawnsbydavid-production.doubleyoup.com", service: "http://localhost:80", path: null, originRequestKeys: [] },
+        { hostname: "cell-syd.doubleyoup.com", service: "http://localhost:9440", path: null, originRequestKeys: [], originRequest: null },
+        { hostname: "lawnsbydavid-production.doubleyoup.com", service: "http://localhost:80", path: null, originRequestKeys: [], originRequest: null },
         {
           hostname: "term-docs.doubleyoup.com",
           service: "https://term-docs-123.australia-southeast1.run.app",
           path: null,
           originRequestKeys: ["httpHostHeader", "noTLSVerify"],
+          originRequest: null,
         },
-        { hostname: "api.example.com", service: "http://localhost:80", path: "^/v1/", originRequestKeys: [] },
-        { hostname: null, service: "http_status:404", path: null, originRequestKeys: [] },
+        { hostname: "api.example.com", service: "http://localhost:80", path: "^/v1/", originRequestKeys: [], originRequest: null },
+        { hostname: null, service: "http_status:404", path: null, originRequestKeys: [], originRequest: null },
       ],
+    });
+  });
+
+  it("integration review M1: a session route's ONE originRequest shape is reported by value; any other shape by name only", () => {
+    const parsed = parseTunnelConfiguration(
+      {
+        config: {
+          ingress: [
+            { hostname: "pma-docs.doubleyoup.com", service: "https://pma-docs-123.australia-southeast1.run.app", originRequest: { httpHostHeader: "pma-docs-123.australia-southeast1.run.app" } },
+            { hostname: "x.doubleyoup.com", service: "https://x.run.app", originRequest: { httpHostHeader: "Not A Host" } },
+            { service: "http_status:404" },
+          ],
+        },
+      },
+      TUNNEL_ID,
+    );
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.rules[0]?.originRequest).toEqual({ httpHostHeader: "pma-docs-123.australia-southeast1.run.app" });
+    expect(parsed.rules[0]?.originRequestKeys).toEqual(["httpHostHeader"]);
+    expect(parsed.rules[1]?.originRequest).toBeNull();
+    expect(parsed.rules[1]?.originRequestKeys).toEqual(["httpHostHeader"]);
+  });
+
+  it("integration review M2: Cloudflare's fresh-tunnel shape (ingress: null, warp-routing) is zero rules with warp-routing by value", () => {
+    expect(parseTunnelConfiguration({ tunnel_id: TUNNEL_ID, version: 0, config: { ingress: null, "warp-routing": { enabled: false } } }, TUNNEL_ID)).toEqual({
+      ok: true,
+      source: null,
+      version: 0,
+      rules: [],
+      otherConfigKeys: [],
+      warpRouting: { enabled: false },
+    });
+    // A warp-routing value of another shape stays a NAME (the writer then refuses unless allowed).
+    expect(parseTunnelConfiguration({ config: { ingress: null, "warp-routing": { enabled: true, connectTimeout: 1 } } }, TUNNEL_ID)).toMatchObject({
+      ok: true,
+      otherConfigKeys: ["warp-routing"],
+      warpRouting: null,
     });
   });
 
@@ -201,6 +244,7 @@ describe("parseTunnelConfiguration: exact report, fail closed on unknown shapes"
       version: null,
       rules: [],
       otherConfigKeys: [],
+      warpRouting: null,
     });
     expect(parseTunnelConfiguration({ config: {} }, TUNNEL_ID)).toMatchObject({ ok: true, rules: [] });
   });
@@ -296,9 +340,10 @@ describe("actuateCfTunnelGet", () => {
       source: "cloudflare",
       version: 7,
       otherConfigKeys: [],
+      warpRouting: null,
       rules: [
-        { hostname: "a.doubleyoup.com", service: "http://localhost:80", path: null, originRequestKeys: [] },
-        { hostname: null, service: "http_status:404", path: null, originRequestKeys: [] },
+        { hostname: "a.doubleyoup.com", service: "http://localhost:80", path: null, originRequestKeys: [], originRequest: null },
+        { hostname: null, service: "http_status:404", path: null, originRequestKeys: [], originRequest: null },
       ],
     });
     // A READ: no PUT, no POST, and the token never comes back.
@@ -850,5 +895,82 @@ describe("actuateGcpInstanceRemoveServiceAccount", () => {
     const result = await actuateGcpInstanceRemoveServiceAccount(PARAMS, env);
     expect(result).toMatchObject({ ok: false, phase: "stop", stopped: false, unconfirmed: true });
     expect(googleCalls().some((call) => call.url.endsWith("/setServiceAccount"))).toBe(false);
+  });
+});
+
+// ── cf-tunnel-config: the keep-foreign extras (planning/50 integration review M1, M2) ───────
+
+describe("cf-tunnel-config: a kept session route's originRequest and the warp-routing key round-trip", () => {
+  const SESSION_RULE = {
+    hostname: "pma-docs.doubleyoup.com",
+    service: "https://pma-docs-123.australia-southeast1.run.app",
+    originRequest: { httpHostHeader: "pma-docs-123.australia-southeast1.run.app" },
+  };
+
+  it("the validator keeps exactly { httpHostHeader } and { enabled }, as fresh objects", () => {
+    const verdict = validateCfTunnelConfigParams({
+      tunnelId: TUNNEL_ID,
+      ingress: [{ ...SESSION_RULE, extra: 1 }, { hostname: "cell-syd.doubleyoup.com", service: "http://localhost:9440" }],
+      catchAllService: "http_status:404",
+      warpRouting: { enabled: false },
+    });
+    expect(verdict).toEqual({
+      ok: true,
+      params: {
+        tunnelId: TUNNEL_ID,
+        ingress: [SESSION_RULE, { hostname: "cell-syd.doubleyoup.com", service: "http://localhost:9440" }],
+        catchAllService: "http_status:404",
+        warpRouting: { enabled: false },
+      },
+    });
+    // Absent extras: exactly the old params object.
+    expect(validateCfTunnelConfigParams({ tunnelId: TUNNEL_ID, ingress: [{ hostname: "a.doubleyoup.com", service: "http://localhost:80" }] })).toEqual({
+      ok: true,
+      params: { tunnelId: TUNNEL_ID, ingress: [{ hostname: "a.doubleyoup.com", service: "http://localhost:80" }] },
+    });
+  });
+
+  it("the validator refuses every other originRequest or warp-routing shape", () => {
+    const badOrigins: unknown[] = [
+      { httpHostHeader: "pma.run.app", noTLSVerify: true },
+      { noTLSVerify: true },
+      { httpHostHeader: "Not A Host" },
+      { httpHostHeader: 7 },
+      "pma.run.app",
+      null,
+    ];
+    for (const originRequest of badOrigins) {
+      const verdict = validateCfTunnelConfigParams({ tunnelId: TUNNEL_ID, ingress: [{ ...SESSION_RULE, originRequest }] });
+      expect(errorText(verdict)).toMatch(/originRequest, when present, must be exactly/);
+    }
+    for (const warpRouting of [{ enabled: "false" }, { enabled: true, x: 1 }, null, true]) {
+      const verdict = validateCfTunnelConfigParams({ tunnelId: TUNNEL_ID, ingress: [SESSION_RULE], warpRouting });
+      expect(errorText(verdict)).toMatch(/warpRouting, when present, must be exactly/);
+    }
+  });
+
+  it("the actuator writes the originRequest and warp-routing back into the PUT, and nothing else", async () => {
+    let putConfig: unknown = null;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/accounts?per_page=1")) {
+        return new Response(JSON.stringify({ success: true, result: [{ id: CF_ACCOUNT_ID }] }), { status: 200 });
+      }
+      if (url.endsWith(`/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/configurations`) && init?.method === "PUT") {
+        putConfig = (JSON.parse(String(init.body)) as { config: unknown }).config;
+        return new Response(JSON.stringify({ success: true, result: {} }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    });
+    const env = { CF_DNS_API_TOKEN: CF_TOKEN } as unknown as Env;
+    const result = await actuateCfTunnelConfig(
+      { tunnelId: TUNNEL_ID, ingress: [SESSION_RULE], catchAllService: "http_status:404", warpRouting: { enabled: false } },
+      env,
+    );
+    expect(result.ok).toBe(true);
+    expect(putConfig).toEqual({
+      ingress: [SESSION_RULE, { service: "http_status:404" }],
+      "warp-routing": { enabled: false },
+    });
   });
 });

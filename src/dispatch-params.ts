@@ -568,6 +568,8 @@ export interface CfTunnelConfigIngressRule {
   hostname: string;
   /** The origin service URL, e.g. "http://dy-web-...internal:9440" (scheme + host + optional port). */
   service: string;
+  /** OPTIONAL: exactly `{ httpHostHeader }` — a kept session route's setting (cleanCfTunnelOriginRequest). */
+  originRequest?: CfTunnelOriginRequest;
 }
 
 export interface CfTunnelConfigParams {
@@ -578,6 +580,8 @@ export interface CfTunnelConfigParams {
   /** OPTIONAL: the catch-all's service — an http(s) origin URL (a rule's `service` grammar) or
    *  `http_status:<3 digits>`. Absent => http_status:404 (unchanged). */
   catchAllService?: string;
+  /** OPTIONAL: the top-level `warp-routing` key, exactly `{ enabled }` (cleanCfTunnelWarpRouting). Absent => not written. */
+  warpRouting?: CfTunnelWarpRouting;
 }
 
 // A Cloudflare tunnel id: a lowercase-hex UUID (the cfd_tunnel API returns a 36-char hyphenated UUID,
@@ -599,7 +603,7 @@ export function validateCfTunnelConfigParams(raw: unknown): ParamsVerdict<CfTunn
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
   }
-  const { tunnelId, ingress, catchAllService } = raw;
+  const { tunnelId, ingress, catchAllService, warpRouting } = raw;
 
   if (typeof tunnelId !== "string" || !CF_TUNNEL_ID_RE.test(tunnelId)) {
     return { ok: false, reason: "tunnelId must be a lowercase-hex Cloudflare tunnel id (a 36-char UUID, or 32 hex chars)" };
@@ -614,7 +618,7 @@ export function validateCfTunnelConfigParams(raw: unknown): ParamsVerdict<CfTunn
     if (!isPlainObject(rule)) {
       return { ok: false, reason: "each ingress rule must be an object { hostname, service }" };
     }
-    const { hostname, service } = rule;
+    const { hostname, service, originRequest } = rule;
     if (typeof hostname !== "string" || hostname.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(hostname)) {
       return { ok: false, reason: "each ingress hostname must be a lowercase fully-qualified hostname (2+ labels)" };
     }
@@ -628,7 +632,16 @@ export function validateCfTunnelConfigParams(raw: unknown): ParamsVerdict<CfTunn
     if (serviceMatch[1] !== undefined && Number(serviceMatch[1]) > TCP_PORT_MAX) {
       return { ok: false, reason: "each ingress service port must be 0-65535" };
     }
-    cleanIngress.push({ hostname, service });
+    // planning/50 integration review M1: a kept session route's originRequest, in its ONE shape.
+    const cleanOrigin = cleanCfTunnelOriginRequest(originRequest);
+    if (!cleanOrigin.ok) {
+      return { ok: false, reason: cleanOrigin.reason };
+    }
+    if (cleanOrigin.value === undefined) {
+      cleanIngress.push({ hostname, service });
+    } else {
+      cleanIngress.push({ hostname, service, originRequest: cleanOrigin.value });
+    }
   }
 
   // The optional catch-all. ABSENT => return exactly the two-key params object every earlier caller
@@ -636,22 +649,32 @@ export function validateCfTunnelConfigParams(raw: unknown): ParamsVerdict<CfTunn
   // PRESENT => either the http_status form or an origin URL under the SAME grammar (and port bound)
   // as a rule's `service` above — a catch-all is just a hostname-less rule, so it may reach only what
   // a named rule may reach. Anything else (null, a number, "") fails closed.
-  if (catchAllService === undefined) {
-    return { ok: true, params: { tunnelId, ingress: cleanIngress } };
-  }
-  if (typeof catchAllService !== "string") {
-    return { ok: false, reason: CF_TUNNEL_CATCH_ALL_REASON };
-  }
-  if (!CF_TUNNEL_HTTP_STATUS_SERVICE_RE.test(catchAllService)) {
-    const catchAllMatch = CF_TUNNEL_SERVICE_RE.exec(catchAllService);
-    if (!catchAllMatch) {
+  const params: CfTunnelConfigParams = { tunnelId, ingress: cleanIngress };
+  if (catchAllService !== undefined) {
+    if (typeof catchAllService !== "string") {
       return { ok: false, reason: CF_TUNNEL_CATCH_ALL_REASON };
     }
-    if (catchAllMatch[1] !== undefined && Number(catchAllMatch[1]) > TCP_PORT_MAX) {
-      return { ok: false, reason: "catchAllService port must be 0-65535" };
+    if (!CF_TUNNEL_HTTP_STATUS_SERVICE_RE.test(catchAllService)) {
+      const catchAllMatch = CF_TUNNEL_SERVICE_RE.exec(catchAllService);
+      if (!catchAllMatch) {
+        return { ok: false, reason: CF_TUNNEL_CATCH_ALL_REASON };
+      }
+      if (catchAllMatch[1] !== undefined && Number(catchAllMatch[1]) > TCP_PORT_MAX) {
+        return { ok: false, reason: "catchAllService port must be 0-65535" };
+      }
     }
+    params.catchAllService = catchAllService;
   }
-  return { ok: true, params: { tunnelId, ingress: cleanIngress, catchAllService } };
+  // planning/50 integration review M2: the top-level warp-routing key, written back as it was read.
+  // ABSENT => no key, so every earlier caller's signed bytes and written config are unchanged.
+  if (warpRouting !== undefined) {
+    const cleanWarp = cleanCfTunnelWarpRouting(warpRouting);
+    if (!cleanWarp.ok) {
+      return { ok: false, reason: cleanWarp.reason };
+    }
+    params.warpRouting = cleanWarp.value;
+  }
+  return { ok: true, params };
 }
 
 // ── cf-tunnel-delete ─────────────────────────────────────────────────────────────────
@@ -2242,6 +2265,60 @@ export function validateGcpInstanceRemoveServiceAccountParams(raw: unknown): Par
 
   // A FRESH object of only the known keys — never the caller's object.
   return { ok: true, params: { project, zone, name } };
+}
+
+// ── cf-tunnel-config: the keep-foreign extras (planning/50 integration review M1, M2) ───────
+// The orchestrator's ONE tunnel writer (cell-ingress-keep.ts) reads a tunnel's live config and writes
+// back every rule it does not own. Two live shapes must survive that round trip byte for byte, so
+// cf-tunnel-config accepts them — and ONLY in these exact shapes:
+//   - a rule's `originRequest` of exactly `{ httpHostHeader: <lowercase FQDN> }`: the one setting the
+//     session runner's route recipes write (infra cell-run/provision-*-route.sh: the Run service's own
+//     host, e.g. "pma-docs-123.australia-southeast1.run.app");
+//   - the top-level `warp-routing` key of exactly `{ enabled: <boolean> }` (cf-tunnel-get's warpRouting).
+// Any other originRequest key or top-level key still fails closed: it never reaches a signature.
+
+export interface CfTunnelOriginRequest {
+  /** The Host header cloudflared sends to the origin: a lowercase FQDN. */
+  httpHostHeader: string;
+}
+
+export interface CfTunnelWarpRouting {
+  enabled: boolean;
+}
+
+const CF_TUNNEL_ORIGIN_REQUEST_REASON =
+  "an ingress rule's originRequest, when present, must be exactly { httpHostHeader: <lowercase fully-qualified hostname> }";
+const CF_TUNNEL_WARP_ROUTING_REASON = "warpRouting, when present, must be exactly { enabled: <boolean> }";
+
+/** A rule's optional originRequest: absent => undefined; exactly `{ httpHostHeader }` => a FRESH copy. */
+export function cleanCfTunnelOriginRequest(raw: unknown): { ok: true; value: CfTunnelOriginRequest | undefined } | { ok: false; reason: string } {
+  if (raw === undefined) {
+    return { ok: true, value: undefined };
+  }
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: CF_TUNNEL_ORIGIN_REQUEST_REASON };
+  }
+  const keys = Object.keys(raw);
+  if (keys.length !== 1 || keys[0] !== "httpHostHeader") {
+    return { ok: false, reason: CF_TUNNEL_ORIGIN_REQUEST_REASON };
+  }
+  const { httpHostHeader } = raw;
+  if (typeof httpHostHeader !== "string" || httpHostHeader.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(httpHostHeader)) {
+    return { ok: false, reason: CF_TUNNEL_ORIGIN_REQUEST_REASON };
+  }
+  return { ok: true, value: { httpHostHeader } };
+}
+
+/** The optional warp-routing key: exactly `{ enabled: <boolean> }` => a FRESH copy. */
+export function cleanCfTunnelWarpRouting(raw: unknown): { ok: true; value: CfTunnelWarpRouting } | { ok: false; reason: string } {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: CF_TUNNEL_WARP_ROUTING_REASON };
+  }
+  const keys = Object.keys(raw);
+  if (keys.length !== 1 || keys[0] !== "enabled" || typeof raw.enabled !== "boolean") {
+    return { ok: false, reason: CF_TUNNEL_WARP_ROUTING_REASON };
+  }
+  return { ok: true, value: { enabled: raw.enabled } };
 }
 
 // ── planning/49: the agency-side ephemeral-compute ops ───────────────────────────────

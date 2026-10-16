@@ -24,6 +24,8 @@
 
 import type { Env } from "./env.js";
 import {
+  cleanCfTunnelOriginRequest,
+  cleanCfTunnelWarpRouting,
   diskSnapshotNameFor,
   type CfTunnelGetParams,
   type GcpDiskSnapshotCreateParams,
@@ -65,6 +67,12 @@ export interface CfTunnelGetRule {
   path: string | null;
   /** The names of the rule's originRequest settings, sorted. [] when it has none. */
   originRequestKeys: string[];
+  /**
+   * planning/50 integration review M1: the rule's originRequest VALUE when it is exactly
+   * `{ httpHostHeader: <string> }` (the session runner's route shape), so the writer can keep it byte
+   * for byte. null otherwise — no settings, or settings the writer cannot write back.
+   */
+  originRequest: { httpHostHeader: string } | null;
 }
 
 export type CfTunnelGetResult =
@@ -78,8 +86,13 @@ export type CfTunnelGetResult =
       version: number | null;
       /** Every ingress rule, in the order cloudflared evaluates them (the catch-all is last). */
       rules: CfTunnelGetRule[];
-      /** The names of every top-level config key other than `ingress` (e.g. "originRequest"), sorted. */
+      /**
+       * The names of every top-level config key other than `ingress` (e.g. "originRequest"), sorted —
+       * except a `warp-routing` key of the exact shape `{ enabled: <boolean> }`, which is in warpRouting.
+       */
       otherConfigKeys: string[];
+      /** planning/50 integration review M2: the top-level `warp-routing` value, or null when absent (or reported by name). */
+      warpRouting: { enabled: boolean } | null;
     }
   | { ok: false; op: "cf-tunnel-get"; tunnelId: string; detail: string };
 
@@ -145,6 +158,7 @@ function parseTunnelRule(rule: unknown, index: number): { ok: true; rule: CfTunn
   }
 
   let originRequestKeys: string[] = [];
+  let keptOriginRequest: { httpHostHeader: string } | null = null;
   if (originRequest !== undefined) {
     if (!isPlainRecord(originRequest)) {
       return { ok: false, reason: `ingress rule ${index} has an originRequest that is not an object` };
@@ -154,20 +168,29 @@ function parseTunnelRule(rule: unknown, index: number): { ok: true; rule: CfTunn
       return { ok: false, reason: `ingress rule ${index} has originRequest keys this op does not understand` };
     }
     originRequestKeys = names;
+    // The session runner's ONE shape: reported by value, so the writer can keep it (twin
+    // cleanCfTunnelOriginRequest is what cf-tunnel-config accepts back).
+    const kept = cleanCfTunnelOriginRequest(originRequest);
+    if (kept.ok && kept.value !== undefined) {
+      keptOriginRequest = kept.value;
+    }
   }
 
-  return { ok: true, rule: { hostname: parsedHostname, service, path: parsedPath, originRequestKeys } };
+  return { ok: true, rule: { hostname: parsedHostname, service, path: parsedPath, originRequestKeys, originRequest: keptOriginRequest } };
 }
 
 /** What parseTunnelConfiguration extracts from Cloudflare's `result` object. */
 export type ParsedTunnelConfiguration =
-  | { ok: true; source: string | null; version: number | null; rules: CfTunnelGetRule[]; otherConfigKeys: string[] }
+  | { ok: true; source: string | null; version: number | null; rules: CfTunnelGetRule[]; otherConfigKeys: string[]; warpRouting: { enabled: boolean } | null }
   | { ok: false; reason: string };
 
 /**
  * Parse the `result` of GET /accounts/{id}/cfd_tunnel/{tunnelId}/configurations. PURE and exported
- * for the unit tests. A tunnel that has never been configured answers with no config or no ingress,
- * which is reported as zero rules. Every other surprise is a refusal with the reason.
+ * for the unit tests. A tunnel that has never been configured answers with no config, no ingress or
+ * `ingress: null` (Cloudflare's shape for a fresh remotely-managed tunnel — planning/50 integration
+ * review M2), which is reported as zero rules. A `warp-routing` key of the exact shape
+ * `{ enabled: <boolean> }` is reported by value (warpRouting), so a writer can put it back as it was.
+ * Every other surprise is a refusal with the reason.
  */
 export function parseTunnelConfiguration(result: unknown, tunnelId: string): ParsedTunnelConfiguration {
   if (!isPlainRecord(result)) {
@@ -191,7 +214,7 @@ export function parseTunnelConfiguration(result: unknown, tunnelId: string): Par
 
   const config = result.config;
   if (config === undefined || config === null) {
-    return { ok: true, source, version, rules: [], otherConfigKeys: [] };
+    return { ok: true, source, version, rules: [], otherConfigKeys: [], warpRouting: null };
   }
   if (!isPlainRecord(config)) {
     return { ok: false, reason: "the tunnel's config is not an object" };
@@ -201,11 +224,20 @@ export function parseTunnelConfiguration(result: unknown, tunnelId: string): Par
   if (topLevelNames === null) {
     return { ok: false, reason: "the tunnel's config has top-level keys this op does not understand" };
   }
-  const otherConfigKeys = topLevelNames.filter((name) => name !== "ingress");
+  let warpRouting: { enabled: boolean } | null = null;
+  if (config["warp-routing"] !== undefined) {
+    const kept = cleanCfTunnelWarpRouting(config["warp-routing"]);
+    if (kept.ok) {
+      warpRouting = kept.value;
+    }
+  }
+  // warp-routing of the known shape is reported by value; of any other shape it stays a NAME, which the
+  // writer refuses to drop without an operator's explicit allowance.
+  const otherConfigKeys = topLevelNames.filter((name) => name !== "ingress" && !(name === "warp-routing" && warpRouting !== null));
 
   const ingress = config.ingress;
-  if (ingress === undefined) {
-    return { ok: true, source, version, rules: [], otherConfigKeys };
+  if (ingress === undefined || ingress === null) {
+    return { ok: true, source, version, rules: [], otherConfigKeys, warpRouting };
   }
   if (!Array.isArray(ingress)) {
     return { ok: false, reason: "the tunnel's ingress is not a list" };
@@ -222,7 +254,7 @@ export function parseTunnelConfiguration(result: unknown, tunnelId: string): Par
     }
     rules.push(parsed.rule);
   }
-  return { ok: true, source, version, rules, otherConfigKeys };
+  return { ok: true, source, version, rules, otherConfigKeys, warpRouting };
 }
 
 export async function actuateCfTunnelGet(params: CfTunnelGetParams, env: Env): Promise<CfTunnelGetResult> {
@@ -275,6 +307,7 @@ export async function actuateCfTunnelGet(params: CfTunnelGetParams, env: Env): P
     version: parsed.version,
     rules: parsed.rules,
     otherConfigKeys: parsed.otherConfigKeys,
+    warpRouting: parsed.warpRouting,
   };
 }
 
