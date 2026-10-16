@@ -974,3 +974,22 @@ describe("cf-tunnel-config: a kept session route's originRequest and the warp-ro
     });
   });
 });
+
+describe("parseTunnelConfiguration: an EMPTY originRequest is absent (planning/50 integration review N6)", () => {
+  it("a top-level originRequest of {} or null is not reported; a rule's null or {} reads as no settings", () => {
+    for (const empty of [{}, null]) {
+      const parsed = parseTunnelConfiguration(
+        { config: { originRequest: empty, ingress: [{ hostname: "a.doubleyoup.com", service: "http://localhost:80", originRequest: empty }, { service: "http_status:404" }] } },
+        TUNNEL_ID,
+      );
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) return;
+      expect(parsed.otherConfigKeys).toEqual([]);
+      expect(parsed.rules[0]?.originRequestKeys).toEqual([]);
+      expect(parsed.rules[0]?.originRequest).toBeNull();
+    }
+    // A non-empty top-level originRequest is still reported by name.
+    const set = parseTunnelConfiguration({ config: { originRequest: { connectTimeout: 30 }, ingress: [{ service: "http_status:404" }] } }, TUNNEL_ID);
+    expect(set.ok && set.otherConfigKeys).toEqual(["originRequest"]);
+  });
+});

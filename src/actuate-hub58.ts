@@ -159,7 +159,8 @@ function parseTunnelRule(rule: unknown, index: number): { ok: true; rule: CfTunn
 
   let originRequestKeys: string[] = [];
   let keptOriginRequest: { httpHostHeader: string } | null = null;
-  if (originRequest !== undefined) {
+  // planning/50 integration review N6: an EMPTY originRequest (null or {}) carries no setting — absent.
+  if (originRequest !== undefined && originRequest !== null) {
     if (!isPlainRecord(originRequest)) {
       return { ok: false, reason: `ingress rule ${index} has an originRequest that is not an object` };
     }
@@ -232,8 +233,15 @@ export function parseTunnelConfiguration(result: unknown, tunnelId: string): Par
     }
   }
   // warp-routing of the known shape is reported by value; of any other shape it stays a NAME, which the
-  // writer refuses to drop without an operator's explicit allowance.
-  const otherConfigKeys = topLevelNames.filter((name) => name !== "ingress" && !(name === "warp-routing" && warpRouting !== null));
+  // writer refuses to drop without an operator's explicit allowance. planning/50 integration review N6:
+  // an EMPTY top-level originRequest (null or {}) sets nothing, so it is not reported at all (a writer
+  // that leaves it out writes the same config).
+  const topLevelOriginRequest = config.originRequest;
+  const emptyOriginRequest =
+    topLevelOriginRequest === null || (isPlainRecord(topLevelOriginRequest) && Object.keys(topLevelOriginRequest).length === 0);
+  const otherConfigKeys = topLevelNames.filter(
+    (name) => name !== "ingress" && !(name === "warp-routing" && warpRouting !== null) && !(name === "originRequest" && emptyOriginRequest),
+  );
 
   const ingress = config.ingress;
   if (ingress === undefined || ingress === null) {
