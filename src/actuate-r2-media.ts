@@ -4,14 +4,16 @@
 //   r2-media-state        READ whether one media bucket exists, and the keys this op family minted for it.
 //   r2-site-key-install   MINT one bucket-scoped read-write key in the agency's own Cloudflare account and
 //                         STAGE it on the site's file node, straight from this Worker to the agency's own
-//                         cell-agent. The platform never receives the key.
+//                         cell-agent. The key value is not returned to the platform in the answer.
 //   r2-site-key-revoke    DELETE one such key.
 //
 // Everything runs on the agency's OWN R2_PROVISION_API_TOKEN (an account-owned token that can create
-// buckets and API tokens) and the agency's own file-node cell-agent. The platform holds neither.
+// buckets and API tokens) and the agency's own file-node cell-agent. The platform holds neither of these two.
+// Caveat: the platform does hold the agency cell-agent bearer tokens (to run scripts on the agency's nodes), so "the
+// platform never sees the key" means only that no answer of this op carries it.
 //
-// WHY THE KEY GOES WORKER -> FILE NODE. hub#43 (decided 2026-10-08): the platform never holds a write key
-// to the agency's account again. The earlier copy ran with such a key on the platform's VM and the key had
+// WHY THE KEY GOES WORKER -> FILE NODE. hub#43 (decided 2026-10-08): the platform does not hold a write key
+// to the agency's account again (no key value is handed to it). The earlier copy ran with such a key on the platform's VM and the key had
 // to be revoked by hand. Here the Worker mints the key and posts it to the file node's /set-r2-target
 // endpoint (mode "stage"), which writes DOUBLEYOUP_R2_NEXT_* into the site's locked wp-config. The answer
 // this op returns holds the key's id and name, never its value.

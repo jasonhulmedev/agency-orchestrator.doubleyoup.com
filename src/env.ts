@@ -119,7 +119,7 @@ export interface Env {
   CELL_AGENT_URL?: string;
   CELL_AGENT_TOKEN?: string;
   // hub#43: the agency's FILE-NODE cell-agent (where /set-r2-target runs). The r2-site-key-install op posts
-  // the new per-site media key straight to it, so the platform never sees the key. The web-node CELL_AGENT_*
+  // the new per-site media key straight to it, so no answer to the platform carries the key. The web-node CELL_AGENT_*
   // above cannot be used: only the file node can write /platform/<slug>/wp-config-real.php.
   CELL_FILE_AGENT_URL?: string;
   CELL_FILE_AGENT_TOKEN?: string;

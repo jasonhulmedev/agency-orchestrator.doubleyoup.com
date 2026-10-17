@@ -98,7 +98,7 @@ export const DISPATCH_OPS = [
   // one, never attach one), so its startup-script can be set without iam.serviceAccounts.actAs.
   "gcp-instance-remove-service-account",
   // hub#43 — agency-owned media. READ one media bucket and the keys minted for it; MINT one bucket-scoped
-  // key and stage it straight onto the site's file node (the platform never sees it); DELETE one such key.
+  // key and stage it straight onto the site's file node (no answer to the platform carries it); DELETE one such key.
   "r2-media-buckets",
   "r2-media-state",
   "r2-site-key-install",
