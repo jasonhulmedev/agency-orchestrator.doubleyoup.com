@@ -123,6 +123,8 @@ export interface Env {
   // above cannot be used: only the file node can write /platform/<slug>/wp-config-real.php.
   CELL_FILE_AGENT_URL?: string;
   CELL_FILE_AGENT_TOKEN?: string;
+  /** hub#43 L7: the Cloudflare account id R2_PROVISION_API_TOKEN must belong to. When set, the media ops refuse any other account. */
+  R2_EXPECTED_ACCOUNT_ID?: string;
 
   // AI provider keys.
   ANTHROPIC_API_KEY?: string;

@@ -27,6 +27,7 @@
 #       wrangler secret put R2_PROVISION_API_TOKEN     # account-owned: Workers R2 Storage: Edit (provision-r2) + Account API Tokens: Edit (hub#43 r2-site-key-install/revoke/state)
 #       wrangler secret put CELL_FILE_AGENT_URL        # hub#43: the FILE-node cell-agent (set-r2-target); r2-site-key-install sends the new per-site media key straight to it
 #       wrangler secret put CELL_FILE_AGENT_TOKEN      # its bearer token (the agency's own)
+#       R2_EXPECTED_ACCOUNT_ID (a var, hub#43 L7): the account id R2_PROVISION_API_TOKEN must belong to; the media ops refuse any other
 #       wrangler secret put CF_DNS_API_TOKEN           # Zone:DNS:Edit + Zone:Read (Direction-B dns-record-upsert) + Zone:Cache Purge (cache-purge) + Zone:Cache Rules:Edit (cache-rule-upsert) + Zone WAF:Edit (waf-rule-upsert)
 #       wrangler secret put ANTHROPIC_API_KEY
 #       wrangler secret put OPENROUTER_API_KEY

@@ -93,7 +93,19 @@ export type R2SiteKeyInstallResult =
       /** The marker hash the file node computed for the staged target (no secret). */
       stagedHex: string | null;
     }
-  | { ok: false; op: "r2-site-key-install"; bucket: string; detail: string };
+  | {
+      ok: false;
+      op: "r2-site-key-install";
+      bucket: string;
+      detail: string;
+      /**
+       * Set ONLY when the answer of the file-node agent was ambiguous (a throw, a 5xx or 524, a body that is not
+       * JSON). The key was minted and may or may not be staged, so it is NOT deleted here: the caller reads
+       * the staged key id from the file node and the key list from r2-media-state, and settles it.
+       */
+      maybeStagedKeyId?: string;
+      maybeStagedKeyName?: string;
+    };
 
 export type R2SiteKeyRevokeResult =
   | { ok: true; op: "r2-site-key-revoke"; bucket: string; tokenId: string; status: "revoked" | "already-absent" }
@@ -140,12 +152,38 @@ interface TokenRecord {
   issued_on?: string;
 }
 
+/**
+ * hub#43 M3: a key name belongs to a bucket only when what follows `dy-media-<bucket>-` is exactly the label
+ * shape. Prefixes with hyphens exist (docs and docs-892769, rareepicgamer and rareepicgamer-19f933): a plain
+ * startsWith would let the key of `docs-892769` count as a key of `docs`.
+ */
+export function keyNameBelongsToBucket(name: string, bucket: string): boolean {
+  const namePrefix = `dy-media-${bucket}-`;
+  if (!name.startsWith(namePrefix)) return false;
+  return /^[a-z0-9]{1,16}$/.test(name.slice(namePrefix.length));
+}
+
+/**
+ * hub#43 L7: resolve the account of the token, and when R2_EXPECTED_ACCOUNT_ID is configured, refuse a token that
+ * belongs to any other account (a wrong token pasted into the Worker must not mint keys somewhere else).
+ */
+async function resolveMediaAccount(token: string, env: Env): Promise<{ id: string } | { error: string }> {
+  const account = await resolveAccountId(token, TOKEN_UNAUTHORIZED_HINT);
+  if ("error" in account) {
+    return account;
+  }
+  const expected = env.R2_EXPECTED_ACCOUNT_ID;
+  if (typeof expected === "string" && expected !== "" && expected.toLowerCase() !== account.id.toLowerCase()) {
+    return { error: "R2_PROVISION_API_TOKEN belongs to a different Cloudflare account than R2_EXPECTED_ACCOUNT_ID: refusing." };
+  }
+  return account;
+}
+
 async function listMediaKeys(
   accountId: string,
   token: string,
   bucket: string,
 ): Promise<{ readable: boolean; keys: R2MediaKeySummary[] } | { error: string }> {
-  const namePrefix = `dy-media-${bucket}-`;
   const keys: R2MediaKeySummary[] = [];
   for (let page = 1; page <= TOKEN_LIST_MAX_PAGES; page += 1) {
     const reply = await cfJson("GET", `/accounts/${encodeURIComponent(accountId)}/tokens?page=${page}&per_page=${TOKEN_LIST_PAGE_SIZE}`, token);
@@ -161,7 +199,7 @@ async function listMediaKeys(
     }
     const records = reply.envelope.result as TokenRecord[];
     for (const record of records) {
-      if (typeof record.id === "string" && typeof record.name === "string" && record.name.startsWith(namePrefix)) {
+      if (typeof record.id === "string" && typeof record.name === "string" && keyNameBelongsToBucket(record.name, bucket)) {
         keys.push({ tokenId: record.id, name: record.name, issuedOn: typeof record.issued_on === "string" ? record.issued_on : null });
       }
     }
@@ -194,7 +232,7 @@ export async function readR2MediaState(params: R2MediaStateParams, env: Env): Pr
   if (!token) {
     return { ok: false, op: "r2-media-state", bucket: params.bucket, detail: "R2_PROVISION_API_TOKEN is not configured on this Worker." };
   }
-  const account = await resolveAccountId(token, TOKEN_UNAUTHORIZED_HINT);
+  const account = await resolveMediaAccount(token, env);
   if ("error" in account) {
     return { ok: false, op: "r2-media-state", bucket: params.bucket, detail: account.error };
   }
@@ -239,7 +277,7 @@ export async function actuateR2SiteKeyInstall(params: R2SiteKeyInstallParams, en
     return failure("CELL_FILE_AGENT_URL / CELL_FILE_AGENT_TOKEN are not configured on this Worker (the file node's cell-agent).");
   }
 
-  const account = await resolveAccountId(token, TOKEN_UNAUTHORIZED_HINT);
+  const account = await resolveMediaAccount(token, env);
   if ("error" in account) {
     return failure(account.error);
   }
@@ -271,7 +309,14 @@ export async function actuateR2SiteKeyInstall(params: R2SiteKeyInstallParams, en
     return failure(TOKEN_UNAUTHORIZED_HINT);
   }
   const record = (minted.envelope?.result ?? null) as { id?: string; value?: string } | null;
-  if (minted.status !== 200 || !minted.envelope?.success || !record || typeof record.id !== "string" || typeof record.value !== "string") {
+  if (minted.status !== 200 || !minted.envelope?.success || !record || typeof record.id !== "string" || typeof record.value !== "string" || record.value === "") {
+    // hub#43 L10: a token that came back WITHOUT a value cannot be used, and it exists. Delete it.
+    if (record && typeof record.id === "string" && record.id !== "") {
+      const removedEmpty = await deleteToken(account.id, token, record.id);
+      return failure(
+        `creating the key failed with HTTP ${minted.status}${cloudflareErrorMessage(minted.envelope)}: the answer had no key value. ${removedEmpty ? "The empty token was deleted again." : `The token ${record.id} could NOT be deleted: revoke it.`}`,
+      );
+    }
     return failure(`creating the key failed with HTTP ${minted.status}${cloudflareErrorMessage(minted.envelope)}`);
   }
   const tokenId = record.id;
@@ -297,21 +342,35 @@ export async function actuateR2SiteKeyInstall(params: R2SiteKeyInstallParams, en
       redirect: "manual",
     });
   } catch (err) {
-    const removed = await deleteToken(account.id, token, tokenId);
-    return failure(
-      `could not reach the file-node cell-agent /set-r2-target: ${errorMessage(err)}. ${removed ? "The new key was deleted again." : `The new key ${tokenId} could NOT be deleted: revoke it.`}`,
-    );
+    // AMBIGUOUS: the request may have reached the agent and staged the key. Do NOT delete it. Hand the id back.
+    return {
+      ok: false,
+      op: "r2-site-key-install",
+      bucket: params.bucket,
+      detail: `could not read the answer of the file-node cell-agent /set-r2-target: ${errorMessage(err)}. The key ${tokenId} was minted and MAY be staged: it was not deleted. Read the staged key id and the key list before doing anything else.`,
+      maybeStagedKeyId: tokenId,
+      maybeStagedKeyName: tokenName,
+    };
   }
 
+  // hub#43 H3. Only a DEFINITE refusal deletes the new key: a redirect or a 4xx (the agent did not take the
+  // request), or the agent's own JSON `ok: false`. Anything else (5xx, 524, a body that is not JSON, a body
+  // that cannot be read) is AMBIGUOUS: the key may be staged, so it is kept and its id is handed back.
   let stagedHex: string | null = null;
   let stageDetail = "";
   let staged = false;
+  let definiteRefusal = false;
   if (response.status === 0 || (response.status >= 300 && response.status < 400)) {
     await response.body?.cancel().catch(() => {});
     stageDetail = `the file-node cell-agent redirected (HTTP ${response.status}): refusing to follow.`;
-  } else if (response.status === 401 || response.status === 403) {
+    definiteRefusal = true;
+  } else if (response.status >= 400 && response.status < 500) {
     await response.body?.cancel().catch(() => {});
-    stageDetail = "the file-node cell-agent rejected CELL_FILE_AGENT_TOKEN (bearer auth failed).";
+    stageDetail =
+      response.status === 401 || response.status === 403
+        ? "the file-node cell-agent rejected CELL_FILE_AGENT_TOKEN (bearer auth failed)."
+        : `the file-node cell-agent refused the request (HTTP ${response.status}).`;
+    definiteRefusal = true;
   } else {
     const read = await readBodyCapped(response, AGENT_REPLY_MAX_BYTES);
     if (!read.ok) {
@@ -330,13 +389,26 @@ export async function actuateR2SiteKeyInstall(params: R2SiteKeyInstallParams, en
         // The agent's refusal text carries reasons only; it never echoes a key. Cap it anyway.
         const reason = body?.error ? `: ${body.error}` : "";
         const stderr = body?.stderr ? ` (${String(body.stderr).slice(0, 300)})` : "";
-        stageDetail = `the file-node cell-agent refused to stage (HTTP ${response.status}${reason}${stderr}).`;
+        stageDetail = `the file-node cell-agent did not confirm staging (HTTP ${response.status}${reason}${stderr}).`;
+        if (body !== null && body.ok === false) {
+          definiteRefusal = true;
+        }
       }
     }
   }
-  if (!staged) {
+  if (!staged && definiteRefusal) {
     const removed = await deleteToken(account.id, token, tokenId);
-    return failure(`${stageDetail} ${removed ? "The new key was deleted again, nothing is left behind." : `The new key ${tokenId} could NOT be deleted: revoke it.`}`);
+    return failure(`${stageDetail} ${removed ? "The new key was deleted again, nothing is left behind." : `The new key ${tokenId} could NOT be deleted: it is an orphan the caller revokes.`}`);
+  }
+  if (!staged) {
+    return {
+      ok: false,
+      op: "r2-site-key-install",
+      bucket: params.bucket,
+      detail: `${stageDetail} The key ${tokenId} was minted and MAY be staged: it was not deleted. Read the staged key id and the key list before doing anything else.`,
+      maybeStagedKeyId: tokenId,
+      maybeStagedKeyName: tokenName,
+    };
   }
   return {
     ok: true,
@@ -355,7 +427,7 @@ export async function actuateR2SiteKeyRevoke(params: R2SiteKeyRevokeParams, env:
   if (!token) {
     return failure("R2_PROVISION_API_TOKEN is not configured on this Worker.");
   }
-  const account = await resolveAccountId(token, TOKEN_UNAUTHORIZED_HINT);
+  const account = await resolveMediaAccount(token, env);
   if ("error" in account) {
     return failure(account.error);
   }
@@ -375,7 +447,7 @@ export async function actuateR2SiteKeyRevoke(params: R2SiteKeyRevokeParams, env:
   if (read.status !== 200 || !read.envelope?.success || !record || typeof record.name !== "string") {
     return failure(`reading the key failed with HTTP ${read.status}${cloudflareErrorMessage(read.envelope)}`);
   }
-  if (!record.name.startsWith(`dy-media-${params.bucket}-`)) {
+  if (!keyNameBelongsToBucket(record.name, params.bucket)) {
     return failure(`the key's name does not show that this op family minted it for ${params.bucket}: refusing to delete it.`);
   }
   const deleted = await cfJson("DELETE", `/accounts/${encodeURIComponent(account.id)}/tokens/${encodeURIComponent(params.tokenId)}`, token);
@@ -404,7 +476,7 @@ export async function readR2MediaBuckets(_params: R2MediaBucketsParams, env: Env
   if (!token) {
     return { ok: false, op: "r2-media-buckets", detail: "R2_PROVISION_API_TOKEN is not configured on this Worker." };
   }
-  const account = await resolveAccountId(token, TOKEN_UNAUTHORIZED_HINT);
+  const account = await resolveMediaAccount(token, env);
   if ("error" in account) {
     return { ok: false, op: "r2-media-buckets", detail: account.error };
   }

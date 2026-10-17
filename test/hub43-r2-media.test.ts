@@ -22,7 +22,7 @@ import {
   validateR2SiteKeyInstallParams,
   validateR2SiteKeyRevokeParams,
 } from "../src/dispatch-params.js";
-import { actuateR2SiteKeyInstall, actuateR2SiteKeyRevoke, readR2MediaBuckets, readR2MediaState, R2_BUCKET_ITEM_WRITE_PERMISSION_GROUP_ID } from "../src/actuate-r2-media.js";
+import { actuateR2SiteKeyInstall, actuateR2SiteKeyRevoke, keyNameBelongsToBucket, readR2MediaBuckets, readR2MediaState, R2_BUCKET_ITEM_WRITE_PERMISSION_GROUP_ID } from "../src/actuate-r2-media.js";
 
 const dispatchParamsSource: string = rawDispatchParamsSource as string;
 
@@ -295,40 +295,76 @@ describe("actuateR2SiteKeyInstall", () => {
     expect(calls.some((call) => call.method === "POST")).toBe(false);
   });
 
-  it("deletes the key it just minted when the file node refuses the stage, and says so", async () => {
-    const calls = mockFetch(happyHandler({ status: 500, body: { error: "set-r2-target failed", stderr: "refused: invalid or missing field: bucket" } }));
-    const result = await actuateR2SiteKeyInstall(params, env());
-    expect(result).toMatchObject({ ok: false, op: "r2-site-key-install" });
-    expect(JSON.stringify(result)).toMatch(/refused to stage/);
-    expect(JSON.stringify(result)).toMatch(/deleted again/);
-    expect(calls.filter((call) => call.method === "DELETE").map((call) => call.url)).toEqual([`${TOKENS_URL}/${TOKEN_ID}`]);
-    expect(JSON.stringify(result)).not.toContain(TOKEN_VALUE);
+  it("H3: a DEFINITE refusal (JSON ok:false, a 4xx, a redirect) deletes the new key and says so", async () => {
+    for (const reply of [
+      { status: 200, body: { ok: false, error: "refused" } },
+      { status: 400, body: { error: "bad slug" } },
+      { status: 401, body: { error: "unauthorized" } },
+      { status: 404, body: { error: "no such route" } },
+    ]) {
+      vi.restoreAllMocks();
+      const calls = mockFetch(happyHandler(reply));
+      const result = await actuateR2SiteKeyInstall(params, env());
+      expect(result).toMatchObject({ ok: false, op: "r2-site-key-install" });
+      expect(JSON.stringify(result)).toMatch(/deleted again/);
+      expect(result).not.toHaveProperty("maybeStagedKeyId");
+      expect(calls.filter((call) => call.method === "DELETE").map((call) => call.url)).toEqual([`${TOKENS_URL}/${TOKEN_ID}`]);
+      expect(JSON.stringify(result)).not.toContain(TOKEN_VALUE);
+    }
   });
 
-  it("deletes the key when the file node cannot be reached, and when its bearer is rejected", async () => {
-    const calls = mockFetch((call) => {
-      if (call.url === STAGE_URL) throw new Error("connect ECONNREFUSED");
-      return happyHandler()(call);
-    });
-    const unreachable = await actuateR2SiteKeyInstall(params, env());
-    expect(unreachable).toMatchObject({ ok: false });
-    expect(JSON.stringify(unreachable)).toMatch(/could not reach the file-node cell-agent/);
-    expect(calls.some((call) => call.method === "DELETE")).toBe(true);
-
-    vi.restoreAllMocks();
-    const calls2 = mockFetch(happyHandler({ status: 401, body: { error: "unauthorized" } }));
-    const rejected = await actuateR2SiteKeyInstall(params, env());
-    expect(JSON.stringify(rejected)).toMatch(/rejected CELL_FILE_AGENT_TOKEN/);
-    expect(calls2.some((call) => call.method === "DELETE")).toBe(true);
+  it("H3: an AMBIGUOUS answer (a throw, a 500, a 524, a body that is not JSON) KEEPS the key and hands back its id", async () => {
+    const ambiguous: Array<(call: RecordedCall) => { status?: number; body: unknown }> = [
+      (call) => {
+        if (call.url === STAGE_URL) throw new Error("connect ECONNRESET");
+        return happyHandler()(call);
+      },
+      happyHandler({ status: 500, body: { error: "set-r2-target failed", stderr: "refused: something" } }),
+      happyHandler({ status: 524, body: { error: "origin timeout" } }),
+      happyHandler({ status: 200, body: "<html>not json</html>" }),
+    ];
+    for (const handler of ambiguous) {
+      vi.restoreAllMocks();
+      const calls = mockFetch(handler);
+      const result = await actuateR2SiteKeyInstall(params, env());
+      expect(result).toMatchObject({ ok: false, op: "r2-site-key-install", maybeStagedKeyId: TOKEN_ID });
+      expect(JSON.stringify(result)).toMatch(/MAY be staged/);
+      expect(calls.some((call) => call.method === "DELETE")).toBe(false);
+      expect(JSON.stringify(result)).not.toContain(TOKEN_VALUE);
+    }
   });
 
-  it("reports a key that could NOT be deleted, by id, so it can be revoked", async () => {
+  it("a key that could NOT be deleted after a definite refusal is reported by id", async () => {
     mockFetch((call) => {
       if (call.url === `${TOKENS_URL}/${TOKEN_ID}` && call.method === "DELETE") return { status: 500, body: { success: false } };
-      return happyHandler({ status: 500, body: { error: "x" } })(call);
+      return happyHandler({ status: 400, body: { error: "x" } })(call);
     });
     const result = await actuateR2SiteKeyInstall(params, env());
     expect(JSON.stringify(result)).toContain(`${TOKEN_ID} could NOT be deleted`);
+  });
+
+  it("L10: a token that came back with no value is deleted, never used", async () => {
+    const calls = mockFetch((call) => {
+      if (call.url === TOKENS_URL && call.method === "POST") return { body: { success: true, result: { id: TOKEN_ID } } };
+      return happyHandler()(call);
+    });
+    const result = await actuateR2SiteKeyInstall(params, env());
+    expect(result).toMatchObject({ ok: false });
+    expect(JSON.stringify(result)).toMatch(/no key value/);
+    expect(calls.filter((call) => call.method === "DELETE").map((call) => call.url)).toEqual([`${TOKENS_URL}/${TOKEN_ID}`]);
+    expect(calls.some((call) => call.url === STAGE_URL)).toBe(false);
+  });
+
+  it("L7: a token of another account than R2_EXPECTED_ACCOUNT_ID is refused by every media op, before a mint", async () => {
+    const calls = mockFetch(happyHandler());
+    const wrong = env({ R2_EXPECTED_ACCOUNT_ID: "ffffffffffffffffffffffffffffffff" });
+    expect(await actuateR2SiteKeyInstall(params, wrong)).toMatchObject({ ok: false });
+    expect(await readR2MediaState({ bucket: BUCKET }, wrong)).toMatchObject({ ok: false });
+    expect(await readR2MediaBuckets({}, wrong)).toMatchObject({ ok: false });
+    expect(await actuateR2SiteKeyRevoke({ bucket: BUCKET, tokenId: TOKEN_ID }, wrong)).toMatchObject({ ok: false });
+    expect(calls.some((call) => call.method === "POST")).toBe(false);
+    const right = await readR2MediaBuckets({}, env({ R2_EXPECTED_ACCOUNT_ID: ACCOUNT_ID.toUpperCase() }));
+    expect(JSON.stringify(right)).not.toMatch(/different Cloudflare account/);
   });
 
   it("a Cloudflare denial of the mint says what the token needs, with no stage call", async () => {
@@ -421,5 +457,34 @@ describe("r2-media-buckets", () => {
     mockFetch((call) => (call.url === ACCOUNTS_URL ? { body: { success: true, result: [{ id: ACCOUNT_ID }] } } : { status: 403, body: { success: false } }));
     expect((await readR2MediaBuckets({}, env())).ok).toBe(false);
     expect((await readR2MediaBuckets({}, env({ R2_PROVISION_API_TOKEN: undefined }))).ok).toBe(false);
+  });
+});
+
+describe("M3: a key name belongs to a bucket only when the rest is the exact label shape", () => {
+  it("separates docs from docs-892769 and rareepicgamer from rareepicgamer-19f933", () => {
+    expect(keyNameBelongsToBucket("dy-media-doubleyoup-media-docs-k1abc", "doubleyoup-media-docs")).toBe(true);
+    expect(keyNameBelongsToBucket("dy-media-doubleyoup-media-docs-892769-k1abc", "doubleyoup-media-docs")).toBe(false);
+    expect(keyNameBelongsToBucket("dy-media-doubleyoup-media-docs-892769-k1abc", "doubleyoup-media-docs-892769")).toBe(true);
+    expect(keyNameBelongsToBucket("dy-media-doubleyoup-media-rareepicgamer-19f933-n1", "doubleyoup-media-rareepicgamer")).toBe(false);
+    expect(keyNameBelongsToBucket("dy-media-doubleyoup-media-acme-", "doubleyoup-media-acme")).toBe(false);
+    expect(keyNameBelongsToBucket("dy-media-doubleyoup-media-acme-" + "a".repeat(17), "doubleyoup-media-acme")).toBe(false);
+    expect(keyNameBelongsToBucket("dy-media-doubleyoup-media-acme-K1", "doubleyoup-media-acme")).toBe(false);
+  });
+
+  it("the list and the revoke both use it", async () => {
+    mockFetch((call) => {
+      if (call.url === ACCOUNTS_URL) return { body: { success: true, result: [{ id: ACCOUNT_ID }] } };
+      if (call.url === `${CF}/accounts/${ACCOUNT_ID}/r2/buckets/doubleyoup-media-docs`) return { body: { success: true, result: {} } };
+      if (call.url.startsWith(`${TOKENS_URL}?`)) {
+        return { body: { success: true, result: [{ id: "a".repeat(32), name: "dy-media-doubleyoup-media-docs-k1" }, { id: "b".repeat(32), name: "dy-media-doubleyoup-media-docs-892769-k1" }] } };
+      }
+      if (call.url === `${TOKENS_URL}/${"b".repeat(32)}`) return { body: { success: true, result: { id: "b".repeat(32), name: "dy-media-doubleyoup-media-docs-892769-k1" } } };
+      return { status: 500, body: { success: false } };
+    });
+    const state = await readR2MediaState({ bucket: "doubleyoup-media-docs" }, env());
+    expect(state.ok && state.keys.map((key) => key.tokenId)).toEqual(["a".repeat(32)]);
+    const revoke = await actuateR2SiteKeyRevoke({ bucket: "doubleyoup-media-docs", tokenId: "b".repeat(32) }, env());
+    expect(revoke.ok).toBe(false);
+    expect(JSON.stringify(revoke)).toMatch(/refusing to delete/);
   });
 });
