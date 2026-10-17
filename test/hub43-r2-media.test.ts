@@ -297,7 +297,9 @@ describe("actuateR2SiteKeyInstall", () => {
 
   it("H3: a DEFINITE refusal (JSON ok:false, a 4xx, a redirect) deletes the new key and says so", async () => {
     for (const reply of [
-      { status: 200, body: { ok: false, error: "refused" } },
+      // What the cell-agent really sends for a refusal before any write (exit 4 or 2 of set-r2-target.sh): a 409 with
+      // JSON ok:false. It never sends a 200 with ok:false.
+      { status: 409, body: { ok: false, refused: true, error: "set-r2-target refused: nothing written", code: 4, stderr: "!! the staged key is not the key id the caller expects: nothing written" } },
       { status: 400, body: { error: "bad slug" } },
       { status: 401, body: { error: "unauthorized" } },
       { status: 404, body: { error: "no such route" } },
