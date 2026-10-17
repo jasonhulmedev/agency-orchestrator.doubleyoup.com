@@ -106,7 +106,7 @@ import { presignS3Put, presignS3Get } from "./sigv4.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken, mintGoogleIdToken } from "./validators.js";
 import { errorMessage, stripTrailingSlash } from "./util.js";
 import type { CfTunnelGetResult, GcpDiskSnapshotCreateResult, GcpInstanceRemoveServiceAccountResult } from "./actuate-hub58.js";
-import type { CfTunnelTokenGetResult } from "./actuate-p47.js";
+import type { CfTunnelConnectionsGetResult, CfTunnelTokenGetResult, GcpInstanceMetadataDiffResult } from "./actuate-p47.js";
 
 export const CF_API = "https://api.cloudflare.com/client/v4";
 
@@ -507,6 +507,12 @@ export type GcpInstanceGetResult =
        * would replace and prove what it wrote. null when not found. See InstanceBootMetadataFacts.
        */
       metadata: InstanceBootMetadataFacts | null;
+      /**
+       * planning/47 review M2/L4: the first interface's EXTERNAL IPv4 (its first access config's natIP),
+       * or null (none, or not found). Non-secret. The gateway's preflight compares it with the origin
+       * IPs of the cell tunnel's connectors.
+       */
+      externalIp: string | null;
     }
   | { ok: false; op: "gcp-instance-get"; instanceName: string; detail: string };
 
@@ -519,6 +525,12 @@ export type GcpInstanceGetResult =
 export interface InstanceBootMetadataFacts {
   /** The metadata fingerprint (what gcp-instance-set-metadata's expectedFingerprint names), or null. */
   fingerprint: string | null;
+  /**
+   * planning/47 review L7: the OTHER metadata keys that run code at boot or shutdown and are present
+   * (names only, from BOOT_TIME_METADATA_KEYS): a boot also runs a startup-script-url or cloud-init's
+   * user-data, and a graceful stop runs a shutdown script. The platform authors none of them.
+   */
+  otherBootKeys: string[];
   /** The `startup-script` key, or null when the VM has none. */
   startupScript: {
     /** sha256 hex of the value's UTF-8 bytes (what gcp-instance-set-metadata reports in valuesSha256). */
@@ -725,6 +737,8 @@ export type ActuateResult =
   // hub#58 / planning/51 (actuate-hub58.ts).
   | CfTunnelGetResult
   | CfTunnelTokenGetResult
+  | CfTunnelConnectionsGetResult
+  | GcpInstanceMetadataDiffResult
   | GcpDiskSnapshotCreateResult
   | GcpInstanceRemoveServiceAccountResult;
 
@@ -4885,6 +4899,37 @@ export function substituteMetadataPlaceholders(value: string, env: Env): Placeho
   return { ok: true, value: output.join(""), substituted, placeholderValues };
 }
 
+/**
+ * Substitute the allowlisted placeholders into every item, from the SAME env. Shared by
+ * gcp-instance-set-metadata and its read-only twin gcp-instance-metadata-diff, so both hash exactly
+ * the value a write would send. Every item resolves from one env, so two items naming one placeholder
+ * agree on its value. Non-secret values only in `placeholderValues` (PLACEHOLDER_VALUES_SAFE_TO_ECHO).
+ */
+export function renderMetadataItems(
+  items: GcpInstanceMetadataItem[],
+  env: Env,
+):
+  | { ok: true; renderedItems: GcpInstanceMetadataItem[]; placeholdersSubstituted: MetadataPlaceholderName[]; placeholderValues: Record<string, string> }
+  | { ok: false; detail: string } {
+  const renderedItems: GcpInstanceMetadataItem[] = [];
+  const placeholdersSubstituted: MetadataPlaceholderName[] = [];
+  const placeholderValues: Record<string, string> = {};
+  for (const item of items) {
+    const rendered = substituteMetadataPlaceholders(item.value, env);
+    if (!rendered.ok) {
+      return { ok: false, detail: `metadata key "${item.key}": ${rendered.detail}` };
+    }
+    renderedItems.push({ key: item.key, value: rendered.value });
+    for (const name of rendered.substituted) {
+      if (!placeholdersSubstituted.includes(name)) {
+        placeholdersSubstituted.push(name);
+      }
+    }
+    Object.assign(placeholderValues, rendered.placeholderValues);
+  }
+  return { ok: true, renderedItems, placeholdersSubstituted, placeholderValues };
+}
+
 /** What instances.get answers with (the fields these ops read). */
 interface ComputeInstanceResponse {
   name?: string;
@@ -4903,7 +4948,7 @@ interface ComputeInstanceResponse {
  * unlike a delete, "already absent" is not a converged success here). 401/403 names the read
  * permission; any other non-2xx carries Google's message.
  */
-async function readComputeInstance(input: {
+export async function readComputeInstance(input: {
   url: string;
   accessToken: string;
   what: string;
@@ -5002,25 +5047,11 @@ export async function actuateGcpInstanceSetMetadata(
 
   // Step 1 — substitute, before any credential is minted or any call is made. A refusal here has
   // zero side effects on the agency's project.
-  const renderedItems: GcpInstanceMetadataItem[] = [];
-  const placeholdersSubstituted: MetadataPlaceholderName[] = [];
-  const placeholderValues: Record<string, string> = {};
-  for (const item of params.items) {
-    const rendered = substituteMetadataPlaceholders(item.value, env);
-    if (!rendered.ok) {
-      return failure(`metadata key "${item.key}": ${rendered.detail}`);
-    }
-    renderedItems.push({ key: item.key, value: rendered.value });
-    for (const name of rendered.substituted) {
-      if (!placeholdersSubstituted.includes(name)) {
-        placeholdersSubstituted.push(name);
-      }
-    }
-    // Every item resolves from the SAME env, so two items naming one placeholder agree on its value
-    // and a later item cannot change what an earlier one reported. Non-secret values only — the
-    // PLACEHOLDER_VALUES_SAFE_TO_ECHO allowlist is applied inside substituteMetadataPlaceholders.
-    Object.assign(placeholderValues, rendered.placeholderValues);
+  const renderedAll = renderMetadataItems(params.items, env);
+  if (!renderedAll.ok) {
+    return failure(renderedAll.detail);
   }
+  const { renderedItems, placeholdersSubstituted, placeholderValues } = renderedAll;
 
   const token = await mintPinnedGcpAccessToken(env, project);
   if (!token.ok) {
@@ -5085,7 +5116,15 @@ export async function actuateGcpInstanceSetMetadata(
       body: JSON.stringify({ fingerprint, items: mergedItems }),
     });
   } catch (err) {
-    return failure(`could not reach Google Compute Engine to set metadata on ${what}: ${errorMessage(err)}`);
+    // planning/47 review L1: a fetch that throws may have thrown AFTER the request reached Google, so
+    // the write may be in place. UNKNOWN, never "nothing was written": re-read before deciding.
+    return {
+      ok: false,
+      op: "gcp-instance-set-metadata",
+      instanceName,
+      detail: `the setMetadata call on ${what} failed in transit (${errorMessage(err)}): it may or may not have been written — read the instance before anything else.`,
+      unconfirmed: true,
+    };
   }
   const body = (await response.json().catch(() => null)) as ComputeInsertResponse | null;
 
@@ -5107,6 +5146,16 @@ export async function actuateGcpInstanceSetMetadata(
       `Google Cloud denied setting metadata on ${what} (HTTP ${response.status})${googleErrorMessage(body)} — the service account ` +
         `needs compute.instances.setMetadata (e.g. roles/compute.instanceAdmin.v1) on project "${project}".`,
     );
+  }
+  if (response.status >= 500) {
+    // planning/47 review L1: Google's 5xx does not say the write did not happen.
+    return {
+      ok: false,
+      op: "gcp-instance-set-metadata",
+      instanceName,
+      detail: `setting metadata on ${what} answered HTTP ${response.status}${googleErrorMessage(body)}: it may or may not have been written — read the instance before anything else.`,
+      unconfirmed: true,
+    };
   }
   if (!response.ok) {
     return failure(`setting metadata on ${what} failed with HTTP ${response.status}${googleErrorMessage(body)}.`);
@@ -5153,7 +5202,7 @@ export async function actuateGcpInstanceSetMetadata(
 }
 
 /** The sha256 of a string's UTF-8 bytes, as lowercase hex (what `sha256sum` prints for the same bytes). */
-async function utf8Sha256Hex(text: string): Promise<string> {
+export async function utf8Sha256Hex(text: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -5385,13 +5434,16 @@ interface ComputeInstanceAddressResponse {
   name?: string;
   status?: string;
   /** Each interface's `networkIP` is its in-VPC private IPv4, on `network` (a URL). A cell node has one. */
-  networkInterfaces?: Array<{ networkIP?: string; network?: string }>;
+  networkInterfaces?: Array<{ networkIP?: string; network?: string; accessConfigs?: Array<{ natIP?: unknown }> }>;
   /** The accounts the VM runs as; absent when it runs as none. */
   serviceAccounts?: unknown;
   /** planning/47: read for InstanceBootMetadataFacts only (fingerprint + the startup-script's facts). */
   metadata?: { fingerprint?: unknown; items?: unknown };
   error?: ComputeInsertResponse["error"];
 }
+
+/** planning/47 review L7: the metadata keys besides `startup-script` that run code at boot or stop. */
+export const BOOT_TIME_METADATA_KEYS = ["startup-script-url", "user-data", "shutdown-script", "shutdown-script-url"] as const;
 
 /** The platform's injected bundle lines (orchestrator cell-bootstrap.ts renders `readonly KEY='value'`). */
 const BOOT_BUNDLE_URL_LINE_RE = /^readonly DY_BUNDLE_URL='(https:\/\/[A-Za-z0-9.-]{1,253}\/[A-Za-z0-9._/-]{1,200})'$/gm;
@@ -5418,21 +5470,25 @@ export async function bootMetadataFactsOf(metadata: { fingerprint?: unknown; ite
   }
   const items = Array.isArray(metadata?.items) ? (metadata?.items as unknown[]) : [];
   let scriptText: string | null = null;
+  const otherBootKeys: string[] = [];
   for (const item of items) {
     if (item === null || typeof item !== "object") {
       continue;
     }
     const entry = item as { key?: unknown; value?: unknown };
-    if (entry.key === "startup-script" && typeof entry.value === "string") {
+    if (typeof entry.key === "string" && (BOOT_TIME_METADATA_KEYS as readonly string[]).includes(entry.key) && !otherBootKeys.includes(entry.key)) {
+      otherBootKeys.push(entry.key);
+    }
+    if (scriptText === null && entry.key === "startup-script" && typeof entry.value === "string") {
       scriptText = entry.value;
-      break;
     }
   }
   if (scriptText === null) {
-    return { fingerprint, startupScript: null };
+    return { fingerprint, otherBootKeys, startupScript: null };
   }
   return {
     fingerprint,
+    otherBootKeys,
     startupScript: {
       sha256: await utf8Sha256Hex(scriptText),
       bytes: new TextEncoder().encode(scriptText).length,
@@ -5530,6 +5586,7 @@ export async function readComputeInstanceAddress(params: GcpInstanceGetParams, e
       status: null,
       serviceAccounts: null,
       metadata: null,
+      externalIp: null,
     };
   }
   if (response.status === 401 || response.status === 403) {
@@ -5559,7 +5616,21 @@ export async function readComputeInstanceAddress(params: GcpInstanceGetParams, e
     status,
     serviceAccounts: serviceAccountEmailsOf(body?.serviceAccounts),
     metadata: await bootMetadataFactsOf(body?.metadata),
+    externalIp: firstInterfaceExternalIp(body),
   };
+}
+
+const IPV4_RE = /^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$/;
+
+/** The first interface's first access config's natIP when it is an IPv4 address, else null. PURE. */
+export function firstInterfaceExternalIp(body: ComputeInstanceAddressResponse | null): string | null {
+  const firstInterface = Array.isArray(body?.networkInterfaces) ? body?.networkInterfaces[0] : undefined;
+  const accessConfig = Array.isArray(firstInterface?.accessConfigs) ? firstInterface?.accessConfigs[0] : undefined;
+  const natIp = accessConfig?.natIP;
+  if (typeof natIp === "string" && IPV4_RE.test(natIp)) {
+    return natIp;
+  }
+  return null;
 }
 
 // ── planning/49 Phase 2 + hub#93: gcp-subnet-create / -get / -delete / gcp-subnets-list ─────────

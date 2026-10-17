@@ -101,6 +101,10 @@ export const DISPATCH_OPS = [
   // published on a saga-built cell's gateway (which runs the connector). app binds it to the
   // account's recorded Cell.tunnelId.
   "cf-tunnel-token-get",
+  // planning/47 review M1/M2 — READ-ONLY: the hash a set-metadata would write (no write), and one
+  // tunnel's connectors (their origin IPs), for the pre-reboot checks.
+  "gcp-instance-metadata-diff",
+  "cf-tunnel-connections-get",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 

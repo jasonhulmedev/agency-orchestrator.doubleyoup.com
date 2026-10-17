@@ -2188,6 +2188,62 @@ export function validateCfTunnelTokenGetParams(raw: unknown): ParamsVerdict<CfTu
   return { ok: true, params: { tunnelId } };
 }
 
+// ── gcp-instance-metadata-diff (planning/47 review M1/M2) ────────────────────────────
+// READ-ONLY twin of gcp-instance-set-metadata: the SAME params (minus expectedFingerprint), the same
+// placeholder substitution, and NO write. It answers with the sha256 of each value as a write would
+// send it, and which keys already hold exactly that value. A file-node script holds the agency's
+// object-store credential once substituted, so only this Worker can say whether the node's metadata
+// already equals what the platform would publish: the reboot path refuses unless it does.
+//
+// A separate op (not a flag on set-metadata) on purpose: an app or Worker that predates it REFUSES the
+// op name, where an unknown flag would be dropped by the validator and the call would WRITE.
+//
+// IDEMPOTENT: a read has no side effect. Registered `true` in AGENCY_OP_IDEMPOTENT.
+
+export type GcpInstanceMetadataDiffParams = Omit<GcpInstanceSetMetadataParams, "expectedFingerprint">;
+
+export function validateGcpInstanceMetadataDiffParams(raw: unknown): ParamsVerdict<GcpInstanceMetadataDiffParams> {
+  if (isPlainObject(raw) && raw.expectedFingerprint !== undefined) {
+    return { ok: false, reason: "gcp-instance-metadata-diff takes no expectedFingerprint: it writes nothing" };
+  }
+  const verdict = validateGcpInstanceSetMetadataParams(raw);
+  if (!verdict.ok) {
+    return verdict;
+  }
+  const { project, zone, name, items } = verdict.params;
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, zone, name, items } };
+}
+
+// ── cf-tunnel-connections-get (planning/47 review M2/L4) ─────────────────────────────
+// READ-ONLY: the CONNECTORS of ONE tunnel, as Cloudflare reports them — each connector's id, version
+// and the origin IPs its connections come from. Non-secret. The gateway's pre-reboot check compares
+// the origin IPs with the gateway's external IP, so it knows the gateway runs THIS tunnel's connector
+// without reading the token on the node. app signs it only for a tunnel one of the account's cells
+// records (Cell.tunnelId).
+//
+// One REQUIRED string, `tunnelId`, with the grammar cf-tunnel-get uses.
+//
+// IDEMPOTENT: a read has no side effect. Registered `true` in AGENCY_OP_IDEMPOTENT.
+
+export interface CfTunnelConnectionsGetParams {
+  /** The cfd_tunnel id whose connectors are read. */
+  tunnelId: string;
+}
+
+export function validateCfTunnelConnectionsGetParams(raw: unknown): ParamsVerdict<CfTunnelConnectionsGetParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { tunnelId } = raw;
+  if (typeof tunnelId !== "string" || !CF_TUNNEL_ID_RE.test(tunnelId)) {
+    return { ok: false, reason: "tunnelId must be a lowercase-hex Cloudflare tunnel id (a 36-char UUID, or 32 hex chars)" };
+  }
+
+  // A FRESH object of only the known key — never the caller's object.
+  return { ok: true, params: { tunnelId } };
+}
+
 // ── hub#58: syd through its Worker — cf-tunnel-get and gcp-disk-snapshot-create ──────
 // planning/51 (hub#58) moves the syd cell onto the path every agency cell already uses: signed jobs
 // through the agency's own Worker, on the agency's own credentials. Three ops are new for that. All

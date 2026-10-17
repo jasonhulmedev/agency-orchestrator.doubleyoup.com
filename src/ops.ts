@@ -55,7 +55,8 @@
 // converges on one snapshot. The third, `gcp-instance-remove-service-account`, is NOT: its first call
 // stops a running VM, so it runs exactly once under F1, like gcp-instance-restart.
 //
-// planning/47 decision G (actuate-p47.ts): `cf-tunnel-token-get` is a read, so it is idempotent.
+// planning/47 decision G (actuate-p47.ts): `cf-tunnel-token-get` is a read, so it is idempotent, and so
+// are the review's two reads, `gcp-instance-metadata-diff` (it writes nothing) and `cf-tunnel-connections-get`.
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -188,15 +189,19 @@ import {
 import {
   type CfTunnelGetParams,
   type CfTunnelTokenGetParams,
+  type CfTunnelConnectionsGetParams,
+  type GcpInstanceMetadataDiffParams,
   type GcpDiskSnapshotCreateParams,
   type GcpInstanceRemoveServiceAccountParams,
   validateCfTunnelGetParams,
   validateCfTunnelTokenGetParams,
+  validateCfTunnelConnectionsGetParams,
+  validateGcpInstanceMetadataDiffParams,
   validateGcpDiskSnapshotCreateParams,
   validateGcpInstanceRemoveServiceAccountParams,
 } from "./dispatch-params.js";
 import { actuateCfTunnelGet, actuateGcpDiskSnapshotCreate, actuateGcpInstanceRemoveServiceAccount } from "./actuate-hub58.js";
-import { actuateCfTunnelTokenGet } from "./actuate-p47.js";
+import { actuateCfTunnelConnectionsGet, actuateCfTunnelTokenGet, actuateGcpInstanceMetadataDiff } from "./actuate-p47.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
 interface OpDefinition<P> {
@@ -398,6 +403,14 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "cf-tunnel-token-get": defineOp<CfTunnelTokenGetParams>({
     validateParams: validateCfTunnelTokenGetParams,
     actuate: (params, env) => actuateCfTunnelTokenGet(params, env),
+  }),
+  "gcp-instance-metadata-diff": defineOp<GcpInstanceMetadataDiffParams>({
+    validateParams: validateGcpInstanceMetadataDiffParams,
+    actuate: (params, env) => actuateGcpInstanceMetadataDiff(params, env),
+  }),
+  "cf-tunnel-connections-get": defineOp<CfTunnelConnectionsGetParams>({
+    validateParams: validateCfTunnelConnectionsGetParams,
+    actuate: (params, env) => actuateCfTunnelConnectionsGet(params, env),
   }),
 };
 

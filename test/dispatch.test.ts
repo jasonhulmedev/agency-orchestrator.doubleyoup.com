@@ -1105,6 +1105,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "cache-purge",
       "cache-rule-upsert",
       "cf-tunnel-config",
+      "cf-tunnel-connections-get",
       "cf-tunnel-create",
       "cf-tunnel-delete",
       "cf-tunnel-get",
@@ -1126,6 +1127,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-instance-create",
       "gcp-instance-delete",
       "gcp-instance-get",
+      "gcp-instance-metadata-diff",
       "gcp-instance-remove-service-account",
       "gcp-instance-restart",
       "gcp-instance-set-metadata",
@@ -7357,7 +7359,9 @@ describe("POST /actuate route", () => {
       // No serviceAccounts field in Google's answer = the VM runs as no account (hub#58 finding 4).
       serviceAccounts: [],
       // planning/47: no metadata in Google's answer = no fingerprint and no startup-script reported.
-      metadata: { fingerprint: null, startupScript: null },
+      metadata: { fingerprint: null, otherBootKeys: [], startupScript: null },
+      // No accessConfigs in the answer = no external IP.
+      externalIp: null,
     });
 
     const [getCall] = computeCalls(calls);
@@ -7386,6 +7390,7 @@ describe("POST /actuate route", () => {
       status: null,
       serviceAccounts: null,
       metadata: null,
+      externalIp: null,
     });
   });
 
@@ -7406,7 +7411,8 @@ describe("POST /actuate route", () => {
         network: null,
         status: "TERMINATED",
         serviceAccounts: [],
-        metadata: { fingerprint: null, startupScript: null },
+        metadata: { fingerprint: null, otherBootKeys: [], startupScript: null },
+        externalIp: null,
       });
       vi.restoreAllMocks();
     }

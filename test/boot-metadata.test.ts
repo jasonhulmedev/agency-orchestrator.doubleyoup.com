@@ -19,11 +19,20 @@ import type { Env } from "../src/env.js";
 import {
   GCP_METADATA_FINGERPRINT_RULE,
   expectedFingerprintVerdict,
+  validateCfTunnelConnectionsGetParams,
   validateCfTunnelTokenGetParams,
+  validateGcpInstanceMetadataDiffParams,
   validateGcpInstanceSetMetadataParams,
 } from "../src/dispatch-params.js";
 import { actuateGcpInstanceSetMetadata, bootMetadataFactsOf, readComputeInstanceAddress } from "../src/actuate.js";
-import { actuateCfTunnelTokenGet, isConnectorTokenForTunnel } from "../src/actuate-p47.js";
+import {
+  actuateCfTunnelConnectionsGet,
+  actuateCfTunnelTokenGet,
+  actuateGcpInstanceMetadataDiff,
+  isConnectorTokenForTunnel,
+  parseTunnelConnections,
+} from "../src/actuate-p47.js";
+import { firstInterfaceExternalIp } from "../src/actuate.js";
 import { DISPATCH_OPS } from "../src/dispatch-verify.js";
 import { DISPATCH_OP_REGISTRY } from "../src/ops.js";
 
@@ -34,7 +43,7 @@ const dispatchParamsSource: string = rawDispatchParamsSource as string;
 const TWIN_BLOCK_START_MARKER = "// ── planning/47: the boot-script update";
 const TWIN_BLOCK_END_MARKER = "\n// ── hub#58: syd through its Worker";
 // The app's src/server/services/agency-dispatch-params-p47.test.ts pins the SAME value.
-const TWIN_BLOCK_SHA256 = "cb64e5617b84e60247187568ed00dc68545208ff92e366a309d87c12620f40a7";
+const TWIN_BLOCK_SHA256 = "b0c2abfe41bbb9e29435987416ab1133bd88b6cd8f1b62c5df78e09ca092eaff";
 
 const PROJECT = "sbm-website-272023";
 const ZONE = "australia-southeast2-a";
@@ -117,6 +126,7 @@ describe("bootMetadataFactsOf", () => {
     });
     expect(facts).toEqual({
       fingerprint: "fp-1",
+      otherBootKeys: [],
       startupScript: {
         sha256: await sha256HexOf(RENDERED_WEB_SCRIPT),
         bytes: new TextEncoder().encode(RENDERED_WEB_SCRIPT).length,
@@ -128,10 +138,11 @@ describe("bootMetadataFactsOf", () => {
   });
 
   it("reports no startup-script for a VM without the key, and nulls for a shape it does not understand", async () => {
-    expect(await bootMetadataFactsOf(undefined)).toEqual({ fingerprint: null, startupScript: null });
-    expect(await bootMetadataFactsOf({ fingerprint: "", items: "not-a-list" })).toEqual({ fingerprint: null, startupScript: null });
+    expect(await bootMetadataFactsOf(undefined)).toEqual({ fingerprint: null, otherBootKeys: [], startupScript: null });
+    expect(await bootMetadataFactsOf({ fingerprint: "", items: "not-a-list" })).toEqual({ fingerprint: null, otherBootKeys: [], startupScript: null });
     expect(await bootMetadataFactsOf({ fingerprint: 7, items: [{ key: "startup-script", value: 42 }, null, "x"] })).toEqual({
       fingerprint: null,
+      otherBootKeys: [],
       startupScript: null,
     });
   });
@@ -391,5 +402,147 @@ describe("actuateCfTunnelTokenGet", () => {
     cfMock({ body: { success: true, result: null } });
     expect((await actuateCfTunnelTokenGet({ tunnelId: TUNNEL_ID }, { CF_DNS_API_TOKEN: CF_TOKEN } as Env)).ok).toBe(false);
     expect((await actuateCfTunnelTokenGet({ tunnelId: TUNNEL_ID }, {} as Env)).ok).toBe(false);
+  });
+});
+
+// ── planning/47 review: L7 boot keys, the external IP, L1 unconfirmed writes ────────────────
+
+describe("planning/47 review: the metadata facts and the write's UNKNOWN outcomes", () => {
+  it("L7: the other boot-time keys are reported by NAME (never a value), each once", async () => {
+    const facts = await bootMetadataFactsOf({
+      fingerprint: "fp",
+      items: [
+        { key: "startup-script", value: RENDERED_WEB_SCRIPT },
+        { key: "startup-script-url", value: "gs://bucket/evil.sh" },
+        { key: "user-data", value: "#cloud-config\nruncmd: [x]" },
+        { key: "shutdown-script", value: "#!/bin/bash\necho bye" },
+        { key: "enable-oslogin", value: "TRUE" },
+      ],
+    });
+    expect(facts.otherBootKeys).toEqual(["startup-script-url", "user-data", "shutdown-script"]);
+    expect(JSON.stringify(facts)).not.toContain("gs://bucket");
+    expect(JSON.stringify(facts)).not.toContain("cloud-config");
+  });
+
+  it("the external IP is the first interface's first access config's natIP, IPv4 only", () => {
+    expect(firstInterfaceExternalIp({ networkInterfaces: [{ accessConfigs: [{ natIP: "35.244.66.16" }] }] })).toBe("35.244.66.16");
+    expect(firstInterfaceExternalIp({ networkInterfaces: [{ accessConfigs: [] }] })).toBeNull();
+    expect(firstInterfaceExternalIp({ networkInterfaces: [{}] })).toBeNull();
+    expect(firstInterfaceExternalIp({ networkInterfaces: [{ accessConfigs: [{ natIP: "not-an-ip" }] }] })).toBeNull();
+    expect(firstInterfaceExternalIp(null)).toBeNull();
+  });
+
+  it("L1: a setMetadata fetch that throws in transit, and a Google 5xx, are unconfirmed (not 'nothing written'); a 4xx is not", async () => {
+    for (const answer of ["throw", 503, 400] as const) {
+      const env = { GCP_SERVICE_ACCOUNT_KEY: await makeServiceAccountKey(PROJECT) } as Env;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+        const url = String(input);
+        if (url === "https://oauth2.googleapis.com/token") {
+          return new Response(JSON.stringify({ access_token: GCP_ACCESS_TOKEN, expires_in: 3600 }), { status: 200 });
+        }
+        if (url === INSTANCE_URL && (init?.method ?? "GET") === "GET") {
+          return new Response(JSON.stringify({ name: NODE, metadata: { fingerprint: "fp", items: [] } }), { status: 200 });
+        }
+        if (answer === "throw") {
+          throw new Error("connection reset");
+        }
+        return new Response(JSON.stringify({ error: { code: answer, message: "x" } }), { status: answer });
+      });
+      const result = await actuateGcpInstanceSetMetadata({ project: PROJECT, zone: ZONE, name: NODE, items: [{ key: "startup-script", value: "#!/bin/bash\n" }] }, env);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.unconfirmed === true).toBe(answer !== 400);
+      }
+      vi.restoreAllMocks();
+    }
+  });
+});
+
+// ── gcp-instance-metadata-diff ───────────────────────────────────────────────────────
+
+describe("gcp-instance-metadata-diff (the read-only twin of set-metadata)", () => {
+  const ITEMS = [{ key: "startup-script" as const, value: "#!/bin/bash\nreadonly B='@@DY_T2_S3_BUCKET@@'\nreadonly K='@@DY_T2_S3_SECRET_ACCESS_KEY@@'\n" }];
+  const S3_ENV = {
+    S3_ACCESS_KEY_ID: "s3-akid-example",
+    S3_SECRET_ACCESS_KEY: "s3-secret-example",
+    S3_REGION: "auto",
+    S3_BUCKET: "agency-backups",
+    S3_ENDPOINT: "https://acct123.r2.example.test",
+  };
+  const SUBSTITUTED = "#!/bin/bash\nreadonly B='agency-backups'\nreadonly K='s3-secret-example'\n";
+
+  it("validates like set-metadata, and refuses expectedFingerprint (it writes nothing)", () => {
+    expect(validateGcpInstanceMetadataDiffParams({ project: PROJECT, zone: ZONE, name: NODE, items: ITEMS, extra: 1 })).toEqual({
+      ok: true,
+      params: { project: PROJECT, zone: ZONE, name: NODE, items: ITEMS },
+    });
+    expect(validateGcpInstanceMetadataDiffParams({ project: PROJECT, zone: ZONE, name: NODE, items: ITEMS, expectedFingerprint: "fp" }).ok).toBe(false);
+    expect(validateGcpInstanceMetadataDiffParams({ project: PROJECT, zone: ZONE, name: NODE, items: [{ key: "ssh-keys", value: "x" }] }).ok).toBe(false);
+  });
+
+  it("hashes the value AFTER substitution, says whether it is in place, and NEVER writes or echoes a secret", async () => {
+    for (const existing of [SUBSTITUTED, "#!/bin/bash\necho old\n"]) {
+      const { env: baseEnv, googleCalls } = await setUp([{ key: "startup-script", value: existing }], "fp-7");
+      const env = { ...baseEnv, ...S3_ENV } as Env;
+      const result = await actuateGcpInstanceMetadataDiff({ project: PROJECT, zone: ZONE, name: NODE, items: ITEMS }, env);
+      expect(result).toMatchObject({
+        ok: true,
+        op: "gcp-instance-metadata-diff",
+        fingerprint: "fp-7",
+        valuesSha256: { "startup-script": await sha256HexOf(SUBSTITUTED) },
+        unchangedKeys: existing === SUBSTITUTED ? ["startup-script"] : [],
+        placeholderValues: { "@@DY_T2_S3_BUCKET@@": "agency-backups" },
+      });
+      expect(JSON.stringify(result)).not.toContain("s3-secret-example");
+      expect(googleCalls().map((call) => call.method)).toEqual(["GET"]);
+      vi.restoreAllMocks();
+    }
+  });
+});
+
+// ── cf-tunnel-connections-get ────────────────────────────────────────────────────────
+
+describe("cf-tunnel-connections-get", () => {
+  const CONNECTOR_A = "1bedc527-751f-4ef8-a15b-fe2a3f5a4e6c";
+  const CONNECTIONS = [
+    {
+      id: CONNECTOR_A,
+      version: "2025.9.1",
+      conns: [
+        { colo_name: "syd01", origin_ip: "35.244.66.16", opened_at: "2026-10-16T00:00:00Z" },
+        { colo_name: "syd02", origin_ip: "35.244.66.16", opened_at: "2026-10-16T00:00:00Z" },
+      ],
+    },
+  ];
+
+  it("validates one tunnel id, like cf-tunnel-get", () => {
+    expect(validateCfTunnelConnectionsGetParams({ tunnelId: TUNNEL_ID, extra: 1 })).toEqual({ ok: true, params: { tunnelId: TUNNEL_ID } });
+    expect(validateCfTunnelConnectionsGetParams({ tunnelId: "X" }).ok).toBe(false);
+  });
+
+  it("parses connectors with their DISTINCT origin IPs, and fails closed on another shape", () => {
+    expect(parseTunnelConnections(CONNECTIONS)).toEqual({
+      ok: true,
+      connectors: [{ connectorId: CONNECTOR_A, version: "2025.9.1", originIps: ["35.244.66.16"], connectionCount: 2 }],
+    });
+    expect(parseTunnelConnections([])).toEqual({ ok: true, connectors: [] });
+    for (const bad of [null, {}, [null], [{ id: "x" }], [{ id: CONNECTOR_A, conns: "x" }], [{ id: CONNECTOR_A, conns: [{ origin_ip: "nope;rm" }] }]]) {
+      expect(parseTunnelConnections(bad).ok).toBe(false);
+    }
+  });
+
+  it("reads them in the Worker token's own account", async () => {
+    const calls = mockFetch((call) => {
+      if (call.url.startsWith("https://api.cloudflare.com/client/v4/accounts?")) {
+        return { body: { success: true, result: [{ id: CF_ACCOUNT_ID }] } };
+      }
+      if (call.url === `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/connections`) {
+        return { body: { success: true, result: CONNECTIONS } };
+      }
+      return { status: 500, body: { success: false } };
+    });
+    const result = await actuateCfTunnelConnectionsGet({ tunnelId: TUNNEL_ID }, { CF_DNS_API_TOKEN: CF_TOKEN } as Env);
+    expect(result).toMatchObject({ ok: true, op: "cf-tunnel-connections-get", connectors: [{ connectorId: CONNECTOR_A, originIps: ["35.244.66.16"] }] });
+    expect(calls).toHaveLength(2);
   });
 });
