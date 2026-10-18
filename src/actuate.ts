@@ -513,6 +513,12 @@ export type GcpInstanceGetResult =
        * IPs of the cell tunnel's connectors.
        */
       externalIp: string | null;
+      /**
+       * planning/47 review N1: Google's `lastStartTimestamp` (when the VM last started), passed only as an
+       * RFC 3339 string; null when absent, malformed, or not found. Non-secret. The reboot path requires
+       * the boot's done-marker to be LATER than it, so a marker from the previous boot is never accepted.
+       */
+      lastStartTimestamp: string | null;
     }
   | { ok: false; op: "gcp-instance-get"; instanceName: string; detail: string };
 
@@ -5439,7 +5445,27 @@ interface ComputeInstanceAddressResponse {
   serviceAccounts?: unknown;
   /** planning/47: read for InstanceBootMetadataFacts only (fingerprint + the startup-script's facts). */
   metadata?: { fingerprint?: unknown; items?: unknown };
+  /** planning/47 review N1: when the VM last started (RFC 3339), checked by rfc3339TimestampOf. */
+  lastStartTimestamp?: unknown;
   error?: ComputeInsertResponse["error"];
+}
+
+/** An RFC 3339 date-time as Google writes one: `2026-10-17T03:05:12.345-07:00` (or a `Z` offset). */
+const RFC3339_TIMESTAMP_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$/;
+
+/**
+ * planning/47 review N1: a timestamp field passed through ONLY when it is an RFC 3339 date-time that
+ * parses as a date, else null. A value this op cannot read is never passed through, so the caller fails
+ * closed. PURE and exported for the unit tests.
+ */
+export function rfc3339TimestampOf(value: unknown): string | null {
+  if (typeof value !== "string" || !RFC3339_TIMESTAMP_RE.test(value)) {
+    return null;
+  }
+  if (Number.isNaN(Date.parse(value))) {
+    return null;
+  }
+  return value;
 }
 
 /** planning/47 review L7: the metadata keys besides `startup-script` that run code at boot or stop. */
@@ -5587,6 +5613,7 @@ export async function readComputeInstanceAddress(params: GcpInstanceGetParams, e
       serviceAccounts: null,
       metadata: null,
       externalIp: null,
+      lastStartTimestamp: null,
     };
   }
   if (response.status === 401 || response.status === 403) {
@@ -5617,6 +5644,7 @@ export async function readComputeInstanceAddress(params: GcpInstanceGetParams, e
     serviceAccounts: serviceAccountEmailsOf(body?.serviceAccounts),
     metadata: await bootMetadataFactsOf(body?.metadata),
     externalIp: firstInterfaceExternalIp(body),
+    lastStartTimestamp: rfc3339TimestampOf(body?.lastStartTimestamp),
   };
 }
 

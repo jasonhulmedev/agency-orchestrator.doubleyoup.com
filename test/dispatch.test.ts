@@ -7334,6 +7334,7 @@ describe("POST /actuate route", () => {
         body: {
           name: "dy-file-australia-southeast1-1",
           status: "RUNNING",
+          lastStartTimestamp: "2026-10-17T03:05:12.345-07:00",
           networkInterfaces: [
             {
               networkIP: "10.20.0.4",
@@ -7362,6 +7363,8 @@ describe("POST /actuate route", () => {
       metadata: { fingerprint: null, otherBootKeys: [], startupScript: null },
       // No accessConfigs in the answer = no external IP.
       externalIp: null,
+      // planning/47 review N1: Google's RFC 3339 lastStartTimestamp, passed through as it is.
+      lastStartTimestamp: "2026-10-17T03:05:12.345-07:00",
     });
 
     const [getCall] = computeCalls(calls);
@@ -7391,6 +7394,7 @@ describe("POST /actuate route", () => {
       serviceAccounts: null,
       metadata: null,
       externalIp: null,
+      lastStartTimestamp: null,
     });
   });
 
@@ -7413,6 +7417,8 @@ describe("POST /actuate route", () => {
         serviceAccounts: [],
         metadata: { fingerprint: null, otherBootKeys: [], startupScript: null },
         externalIp: null,
+        // No lastStartTimestamp in Google's answer (a TERMINATED VM that never started) = null.
+        lastStartTimestamp: null,
       });
       vi.restoreAllMocks();
     }

@@ -32,7 +32,7 @@ import {
   isConnectorTokenForTunnel,
   parseTunnelConnections,
 } from "../src/actuate-p47.js";
-import { firstInterfaceExternalIp } from "../src/actuate.js";
+import { firstInterfaceExternalIp, rfc3339TimestampOf } from "../src/actuate.js";
 import { DISPATCH_OPS } from "../src/dispatch-verify.js";
 import { DISPATCH_OP_REGISTRY } from "../src/ops.js";
 
@@ -430,6 +430,15 @@ describe("planning/47 review: the metadata facts and the write's UNKNOWN outcome
     expect(firstInterfaceExternalIp({ networkInterfaces: [{}] })).toBeNull();
     expect(firstInterfaceExternalIp({ networkInterfaces: [{ accessConfigs: [{ natIP: "not-an-ip" }] }] })).toBeNull();
     expect(firstInterfaceExternalIp(null)).toBeNull();
+  });
+
+  it("review N1: lastStartTimestamp passes only as an RFC 3339 date-time; anything else is null", () => {
+    expect(rfc3339TimestampOf("2026-10-17T03:05:12.345-07:00")).toBe("2026-10-17T03:05:12.345-07:00");
+    expect(rfc3339TimestampOf("2026-10-17T10:05:12Z")).toBe("2026-10-17T10:05:12Z");
+    expect(rfc3339TimestampOf("2026-10-17T10:05:12.123456789+10:00")).toBe("2026-10-17T10:05:12.123456789+10:00");
+    for (const bad of [undefined, null, 1760695512, "", "2026-10-17", "2026-10-17 10:05:12Z", "2026-10-17T10:05:12", "2026-13-45T99:99:99Z", "yesterday", " 2026-10-17T10:05:12Z"]) {
+      expect(rfc3339TimestampOf(bad)).toBeNull();
+    }
   });
 
   it("L1: a setMetadata fetch that throws in transit, and a Google 5xx, are unconfirmed (not 'nothing written'); a 4xx is not", async () => {
