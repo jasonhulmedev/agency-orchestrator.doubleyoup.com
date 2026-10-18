@@ -97,6 +97,14 @@ export const DISPATCH_OPS = [
   // hub#58 review finding 4: STOP one cell node and take its service account off (it can only remove
   // one, never attach one), so its startup-script can be set without iam.serviceAccounts.actAs.
   "gcp-instance-remove-service-account",
+  // planning/47 decision G — READ one tunnel's connector token, so the CURRENT gateway.sh can be
+  // published on a saga-built cell's gateway (which runs the connector). app binds it to the
+  // account's recorded Cell.tunnelId.
+  "cf-tunnel-token-get",
+  // planning/47 review M1/M2 — READ-ONLY: the hash a set-metadata would write (no write), and one
+  // tunnel's connectors (their origin IPs), for the pre-reboot checks.
+  "gcp-instance-metadata-diff",
+  "cf-tunnel-connections-get",
   // hub#43 — agency-owned media. READ one media bucket and the keys minted for it; MINT one bucket-scoped
   // key and stage it straight onto the site's file node (no answer to the platform carries it); DELETE one such key.
   "r2-media-buckets",

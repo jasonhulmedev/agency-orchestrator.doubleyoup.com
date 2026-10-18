@@ -1105,9 +1105,11 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "cache-purge",
       "cache-rule-upsert",
       "cf-tunnel-config",
+      "cf-tunnel-connections-get",
       "cf-tunnel-create",
       "cf-tunnel-delete",
       "cf-tunnel-get",
+      "cf-tunnel-token-get",
       "cloudrun-probe-invoke",
       "cloudrun-service-delete",
       "cloudrun-service-get",
@@ -1125,6 +1127,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-instance-create",
       "gcp-instance-delete",
       "gcp-instance-get",
+      "gcp-instance-metadata-diff",
       "gcp-instance-remove-service-account",
       "gcp-instance-restart",
       "gcp-instance-set-metadata",
@@ -7335,6 +7338,7 @@ describe("POST /actuate route", () => {
         body: {
           name: "dy-file-australia-southeast1-1",
           status: "RUNNING",
+          lastStartTimestamp: "2026-10-17T03:05:12.345-07:00",
           networkInterfaces: [
             {
               networkIP: "10.20.0.4",
@@ -7359,6 +7363,12 @@ describe("POST /actuate route", () => {
       status: "RUNNING",
       // No serviceAccounts field in Google's answer = the VM runs as no account (hub#58 finding 4).
       serviceAccounts: [],
+      // planning/47: no metadata in Google's answer = no fingerprint and no startup-script reported.
+      metadata: { fingerprint: null, otherBootKeys: [], startupScript: null },
+      // No accessConfigs in the answer = no external IP.
+      externalIp: null,
+      // planning/47 review N1: Google's RFC 3339 lastStartTimestamp, passed through as it is.
+      lastStartTimestamp: "2026-10-17T03:05:12.345-07:00",
     });
 
     const [getCall] = computeCalls(calls);
@@ -7386,6 +7396,9 @@ describe("POST /actuate route", () => {
       network: null,
       status: null,
       serviceAccounts: null,
+      metadata: null,
+      externalIp: null,
+      lastStartTimestamp: null,
     });
   });
 
@@ -7406,6 +7419,10 @@ describe("POST /actuate route", () => {
         network: null,
         status: "TERMINATED",
         serviceAccounts: [],
+        metadata: { fingerprint: null, otherBootKeys: [], startupScript: null },
+        externalIp: null,
+        // No lastStartTimestamp in Google's answer (a TERMINATED VM that never started) = null.
+        lastStartTimestamp: null,
       });
       vi.restoreAllMocks();
     }
@@ -9159,6 +9176,11 @@ describe("POST /actuate route", () => {
       },
     };
   }
+  /** sha256 hex of a string's UTF-8 bytes, with Web Crypto (what the Worker reports as valuesSha256). */
+  async function sha256HexOf(text: string): Promise<string> {
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+    return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
   /** Google's 412 for a setMetadata whose fingerprint is stale. */
   const STALE_FINGERPRINT_412 = {
     status: 412,
@@ -9206,6 +9228,10 @@ describe("POST /actuate route", () => {
         "@@DY_T2_S3_REGION@@": "auto",
         "@@DY_T1_S3_BUCKET@@": "agency-backups",
       },
+      // planning/47: the hash of the script AS WRITTEN (after the substitution), never the script.
+      valuesSha256: { "startup-script": await sha256HexOf(FILE_NODE_BOOT_SCRIPT_RENDERED) },
+      unchangedKeys: [],
+      expectedFingerprintChecked: false,
       operationName: "operation-setmeta",
     });
     // Names only in the result — never the agency's secret, the script's restic line, or the token.
@@ -9288,6 +9314,9 @@ describe("POST /actuate route", () => {
       placeholdersSubstituted: [],
       // Nothing was substituted, so there is nothing to report a value for.
       placeholderValues: {},
+      valuesSha256: { "startup-script": await sha256HexOf(plainScript) },
+      unchangedKeys: [],
+      expectedFingerprintChecked: false,
       operationName: "operation-setmeta-2",
     });
     const [, setCall] = computeCalls(calls);

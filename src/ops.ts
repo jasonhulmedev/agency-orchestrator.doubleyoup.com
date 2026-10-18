@@ -59,6 +59,8 @@
 // one named key (an absent key is "already-absent"), so both converge. `r2-site-key-install` is NOT
 // idempotent: every run mints a NEW key, so it runs exactly once under F1 and a lost answer is settled
 // by r2-media-state, never by a resend.
+// planning/47 decision G (actuate-p47.ts): `cf-tunnel-token-get` is a read, so it is idempotent, and so
+// are the review's two reads, `gcp-instance-metadata-diff` (it writes nothing) and `cf-tunnel-connections-get`.
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -201,11 +203,18 @@ import {
   validateR2MediaStateParams,
   validateR2SiteKeyInstallParams,
   validateR2SiteKeyRevokeParams,
+  type CfTunnelTokenGetParams,
+  type CfTunnelConnectionsGetParams,
+  type GcpInstanceMetadataDiffParams,
+  validateCfTunnelTokenGetParams,
+  validateCfTunnelConnectionsGetParams,
+  validateGcpInstanceMetadataDiffParams,
   validateGcpDiskSnapshotCreateParams,
   validateGcpInstanceRemoveServiceAccountParams,
 } from "./dispatch-params.js";
 import { actuateCfTunnelGet, actuateGcpDiskSnapshotCreate, actuateGcpInstanceRemoveServiceAccount } from "./actuate-hub58.js";
 import { actuateR2SiteKeyInstall, actuateR2SiteKeyRevoke, readR2MediaBuckets, readR2MediaState } from "./actuate-r2-media.js";
+import { actuateCfTunnelConnectionsGet, actuateCfTunnelTokenGet, actuateGcpInstanceMetadataDiff } from "./actuate-p47.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
 interface OpDefinition<P> {
@@ -419,6 +428,18 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "r2-site-key-revoke": defineOp<R2SiteKeyRevokeParams>({
     validateParams: validateR2SiteKeyRevokeParams,
     actuate: (params, env) => actuateR2SiteKeyRevoke(params, env),
+  }),
+  "cf-tunnel-token-get": defineOp<CfTunnelTokenGetParams>({
+    validateParams: validateCfTunnelTokenGetParams,
+    actuate: (params, env) => actuateCfTunnelTokenGet(params, env),
+  }),
+  "gcp-instance-metadata-diff": defineOp<GcpInstanceMetadataDiffParams>({
+    validateParams: validateGcpInstanceMetadataDiffParams,
+    actuate: (params, env) => actuateGcpInstanceMetadataDiff(params, env),
+  }),
+  "cf-tunnel-connections-get": defineOp<CfTunnelConnectionsGetParams>({
+    validateParams: validateCfTunnelConnectionsGetParams,
+    actuate: (params, env) => actuateCfTunnelConnectionsGet(params, env),
   }),
 };
 

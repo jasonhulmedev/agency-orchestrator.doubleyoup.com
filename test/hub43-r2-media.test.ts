@@ -27,7 +27,8 @@ import { actuateR2SiteKeyInstall, actuateR2SiteKeyRevoke, keyNameBelongsToBucket
 const dispatchParamsSource: string = rawDispatchParamsSource as string;
 
 const TWIN_BLOCK_START_MARKER = "// ── hub#43: agency-owned media";
-const TWIN_BLOCK_END_MARKER = "\n// ── hub#58: syd through its Worker";
+// The planning/47 twin block follows this one, so this block ends where that one starts (the two blocks are adjacent).
+const TWIN_BLOCK_END_MARKER = "\n// ── planning/47: the boot-script update";
 // The app's src/server/services/agency-dispatch-params-hub43.test.ts pins the SAME value.
 const TWIN_BLOCK_SHA256 = "f2b700d3ef4e712143ed625abb15a9aca3a6c2ef9712ae8115e1f364a4eea2cc";
 
