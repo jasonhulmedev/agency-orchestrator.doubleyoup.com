@@ -61,9 +61,22 @@
 // by r2-media-state, never by a resend.
 // planning/47 decision G (actuate-p47.ts): `cf-tunnel-token-get` is a read, so it is idempotent, and so
 // are the review's two reads, `gcp-instance-metadata-diff` (it writes nothing) and `cf-tunnel-connections-get`.
+// The three hub#46 custom-hostname ops (actuate-custom-hostname.ts) are idempotent too: the upsert creates
+// only an ABSENT (or dead, `deleted`) hostname and otherwise reports the one there is, so a re-run after a
+// lost answer finds the hostname it created; `custom-hostname-get` is a read; `custom-hostname-delete`
+// treats an absent hostname as "already-absent".
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
+import {
+  type CustomHostnameDeleteParams,
+  type CustomHostnameGetParams,
+  type CustomHostnameUpsertParams,
+  validateCustomHostnameDeleteParams,
+  validateCustomHostnameGetParams,
+  validateCustomHostnameUpsertParams,
+} from "./dispatch-params-custom-hostname.js";
+import { actuateCustomHostnameDelete, actuateCustomHostnameGet, actuateCustomHostnameUpsert } from "./actuate-custom-hostname.js";
 import {
   type ParamsVerdict,
   type ProvisionR2Params,
@@ -260,6 +273,18 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "waf-rule-upsert": defineOp<WafRuleUpsertParams>({
     validateParams: validateWafRuleUpsertParams,
     actuate: (params, env) => actuateWafRuleUpsert(params, env),
+  }),
+  "custom-hostname-upsert": defineOp<CustomHostnameUpsertParams>({
+    validateParams: validateCustomHostnameUpsertParams,
+    actuate: (params, env) => actuateCustomHostnameUpsert(params, env),
+  }),
+  "custom-hostname-get": defineOp<CustomHostnameGetParams>({
+    validateParams: validateCustomHostnameGetParams,
+    actuate: (params, env) => actuateCustomHostnameGet(params, env),
+  }),
+  "custom-hostname-delete": defineOp<CustomHostnameDeleteParams>({
+    validateParams: validateCustomHostnameDeleteParams,
+    actuate: (params, env) => actuateCustomHostnameDelete(params, env),
   }),
   "cf-tunnel-create": defineOp<CfTunnelCreateParams>({
     validateParams: validateCfTunnelCreateParams,

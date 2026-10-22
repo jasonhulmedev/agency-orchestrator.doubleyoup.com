@@ -103,6 +103,7 @@ import {
   type WafRule,
 } from "./edge-waf-rule.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
+import type { CustomHostnameDeleteResult, CustomHostnameGetResult, CustomHostnameUpsertResult } from "./actuate-custom-hostname.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken, mintGoogleIdToken } from "./validators.js";
 import { errorMessage, stripTrailingSlash } from "./util.js";
 import type { CfTunnelGetResult, GcpDiskSnapshotCreateResult, GcpInstanceRemoveServiceAccountResult } from "./actuate-hub58.js";
@@ -706,6 +707,10 @@ export type ActuateResult =
   | CachePurgeResult
   | CacheRuleUpsertResult
   | WafRuleUpsertResult
+  // hub#46 (actuate-custom-hostname.ts): customer domains as custom hostnames in the agency zone.
+  | CustomHostnameUpsertResult
+  | CustomHostnameGetResult
+  | CustomHostnameDeleteResult
   | CfTunnelCreateResult
   | CfTunnelConfigResult
   | CfTunnelDeleteResult

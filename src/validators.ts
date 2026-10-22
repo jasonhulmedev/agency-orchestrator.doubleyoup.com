@@ -11,6 +11,7 @@
 import type { Env } from "./env.js";
 import { signS3Request } from "./sigv4.js";
 import { errorMessage, extractXmlTag, stripTrailingSlash } from "./util.js";
+import { probeCustomHostnameScope, type CustomHostnameScopeReport } from "./actuate-custom-hostname.js";
 
 export interface ValidationResult {
   ok: boolean;
@@ -20,6 +21,12 @@ export interface ValidationResult {
    * level. ADVISORY — it never changes `ok`. Absent for every other credential.
    */
   missingUpdatePermissions?: string[];
+  /**
+   * cfDns only (hub#46): can the token read the custom hostnames of CF_CUSTOM_HOSTNAME_ZONE, and does
+   * that zone have a Cloudflare-for-SaaS fallback origin? ADVISORY — it never changes `ok`. Absent for
+   * every other credential.
+   */
+  customHostnames?: CustomHostnameScopeReport;
 }
 
 export interface AllValidations {
@@ -499,9 +506,14 @@ export async function validateCfDns(env: Env): Promise<ValidationResult> {
         // Edge defense: the same token also drives waf-rule-upsert. Same non-fatal pattern — a
         // missing WAF scope must be visible HERE, not on the first apply against a live zone.
         const wafRulesStatus = await probeWafRulesScope(env.CF_DNS_API_TOKEN, body.result[0]?.id);
+        // hub#46 customer domains: the same token also drives the custom-hostname ops, on the zone in
+        // CF_CUSTOM_HOSTNAME_ZONE. Same non-fatal pattern: an agency with no customer domains yet still
+        // validates green, but a missing scope or fallback origin shows here, not on a customer's domain.
+        const customHostnames = await probeCustomHostnameScope(env);
         return {
           ok: true,
-          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch. ${tunnelStatus} ${cacheRulesStatus} ${wafRulesStatus}`,
+          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch. ${tunnelStatus} ${cacheRulesStatus} ${wafRulesStatus} ${customHostnames.detail}`,
+          customHostnames,
         };
       }
       return {

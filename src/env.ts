@@ -101,7 +101,17 @@ export interface Env {
   // direct access to the agency's Cloudflare zones. Also probed read-only by /validate
   // (validators.ts::validateCfDns, including Cache Rules and WAF read probes); the edit + purge
   // scopes are exercised for real on first use. Set only as a Worker secret, never in [vars].
+  // hub#46: the custom-hostname ops (src/actuate-custom-hostname.ts) use this SAME token, which then also
+  // needs "SSL and Certificates: Edit" on the zone named by CF_CUSTOM_HOSTNAME_ZONE below.
   CF_DNS_API_TOKEN?: string;
+
+  // hub#46: the agency zone that holds its customers' Cloudflare-for-SaaS custom hostnames — a zone NAME
+  // such as "example.com" (the cell's Cell.cfZone). The custom-hostname-upsert / -get / -delete ops act
+  // on THIS zone only: a signed job names a hostname, never a zone. Unset => those ops return a clean
+  // ok:false and call nothing. Not a secret, but set it with `wrangler secret put` anyway: `wrangler
+  // deploy` (and so every Workers Builds redeploy after a fork sync) removes plain variables that are
+  // not in wrangler.toml, and wrangler.toml is the same file for every agency.
+  CF_CUSTOM_HOSTNAME_ZONE?: string;
 
   // ── Direction-B cell-agent access (secrets) ───────────────────────────────
   // The agency's OWN on-VM cell-agent — the base URL of the cell-agent this

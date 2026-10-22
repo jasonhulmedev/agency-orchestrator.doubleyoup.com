@@ -28,7 +28,8 @@
 #       wrangler secret put CELL_FILE_AGENT_URL        # hub#43: the FILE-node cell-agent (set-r2-target); r2-site-key-install sends the new per-site media key straight to it
 #       wrangler secret put CELL_FILE_AGENT_TOKEN      # its bearer token (the agency's own)
 #       R2_EXPECTED_ACCOUNT_ID (a var, hub#43 L7): the account id R2_PROVISION_API_TOKEN must belong to; the media ops refuse any other
-#       wrangler secret put CF_DNS_API_TOKEN           # Zone:DNS:Edit + Zone:Read (Direction-B dns-record-upsert) + Zone:Cache Purge (cache-purge) + Zone:Cache Rules:Edit (cache-rule-upsert) + Zone WAF:Edit (waf-rule-upsert)
+#       wrangler secret put CF_DNS_API_TOKEN           # Zone:DNS:Edit + Zone:Read (Direction-B dns-record-upsert) + Zone:Cache Purge (cache-purge) + Zone:Cache Rules:Edit (cache-rule-upsert) + Zone WAF:Edit (waf-rule-upsert) + Zone:SSL and Certificates:Edit (hub#46 custom-hostname-*)
+#       wrangler secret put CF_CUSTOM_HOSTNAME_ZONE    # hub#46: the agency zone NAME that holds its customers' custom hostnames, e.g. example.com (a secret so a redeploy keeps it)
 #       wrangler secret put ANTHROPIC_API_KEY
 #       wrangler secret put OPENROUTER_API_KEY
 #

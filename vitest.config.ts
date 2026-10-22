@@ -40,6 +40,7 @@ export default defineConfig({
             "test/hub58-ops.test.ts",
             "test/hub43-r2-media.test.ts",
             "test/boot-metadata.test.ts",
+            "test/custom-hostname-ops.test.ts",
           ],
         },
       },

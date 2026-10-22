@@ -43,6 +43,11 @@ export const DISPATCH_OPS = [
   "cache-purge",
   "cache-rule-upsert",
   "waf-rule-upsert",
+  // hub#46 — a customer domain of an agency cell site, as a Cloudflare-for-SaaS custom hostname in the
+  // agency's OWN zone (CF_CUSTOM_HOSTNAME_ZONE; a job never names a zone). Create-or-report, read, delete.
+  "custom-hostname-upsert",
+  "custom-hostname-get",
+  "custom-hostname-delete",
   "cf-tunnel-create",
   "cf-tunnel-config",
   "cf-tunnel-delete",
