@@ -25,11 +25,13 @@
 import type { Env } from "./env.js";
 import { errorMessage } from "./util.js";
 import {
+  CUSTOM_HOSTNAME_PLATFORM_ZONE,
   type CustomHostnameDeleteParams,
   type CustomHostnameGetParams,
   type CustomHostnameUpsertParams,
   customHostnameZoneReason,
   isCustomHostnameFqdn,
+  isNameAtOrUnderZone,
 } from "./dispatch-params-custom-hostname.js";
 
 const CLOUDFLARE_API = "https://api.cloudflare.com/client/v4";
@@ -227,6 +229,13 @@ export function configuredCustomHostnameZone(env: Env): { zone: string } | { err
   const zone = configured.trim().toLowerCase();
   if (!isCustomHostnameFqdn(zone)) {
     return { error: "CF_CUSTOM_HOSTNAME_ZONE is not a zone name (expected a lowercase name such as example.com)." };
+  }
+  // review L1: the platform zone holds the control plane and every platform host. An agency Worker
+  // never acts on it, even when a token that can see it is pasted in by mistake.
+  if (isNameAtOrUnderZone(zone, CUSTOM_HOSTNAME_PLATFORM_ZONE)) {
+    return {
+      error: `CF_CUSTOM_HOSTNAME_ZONE must be the agency's own zone, not ${CUSTOM_HOSTNAME_PLATFORM_ZONE} or a name under it (the platform zone).`,
+    };
   }
   return { zone };
 }

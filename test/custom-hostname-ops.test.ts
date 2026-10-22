@@ -31,6 +31,7 @@ import {
   actuateCustomHostnameGet,
   actuateCustomHostnameUpsert,
   probeCustomHostnameScope,
+  configuredCustomHostnameZone,
 } from "../src/actuate-custom-hostname.js";
 import { validateCfDns } from "../src/validators.js";
 
@@ -258,6 +259,27 @@ describe("custom-hostname-upsert", () => {
     const badZone = await actuateCustomHostnameUpsert(params, envWith({ CF_CUSTOM_HOSTNAME_ZONE: "not a zone" }));
     expect(JSON.stringify(badZone)).toMatch(/is not a zone name/);
     expect(calls).toHaveLength(0);
+  });
+
+  it("review L1: refuses the PLATFORM zone (or a name under it) as CF_CUSTOM_HOSTNAME_ZONE, for every op, calling nothing", async () => {
+    const calls = mockCloudflare(zoneWith([customHostnameRow()]));
+    for (const zone of ["doubleyoup.com", " DoubleYouP.com\n", "agency.doubleyoup.com"]) {
+      const env = envWith({ CF_CUSTOM_HOSTNAME_ZONE: zone });
+      const answers = [
+        await actuateCustomHostnameUpsert(params, env),
+        await actuateCustomHostnameGet({ hostname: HOSTNAME, customOriginServer: ORIGIN }, env),
+        await actuateCustomHostnameDelete({ hostname: HOSTNAME, customOriginServer: ORIGIN }, env),
+      ];
+      for (const answer of answers) {
+        expect(answer.ok, zone).toBe(false);
+        expect(JSON.stringify(answer), zone).toMatch(/must be the agency's own zone, not doubleyoup\.com/);
+      }
+      const report = await probeCustomHostnameScope(env);
+      expect(report.canReadCustomHostnames, zone).toBe(false);
+    }
+    expect(calls).toHaveLength(0);
+    // A look-alike is not the platform zone.
+    expect(configuredCustomHostnameZone(envWith({ CF_CUSTOM_HOSTNAME_ZONE: "notdoubleyoup.com" }))).toEqual({ zone: "notdoubleyoup.com" });
   });
 
   it("creates an absent hostname in the ENV zone with HTTP DV + TLS 1.2 and the given origin", async () => {
