@@ -92,9 +92,13 @@ export type CustomHostnameGetResult =
   | { ok: true; op: "custom-hostname-get"; zone: string; hostname: string; found: true; customHostname: CustomHostnameView }
   | { ok: false; op: "custom-hostname-get"; hostname: string; detail: string };
 
+/**
+ * `foreign: true` — the entry's origin is not the job's customOriginServer, so it is not the platform's.
+ * Nothing was deleted (review M1: a remove/re-add race, or a delete aimed at an agency client's entry).
+ */
 export type CustomHostnameDeleteResult =
   | { ok: true; op: "custom-hostname-delete"; zone: string; hostname: string; status: "deleted" | "already-absent" }
-  | { ok: false; op: "custom-hostname-delete"; hostname: string; detail: string };
+  | { ok: false; op: "custom-hostname-delete"; hostname: string; detail: string; foreign?: true };
 
 interface CloudflareEnvelope {
   success?: boolean;
@@ -466,14 +470,26 @@ export async function actuateCustomHostnameGet(params: CustomHostnameGetParams, 
   return { ok: true, op: "custom-hostname-get", zone: resolved.zone, hostname, found: true, customHostname: lookup.found };
 }
 
-/** DELETE one custom hostname. An absent one is "already-absent". Never touches another hostname. */
+/** True when the entry forwards to `expectedOrigin` (case-insensitive). An entry with no custom origin never matches. */
+export function customHostnameOriginMatches(view: CustomHostnameView, expectedOrigin: string): boolean {
+  if (view.customOriginServer === null) {
+    return false;
+  }
+  return view.customOriginServer.toLowerCase() === expectedOrigin.toLowerCase();
+}
+
+/**
+ * DELETE one custom hostname, ONLY when its origin is the job's customOriginServer (review M1). An
+ * absent one is "already-absent". An entry with another origin is left in place and reported
+ * `foreign`. Never touches another hostname.
+ */
 export async function actuateCustomHostnameDelete(params: CustomHostnameDeleteParams, env: Env): Promise<CustomHostnameDeleteResult> {
-  const { hostname } = params;
+  const { hostname, customOriginServer } = params;
   const resolved = await resolveCustomHostnameZone(env);
   if ("error" in resolved) {
     return { ok: false, op: "custom-hostname-delete", hostname, detail: resolved.error };
   }
-  const zoneRefusal = customHostnameZoneReason({ hostname }, resolved.zone);
+  const zoneRefusal = customHostnameZoneReason({ hostname, customOriginServer }, resolved.zone);
   if (zoneRefusal !== null) {
     return { ok: false, op: "custom-hostname-delete", hostname, detail: zoneRefusal };
   }
@@ -483,6 +499,17 @@ export async function actuateCustomHostnameDelete(params: CustomHostnameDeletePa
   }
   if (lookup.found === null) {
     return { ok: true, op: "custom-hostname-delete", zone: resolved.zone, hostname, status: "already-absent" };
+  }
+  if (!customHostnameOriginMatches(lookup.found, customOriginServer)) {
+    return {
+      ok: false,
+      op: "custom-hostname-delete",
+      hostname,
+      foreign: true,
+      detail:
+        `the custom hostname ${hostname} in ${resolved.zone} forwards to ${lookup.found.customOriginServer ?? "the zone's fallback origin"}, ` +
+        `not ${customOriginServer} — it is not the platform's, so it was left in place`,
+    };
   }
   const deleted = await deleteCustomHostnameById(resolved, lookup.found.id);
   if ("error" in deleted) {

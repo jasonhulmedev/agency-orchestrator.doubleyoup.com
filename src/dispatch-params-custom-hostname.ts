@@ -38,9 +38,15 @@ export interface CustomHostnameGetParams {
   hostname: string;
 }
 
-/** custom-hostname-delete: delete one custom hostname. */
+/**
+ * custom-hostname-delete: delete one custom hostname, but ONLY one whose origin is this cell's origin
+ * host. An entry with another origin is not the platform's (a hand-made entry, or one of the agency's
+ * clients that is not on the platform), and it is left in place.
+ */
 export interface CustomHostnameDeleteParams {
   hostname: string;
+  /** The cell's origin host (Cell.originHost). The entry's custom_origin_server must equal it. */
+  customOriginServer: string;
 }
 
 // One label: 1-63 lowercase letters, digits or hyphens, not starting or ending with a hyphen. No
@@ -113,7 +119,8 @@ function validateCustomHostnameOnlyParams(raw: unknown): ParamsVerdict<{ hostnam
   return { ok: true, params: { hostname: record.hostname as string } };
 }
 
-export function validateCustomHostnameUpsertParams(raw: unknown): ParamsVerdict<CustomHostnameUpsertParams> {
+/** Shared by the ops that carry the cell's origin: exactly two keys, `hostname` and `customOriginServer`. */
+function validateCustomHostnameWithOriginParams(raw: unknown): ParamsVerdict<{ hostname: string; customOriginServer: string }> {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
   }
@@ -135,12 +142,16 @@ export function validateCustomHostnameUpsertParams(raw: unknown): ParamsVerdict<
   };
 }
 
+export function validateCustomHostnameUpsertParams(raw: unknown): ParamsVerdict<CustomHostnameUpsertParams> {
+  return validateCustomHostnameWithOriginParams(raw);
+}
+
 export function validateCustomHostnameGetParams(raw: unknown): ParamsVerdict<CustomHostnameGetParams> {
   return validateCustomHostnameOnlyParams(raw);
 }
 
 export function validateCustomHostnameDeleteParams(raw: unknown): ParamsVerdict<CustomHostnameDeleteParams> {
-  return validateCustomHostnameOnlyParams(raw);
+  return validateCustomHostnameWithOriginParams(raw);
 }
 
 /**
