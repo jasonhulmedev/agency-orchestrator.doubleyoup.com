@@ -33,9 +33,11 @@ export interface CustomHostnameUpsertParams {
   customOriginServer: string;
 }
 
-/** custom-hostname-get: read one custom hostname. */
+/** custom-hostname-get: read one custom hostname, and say whether its origin is this cell's (review M3). */
 export interface CustomHostnameGetParams {
   hostname: string;
+  /** The cell's origin host (Cell.originHost). The result's originMatches compares the entry with it. */
+  customOriginServer: string;
 }
 
 /**
@@ -102,24 +104,7 @@ function customHostnameReason(hostname: unknown): string | null {
   return null;
 }
 
-/** Shared by the get and delete ops: exactly one key, `hostname`. */
-function validateCustomHostnameOnlyParams(raw: unknown): ParamsVerdict<{ hostname: string }> {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-    return { ok: false, reason: "params must be a JSON object" };
-  }
-  const record = raw as Record<string, unknown>;
-  const unknownKey = unknownCustomHostnameKeyReason(record, ["hostname"]);
-  if (unknownKey !== null) {
-    return { ok: false, reason: unknownKey };
-  }
-  const hostnameRefusal = customHostnameReason(record.hostname);
-  if (hostnameRefusal !== null) {
-    return { ok: false, reason: hostnameRefusal };
-  }
-  return { ok: true, params: { hostname: record.hostname as string } };
-}
-
-/** Shared by the ops that carry the cell's origin: exactly two keys, `hostname` and `customOriginServer`. */
+/** Shared by all three ops: exactly two keys, `hostname` and `customOriginServer` (the cell's origin). */
 function validateCustomHostnameWithOriginParams(raw: unknown): ParamsVerdict<{ hostname: string; customOriginServer: string }> {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
@@ -147,7 +132,7 @@ export function validateCustomHostnameUpsertParams(raw: unknown): ParamsVerdict<
 }
 
 export function validateCustomHostnameGetParams(raw: unknown): ParamsVerdict<CustomHostnameGetParams> {
-  return validateCustomHostnameOnlyParams(raw);
+  return validateCustomHostnameWithOriginParams(raw);
 }
 
 export function validateCustomHostnameDeleteParams(raw: unknown): ParamsVerdict<CustomHostnameDeleteParams> {

@@ -68,11 +68,16 @@ export interface CustomHostnameView {
 
 /**
  * created   — there was no custom hostname for the name; this run created it.
- * recreated — the one there was `deleted` (Cloudflare gave up validating it); this run deleted the dead
- *             entry and created a fresh one.
- * unchanged — one exists that is not `deleted` (validating, active, blocked, pending_deletion). It is
- *             reported as it is and never edited: re-pointing a working hostname moves live traffic,
- *             and a `blocked` one needs a human.
+ * recreated — the one there was `deleted` (Cloudflare gave up validating it) AND had this cell's
+ *             origin; this run deleted the dead entry and created a fresh one.
+ * unchanged — one exists that is not `deleted` (validating, active, blocked, pending_deletion), or a
+ *             `deleted` one with ANOTHER origin. It is reported as it is and never edited: re-pointing a
+ *             working hostname moves live traffic, a `blocked` one needs a human, and an entry with
+ *             another origin is not the platform's (review M3).
+ *
+ * `originMatches` (review M3, upsert and get): the entry's custom_origin_server equals the job's
+ * customOriginServer. False means the entry is NOT the platform's: the platform must never treat that
+ * domain as live through it, and never delete it.
  */
 export type CustomHostnameUpsertAction = "created" | "recreated" | "unchanged";
 
@@ -84,12 +89,13 @@ export type CustomHostnameUpsertResult =
       hostname: string;
       action: CustomHostnameUpsertAction;
       customHostname: CustomHostnameView;
+      originMatches: boolean;
     }
   | { ok: false; op: "custom-hostname-upsert"; hostname: string; detail: string };
 
 export type CustomHostnameGetResult =
   | { ok: true; op: "custom-hostname-get"; zone: string; hostname: string; found: false }
-  | { ok: true; op: "custom-hostname-get"; zone: string; hostname: string; found: true; customHostname: CustomHostnameView }
+  | { ok: true; op: "custom-hostname-get"; zone: string; hostname: string; found: true; customHostname: CustomHostnameView; originMatches: boolean }
   | { ok: false; op: "custom-hostname-get"; hostname: string; detail: string };
 
 /**
@@ -412,9 +418,13 @@ export async function actuateCustomHostnameUpsert(params: CustomHostnameUpsertPa
   }
   const existing = lookup.found;
 
-  if (existing !== null && existing.status !== "deleted") {
-    // Validating, active, blocked or pending_deletion: report it as it is (see the action notes above).
-    return { ok: true, op: "custom-hostname-upsert", zone: resolved.zone, hostname, action: "unchanged", customHostname: existing };
+  if (existing !== null) {
+    const originMatches = customHostnameOriginMatches(existing, customOriginServer);
+    // Validating, active, blocked or pending_deletion, or a dead entry that is not the platform's:
+    // report it as it is (see the action notes above). A foreign entry is never deleted (review M3).
+    if (existing.status !== "deleted" || !originMatches) {
+      return { ok: true, op: "custom-hostname-upsert", zone: resolved.zone, hostname, action: "unchanged", customHostname: existing, originMatches };
+    }
   }
 
   let action: CustomHostnameUpsertAction = "created";
@@ -437,7 +447,15 @@ export async function actuateCustomHostnameUpsert(params: CustomHostnameUpsertPa
     if (reread.found === null) {
       return upsertFailure(hostname, "Cloudflare reports the hostname exists (1406), but it is not in this zone — it may belong to another Cloudflare account.");
     }
-    return { ok: true, op: "custom-hostname-upsert", zone: resolved.zone, hostname, action: "unchanged", customHostname: reread.found };
+    return {
+      ok: true,
+      op: "custom-hostname-upsert",
+      zone: resolved.zone,
+      hostname,
+      action: "unchanged",
+      customHostname: reread.found,
+      originMatches: customHostnameOriginMatches(reread.found, customOriginServer),
+    };
   }
   if ("error" in created) {
     if (action === "recreated") {
@@ -446,17 +464,25 @@ export async function actuateCustomHostnameUpsert(params: CustomHostnameUpsertPa
     }
     return upsertFailure(hostname, created.error);
   }
-  return { ok: true, op: "custom-hostname-upsert", zone: resolved.zone, hostname, action, customHostname: created.created };
+  return {
+    ok: true,
+    op: "custom-hostname-upsert",
+    zone: resolved.zone,
+    hostname,
+    action,
+    customHostname: created.created,
+    originMatches: customHostnameOriginMatches(created.created, customOriginServer),
+  };
 }
 
 /** READ one custom hostname. `found:false` means the zone has no entry for the name. */
 export async function actuateCustomHostnameGet(params: CustomHostnameGetParams, env: Env): Promise<CustomHostnameGetResult> {
-  const { hostname } = params;
+  const { hostname, customOriginServer } = params;
   const resolved = await resolveCustomHostnameZone(env);
   if ("error" in resolved) {
     return { ok: false, op: "custom-hostname-get", hostname, detail: resolved.error };
   }
-  const zoneRefusal = customHostnameZoneReason({ hostname }, resolved.zone);
+  const zoneRefusal = customHostnameZoneReason({ hostname, customOriginServer }, resolved.zone);
   if (zoneRefusal !== null) {
     return { ok: false, op: "custom-hostname-get", hostname, detail: zoneRefusal };
   }
@@ -467,7 +493,15 @@ export async function actuateCustomHostnameGet(params: CustomHostnameGetParams, 
   if (lookup.found === null) {
     return { ok: true, op: "custom-hostname-get", zone: resolved.zone, hostname, found: false };
   }
-  return { ok: true, op: "custom-hostname-get", zone: resolved.zone, hostname, found: true, customHostname: lookup.found };
+  return {
+    ok: true,
+    op: "custom-hostname-get",
+    zone: resolved.zone,
+    hostname,
+    found: true,
+    customHostname: lookup.found,
+    originMatches: customHostnameOriginMatches(lookup.found, customOriginServer),
+  };
 }
 
 /** True when the entry forwards to `expectedOrigin` (case-insensitive). An entry with no custom origin never matches. */

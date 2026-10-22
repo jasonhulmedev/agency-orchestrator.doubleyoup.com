@@ -39,7 +39,7 @@ const customHostnameParamsSource: string = rawCustomHostnameParamsSource as stri
 const TWIN_BLOCK_START_MARKER = "// ── custom-hostname ops (hub#46): twin block start";
 const TWIN_BLOCK_END_MARKER = "// ── custom-hostname ops (hub#46): twin block end";
 // The app's src/server/services/agency-dispatch-params-custom-hostname.test.ts pins the SAME value.
-const TWIN_BLOCK_SHA256 = "dcc5d25d78a5e12b1f8adf8d4bc45c16829469c1fac5917d556c1c8250f9d447";
+const TWIN_BLOCK_SHA256 = "dbe2e69b4d97c2a46c979030a3bdc8948e8b3b9fc4d32e1f81d42fdb92ce106d";
 
 const CF_TOKEN = "cf-dns-token-must-not-be-echoed";
 const AGENCY_ZONE = "sbmstudio.com.au";
@@ -165,7 +165,12 @@ describe("custom-hostname params (twin of the app's rules)", () => {
       ok: true,
       params: { hostname: HOSTNAME, customOriginServer: ORIGIN },
     });
-    expect(validateCustomHostnameGetParams({ hostname: "ellissi.com.au" })).toEqual({ ok: true, params: { hostname: "ellissi.com.au" } });
+    expect(validateCustomHostnameGetParams({ hostname: "ellissi.com.au", customOriginServer: ORIGIN })).toEqual({
+      ok: true,
+      params: { hostname: "ellissi.com.au", customOriginServer: ORIGIN },
+    });
+    // review M3: a read names the cell's origin, so it can say whether the entry is the platform's.
+    expect(reasonOf(validateCustomHostnameGetParams({ hostname: HOSTNAME }))).toMatch(/^customOriginServer must be/);
     expect(validateCustomHostnameDeleteParams({ hostname: "xn--bcher-kva.example", customOriginServer: ORIGIN })).toEqual({
       ok: true,
       params: { hostname: "xn--bcher-kva.example", customOriginServer: ORIGIN },
@@ -178,7 +183,7 @@ describe("custom-hostname params (twin of the app's rules)", () => {
     expect(reasonOf(validateCustomHostnameUpsertParams({ hostname: HOSTNAME, customOriginServer: ORIGIN, zone: "evil.com" }))).toMatch(
       /^unknown key "zone"/,
     );
-    expect(reasonOf(validateCustomHostnameGetParams({ hostname: HOSTNAME, zoneId: ZONE_ID }))).toMatch(/^unknown key "zoneId"/);
+    expect(reasonOf(validateCustomHostnameGetParams({ hostname: HOSTNAME, customOriginServer: ORIGIN, zoneId: ZONE_ID }))).toMatch(/^unknown key "zoneId"/);
     expect(reasonOf(validateCustomHostnameDeleteParams({ hostname: HOSTNAME, customOriginServer: ORIGIN, ssl: "txt" }))).toMatch(/^unknown key "ssl"/);
   });
 
@@ -203,7 +208,9 @@ describe("custom-hostname params (twin of the app's rules)", () => {
       `${"a.".repeat(127)}com`,
       42,
     ]) {
-      expect(reasonOf(validateCustomHostnameGetParams({ hostname })), String(hostname)).toMatch(/^hostname must be a lowercase fully-qualified domain name/);
+      expect(reasonOf(validateCustomHostnameGetParams({ hostname, customOriginServer: ORIGIN })), String(hostname)).toMatch(
+        /^hostname must be a lowercase fully-qualified domain name/,
+      );
     }
   });
 
@@ -212,7 +219,7 @@ describe("custom-hostname params (twin of the app's rules)", () => {
       expect(reasonOf(validateCustomHostnameUpsertParams({ hostname, customOriginServer: ORIGIN }))).toMatch(/must not be doubleyoup\.com/);
     }
     // A name that only ENDS in the same letters is not under the zone.
-    expect(validateCustomHostnameGetParams({ hostname: "notdoubleyoup.com" }).ok).toBe(true);
+    expect(validateCustomHostnameGetParams({ hostname: "notdoubleyoup.com", customOriginServer: ORIGIN }).ok).toBe(true);
   });
 
   it("refuses a malformed customOriginServer", () => {
@@ -257,7 +264,7 @@ describe("custom-hostname-upsert", () => {
     const calls = mockCloudflare(zoneWith([]));
     // A trailing newline in the pasted secret is tolerated.
     const result = await actuateCustomHostnameUpsert(params, envWith({ CF_CUSTOM_HOSTNAME_ZONE: `${AGENCY_ZONE}\n` }));
-    expect(result).toMatchObject({ ok: true, op: "custom-hostname-upsert", zone: AGENCY_ZONE, hostname: HOSTNAME, action: "created" });
+    expect(result).toMatchObject({ ok: true, op: "custom-hostname-upsert", zone: AGENCY_ZONE, hostname: HOSTNAME, action: "created", originMatches: true });
     expect(calls[0]?.url).toBe(`https://api.cloudflare.com/client/v4/zones?name=${AGENCY_ZONE}&per_page=2`);
     const post = calls.find((call) => call.method === "POST");
     expect(post?.url).toBe(`https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/custom_hostnames`);
@@ -278,11 +285,24 @@ describe("custom-hostname-upsert", () => {
       customHostnameRow({ status: "active", ssl: { status: "active" } }),
       customHostnameRow({ status: "blocked" }),
       customHostnameRow({ status: "pending_deletion", ssl: { status: "active" } }),
-      customHostnameRow({ custom_origin_server: "other-origin.sbmstudio.com.au" }),
     ]) {
       const calls = mockCloudflare(zoneWith([row]));
       const result = await actuateCustomHostnameUpsert(params, envWith());
-      expect(result).toMatchObject({ ok: true, action: "unchanged", customHostname: { id: "ch-1", status: row.status } });
+      expect(result).toMatchObject({ ok: true, action: "unchanged", customHostname: { id: "ch-1", status: row.status }, originMatches: true });
+      expect(calls.filter((call) => call.method !== "GET")).toHaveLength(0);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("review M3: an entry with another origin, or none, is reported unchanged with originMatches:false — even a dead one is never deleted", async () => {
+    for (const row of [
+      customHostnameRow({ custom_origin_server: "other-origin.sbmstudio.com.au", status: "active", ssl: { status: "active" } }),
+      customHostnameRow({ custom_origin_server: null }),
+      customHostnameRow({ custom_origin_server: "other-origin.sbmstudio.com.au", status: "deleted" }),
+    ]) {
+      const calls = mockCloudflare(zoneWith([row]));
+      const result = await actuateCustomHostnameUpsert(params, envWith());
+      expect(result).toMatchObject({ ok: true, action: "unchanged", originMatches: false });
       expect(calls.filter((call) => call.method !== "GET")).toHaveLength(0);
       vi.restoreAllMocks();
     }
@@ -291,7 +311,7 @@ describe("custom-hostname-upsert", () => {
   it("a `deleted` hostname is DELETEd and then re-created", async () => {
     const calls = mockCloudflare(zoneWith([customHostnameRow({ status: "deleted", ssl: { status: "validation_timed_out" } })]));
     const result = await actuateCustomHostnameUpsert(params, envWith());
-    expect(result).toMatchObject({ ok: true, action: "recreated", customHostname: { id: "ch-new" } });
+    expect(result).toMatchObject({ ok: true, action: "recreated", customHostname: { id: "ch-new" }, originMatches: true });
     const writes = calls.filter((call) => call.method !== "GET").map((call) => `${call.method} ${call.url.replace(/^.*custom_hostnames/, "")}`);
     expect(writes).toEqual(["DELETE /ch-1", "POST "]);
   });
@@ -321,7 +341,7 @@ describe("custom-hostname-upsert", () => {
       return { status: 409, body: { success: false, errors: [{ code: 1406, message: "Duplicate custom hostname found." }] } };
     });
     const result = await actuateCustomHostnameUpsert(params, envWith());
-    expect(result).toMatchObject({ ok: true, action: "unchanged", customHostname: { id: "ch-1" } });
+    expect(result).toMatchObject({ ok: true, action: "unchanged", customHostname: { id: "ch-1" }, originMatches: true });
   });
 
   it("refuses a hostname inside the agency zone and an origin outside it, before any custom-hostname call", async () => {
@@ -375,7 +395,7 @@ describe("custom-hostname-get", () => {
         }),
       ]),
     );
-    const result = await actuateCustomHostnameGet({ hostname: HOSTNAME }, envWith());
+    const result = await actuateCustomHostnameGet({ hostname: HOSTNAME, customOriginServer: ORIGIN }, envWith());
     expect(result).toMatchObject({
       ok: true,
       op: "custom-hostname-get",
@@ -396,16 +416,26 @@ describe("custom-hostname-get", () => {
     expect(calls.filter((call) => call.method !== "GET")).toHaveLength(0);
   });
 
+  it("review M3: reports originMatches — true for the cell's origin, false for another one", async () => {
+    mockCloudflare(zoneWith([customHostnameRow({ status: "active", ssl: { status: "active" } })]));
+    const ours = await actuateCustomHostnameGet({ hostname: HOSTNAME, customOriginServer: ORIGIN }, envWith());
+    expect(ours).toMatchObject({ ok: true, found: true, originMatches: true });
+    vi.restoreAllMocks();
+    mockCloudflare(zoneWith([customHostnameRow({ status: "active", ssl: { status: "active" }, custom_origin_server: "wpe-origin.sbmstudio.com.au" })]));
+    const foreign = await actuateCustomHostnameGet({ hostname: HOSTNAME, customOriginServer: ORIGIN }, envWith());
+    expect(foreign).toMatchObject({ ok: true, found: true, originMatches: false });
+  });
+
   it("reports found:false when the zone has no entry for the name", async () => {
     mockCloudflare(zoneWith([]));
-    const result = await actuateCustomHostnameGet({ hostname: HOSTNAME }, envWith());
+    const result = await actuateCustomHostnameGet({ hostname: HOSTNAME, customOriginServer: ORIGIN }, envWith());
     expect(result).toEqual({ ok: true, op: "custom-hostname-get", zone: AGENCY_ZONE, hostname: HOSTNAME, found: false });
   });
 
   it("follows full pages, and refuses to guess when every page is full and none matches", async () => {
     const fullPage = Array.from({ length: 50 }, (_, index) => customHostnameRow({ id: `ch-${index}`, hostname: `x${index}.${HOSTNAME}` }));
     mockCloudflare(zoneWith(fullPage));
-    const result = await actuateCustomHostnameGet({ hostname: HOSTNAME }, envWith());
+    const result = await actuateCustomHostnameGet({ hostname: HOSTNAME, customOriginServer: ORIGIN }, envWith());
     expect(result.ok).toBe(false);
     expect(JSON.stringify(result)).toMatch(/refusing to guess/);
   });
