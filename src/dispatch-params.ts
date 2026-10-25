@@ -3232,6 +3232,22 @@ export const CLOUD_RUN_PROBE_SERVICE_NAME = "dy-run-probe";
  */
 export const CLOUD_RUN_PROBE_IMAGE =
   "docker.io/library/python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe";
+/**
+ * The ONE public Artifact Registry repo the platform publishes session images to (planning/49 §4.5).
+ * A signed job may choose the DIGEST, but not the registry or the image name, so a session can run
+ * only an image the platform published. This is the platform's publishing location, the same for every
+ * cell and every agency. It is not a cell fact and does not move with any cell, even though syd also
+ * lives in that project and region.
+ */
+export const SESSION_IMAGE_REPO = "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run-public";
+/** The image name in SESSION_IMAGE_REPO that each session prefix may run. */
+export const SESSION_IMAGE_NAMES: Readonly<Record<CloudRunSessionServicePrefix, string>> = {
+  term: "dy-run-terminal",
+  sterm: "dy-run-terminal",
+  pma: "phpmyadmin",
+  spma: "phpmyadmin",
+  staging: "dy-run-wp",
+};
 /** The ONLY ports the probe may test: MariaDB on the data node and NFS on the file node. */
 export const CLOUD_RUN_PROBE_PORTS = ["2049", "3306"] as const;
 const CLOUD_RUN_PROBE_TARGETS_MAX = 8;
@@ -3243,7 +3259,8 @@ const CLOUD_RUN_SERVICE_NAME_RE = /^[a-z]([-a-z0-9]{0,47}[a-z0-9])?$/;
 const CLOUD_RUN_SESSION_SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
 // A container image reference PINNED BY DIGEST: <host>[:port]/<path>@sha256:<64 hex>. No tag form
 // is accepted (review M1/L2): a tag can be repointed by its publisher, a digest cannot. The probe
-// image is pinned exactly (CLOUD_RUN_PROBE_IMAGE).
+// image is pinned exactly (CLOUD_RUN_PROBE_IMAGE), and a session image to SESSION_IMAGE_REPO plus the
+// image name of its prefix.
 const CONTAINER_IMAGE_RE =
   /^[a-z0-9][a-z0-9.-]*(?::[0-9]{1,5})?(?:\/[a-z0-9][a-z0-9._-]*){1,6}@sha256:[a-f0-9]{64}$/;
 const CONTAINER_IMAGE_MAX_LENGTH = 512;
@@ -3626,6 +3643,8 @@ function cleanCloudRunProbe(value: unknown): { ok: true; probe: CloudRunProbeSpe
 //          the job's project, region and account, the slot must be Site.runSlot, its subnet must be
 //          confirmed created, and each NFS server must be the cell's file node. The twin can see that
 //          the shapes agree; it cannot know that N is THIS slug's slot.
+//     A session image is pinned to SESSION_IMAGE_REPO plus the image name of its prefix. The digest
+//     is the caller's choice (planning/49 §4.5).
 //     The Worker adds a third check at actuation: it reads the subnet and refuses unless its
 //     description names the same slug and its range is the one derived from the slot (D7).
 //
@@ -3638,7 +3657,7 @@ export interface CloudRunServiceUpsertParams {
   region: string;
   /** A session service name (`<prefix>-<slug>`), or the probe name when `probe` is set. */
   serviceName: string;
-  /** The container image reference. Exactly CLOUD_RUN_PROBE_IMAGE when `probe` is set. */
+  /** The container image reference. Exactly CLOUD_RUN_PROBE_IMAGE when `probe` is set, else SESSION_IMAGE_REPO/<name of the prefix>@sha256:<64 hex>. */
   image: string;
   /** EXACTLY `dy-run@<project>.iam.gserviceaccount.com`. */
   runServiceAccount: string;
@@ -3691,14 +3710,36 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
   if (nameReason !== null) {
     return { ok: false, reason: nameReason };
   }
-  if (typeof image !== "string" || image.length > CONTAINER_IMAGE_MAX_LENGTH || !CONTAINER_IMAGE_RE.test(image)) {
-    return {
-      ok: false,
-      reason: "image must be a container image reference pinned by digest: <registry>/<path>@sha256:<64 hex>",
-    };
+  const imageGrammarReason = "image must be a container image reference pinned by digest: <registry>/<path>@sha256:<64 hex>";
+  if (typeof image !== "string") {
+    return { ok: false, reason: imageGrammarReason };
   }
-  if (isProbe && image !== CLOUD_RUN_PROBE_IMAGE) {
-    return { ok: false, reason: `a probe must run exactly "${CLOUD_RUN_PROBE_IMAGE}"` };
+  if (isProbe) {
+    if (image.length > CONTAINER_IMAGE_MAX_LENGTH || !CONTAINER_IMAGE_RE.test(image)) {
+      return { ok: false, reason: imageGrammarReason };
+    }
+    if (image !== CLOUD_RUN_PROBE_IMAGE) {
+      return { ok: false, reason: `a probe must run exactly "${CLOUD_RUN_PROBE_IMAGE}"` };
+    }
+  } else {
+    // A session image is pinned to the platform's public repo and to the image name of its prefix.
+    // Only the digest is the caller's choice. The pin is an exact match, so it also covers the grammar:
+    // a tag, uppercase hex or a trailing newline gets this refusal, which names the pinned repo.
+    const sessionImageName = splitCloudRunSessionServiceName(serviceName as string);
+    if (sessionImageName === null) {
+      return { ok: false, reason: "serviceName must be <prefix>-<slug> with a site slug ([a-z0-9-], alphanumeric at both ends)" };
+    }
+    const imageName = SESSION_IMAGE_NAMES[sessionImageName.prefix];
+    const expectedImagePrefix = `${SESSION_IMAGE_REPO}/${imageName}@sha256:`;
+    const imageDigest = image.slice(expectedImagePrefix.length);
+    const hasExpectedPrefix = image.startsWith(expectedImagePrefix);
+    const hasValidDigest = /^[a-f0-9]{64}$/.test(imageDigest);
+    if (!hasExpectedPrefix || !hasValidDigest) {
+      return {
+        ok: false,
+        reason: `a ${sessionImageName.prefix}- session service must run ${SESSION_IMAGE_REPO}/${imageName}@sha256:<64 hex> (the platform's public session image repo, planning/49 §4.5)`,
+      };
+    }
   }
   const expectedServiceAccount = cellRunServiceAccountFor(project);
   if (runServiceAccount !== expectedServiceAccount) {

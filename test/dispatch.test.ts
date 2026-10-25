@@ -492,7 +492,7 @@ const CLOUD_RUN_SESSION_PARAMS = {
   project: "dy-agency-proof",
   region: "australia-southeast1",
   serviceName: "term-docs-892769",
-  image: "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run/dy-run-terminal@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  image: "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run-public/dy-run-terminal@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   runServiceAccount: "dy-run@dy-agency-proof.iam.gserviceaccount.com",
   network: "dy-cell-australia-southeast1",
   subnet: "dy-cell-australia-southeast1-run",
@@ -500,6 +500,21 @@ const CLOUD_RUN_SESSION_PARAMS = {
   memory: "2Gi",
   maxInstances: 1,
 };
+// The pinned session image for a service name: the platform's public repo plus the image name of its
+// prefix (planning/49 §4.5).
+const SESSION_IMAGE_REPO_FOR_TESTS = "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run-public";
+function sessionImageFor(serviceName: string) {
+  const prefix = serviceName.split("-")[0];
+  let imageName = "dy-run-terminal";
+  if (prefix === "pma" || prefix === "spma") {
+    imageName = "phpmyadmin";
+  }
+  if (prefix === "staging") {
+    imageName = "dy-run-wp";
+  }
+  return `${SESSION_IMAGE_REPO_FOR_TESTS}/${imageName}@sha256:` + "a".repeat(64);
+}
+
 /** The premise probe: the stock image, two targets, and nothing else. */
 const CLOUD_RUN_PROBE_PARAMS = {
   project: "dy-agency-proof",
@@ -526,7 +541,7 @@ const CLOUD_RUN_PROBE_REF_PARAMS = { project: "dy-agency-proof", region: "austra
 // this marker up to, not including, the next section rule after it). Changing the block means changing
 // BOTH twins and BOTH pins in one go.
 const TWIN_BLOCK_START_MARKER = "// ── planning/49: the agency-side ephemeral-compute ops";
-const TWIN_BLOCK_SHA256 = "47a01de5723413a41f971849af79af208fff9b2d8ce5ebd9ca78bb9a52eedcb1";
+const TWIN_BLOCK_SHA256 = "2b046c6e3064520ed51945e89910eaee8db70fc2bde6cc2bb21737a92049513b";
 
 function planning49Job(op: DispatchJob["op"], params: unknown, nonce: string): DispatchJob {
   return sampleJob({ op, params: JSON.stringify(params), nonce });
@@ -3204,9 +3219,9 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
   it("cloudrun-service-upsert (hub#93 M4 lift): a session on the SHARED probe subnet, or with no slot, is still refused", () => {
     for (const serviceName of ["term-docs-892769", "pma-docs-892769", "staging-docs-892769", "sterm-docs-892769", "spma-docs-892769"]) {
       // The pre-M4 shape: no slot, the probe subnet. Never signable for a session.
-      expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, serviceName }), /^a session service must carry its site's Run slot/);
+      expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, image: sessionImageFor(serviceName), serviceName }), /^a session service must carry its site's Run slot/);
       expectRefused(
-        validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, serviceName, slot: 3 }),
+        validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, image: sessionImageFor(serviceName), serviceName, slot: 3 }),
         /^subnet must be exactly "dy-cell-australia-southeast1-run-s003"/,
       );
     }
@@ -3372,11 +3387,48 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(probe.ok && "slot" in probe.params).toBe(false);
   });
 
+  it("cloudrun-service-upsert SESSION (planning/49 §4.5): the image is pinned to the platform's public repo and the image name of its prefix", () => {
+    const repo = "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run-public";
+    const digest = "@sha256:" + "b".repeat(64);
+    const withImage = (serviceName: string, image: string) =>
+      validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, serviceName, image });
+    expect(withImage("term-docs-892769", repo + "/dy-run-terminal" + digest).ok).toBe(true);
+    expect(withImage("sterm-docs-892769", repo + "/dy-run-terminal" + digest).ok).toBe(true);
+    expect(withImage("pma-docs-892769", repo + "/phpmyadmin" + digest).ok).toBe(true);
+    expect(withImage("spma-docs-892769", repo + "/phpmyadmin" + digest).ok).toBe(true);
+    expect(withImage("staging-docs-892769", repo + "/dy-run-wp" + digest).ok).toBe(true);
+    const reason = /^a term- session service must run australia-southeast1-docker\.pkg\.dev\/doubleyoup\/dy-run-public\/dy-run-terminal@sha256:<64 hex> \(the platform's public session image repo, planning\/49 §4\.5\)$/;
+    // Another registry, with the right name.
+    expectRefused(withImage("term-docs-892769", "docker.io/library/dy-run-terminal" + digest), reason);
+    expectRefused(withImage("term-docs-892769", "europe-docker.pkg.dev/doubleyoup/dy-run-public/dy-run-terminal" + digest), reason);
+    // The right repo, the name of another prefix.
+    expectRefused(withImage("term-docs-892769", repo + "/phpmyadmin" + digest), reason);
+    expectRefused(withImage("staging-docs-892769", repo + "/dy-run-terminal" + digest), /^a staging- session service must run /);
+    // A name that only starts with the right name.
+    expectRefused(withImage("term-docs-892769", repo + "/dy-run-terminal-x" + digest), reason);
+    // A tag form stays refused by the digest grammar.
+    // Images that pass the generic grammar but fail the pin.
+    const pinnedName = "/dy-run-terminal";
+    expectRefused(withImage("term-docs-892769", repo + "/x" + pinnedName + digest), reason);
+    expectRefused(withImage("term-docs-892769", "australia-southeast1-docker.pkg.dev.evil.io/doubleyoup/dy-run-public" + pinnedName + digest), reason);
+    expectRefused(withImage("term-docs-892769", "australia-southeast1-docker.pkg.dev:443/doubleyoup/dy-run-public" + pinnedName + digest), reason);
+    expectRefused(withImage("term-docs-892769", "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run-public-x" + pinnedName + digest), reason);
+    // A malformed session image gets the pin refusal, not the generic grammar one.
+    expectRefused(withImage("term-docs-892769", repo + "/dy-run-terminal:v5"), reason);
+    expectRefused(withImage("term-docs-892769", repo + pinnedName + "@sha256:" + "B".repeat(64)), reason);
+    expectRefused(withImage("term-docs-892769", repo + pinnedName + digest + "\n"), reason);
+    // A non-string image keeps the generic grammar refusal.
+    expectRefused(validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, image: 5 }), /^image must be a container image reference pinned by digest/);
+    // The probe still accepts exactly CLOUD_RUN_PROBE_IMAGE.
+    expect(validateCloudRunServiceUpsertParams(CLOUD_RUN_PROBE_PARAMS).ok).toBe(true);
+    expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_PROBE_PARAMS, image: repo + "/dy-run-terminal" + digest }), /^a probe must run exactly/);
+  });
+
   it("cloudrun-service-upsert SESSION: each NFS path is one of the EXACT per-purpose paths for the service's OWN slug", () => {
     const volume = (path: string, name = "v") => ({ name, server: "10.20.0.4", path, mountPath: `/m/${name}` });
     const accept = (serviceName: string, paths: string[]) => {
       const nfsVolumes = paths.map((path, index) => volume(path, `v${index}`));
-      const verdict = validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, serviceName, nfsVolumes });
+      const verdict = validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, image: sessionImageFor(serviceName), serviceName, nfsVolumes });
       expect(verdict.ok).toBe(true);
     };
     accept("term-docs-892769", ["/srv/dy-storage/sites/docs-892769", "/srv/dy-storage/platform/docs-892769"]);
@@ -3384,7 +3436,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     accept("sterm-docs-892769", ["/srv/dy-storage/sites/docs-892769/staging", "/srv/dy-storage/platform/docs-892769-staging"]);
 
     const refuse = (serviceName: string, path: string) =>
-      expectRefused(validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, serviceName, nfsVolumes: [volume(path)] }), /session for "docs-892769" may mount/);
+      expectRefused(validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, image: sessionImageFor(serviceName), serviceName, nfsVolumes: [volume(path)] }), /session for "docs-892769" may mount/);
     // Another site's tree — including the prefix trap (docs-892769 vs docs-892769-x).
     refuse("term-docs-892769", "/srv/dy-storage/sites/geelongns");
     refuse("term-docs-892769", "/srv/dy-storage/sites/docs-892769-x");
