@@ -91,6 +91,10 @@ export const DISPATCH_OPS = [
   // own zone. The agency site delete removes it after the session service is gone.
   "workers-route-upsert",
   "workers-route-delete",
+  // planning/49 Phase 3 (I4) — deploy the cell's session edge gate: THIS Worker's own embedded gate script,
+  // as `dy-gate-<project>-<region>`, with the cell's session secret. Never takes over a script without the
+  // gate's marker line.
+  "edge-gate-deploy",
   // hub#93 §1 "Quota", §6 — READ the agency project's live SUBNETWORKS usage and limit, which the
   // per-site Run slot allocator checks just before it allocates (the quota is per project).
   "gcp-project-quota-get",

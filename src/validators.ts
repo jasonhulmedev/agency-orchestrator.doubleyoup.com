@@ -10,8 +10,9 @@
 
 import type { Env } from "./env.js";
 import { signS3Request } from "./sigv4.js";
-import { errorMessage, extractXmlTag, stripTrailingSlash } from "./util.js";
+import { errorMessage, extractXmlTag, isWorkerScriptName, stripTrailingSlash } from "./util.js";
 import { probeCustomHostnameScope, type CustomHostnameScopeReport } from "./actuate-custom-hostname.js";
+import { cellRunServiceAccountFor } from "./dispatch-params.js";
 
 export interface ValidationResult {
   ok: boolean;
@@ -22,11 +23,49 @@ export interface ValidationResult {
    */
   missingUpdatePermissions?: string[];
   /**
+   * GCP only (planning/49 Phase 3): the Cloud Run permissions of the session ops that testIamPermissions
+   * did NOT report at project level. ADVISORY — it never changes `ok`. Tested in a SEPARATE call; ABSENT
+   * when that call failed (the advisory is then "unknown", and the detail says so).
+   */
+  missingSessionPermissions?: string[];
+  /**
+   * GCP only (planning/49 Phase 3): may the Worker's service account act as the session runtime identity
+   * `dy-run@<project>`? Tested on that service account itself. ADVISORY — it never changes `ok`.
+   */
+  runServiceAccountActAs?: RunServiceAccountActAsState;
+  /**
    * cfDns only (hub#46): can the token read the custom hostnames of CF_CUSTOM_HOSTNAME_ZONE, and does
    * that zone have a Cloudflare-for-SaaS fallback origin? ADVISORY — it never changes `ok`. Absent for
    * every other credential.
    */
   customHostnames?: CustomHostnameScopeReport;
+  /**
+   * cfDns only (planning/49 Phase 3): can the token READ Workers scripts on its account and Workers
+   * routes on the zone it lists first? A read cannot prove the Edit scopes the edge gate needs.
+   * ADVISORY — it never changes `ok`.
+   */
+  workersScope?: WorkersScopeReport;
+}
+
+/**
+ * The actAs check on `dy-run@<project>`: held; denied (the account exists and the Worker does not hold
+ * the permission on it); not-found (no such account); unknown (the check could not be made or Google
+ * refused it without saying which).
+ */
+export type RunServiceAccountActAsState = "held" | "denied" | "not-found" | "unknown";
+
+/** One Workers read probe: the read worked, Cloudflare refused it (401/403), or the probe was inconclusive. */
+export type WorkersReadState = "read-ok" | "denied" | "unknown";
+
+/** The two Workers read probes /validate makes with CF_DNS_API_TOKEN, and whether DY_WORKER_NAME is set. */
+export interface WorkersScopeReport {
+  scripts: WorkersReadState;
+  routes: WorkersReadState;
+  /**
+   * planning/49 Phase 3 (I4): is DY_WORKER_NAME set? edge-gate-deploy binds the session gate to this Worker
+   * by that name and refuses without it. A presence check only (the deploy checks that the script exists).
+   */
+  workerName: "set" | "unset";
 }
 
 export interface AllValidations {
@@ -473,6 +512,92 @@ async function probeWafRulesScope(token: string, zoneId: string | undefined): Pr
   }
 }
 
+/** One READ-ONLY Workers probe: GET `url` with the token and classify the answer. Never throws. */
+async function probeWorkersRead(token: string, url: string): Promise<{ state: WorkersReadState; status: string }> {
+  try {
+    const response = await fetch(url, { headers: { authorization: `Bearer ${token}`, accept: "application/json" } });
+    if (response.status === 200) {
+      return { state: "read-ok", status: "HTTP 200" };
+    }
+    if (response.status === 401 || response.status === 403) {
+      return { state: "denied", status: `HTTP ${response.status}` };
+    }
+    return { state: "unknown", status: `HTTP ${response.status}` };
+  } catch (err) {
+    return { state: "unknown", status: `not sent: ${errorMessage(err)}` };
+  }
+}
+
+/**
+ * planning/49 Phase 3: READ-ONLY probes of the two Workers scopes the session edge gate needs (decision
+ * C). Workers Scripts on the token's account (the edge-gate deploy uploads a script) and Workers Routes
+ * on the zone the zone list returned first (a route puts the gate in front of a session host). A READ
+ * cannot prove Edit: Cloudflare offers no way to test an edit scope without writing, so the row says so,
+ * and Edit is exercised on the first edge-gate deploy and route upsert. ADVISORY: never changes `ok`.
+ */
+async function probeWorkersScope(
+  token: string,
+  zone: { id: string | undefined; name: string | undefined },
+  workerName: string | undefined,
+): Promise<{ detail: string; report: WorkersScopeReport }> {
+  const editNote =
+    "A read cannot prove Workers Scripts: Edit or Workers Routes: Edit; those are exercised on the first edge-gate deploy and route upsert.";
+
+  // The account: the same first-account lookup the tunnel probe uses.
+  let accountId: string | undefined;
+  try {
+    const acctResponse = await fetch("https://api.cloudflare.com/client/v4/accounts?per_page=1", {
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+    });
+    const acctBody = (await acctResponse.json().catch(() => null)) as { success?: boolean; result?: Array<{ id?: string }> } | null;
+    if (acctBody?.success && Array.isArray(acctBody.result) && acctBody.result.length > 0) {
+      accountId = acctBody.result[0]?.id;
+    }
+  } catch {
+    accountId = undefined;
+  }
+
+  let scripts: { state: WorkersReadState; status: string } = { state: "unknown", status: "the token's account could not be resolved" };
+  if (accountId) {
+    scripts = await probeWorkersRead(token, `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/workers/scripts`);
+  }
+  let routes: { state: WorkersReadState; status: string } = { state: "unknown", status: "the zone list returned no zone id" };
+  if (zone.id) {
+    routes = await probeWorkersRead(token, `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(zone.id)}/workers/routes`);
+  }
+
+  const zoneText = zone.name ?? "the first listed zone";
+  const scriptsText = workersReadText(scripts, "Workers scripts on the account", "Account → Workers Scripts: Edit");
+  const routesText = workersReadText(routes, `Workers routes on ${zoneText}`, "Zone → Workers Routes: Edit");
+  // planning/49 Phase 3 (I4): the gate reaches this Worker's SessionGateMinter by the name in DY_WORKER_NAME.
+  let workerNameState: "set" | "unset" = "unset";
+  let workerNameText =
+    "DY_WORKER_NAME: NOT set — set it to this Worker's own script name as Cloudflare shows it (`wrangler secret put DY_WORKER_NAME`); the edge-gate deploy refuses without it";
+  if (workerName) {
+    workerNameState = "set";
+    // The value is echoed only when it is a script name; anything else could be any text.
+    workerNameText = "DY_WORKER_NAME: set, but NOT a Worker script name (lowercase letters, digits, \"-\" and \"_\", at most 63 characters)";
+    if (isWorkerScriptName(workerName)) {
+      workerNameText = `DY_WORKER_NAME: set ("${workerName}")`;
+    }
+  }
+  return {
+    detail: `Session edge gate (advisory, does not affect this check): ${scriptsText}; ${routesText}; ${workerNameText}. ${editNote}`,
+    report: { scripts: scripts.state, routes: routes.state, workerName: workerNameState },
+  };
+}
+
+/** One Workers probe as row text. */
+function workersReadText(probe: { state: WorkersReadState; status: string }, what: string, scope: string): string {
+  if (probe.state === "read-ok") {
+    return `${what}: read OK`;
+  }
+  if (probe.state === "denied") {
+    return `${what}: NOT readable (${probe.status}) — add ${scope}`;
+  }
+  return `${what}: check inconclusive (${probe.status})`;
+}
+
 export async function validateCfDns(env: Env): Promise<ValidationResult> {
   if (!env.CF_DNS_API_TOKEN) {
     return {
@@ -510,10 +635,13 @@ export async function validateCfDns(env: Env): Promise<ValidationResult> {
         // CF_CUSTOM_HOSTNAME_ZONE. Same non-fatal pattern: an agency with no customer domains yet still
         // validates green, but a missing scope or fallback origin shows here, not on a customer's domain.
         const customHostnames = await probeCustomHostnameScope(env);
+        // planning/49 Phase 3: the session edge gate's Workers scopes. Same non-fatal pattern.
+        const workers = await probeWorkersScope(env.CF_DNS_API_TOKEN, { id: body.result[0]?.id, name: zoneName }, env.DY_WORKER_NAME);
         return {
           ok: true,
-          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch. ${tunnelStatus} ${cacheRulesStatus} ${wafRulesStatus} ${customHostnames.detail}`,
+          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch. ${tunnelStatus} ${cacheRulesStatus} ${wafRulesStatus} ${customHostnames.detail} ${workers.detail}`,
           customHostnames,
+          workersScope: workers.report,
         };
       }
       return {
@@ -716,10 +844,14 @@ interface GoogleTokenResponse {
   access_token?: string;
 }
 
-// The two OAuth2 scopes this Worker ever mints a Google access token for. A scope bounds what
+// The three OAuth2 scopes this Worker ever mints a Google access token for. A scope bounds what
 // the TOKEN may do (the service account's IAM roles still bound what the agency has granted):
-//   - READ_ONLY is the DEFAULT and is all validateGCP's testIamPermissions probe needs —
+//   - READ_ONLY is the DEFAULT and is all validateGCP's PROJECT-level testIamPermissions probe needs —
 //     least-privilege for a probe that must never be able to change anything.
+//   - IAM is requested ONLY by validateGCP's actAs check on the session runtime identity (planning/49
+//     Phase 3): the IAM API's serviceAccounts.testIamPermissions accepts the `iam` or `cloud-platform`
+//     scope and not the read-only one. `iam` is the narrower of the two (the IAM API only). The token is
+//     used for that ONE read and never leaves the Worker.
 //   - CLOUD_PLATFORM (full) is requested ONLY by the Direction-B `gcp-*` write actuators
 //     (actuate.ts::mintPinnedGcpAccessToken — the one place that asks for it, on behalf of
 //     gcp-instance-create / gcp-network-create / gcp-firewall-create / gcp-address-create /
@@ -729,6 +861,7 @@ interface GoogleTokenResponse {
 //     for it, and validateGCP stays on the read-only default.
 export const GOOGLE_SCOPE_CLOUD_PLATFORM_READ_ONLY = "https://www.googleapis.com/auth/cloud-platform.read-only";
 export const GOOGLE_SCOPE_CLOUD_PLATFORM = "https://www.googleapis.com/auth/cloud-platform";
+export const GOOGLE_SCOPE_IAM = "https://www.googleapis.com/auth/iam";
 
 // Mint a Google OAuth2 access token via the JWT-bearer grant (RFC 7523 /
 // Google's "server-to-server" flow): build a JWT signed with the service
@@ -909,6 +1042,149 @@ export const UPDATE_GCP_PERMISSIONS = [
   "compute.snapshots.get",
 ];
 
+// planning/49 Phase 3: the Cloud Run permissions the SESSION ops use (actuate.ts): the upsert reads the
+// service, creates or updates it, reads its IAM policy before a patch, and waits on the operation; the
+// delete deletes it and waits; and the session is invoked with an ID token of the Worker's own identity
+// (the edge gate's minter, like the probe invoke). ADVISORY, for the update-path reasons above: an agency
+// that has not opened a session must still pass, and a grant with IAM Conditions on service names
+// (planning/49 decision B, the syd cell) does not show at project level. Tested in a SEPARATE
+// testIamPermissions call (probeSessionPermissions), so an error there — e.g. Google refusing a
+// permission name for this resource — makes only this advisory "unknown" and can never change the
+// required check. The subnet and actAs permissions are not here: the subnet ones are compute rights,
+// and actAs is tested on the runtime service account itself.
+export const SESSION_GCP_PERMISSIONS = [
+  "run.services.get",
+  "run.services.create",
+  "run.services.update",
+  "run.services.delete",
+  "run.services.getIamPolicy",
+  "run.operations.get",
+  "run.routes.invoke",
+];
+
+/**
+ * planning/49 Phase 3: the session-path permission check, in its OWN testIamPermissions call with the
+ * same read-only token. Never throws: any failure (a fetch error, a non-200, a garbled body) is
+ * "unknown" (missing: null), described in the advisory sentence.
+ */
+async function probeSessionPermissions(input: { accessToken: string; projectId: string }): Promise<{ missing: string[] | null; detail: string }> {
+  const unknownHead = " Session path (advisory, does not affect this check): the Cloud Run permissions could not be checked";
+  let response: Response;
+  try {
+    response = await fetch(
+      `https://cloudresourcemanager.googleapis.com/v1/projects/${encodeURIComponent(input.projectId)}:testIamPermissions`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${input.accessToken}`,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify({ permissions: SESSION_GCP_PERMISSIONS }),
+      },
+    );
+  } catch (err) {
+    return { missing: null, detail: `${unknownHead} (the call could not be sent: ${errorMessage(err)}).` };
+  }
+  const body = (await response.json().catch(() => null)) as { permissions?: unknown; error?: { message?: string } } | null;
+  if (response.status !== 200) {
+    const message = body?.error?.message;
+    return { missing: null, detail: `${unknownHead} (HTTP ${response.status}${message ? `: ${message}` : ""}).` };
+  }
+  if (body === null || (body.permissions !== undefined && !Array.isArray(body.permissions))) {
+    return { missing: null, detail: `${unknownHead} (the answer was not a permission list).` };
+  }
+  // An absent list is Google's answer for "none held".
+  const held = new Set(Array.isArray(body.permissions) ? (body.permissions as unknown[]) : []);
+  const missing = SESSION_GCP_PERMISSIONS.filter((permission) => !held.has(permission));
+  return { missing, detail: sessionPermissionsNote(missing) };
+}
+
+/** The advisory sentence /validate appends about the session-path Cloud Run permissions. */
+function sessionPermissionsNote(missing: string[]): string {
+  if (missing.length === 0) {
+    return ` Session path (advisory): all ${SESSION_GCP_PERMISSIONS.length} Cloud Run permission(s) held at project level.`;
+  }
+  return (
+    ` Session path (advisory, does not affect this check): ${missing.length} of ${SESSION_GCP_PERMISSIONS.length} Cloud Run ` +
+    `permission(s) not held at project level: ${missing.join(", ")}. A grant with IAM Conditions on service names does ` +
+    "not show at project level."
+  );
+}
+
+/**
+ * planning/49 Phase 3: test `iam.serviceAccounts.actAs` on the session runtime identity
+ * `dy-run@<project>` itself (the onboarding grant is on that account, not on the project). Mints its own
+ * `iam`-scoped token (see GOOGLE_SCOPE_IAM). ADVISORY and never throws: every failure is "unknown".
+ * Google answers 404 for an account that does not exist. A 200 lists the permissions held, so a 200
+ * without actAs means the account exists and the grant is missing.
+ */
+async function probeRunServiceAccountActAs(input: {
+  clientEmail: string;
+  privateKeyPem: string;
+  tokenUri: string;
+  projectId: string;
+}): Promise<{ state: RunServiceAccountActAsState; detail: string }> {
+  const runServiceAccount = cellRunServiceAccountFor(input.projectId);
+  const head = " Session runtime identity (advisory";
+  const notAffecting = ", does not affect this check)";
+
+  let accessToken: string;
+  try {
+    accessToken = await mintGoogleAccessToken({
+      clientEmail: input.clientEmail,
+      privateKeyPem: input.privateKeyPem,
+      tokenUri: input.tokenUri,
+      scope: GOOGLE_SCOPE_IAM,
+    });
+  } catch (err) {
+    return {
+      state: "unknown",
+      detail: `${head}${notAffecting}: could not mint a token to test iam.serviceAccounts.actAs on ${runServiceAccount}: ${errorMessage(err)}.`,
+    };
+  }
+
+  const url =
+    `https://iam.googleapis.com/v1/projects/${encodeURIComponent(input.projectId)}/serviceAccounts/` +
+    `${encodeURIComponent(runServiceAccount)}:testIamPermissions`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ permissions: ["iam.serviceAccounts.actAs"] }),
+    });
+  } catch (err) {
+    return { state: "unknown", detail: `${head}${notAffecting}: the actAs check on ${runServiceAccount} could not be sent: ${errorMessage(err)}.` };
+  }
+
+  if (response.status === 404) {
+    return {
+      state: "not-found",
+      detail: `${head}${notAffecting}: ${runServiceAccount} was not found. Create it once at onboarding (it needs no roles).`,
+    };
+  }
+  if (response.status !== 200) {
+    return {
+      state: "unknown",
+      detail:
+        `${head}${notAffecting}: the actAs check on ${runServiceAccount} answered HTTP ${response.status}. Google can refuse ` +
+        "the check without saying whether the account exists.",
+    };
+  }
+  const body = (await response.json().catch(() => null)) as { permissions?: string[] } | null;
+  const held = Array.isArray(body?.permissions) && body.permissions.includes("iam.serviceAccounts.actAs");
+  if (held) {
+    return { state: "held", detail: `${head}): the service account may act as ${runServiceAccount} (iam.serviceAccounts.actAs).` };
+  }
+  return {
+    state: "denied",
+    detail:
+      `${head}${notAffecting}: the service account does NOT hold iam.serviceAccounts.actAs on ${runServiceAccount}. ` +
+      "Grant it on that service account (roles/iam.serviceAccountUser), not on the project.",
+  };
+}
+
 /** The advisory sentence /validate appends about the update-path permissions. */
 function updatePermissionsNote(missing: string[]): string {
   if (missing.length === 0) {
@@ -988,17 +1264,30 @@ export async function validateGCP(env: Env): Promise<ValidationResult> {
       const missing = REQUIRED_GCP_PERMISSIONS.filter((permission) => !held.has(permission));
       const missingUpdatePermissions = UPDATE_GCP_PERMISSIONS.filter((permission) => !held.has(permission));
       const updateNote = updatePermissionsNote(missingUpdatePermissions);
+      // planning/49 Phase 3: the session rows, each in its OWN call. ADVISORY, like the update-path note:
+      // neither changes `ok`, and a failure of either only makes that row "unknown".
+      const sessionPermissions = await probeSessionPermissions({ accessToken, projectId });
+      const actAs = await probeRunServiceAccountActAs({ clientEmail, privateKeyPem, tokenUri, projectId });
+      const advisoryNotes = `${updateNote}${sessionPermissions.detail}${actAs.detail}`;
+      const sessionFields: Pick<ValidationResult, "missingSessionPermissions" | "runServiceAccountActAs"> = {
+        runServiceAccountActAs: actAs.state,
+      };
+      if (sessionPermissions.missing !== null) {
+        sessionFields.missingSessionPermissions = sessionPermissions.missing;
+      }
       if (missing.length === 0) {
         return {
           ok: true,
-          detail: `Google Cloud authenticated as ${clientEmail}; project "${projectId}" accessible with all ${REQUIRED_GCP_PERMISSIONS.length} required permission(s).${updateNote}`,
+          detail: `Google Cloud authenticated as ${clientEmail}; project "${projectId}" accessible with all ${REQUIRED_GCP_PERMISSIONS.length} required permission(s).${advisoryNotes}`,
           missingUpdatePermissions,
+          ...sessionFields,
         };
       }
       return {
         ok: false,
-        detail: `Google Cloud authenticated as ${clientEmail}, but the service account is missing ${missing.length} required permission(s): ${missing.join(", ")}. Grant the service account "roles/compute.admin" on the project — it covers every permission the cell provisioner needs.${updateNote}`,
+        detail: `Google Cloud authenticated as ${clientEmail}, but the service account is missing ${missing.length} required permission(s): ${missing.join(", ")}. Grant the service account "roles/compute.admin" on the project — it covers every permission the cell provisioner needs.${advisoryNotes}`,
         missingUpdatePermissions,
+        ...sessionFields,
       };
     }
     if (response.status === 403) {

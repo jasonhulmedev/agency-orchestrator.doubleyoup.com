@@ -10,12 +10,14 @@ import {
   validateGCP,
   REQUIRED_GCP_PERMISSIONS,
   UPDATE_GCP_PERMISSIONS,
+  SESSION_GCP_PERMISSIONS,
   validateR2Provision,
   validateCfDns,
   validateAll,
   mintGoogleAccessToken,
   GOOGLE_SCOPE_CLOUD_PLATFORM,
   GOOGLE_SCOPE_CLOUD_PLATFORM_READ_ONLY,
+  GOOGLE_SCOPE_IAM,
 } from "../src/validators.js";
 
 // Minimal Env with only the Direction-A fields; each test spreads in the
@@ -466,9 +468,18 @@ describe("validateCfDns", () => {
           u === "https://api.cloudflare.com/client/v4/zones/z1/rulesets/phases/http_request_firewall_custom/entrypoint",
         respond: () => jsonResponse({ success: false, errors: [{ code: 10003 }] }, 404),
       },
+      // planning/49 Phase 3: READ-ONLY probes of the session edge gate's Workers scopes.
+      {
+        match: (u) => u === "https://api.cloudflare.com/client/v4/accounts/acc1/workers/scripts",
+        respond: () => jsonResponse({ success: true, result: [] }),
+      },
+      {
+        match: (u) => u === "https://api.cloudflare.com/client/v4/zones/z1/workers/routes",
+        respond: () => jsonResponse({ success: true, result: [] }),
+      },
     ]);
     vi.stubGlobal("fetch", fetchMock);
-    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
+    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token", DY_WORKER_NAME: "sbmstudio" });
     expect(result.ok).toBe(true);
     expect(result.detail).toContain("jasonhulme.com");
     expect(result.detail).toMatch(/edit permission is exercised on the first DNS dispatch/i);
@@ -478,10 +489,16 @@ describe("validateCfDns", () => {
     expect(result.detail).toMatch(/Cache Rules: read access OK/i);
     // ...and the WAF probe.
     expect(result.detail).toMatch(/WAF rules: read access OK/i);
+    // ...and the Workers probes, which say a read cannot prove Edit.
+    expect(result.detail).toMatch(/Workers scripts on the account: read OK; Workers routes on jasonhulme\.com: read OK/);
+    expect(result.detail).toMatch(/A read cannot prove Workers Scripts: Edit or Workers Routes: Edit/);
+    expect(result.workersScope).toEqual({ scripts: "read-ok", routes: "read-ok", workerName: "set" });
+    // planning/49 Phase 3 (I4): DY_WORKER_NAME is reported with its value (a script name, not a secret).
+    expect(result.detail).toContain('DY_WORKER_NAME: set ("sbmstudio")');
 
-    // Strictly read-only: the zone read, the two tunnel-scope probes, the Cache Rules probe and the
-    // WAF probe, all GETs with the bearer.
-    expect(fetchMock.mock.calls.length).toBe(5);
+    // Strictly read-only: the zone read, the two tunnel-scope probes, the Cache Rules probe, the WAF
+    // probe, and the Workers probes (the account read again, scripts, routes), all GETs with the bearer.
+    expect(fetchMock.mock.calls.length).toBe(8);
     for (const call of fetchMock.mock.calls) {
       const [, init] = call as unknown as [string, RequestInit | undefined];
       expect(init?.method ?? "GET").toBe("GET");
@@ -573,6 +590,51 @@ describe("validateCfDns", () => {
     expect(result.detail).toMatch(/WAF rules: NOT available/i);
     expect(result.detail).toMatch(/Zone WAF Write/);
     expect(result.detail).toMatch(/API-token editor/);
+  });
+
+  it("planning/49 Phase 3: stays green when the Workers scopes are NOT readable, and names the scopes to add", async () => {
+    const fetchMock = routedFetch([
+      { match: (u) => u === "https://api.cloudflare.com/client/v4/zones?per_page=1", respond: () => jsonResponse({ success: true, result: [{ id: "z1", name: "jasonhulme.com" }] }) },
+      { match: (u) => u === "https://api.cloudflare.com/client/v4/accounts?per_page=1", respond: () => jsonResponse({ success: true, result: [{ id: "acc1" }] }) },
+      { match: (u) => u.startsWith("https://api.cloudflare.com/client/v4/accounts/acc1/cfd_tunnel"), respond: () => jsonResponse({ success: true, result: [] }) },
+      { match: (u) => u.includes("/rulesets/phases/"), respond: () => jsonResponse({ success: false, errors: [{ code: 10003 }] }, 404) },
+      { match: (u) => u === "https://api.cloudflare.com/client/v4/accounts/acc1/workers/scripts", respond: () => jsonResponse({ success: false, errors: [{ code: 10000 }] }, 403) },
+      { match: (u) => u === "https://api.cloudflare.com/client/v4/zones/z1/workers/routes", respond: () => jsonResponse({ success: false, errors: [{ code: 10000 }] }, 401) },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
+    expect(result.ok).toBe(true);
+    expect(result.workersScope).toEqual({ scripts: "denied", routes: "denied", workerName: "unset" });
+    // planning/49 Phase 3 (I4): an unset DY_WORKER_NAME is advisory too, and says how to set it.
+    expect(result.detail).toMatch(/DY_WORKER_NAME: NOT set — set it to this Worker's own script name/);
+    expect(result.detail).toContain("wrangler secret put DY_WORKER_NAME");
+    expect(result.detail).toMatch(/Session edge gate \(advisory, does not affect this check\)/);
+    expect(result.detail).toMatch(/Workers scripts on the account: NOT readable \(HTTP 403\) — add Account → Workers Scripts: Edit/);
+    expect(result.detail).toMatch(/Workers routes on jasonhulme\.com: NOT readable \(HTTP 401\) — add Zone → Workers Routes: Edit/);
+  });
+
+  it("planning/49 Phase 3: a Workers probe that cannot be made is inconclusive, never a failure", async () => {
+    // The account list answers no account, and the routes probe answers a 500.
+    const fetchMock = routedFetch([
+      { match: (u) => u === "https://api.cloudflare.com/client/v4/zones?per_page=1", respond: () => jsonResponse({ success: true, result: [{ id: "z1", name: "jasonhulme.com" }] }) },
+      { match: (u) => u === "https://api.cloudflare.com/client/v4/accounts?per_page=1", respond: () => jsonResponse({ success: true, result: [] }) },
+      { match: (u) => u.includes("/rulesets/phases/"), respond: () => jsonResponse({ success: false, errors: [{ code: 10003 }] }, 404) },
+      { match: (u) => u === "https://api.cloudflare.com/client/v4/zones/z1/workers/routes", respond: () => jsonResponse({ success: false }, 500) },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+    // planning/49 Phase 3 (I4 review): a DY_WORKER_NAME that is not a script name is reported, not echoed.
+    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token", DY_WORKER_NAME: "<b>Not A Name</b>" });
+    expect(result.ok).toBe(true);
+    expect(result.workersScope).toEqual({ scripts: "unknown", routes: "unknown", workerName: "set" });
+    expect(result.detail).toMatch(/DY_WORKER_NAME: set, but NOT a Worker script name/);
+    expect(result.detail).not.toContain("Not A Name");
+    expect(result.detail).toMatch(/Workers scripts on the account: check inconclusive \(the token's account could not be resolved\)/);
+    expect(result.detail).toMatch(/Workers routes on jasonhulme\.com: check inconclusive \(HTTP 500\)/);
+    // No Workers write was attempted: every call is a GET.
+    for (const call of fetchMock.mock.calls) {
+      const [, init] = call as unknown as [string, RequestInit | undefined];
+      expect(init?.method ?? "GET").toBe("GET");
+    }
   });
 
   it("fails closed when the token authenticates but can list NO zones (wrong scope)", async () => {
@@ -683,7 +745,8 @@ describe("validateGCP", () => {
     expect(new Headers(projectInit.headers).get("authorization")).toBe("Bearer ya29.test");
     expect(projectInit.method).toBe("POST");
     const requestedPermissions = JSON.parse(String(projectInit.body)).permissions as string[];
-    // planning/51: the SAME call also asks for the advisory update-path permissions, after the required set.
+    // planning/51: the SAME call also asks for the advisory update-path permissions, after the required
+    // set. planning/49 Phase 3: the session-path ones are NOT in it (they have their own call).
     expect(requestedPermissions).toEqual([...REQUIRED_GCP_PERMISSIONS, ...UPDATE_GCP_PERMISSIONS]);
     expect(requestedPermissions).toContain("compute.instances.create");
   });
@@ -733,6 +796,177 @@ describe("validateGCP", () => {
     expect(result.ok).toBe(true);
     expect(result.missingUpdatePermissions).toEqual([]);
     expect(result.detail).toMatch(/all 9 update permission\(s\) held at project level/);
+  });
+
+  /**
+   * A fetch mock for validateGCP: the token, the two project checks (told apart by the permissions they
+   * ask for: the session call asks for run.*), and (optionally) the actAs check. Google answers a
+   * project check with the SUBSET of the asked permissions that `projectPermissions` holds. An unrouted
+   * URL throws, like routedFetch.
+   */
+  function gcpRoutes(input: { projectPermissions: string[]; sessionCall?: () => Response; actAs?: () => Response }) {
+    return vi.fn(async (url: unknown, init?: RequestInit) => {
+      const target = String(url);
+      if (target.includes("oauth2.googleapis.com/token")) {
+        return jsonResponse({ access_token: "ya29.test" });
+      }
+      if (target.includes("cloudresourcemanager.googleapis.com")) {
+        const asked = JSON.parse(String(init?.body)).permissions as string[];
+        const isSessionCall = asked.some((permission) => permission.startsWith("run."));
+        if (isSessionCall && input.sessionCall !== undefined) {
+          return input.sessionCall();
+        }
+        return jsonResponse({ permissions: asked.filter((permission) => input.projectPermissions.includes(permission)) });
+      }
+      const actAsUrl =
+        "https://iam.googleapis.com/v1/projects/demo-project/serviceAccounts/dy-run%40demo-project.iam.gserviceaccount.com:testIamPermissions";
+      if (target === actAsUrl && input.actAs !== undefined) {
+        return input.actAs();
+      }
+      throw new Error(`unexpected fetch to ${target}`);
+    });
+  }
+
+  it("planning/49 Phase 3: the session permissions are asked in their OWN call, after the main one", async () => {
+    const key = await makeServiceAccountKey();
+    const fetchMock = gcpRoutes({ projectPermissions: [...REQUIRED_GCP_PERMISSIONS, ...SESSION_GCP_PERMISSIONS] });
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+    expect(result.ok).toBe(true);
+    const calls = fetchMock.mock.calls as unknown as Array<[string, RequestInit]>;
+    const projectCalls = calls.filter(([url]) => url.includes("cloudresourcemanager.googleapis.com"));
+    expect(projectCalls).toHaveLength(2);
+    expect(JSON.parse(String(projectCalls[0][1].body)).permissions).toEqual([...REQUIRED_GCP_PERMISSIONS, ...UPDATE_GCP_PERMISSIONS]);
+    expect(JSON.parse(String(projectCalls[1][1].body)).permissions).toEqual(SESSION_GCP_PERMISSIONS);
+    // The same read-only token, a POST.
+    expect(new Headers(projectCalls[1][1].headers).get("authorization")).toBe("Bearer ya29.test");
+    expect(projectCalls[1][1].method).toBe("POST");
+  });
+
+  it("planning/49 Phase 3: a FAILED session call makes only the advisory unknown — the main row passes exactly as before", async () => {
+    const key = await makeServiceAccountKey();
+    // Google refusing a permission name for this resource answers 400 for the WHOLE call.
+    const rejected = () => jsonResponse({ error: { code: 400, message: "Permission run.routes.invoke is not valid for this resource." } }, 400);
+    vi.stubGlobal("fetch", gcpRoutes({ projectPermissions: [...REQUIRED_GCP_PERMISSIONS, ...UPDATE_GCP_PERMISSIONS], sessionCall: rejected }));
+    const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+    expect(result.ok).toBe(true);
+    expect(result.detail).toMatch(/^Google Cloud authenticated as .*; project "demo-project" accessible with all 6 required permission\(s\)\./);
+    expect(result.detail).toMatch(/all 9 update permission\(s\) held at project level/);
+    expect(result.missingUpdatePermissions).toEqual([]);
+    expect(result.missingSessionPermissions).toBeUndefined();
+    expect(result.detail).toMatch(
+      /Session path \(advisory, does not affect this check\): the Cloud Run permissions could not be checked \(HTTP 400: Permission run\.routes\.invoke is not valid for this resource\.\)/,
+    );
+
+    // A session call that cannot be sent, or answers garbage: unknown too, and the row still passes.
+    for (const sessionCall of [
+      () => {
+        throw new Error("network down");
+      },
+      () => new Response("not json", { status: 200 }),
+      () => jsonResponse({ permissions: "run.services.get" }),
+    ]) {
+      vi.stubGlobal("fetch", gcpRoutes({ projectPermissions: [...REQUIRED_GCP_PERMISSIONS], sessionCall }));
+      const unknown = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+      expect(unknown.ok).toBe(true);
+      expect(unknown.missingSessionPermissions).toBeUndefined();
+      expect(unknown.detail).toMatch(/the Cloud Run permissions could not be checked/);
+      vi.unstubAllGlobals();
+    }
+
+    // A failing REQUIRED set still fails, whatever the session call does.
+    vi.stubGlobal("fetch", gcpRoutes({ projectPermissions: [], sessionCall: rejected }));
+    const failing = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+    expect(failing.ok).toBe(false);
+    expect(failing.detail).toMatch(/missing 6 required permission/);
+  });
+
+  it("planning/49 Phase 3: the session Cloud Run permissions are ADVISORY — missing ones are named but never change ok", async () => {
+    const key = await makeServiceAccountKey();
+    vi.stubGlobal("fetch", gcpRoutes({ projectPermissions: [...REQUIRED_GCP_PERMISSIONS, "run.services.get"] }));
+    const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+    expect(result.ok).toBe(true);
+    expect(result.missingSessionPermissions).toEqual([
+      "run.services.create",
+      "run.services.update",
+      "run.services.delete",
+      "run.services.getIamPolicy",
+      "run.operations.get",
+      "run.routes.invoke",
+    ]);
+    expect(result.detail).toMatch(/Session path \(advisory, does not affect this check\): 6 of 7 Cloud Run permission\(s\) not held/);
+    expect(result.detail).toMatch(/IAM Conditions on service names does not show at project level/);
+  });
+
+  it("planning/49 Phase 3: every session permission held => the advisory says so", async () => {
+    const key = await makeServiceAccountKey();
+    vi.stubGlobal("fetch", gcpRoutes({ projectPermissions: [...REQUIRED_GCP_PERMISSIONS, ...SESSION_GCP_PERMISSIONS] }));
+    const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+    expect(result.ok).toBe(true);
+    expect(result.missingSessionPermissions).toEqual([]);
+    expect(result.detail).toMatch(/Session path \(advisory\): all 7 Cloud Run permission\(s\) held at project level/);
+  });
+
+  it("planning/49 Phase 3: actAs on dy-run@<project> is tested on THAT service account with an iam-scoped token", async () => {
+    const key = await makeServiceAccountKey();
+    const fetchMock = gcpRoutes({
+      projectPermissions: [...REQUIRED_GCP_PERMISSIONS],
+      actAs: () => jsonResponse({ permissions: ["iam.serviceAccounts.actAs"] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+    expect(result.ok).toBe(true);
+    expect(result.runServiceAccountActAs).toBe("held");
+    expect(result.detail).toMatch(/may act as dy-run@demo-project\.iam\.gserviceaccount\.com/);
+
+    // The calls: the read-only token, the main project check, the session project check, the
+    // iam-scoped token, the actAs check.
+    const calls = fetchMock.mock.calls as unknown as Array<[string, RequestInit]>;
+    expect(calls.map(([url]) => url.split("?")[0].split(":testIamPermissions")[0])).toEqual([
+      "https://oauth2.googleapis.com/token",
+      "https://cloudresourcemanager.googleapis.com/v1/projects/demo-project",
+      "https://cloudresourcemanager.googleapis.com/v1/projects/demo-project",
+      "https://oauth2.googleapis.com/token",
+      "https://iam.googleapis.com/v1/projects/demo-project/serviceAccounts/dy-run%40demo-project.iam.gserviceaccount.com",
+    ]);
+    const projectTokenClaims = jwtClaimsOf(new URLSearchParams(String(calls[0][1].body)).get("assertion") ?? "");
+    expect(projectTokenClaims.scope).toBe(GOOGLE_SCOPE_CLOUD_PLATFORM_READ_ONLY);
+    const iamTokenClaims = jwtClaimsOf(new URLSearchParams(String(calls[3][1].body)).get("assertion") ?? "");
+    expect(iamTokenClaims.scope).toBe(GOOGLE_SCOPE_IAM);
+    expect(GOOGLE_SCOPE_IAM).toBe("https://www.googleapis.com/auth/iam");
+    expect(calls[4][1].method).toBe("POST");
+    expect(JSON.parse(String(calls[4][1].body))).toEqual({ permissions: ["iam.serviceAccounts.actAs"] });
+  });
+
+  it("planning/49 Phase 3: actAs denied, not-found and unknown are told apart, and none changes ok", async () => {
+    const key = await makeServiceAccountKey();
+    const cases: Array<[() => Response, string, RegExp]> = [
+      [() => jsonResponse({}), "denied", /does NOT hold iam\.serviceAccounts\.actAs on dy-run@demo-project\.iam\.gserviceaccount\.com/],
+      [() => jsonResponse({ error: { code: 404, message: "not found" } }, 404), "not-found", /dy-run@demo-project\.iam\.gserviceaccount\.com was not found/],
+      [() => jsonResponse({ error: { code: 403, message: "denied" } }, 403), "unknown", /answered HTTP 403/],
+    ];
+    for (const [actAs, state, detail] of cases) {
+      vi.stubGlobal("fetch", gcpRoutes({ projectPermissions: [...REQUIRED_GCP_PERMISSIONS], actAs }));
+      const result = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+      expect(result.ok).toBe(true);
+      expect(result.runServiceAccountActAs).toBe(state);
+      expect(result.detail).toMatch(detail);
+      vi.unstubAllGlobals();
+    }
+
+    // A check that cannot be sent is unknown too (the IAM URL is not routed here, so the fetch throws).
+    vi.stubGlobal("fetch", gcpRoutes({ projectPermissions: [...REQUIRED_GCP_PERMISSIONS] }));
+    const unsent = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+    expect(unsent.ok).toBe(true);
+    expect(unsent.runServiceAccountActAs).toBe("unknown");
+    expect(unsent.detail).toMatch(/could not be sent/);
+
+    // A failing REQUIRED set still fails, with the session rows riding along.
+    vi.stubGlobal("fetch", gcpRoutes({ projectPermissions: [], actAs: () => jsonResponse({ permissions: ["iam.serviceAccounts.actAs"] }) }));
+    const failing = await validateGCP({ ...baseEnv, GCP_SERVICE_ACCOUNT_KEY: key });
+    expect(failing.ok).toBe(false);
+    expect(failing.runServiceAccountActAs).toBe("held");
+    expect(failing.missingSessionPermissions).toEqual(SESSION_GCP_PERMISSIONS);
   });
 
   it("planning/51: a missing REQUIRED permission still fails, and the update advisory rides along", async () => {

@@ -47,7 +47,9 @@
 // `cloudrun-service-delete` and `workers-route-delete` treat an absent resource as "already-absent".
 // `cloudrun-service-upsert` READS the service first and then creates or patches ONE named service, and
 // `workers-route-upsert` creates an absent route and leaves a correct one alone, so a re-run converges.
-// `gcp-project-quota-get` (hub#93) is a read of the project's SUBNETWORKS quota.
+// `gcp-project-quota-get` (hub#93) is a read of the project's SUBNETWORKS quota. `edge-gate-deploy`
+// (planning/49 Phase 3, actuate-edge-gate.ts) leaves a matching gate unchanged and otherwise uploads the same
+// embedded script with the same bindings, so a re-run converges.
 //
 // Two hub#58 ops (planning/51, actuate-hub58.ts) are idempotent too. `cf-tunnel-get` is a read.
 // `gcp-disk-snapshot-create` derives ONE snapshot name from its params and reports a snapshot of the
@@ -118,6 +120,7 @@ import {
   type GcpSubnetsListParams,
   type WorkersRouteUpsertParams,
   type WorkersRouteDeleteParams,
+  type EdgeGateDeployParams,
   type GcpProjectQuotaGetParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
@@ -158,6 +161,7 @@ import {
   validateGcpSubnetsListParams,
   validateWorkersRouteUpsertParams,
   validateWorkersRouteDeleteParams,
+  validateEdgeGateDeployParams,
   validateGcpProjectQuotaGetParams,
 } from "./dispatch-params.js";
 import {
@@ -228,6 +232,7 @@ import {
 import { actuateCfTunnelGet, actuateGcpDiskSnapshotCreate, actuateGcpInstanceRemoveServiceAccount } from "./actuate-hub58.js";
 import { actuateR2SiteKeyInstall, actuateR2SiteKeyRevoke, readR2MediaBuckets, readR2MediaState } from "./actuate-r2-media.js";
 import { actuateCfTunnelConnectionsGet, actuateCfTunnelTokenGet, actuateGcpInstanceMetadataDiff } from "./actuate-p47.js";
+import { actuateEdgeGateDeploy } from "./actuate-edge-gate.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
 interface OpDefinition<P> {
@@ -421,6 +426,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "workers-route-delete": defineOp<WorkersRouteDeleteParams>({
     validateParams: validateWorkersRouteDeleteParams,
     actuate: (params, env) => actuateWorkersRouteDelete(params, env),
+  }),
+  "edge-gate-deploy": defineOp<EdgeGateDeployParams>({
+    validateParams: validateEdgeGateDeployParams,
+    actuate: (params, env) => actuateEdgeGateDeploy(params, env),
   }),
   "gcp-project-quota-get": defineOp<GcpProjectQuotaGetParams>({
     validateParams: validateGcpProjectQuotaGetParams,

@@ -16,3 +16,14 @@ export class DurableObject<Env = unknown> {
     this.env = env;
   }
 }
+
+// planning/49 Phase 3 (I4): src/index.ts exports the SessionGateMinter named entrypoint. Under Node the class
+// only needs its constructor's (ctx, env) shape, so a test can build one and call its RPC method directly.
+export class WorkerEntrypoint<Env = unknown> {
+  protected ctx: unknown;
+  protected env: Env;
+  constructor(ctx: unknown, env: Env) {
+    this.ctx = ctx;
+    this.env = env;
+  }
+}

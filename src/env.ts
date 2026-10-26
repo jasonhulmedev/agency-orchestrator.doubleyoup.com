@@ -136,6 +136,16 @@ export interface Env {
   /** hub#43 L7: the Cloudflare account id R2_PROVISION_API_TOKEN must belong to. When set, the media ops refuse any other account. */
   R2_EXPECTED_ACCOUNT_ID?: string;
 
+  // planning/49 Phase 3 (I4): THIS Worker's own script name, as Cloudflare knows it (the name in the
+  // dashboard, e.g. "sbmstudio"). edge-gate-deploy binds the session gate's DY_MINTER service binding to it,
+  // so the gate can call this Worker's SessionGateMinter entrypoint. It cannot come from wrangler.toml: a
+  // fork deployed by Workers Builds runs under the name of the Worker it is connected to, not the `name`
+  // in its wrangler.toml (I0: SBM's script is "sbmstudio", its fork says "agencydoubleyoup"). Unset =>
+  // edge-gate-deploy refuses and says what to set. Not a secret, but set it with `wrangler secret put
+  // DY_WORKER_NAME` for the CF_CUSTOM_HOSTNAME_ZONE reason: a redeploy removes plain variables that are not
+  // in wrangler.toml.
+  DY_WORKER_NAME?: string;
+
   // AI provider keys.
   ANTHROPIC_API_KEY?: string;
   OPENROUTER_API_KEY?: string;
