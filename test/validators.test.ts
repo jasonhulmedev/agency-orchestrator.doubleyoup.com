@@ -479,7 +479,7 @@ describe("validateCfDns", () => {
       },
     ]);
     vi.stubGlobal("fetch", fetchMock);
-    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
+    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token", DY_WORKER_NAME: "sbmstudio" });
     expect(result.ok).toBe(true);
     expect(result.detail).toContain("jasonhulme.com");
     expect(result.detail).toMatch(/edit permission is exercised on the first DNS dispatch/i);
@@ -492,7 +492,9 @@ describe("validateCfDns", () => {
     // ...and the Workers probes, which say a read cannot prove Edit.
     expect(result.detail).toMatch(/Workers scripts on the account: read OK; Workers routes on jasonhulme\.com: read OK/);
     expect(result.detail).toMatch(/A read cannot prove Workers Scripts: Edit or Workers Routes: Edit/);
-    expect(result.workersScope).toEqual({ scripts: "read-ok", routes: "read-ok" });
+    expect(result.workersScope).toEqual({ scripts: "read-ok", routes: "read-ok", workerName: "set" });
+    // planning/49 Phase 3 (I4): DY_WORKER_NAME is reported with its value (a script name, not a secret).
+    expect(result.detail).toContain('DY_WORKER_NAME: set ("sbmstudio")');
 
     // Strictly read-only: the zone read, the two tunnel-scope probes, the Cache Rules probe, the WAF
     // probe, and the Workers probes (the account read again, scripts, routes), all GETs with the bearer.
@@ -602,7 +604,10 @@ describe("validateCfDns", () => {
     vi.stubGlobal("fetch", fetchMock);
     const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
     expect(result.ok).toBe(true);
-    expect(result.workersScope).toEqual({ scripts: "denied", routes: "denied" });
+    expect(result.workersScope).toEqual({ scripts: "denied", routes: "denied", workerName: "unset" });
+    // planning/49 Phase 3 (I4): an unset DY_WORKER_NAME is advisory too, and says how to set it.
+    expect(result.detail).toMatch(/DY_WORKER_NAME: NOT set — set it to this Worker's own script name/);
+    expect(result.detail).toContain("wrangler secret put DY_WORKER_NAME");
     expect(result.detail).toMatch(/Session edge gate \(advisory, does not affect this check\)/);
     expect(result.detail).toMatch(/Workers scripts on the account: NOT readable \(HTTP 403\) — add Account → Workers Scripts: Edit/);
     expect(result.detail).toMatch(/Workers routes on jasonhulme\.com: NOT readable \(HTTP 401\) — add Zone → Workers Routes: Edit/);
@@ -617,9 +622,12 @@ describe("validateCfDns", () => {
       { match: (u) => u === "https://api.cloudflare.com/client/v4/zones/z1/workers/routes", respond: () => jsonResponse({ success: false }, 500) },
     ]);
     vi.stubGlobal("fetch", fetchMock);
-    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
+    // planning/49 Phase 3 (I4 review): a DY_WORKER_NAME that is not a script name is reported, not echoed.
+    const result = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token", DY_WORKER_NAME: "<b>Not A Name</b>" });
     expect(result.ok).toBe(true);
-    expect(result.workersScope).toEqual({ scripts: "unknown", routes: "unknown" });
+    expect(result.workersScope).toEqual({ scripts: "unknown", routes: "unknown", workerName: "set" });
+    expect(result.detail).toMatch(/DY_WORKER_NAME: set, but NOT a Worker script name/);
+    expect(result.detail).not.toContain("Not A Name");
     expect(result.detail).toMatch(/Workers scripts on the account: check inconclusive \(the token's account could not be resolved\)/);
     expect(result.detail).toMatch(/Workers routes on jasonhulme\.com: check inconclusive \(HTTP 500\)/);
     // No Workers write was attempted: every call is a GET.

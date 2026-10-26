@@ -109,6 +109,7 @@ import { errorMessage, stripTrailingSlash } from "./util.js";
 import type { CfTunnelGetResult, GcpDiskSnapshotCreateResult, GcpInstanceRemoveServiceAccountResult } from "./actuate-hub58.js";
 import type { R2MediaBucketsResult, R2MediaStateResult, R2SiteKeyInstallResult, R2SiteKeyRevokeResult } from "./actuate-r2-media.js";
 import type { CfTunnelConnectionsGetResult, CfTunnelTokenGetResult, GcpInstanceMetadataDiffResult } from "./actuate-p47.js";
+import type { EdgeGateDeployResult } from "./actuate-edge-gate.js";
 
 export const CF_API = "https://api.cloudflare.com/client/v4";
 
@@ -785,6 +786,8 @@ export type ActuateResult =
   | GcpSubnetsListResult
   | WorkersRouteUpsertResult
   | WorkersRouteDeleteResult
+  // planning/49 Phase 3 (I4, actuate-edge-gate.ts): the cell's session edge gate.
+  | EdgeGateDeployResult
   | GcpProjectQuotaGetResult
   // hub#58 / planning/51 (actuate-hub58.ts).
   | CfTunnelGetResult
@@ -954,6 +957,8 @@ interface CloudflareZoneSummary {
   name?: string;
   /** Deprecated by Cloudflare but still returned; `legacy_id` is "free" / "pro" / "business" / "enterprise". */
   plan?: { legacy_id?: string };
+  /** The Cloudflare account that holds the zone. */
+  account?: { id?: string };
 }
 
 interface CloudflareDnsRecordSummary {
@@ -977,10 +982,10 @@ function dnsFailure(name: string, detail: string): DnsRecordUpsertResult {
  * zero means the token can't see the zone (wrong account or missing Zone:Read), more than
  * one would be ambiguous (should not happen for an exact-name filter, but never guess).
  */
-async function resolveZoneId(
+export async function resolveZoneId(
   token: string,
   zoneName: string,
-): Promise<{ id: string; planLegacyId: string | null } | { error: string }> {
+): Promise<{ id: string; planLegacyId: string | null; accountId: string | null } | { error: string }> {
   const query = new URLSearchParams({ name: zoneName, per_page: "2" });
   let response: Response;
   try {
@@ -1021,7 +1026,14 @@ async function resolveZoneId(
   if (typeof legacyId === "string" && legacyId.length > 0) {
     planLegacyId = legacyId;
   }
-  return { id: zones[0].id as string, planLegacyId };
+  // The account rides along for edge-gate-deploy (planning/49 Phase 3): a Workers route runs only a script
+  // of its zone's own account, so the gate script is uploaded there. Every other caller ignores it.
+  let accountId: string | null = null;
+  const zoneAccountId = zones[0].account?.id;
+  if (typeof zoneAccountId === "string" && zoneAccountId.length > 0) {
+    accountId = zoneAccountId;
+  }
+  return { id: zones[0].id as string, planLegacyId, accountId };
 }
 
 /**
@@ -3088,7 +3100,7 @@ export async function mintPinnedGcpAccessToken(env: Env, project: string): Promi
 }
 
 /** The agency's service-account key, parsed, and PINNED to the op's project — or why it is not. */
-type PinnedServiceAccountKey =
+export type PinnedServiceAccountKey =
   | { ok: true; clientEmail: string; privateKeyPem: string; tokenUri: string }
   | { ok: false; detail: string };
 
@@ -3097,7 +3109,7 @@ type PinnedServiceAccountKey =
  * to the key's OWN project_id), as one function so the access-token mint and the planning/49 ID-token
  * mint cannot drift apart on the agency-boundary check. Makes NO network call.
  */
-function readPinnedServiceAccountKey(env: Env, project: string): PinnedServiceAccountKey {
+export function readPinnedServiceAccountKey(env: Env, project: string): PinnedServiceAccountKey {
   if (!env.GCP_SERVICE_ACCOUNT_KEY) {
     return { ok: false, detail: "GCP_SERVICE_ACCOUNT_KEY is not configured on this Worker." };
   }
@@ -3136,14 +3148,14 @@ function readPinnedServiceAccountKey(env: Env, project: string): PinnedServiceAc
 }
 
 /** The outcome of minting a Google ID token for an op pinned to `project`. */
-type GcpIdTokenOutcome = { ok: true; idToken: string } | { ok: false; detail: string };
+export type GcpIdTokenOutcome = { ok: true; idToken: string } | { ok: false; detail: string };
 
 /**
  * planning/49 Phase 2: mint a Google ID TOKEN for `audience` (a Cloud Run service URL) from the
  * agency's OWN key, after the same project pin every gcp-* op uses. The token goes back to the caller
  * alone, who puts it in an Authorization header and never logs or echoes it.
  */
-async function mintPinnedGcpIdToken(env: Env, project: string, audience: string): Promise<GcpIdTokenOutcome> {
+export async function mintPinnedGcpIdToken(env: Env, project: string, audience: string): Promise<GcpIdTokenOutcome> {
   const key = readPinnedServiceAccountKey(env, project);
   if (!key.ok) {
     return { ok: false, detail: key.detail };

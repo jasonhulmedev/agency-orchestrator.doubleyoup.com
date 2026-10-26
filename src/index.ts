@@ -39,6 +39,7 @@
 // ed25519 signature over the canonical job, verified with the agency's own public key
 // (DY_SIGNING_PUBLIC_KEY). An unverified request actuates NOTHING.
 
+import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Env } from "./env.js";
 import { callApp } from "./app-client.js";
 import { validateAll, type AllValidations } from "./validators.js";
@@ -47,10 +48,26 @@ import { errorMessage } from "./util.js";
 import { verifyDispatch, signingPublicKey } from "./dispatch-verify.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "./ops.js";
 import { nonceExpiresAtMs } from "./nonce-store.js";
+import { mintSessionGateIdToken, type SessionGateMintResult } from "./session-gate/minter.js";
 
 // Re-exported so wrangler can bind the Durable Object class declared in wrangler.toml. The
 // DO must be an export of the configured `main` worker script.
 export { NonceStore } from "./nonce-store.js";
+
+/**
+ * planning/49 Phase 3 (I4), decision A: the session edge gate's ID-token minter. A NAMED entrypoint, so it
+ * is reachable ONLY through a Workers service binding (the gate's DY_MINTER, which edge-gate-deploy points
+ * at DY_WORKER_NAME + this class), never over HTTP. It needs no wrangler.toml entry: a named entrypoint is
+ * just an export of the main module, so a fork that syncs gets it with no config change.
+ *
+ * One RPC method. It mints from the agency's own key ONLY for this project's session service URLs and
+ * returns the token and its exp, or a reason code with no token (src/session-gate/minter.ts). It never logs.
+ */
+export class SessionGateMinter extends WorkerEntrypoint<Env> {
+  async mintIdToken(audience: unknown): Promise<SessionGateMintResult> {
+    return mintSessionGateIdToken(this.env, audience);
+  }
+}
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {

@@ -4188,6 +4188,30 @@ export function edgeGateScriptNameFor(project: string, region: string): string {
   return `dy-gate-${project}-${region}`;
 }
 
+/**
+ * The reason the edge-gate script name derived from (project, region) cannot be used, or null when it
+ * fits EDGE_GATE_SCRIPT_NAME_MAX_LENGTH. The route ops and edge-gate-deploy share this one rule.
+ */
+function edgeGateScriptNameReason(project: string, region: string): string | null {
+  const script = edgeGateScriptNameFor(project, region);
+  if (script.length <= EDGE_GATE_SCRIPT_NAME_MAX_LENGTH) {
+    return null;
+  }
+  return (
+    `the derived edge-gate script name "${script}" is ${script.length} characters — a Worker name must be at most ` +
+    `${EDGE_GATE_SCRIPT_NAME_MAX_LENGTH} (one DNS label)`
+  );
+}
+
+/**
+ * True when `value` is a Compute REGION name (e.g. australia-southeast1), in the grammar every region
+ * param here uses. Exported for the agency Worker's session-gate minter, which checks the region label
+ * of a Cloud Run URL with it.
+ */
+export function isGcpRegionName(value: unknown): value is string {
+  return typeof value === "string" && value.length <= GCP_RESOURCE_NAME_MAX_LENGTH && GCP_REGION_RE.test(value);
+}
+
 export interface WorkersRouteParams {
   /** The agency's Cloudflare zone NAME, e.g. "sbmstudio.com.au". */
   zone: string;
@@ -4231,14 +4255,9 @@ function validateWorkersRouteParams(raw: unknown): ParamsVerdict<WorkersRoutePar
   if (typeof region !== "string" || region.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_REGION_RE.test(region)) {
     return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast2)" };
   }
-  const script = edgeGateScriptNameFor(project, region);
-  if (script.length > EDGE_GATE_SCRIPT_NAME_MAX_LENGTH) {
-    return {
-      ok: false,
-      reason:
-        `the derived edge-gate script name "${script}" is ${script.length} characters — a Worker name must be at most ` +
-        `${EDGE_GATE_SCRIPT_NAME_MAX_LENGTH} (one DNS label)`,
-    };
+  const scriptReason = edgeGateScriptNameReason(project, region);
+  if (scriptReason !== null) {
+    return { ok: false, reason: scriptReason };
   }
 
   // A FRESH object of only the known keys — never the caller's object.
@@ -4251,6 +4270,86 @@ export function validateWorkersRouteUpsertParams(raw: unknown): ParamsVerdict<Wo
 
 export function validateWorkersRouteDeleteParams(raw: unknown): ParamsVerdict<WorkersRouteDeleteParams> {
   return validateWorkersRouteParams(raw);
+}
+
+// ── edge-gate-deploy ─────────────────────────────────────────────────────────────────
+// planning/49 §5.1, Phase 3 (I4): deploy the cell's SESSION EDGE GATE. The agency Worker uploads ITS OWN
+// embedded gate script (src/session-gate/gate.js in that repo); no script bytes travel from the platform.
+// The script is the DERIVED `dy-gate-<project>-<region>` (edgeGateScriptNameFor), the same script the
+// route ops point at. Five REQUIRED params:
+//   1. `project`       — the cell's GCP project. PINNED by the actuator to its service-account key's own
+//                        project. With the project's NUMBER it gives the Cloud Run URL suffix
+//                        `-<projectNumber>.<region>.run.app` that the gate forwards to.
+//   2. `region`        — the cell's Compute region.
+//   3. `zone`          — the cell's Cloudflare zone NAME (Cell.cfZone). The gate answers only on
+//                        `<session service name>.<zone>`, and the script goes into the Cloudflare account
+//                        that holds this zone (a Workers route can run only a script of its zone's account).
+//   4. `sessionSecret` — the cell's session secret, EXACTLY 64 lowercase hex (planning/49 §5.2, step 2 of
+//                        the key chain). The gate holds it as a secret_text binding, its only copy.
+//                        A LIVE KEY: no refusal here names the value, only the rule, and no result,
+//                        error text or log on either side may contain it.
+//   5. `keyVersion`    — the cell's EFFECTIVE Cell.sessionKeyVersion, an integer from 1 to 9999. The gate
+//                        carries it as a plain binding, so a re-deploy can tell a rotated key apart.
+// The derived script name must fit EDGE_GATE_SCRIPT_NAME_MAX_LENGTH, as for the route ops.
+// app binds project, region, zone and keyVersion to ONE cell of the dispatching account before it signs
+// (agency-dispatch-binding.ts). Neither side can check the secret itself: only the orchestrator holds the
+// master key the secret is derived from.
+//
+// IDEMPOTENT: the actuator leaves a gate whose version and bindings already match unchanged, and
+// otherwise uploads the same script with the same bindings, so a re-run converges.
+
+/** The highest per-cell session key version (Cell.sessionKeyVersion, planning/49 Phase 3). */
+export const SESSION_KEY_VERSION_MAX = 9999;
+// The cell's session secret: the 64-hex text of 32 HKDF bytes (orchestrator session-token.ts).
+const SESSION_SECRET_RE = /^[0-9a-f]{64}$/;
+
+export interface EdgeGateDeployParams {
+  /** The cell's GCP project (pinned by the actuator to its key's own project). */
+  project: string;
+  /** The cell's Compute region. */
+  region: string;
+  /** The cell's Cloudflare zone NAME, e.g. "sbmstudio.com.au". */
+  zone: string;
+  /** The cell's session secret, 64 lowercase hex. A LIVE KEY: never log, store or echo it. */
+  sessionSecret: string;
+  /** The cell's effective session key version, 1-9999. */
+  keyVersion: number;
+}
+
+export function validateEdgeGateDeployParams(raw: unknown): ParamsVerdict<EdgeGateDeployParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { project, region, zone, sessionSecret, keyVersion } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (!isGcpRegionName(region)) {
+    return { ok: false, reason: "region must be a Compute Engine region name (e.g. australia-southeast2)" };
+  }
+  if (typeof zone !== "string" || zone.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a lowercase DNS zone name (e.g. example.com)" };
+  }
+  // The rule only, NEVER the value: this reason reaches the caller (app's 400, the Worker's 400 body).
+  if (typeof sessionSecret !== "string" || !SESSION_SECRET_RE.test(sessionSecret)) {
+    return { ok: false, reason: "sessionSecret must be exactly 64 lowercase hex characters (the cell's session secret)" };
+  }
+  if (
+    typeof keyVersion !== "number" ||
+    !Number.isSafeInteger(keyVersion) ||
+    keyVersion < 1 ||
+    keyVersion > SESSION_KEY_VERSION_MAX
+  ) {
+    return { ok: false, reason: `keyVersion must be an integer from 1 to ${SESSION_KEY_VERSION_MAX}` };
+  }
+  const scriptReason = edgeGateScriptNameReason(project, region);
+  if (scriptReason !== null) {
+    return { ok: false, reason: scriptReason };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, region, zone, sessionSecret, keyVersion } };
 }
 
 // ── shared ─────────────────────────────────────────────────────────────────────────

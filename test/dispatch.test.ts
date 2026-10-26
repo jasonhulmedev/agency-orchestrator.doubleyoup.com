@@ -69,6 +69,8 @@ import {
   GCP_PROJECT_QUOTA_METRIC,
   validateWorkersRouteUpsertParams,
   validateWorkersRouteDeleteParams,
+  validateEdgeGateDeployParams,
+  SESSION_KEY_VERSION_MAX,
   isSiteRunSlot,
   siteRunSubnetCidrForSlot,
   cellSiteRunSubnetNameFor,
@@ -545,7 +547,7 @@ const CLOUD_RUN_PROBE_REF_PARAMS = { project: "dy-agency-proof", region: "austra
 // this marker up to, not including, the next section rule after it). Changing the block means changing
 // BOTH twins and BOTH pins in one go.
 const TWIN_BLOCK_START_MARKER = "// ── planning/49: the agency-side ephemeral-compute ops";
-const TWIN_BLOCK_SHA256 = "12b9f077d316ed0c07c0867dd4c5e5b1985fdaf925aa51ca3559a868558af0d7";
+const TWIN_BLOCK_SHA256 = "1759a1c312c2835caef4b93a144e496c7e1d4039d02d362502305cbf61d9c0fe";
 
 function planning49Job(op: DispatchJob["op"], params: unknown, nonce: string): DispatchJob {
   return sampleJob({ op, params: JSON.stringify(params), nonce });
@@ -1140,6 +1142,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "db-import",
       "dns-record-delete",
       "dns-record-upsert",
+      "edge-gate-deploy",
       "gcp-address-create",
       "gcp-address-delete",
       "gcp-disk-snapshot-create",
@@ -3608,6 +3611,59 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
         validate({ ...base, project: longestProject, region: "northamerica-northeast123" }),
         /^the derived edge-gate script name "dy-gate-a.*-northamerica-northeast123" is 64 characters — a Worker name must be at most 63/,
       );
+    }
+  });
+
+  // ── planning/49 Phase 3 (I4): edge-gate-deploy (twin of the app's rules) ──────────────────────
+  const EDGE_GATE_PARAMS = {
+    project: "sbm-website-272023",
+    region: "australia-southeast2",
+    zone: "sbmstudio.com.au",
+    sessionSecret: "603807493e9f841f3f587631aad45bc075fa1cc8ec73adba4872405dc05ba367",
+    keyVersion: 1,
+  };
+
+  it("edge-gate-deploy: accepts the five params and returns ONLY them (no script, no source, no bindings from the job)", () => {
+    expect(
+      validateEdgeGateDeployParams({ ...EDGE_GATE_PARAMS, script: "dy-edge-gate", source: "export default {}", bindings: [] }),
+    ).toEqual({ ok: true, params: EDGE_GATE_PARAMS });
+    expect(validateEdgeGateDeployParams({ ...EDGE_GATE_PARAMS, keyVersion: SESSION_KEY_VERSION_MAX }).ok).toBe(true);
+    expect(SESSION_KEY_VERSION_MAX).toBe(9999);
+  });
+
+  it("edge-gate-deploy: refuses each bad param by its rule, and NO reason names the secret", () => {
+    const secret = EDGE_GATE_PARAMS.sessionSecret;
+    const refusals: Array<[Record<string, unknown> | unknown, RegExp]> = [
+      [null, /^params must be a JSON object$/],
+      [[EDGE_GATE_PARAMS], /^params must be a JSON object$/],
+      [{ ...EDGE_GATE_PARAMS, project: "Bad_Project" }, /^project must be/],
+      [{ ...EDGE_GATE_PARAMS, project: undefined }, /^project must be/],
+      [{ ...EDGE_GATE_PARAMS, region: "australia-southeast2-a" }, /^region must be a Compute Engine region name/],
+      [{ ...EDGE_GATE_PARAMS, region: undefined }, /^region must be a Compute Engine region name/],
+      [{ ...EDGE_GATE_PARAMS, zone: "*.sbmstudio.com.au" }, /^zone must be a lowercase DNS zone name/],
+      [{ ...EDGE_GATE_PARAMS, zone: "SBMstudio.com.au" }, /^zone must be a lowercase DNS zone name/],
+      [{ ...EDGE_GATE_PARAMS, sessionSecret: secret.toUpperCase() }, /^sessionSecret must be exactly 64 lowercase hex characters/],
+      [{ ...EDGE_GATE_PARAMS, sessionSecret: secret.slice(1) }, /^sessionSecret must be exactly 64 lowercase hex characters/],
+      [{ ...EDGE_GATE_PARAMS, sessionSecret: `${secret}0` }, /^sessionSecret must be exactly 64 lowercase hex characters/],
+      [{ ...EDGE_GATE_PARAMS, sessionSecret: ` ${secret}` }, /^sessionSecret must be exactly 64 lowercase hex characters/],
+      [{ ...EDGE_GATE_PARAMS, sessionSecret: "unit-test-master-key-not-a-real-secret" }, /^sessionSecret must be exactly 64/],
+      [{ ...EDGE_GATE_PARAMS, sessionSecret: 42 }, /^sessionSecret must be exactly 64/],
+      [{ ...EDGE_GATE_PARAMS, keyVersion: 0 }, /^keyVersion must be an integer from 1 to 9999$/],
+      [{ ...EDGE_GATE_PARAMS, keyVersion: 10000 }, /^keyVersion must be an integer from 1 to 9999$/],
+      [{ ...EDGE_GATE_PARAMS, keyVersion: 1.5 }, /^keyVersion must be an integer from 1 to 9999$/],
+      [{ ...EDGE_GATE_PARAMS, keyVersion: "1" }, /^keyVersion must be an integer from 1 to 9999$/],
+      [{ ...EDGE_GATE_PARAMS, keyVersion: undefined }, /^keyVersion must be an integer from 1 to 9999$/],
+      [
+        { ...EDGE_GATE_PARAMS, project: `a${"b".repeat(29)}`, region: "northamerica-northeast123" },
+        /^the derived edge-gate script name "dy-gate-ab+-northamerica-northeast123" is 64 characters/,
+      ],
+    ];
+    for (const [raw, expected] of refusals) {
+      const verdict = validateEdgeGateDeployParams(raw);
+      expectRefused(verdict, expected);
+      expect(JSON.stringify(verdict)).not.toContain(secret);
+      expect(JSON.stringify(verdict)).not.toContain(secret.toUpperCase());
+      expect(JSON.stringify(verdict)).not.toContain(secret.slice(1));
     }
   });
 
@@ -8386,6 +8442,118 @@ describe("POST /actuate route", () => {
       expect(foreignCalls.filter((call) => call.method === "DELETE")).toHaveLength(0);
       vi.restoreAllMocks();
     }
+  });
+
+  // ── planning/49 Phase 3 (I4): edge-gate-deploy through POST /actuate ────────────────────────────
+  const EDGE_GATE_SECRET = "603807493e9f841f3f587631aad45bc075fa1cc8ec73adba4872405dc05ba367";
+  const EDGE_GATE_JOB_PARAMS = { project: "dy-agency-proof", region: "australia-southeast2", zone: "sbmstudio.com.au", sessionSecret: EDGE_GATE_SECRET, keyVersion: 1 };
+  const EDGE_GATE_SCRIPT = "dy-gate-dy-agency-proof-australia-southeast2";
+
+  /** A minimal Cloudflare + Google for one gate deploy: no gate yet, the minter Worker present. */
+  function mockEdgeGateApis() {
+    const calls: Array<{ method: string; url: string }> = [];
+    let uploadedMetadata: { bindings: Array<Record<string, unknown>>; [key: string]: unknown } | null = null;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = urlOf(input);
+      const method = init?.method ?? "GET";
+      calls.push({ method, url });
+      if (url === "https://oauth2.googleapis.com/token") {
+        return jsonResponse({ access_token: "google-read-only", expires_in: 3600 });
+      }
+      if (url === "https://cloudresourcemanager.googleapis.com/v1/projects/dy-agency-proof") {
+        return jsonResponse({ projectId: "dy-agency-proof", projectNumber: "123456789012" });
+      }
+      if (url.startsWith("https://api.cloudflare.com/client/v4/zones?")) {
+        return jsonResponse({ success: true, result: [{ id: "zone-sbm", name: "sbmstudio.com.au", account: { id: "acct-sbm" } }] });
+      }
+      const scripts = "https://api.cloudflare.com/client/v4/accounts/acct-sbm/workers/scripts";
+      if (url === `${scripts}/sbmstudio/settings`) {
+        return jsonResponse({ success: true, result: { bindings: [] } });
+      }
+      if (url === `${scripts}/${EDGE_GATE_SCRIPT}/settings`) {
+        if (uploadedMetadata === null) {
+          return jsonResponse({ success: false, errors: [{ code: 10007 }] }, 404);
+        }
+        // Cloudflare reports what the upload set, without the secret_text value.
+        const reported = uploadedMetadata.bindings.map((binding) => {
+          if (binding.type === "secret_text") {
+            return { type: "secret_text", name: binding.name };
+          }
+          return binding;
+        });
+        return jsonResponse({
+          success: true,
+          result: {
+            bindings: reported,
+            compatibility_date: uploadedMetadata.compatibility_date,
+            logpush: uploadedMetadata.logpush,
+            observability: uploadedMetadata.observability,
+            tail_consumers: uploadedMetadata.tail_consumers,
+          },
+        });
+      }
+      if (url === `${scripts}/${EDGE_GATE_SCRIPT}` && method === "PUT") {
+        uploadedMetadata = JSON.parse(await ((init?.body as FormData).get("metadata") as Blob).text()) as {
+          bindings: Array<Record<string, unknown>>;
+        };
+        return jsonResponse({ success: true, result: { id: EDGE_GATE_SCRIPT } });
+      }
+      throw new Error(`unexpected fetch ${method} ${url}`);
+    });
+    return calls;
+  }
+
+  it("edge-gate-deploy: a signed job deploys the gate, and the secret is in no answer and no log", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const consoleSpies = [vi.spyOn(console, "log"), vi.spyOn(console, "info"), vi.spyOn(console, "warn"), vi.spyOn(console, "error"), vi.spyOn(console, "debug")];
+    const calls = mockEdgeGateApis();
+    const job = planning49Job("edge-gate-deploy", EDGE_GATE_JOB_PARAMS, "e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9");
+    const signature = await signAsApp(job, privateKey);
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey, DY_WORKER_NAME: "sbmstudio" }),
+    );
+
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    expect(text).not.toContain(EDGE_GATE_SECRET);
+    expect(JSON.parse(text)).toMatchObject({
+      ok: true,
+      op: "edge-gate-deploy",
+      script: EDGE_GATE_SCRIPT,
+      status: "created",
+      keyVersion: 1,
+      runUrlSuffix: "-123456789012.australia-southeast2.run.app",
+      minterWorker: "sbmstudio",
+    });
+    expect(calls.filter((call) => call.method === "PUT")).toHaveLength(1);
+    for (const spy of consoleSpies) {
+      expect(JSON.stringify(spy.mock.calls)).not.toContain(EDGE_GATE_SECRET);
+    }
+  });
+
+  it("edge-gate-deploy: a signed job with a bad param is a 400 that names the rule, never the secret, and actuates nothing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const badJobs = [
+      { ...EDGE_GATE_JOB_PARAMS, keyVersion: 0 },
+      { ...EDGE_GATE_JOB_PARAMS, sessionSecret: `${EDGE_GATE_SECRET}ff` },
+      { ...EDGE_GATE_JOB_PARAMS, sessionSecret: EDGE_GATE_SECRET.toUpperCase() },
+    ];
+    let index = 0;
+    for (const params of badJobs) {
+      index += 1;
+      const job = planning49Job("edge-gate-deploy", params, `ea${String(index).padStart(30, "0")}`);
+      const signature = await signAsApp(job, privateKey);
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey, DY_WORKER_NAME: "sbmstudio" }));
+      expect(response.status).toBe(400);
+      const text = await response.text();
+      expect(text).not.toContain(EDGE_GATE_SECRET);
+      expect(text).not.toContain(EDGE_GATE_SECRET.toUpperCase());
+      expect(JSON.parse(text)).toMatchObject({ ok: false, error: "invalid params" });
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it("cloudrun-service-upsert: a MISSING service is CREATEd with the label + invoker IAM ON, waited, then re-read", async () => {

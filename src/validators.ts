@@ -10,7 +10,7 @@
 
 import type { Env } from "./env.js";
 import { signS3Request } from "./sigv4.js";
-import { errorMessage, extractXmlTag, stripTrailingSlash } from "./util.js";
+import { errorMessage, extractXmlTag, isWorkerScriptName, stripTrailingSlash } from "./util.js";
 import { probeCustomHostnameScope, type CustomHostnameScopeReport } from "./actuate-custom-hostname.js";
 import { cellRunServiceAccountFor } from "./dispatch-params.js";
 
@@ -57,10 +57,15 @@ export type RunServiceAccountActAsState = "held" | "denied" | "not-found" | "unk
 /** One Workers read probe: the read worked, Cloudflare refused it (401/403), or the probe was inconclusive. */
 export type WorkersReadState = "read-ok" | "denied" | "unknown";
 
-/** The two Workers read probes /validate makes with CF_DNS_API_TOKEN. */
+/** The two Workers read probes /validate makes with CF_DNS_API_TOKEN, and whether DY_WORKER_NAME is set. */
 export interface WorkersScopeReport {
   scripts: WorkersReadState;
   routes: WorkersReadState;
+  /**
+   * planning/49 Phase 3 (I4): is DY_WORKER_NAME set? edge-gate-deploy binds the session gate to this Worker
+   * by that name and refuses without it. A presence check only (the deploy checks that the script exists).
+   */
+  workerName: "set" | "unset";
 }
 
 export interface AllValidations {
@@ -533,6 +538,7 @@ async function probeWorkersRead(token: string, url: string): Promise<{ state: Wo
 async function probeWorkersScope(
   token: string,
   zone: { id: string | undefined; name: string | undefined },
+  workerName: string | undefined,
 ): Promise<{ detail: string; report: WorkersScopeReport }> {
   const editNote =
     "A read cannot prove Workers Scripts: Edit or Workers Routes: Edit; those are exercised on the first edge-gate deploy and route upsert.";
@@ -563,9 +569,21 @@ async function probeWorkersScope(
   const zoneText = zone.name ?? "the first listed zone";
   const scriptsText = workersReadText(scripts, "Workers scripts on the account", "Account → Workers Scripts: Edit");
   const routesText = workersReadText(routes, `Workers routes on ${zoneText}`, "Zone → Workers Routes: Edit");
+  // planning/49 Phase 3 (I4): the gate reaches this Worker's SessionGateMinter by the name in DY_WORKER_NAME.
+  let workerNameState: "set" | "unset" = "unset";
+  let workerNameText =
+    "DY_WORKER_NAME: NOT set — set it to this Worker's own script name as Cloudflare shows it (`wrangler secret put DY_WORKER_NAME`); the edge-gate deploy refuses without it";
+  if (workerName) {
+    workerNameState = "set";
+    // The value is echoed only when it is a script name; anything else could be any text.
+    workerNameText = "DY_WORKER_NAME: set, but NOT a Worker script name (lowercase letters, digits, \"-\" and \"_\", at most 63 characters)";
+    if (isWorkerScriptName(workerName)) {
+      workerNameText = `DY_WORKER_NAME: set ("${workerName}")`;
+    }
+  }
   return {
-    detail: `Session edge gate (advisory, does not affect this check): ${scriptsText}; ${routesText}. ${editNote}`,
-    report: { scripts: scripts.state, routes: routes.state },
+    detail: `Session edge gate (advisory, does not affect this check): ${scriptsText}; ${routesText}; ${workerNameText}. ${editNote}`,
+    report: { scripts: scripts.state, routes: routes.state, workerName: workerNameState },
   };
 }
 
@@ -618,7 +636,7 @@ export async function validateCfDns(env: Env): Promise<ValidationResult> {
         // validates green, but a missing scope or fallback origin shows here, not on a customer's domain.
         const customHostnames = await probeCustomHostnameScope(env);
         // planning/49 Phase 3: the session edge gate's Workers scopes. Same non-fatal pattern.
-        const workers = await probeWorkersScope(env.CF_DNS_API_TOKEN, { id: body.result[0]?.id, name: zoneName });
+        const workers = await probeWorkersScope(env.CF_DNS_API_TOKEN, { id: body.result[0]?.id, name: zoneName }, env.DY_WORKER_NAME);
         return {
           ok: true,
           detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch. ${tunnelStatus} ${cacheRulesStatus} ${wafRulesStatus} ${customHostnames.detail} ${workers.detail}`,

@@ -23,3 +23,12 @@ export function extractXmlTag(xml: string, tag: string): string | null {
 export function stripTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
 }
+
+// A Worker script name: lowercase letters, digits, "-" and "_", alphanumeric at both ends, one DNS label
+// (at most 63 characters).
+const WORKER_SCRIPT_NAME_RE = /^[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?$/;
+
+/** True when `value` is a Worker script name (planning/49 Phase 3: DY_WORKER_NAME). */
+export function isWorkerScriptName(value: unknown): value is string {
+  return typeof value === "string" && WORKER_SCRIPT_NAME_RE.test(value);
+}
