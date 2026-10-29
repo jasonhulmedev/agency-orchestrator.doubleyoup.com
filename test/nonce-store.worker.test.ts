@@ -134,6 +134,41 @@ describe("NonceStore.consume — real Durable Object, SQLite-backed", () => {
   });
 });
 
+describe("NonceStore leases (waf-edge-sync, one instance per zone) — real Durable Object", () => {
+  function leaseStub(zone: string) {
+    const ns = workerEnv.NONCE_STORE;
+    return ns.get(ns.idFromName(`edge-sync-lease:${zone}`));
+  }
+
+  it("grants one holder at a time; only the holder releases; then the next holder gets it", async () => {
+    const stub = leaseStub("lease-a.example.com");
+    expect(await stub.acquireLease("lease-a.example.com", "run-1", 300_000)).toBe("acquired");
+    expect(await stub.acquireLease("lease-a.example.com", "run-2", 300_000)).toBe("busy");
+    // The same holder asking again is busy too: a lease is not re-entrant.
+    expect(await stub.acquireLease("lease-a.example.com", "run-1", 300_000)).toBe("busy");
+    // A non-holder's release changes nothing.
+    await stub.releaseLease("lease-a.example.com", "run-2");
+    expect(await stub.acquireLease("lease-a.example.com", "run-3", 300_000)).toBe("busy");
+    await stub.releaseLease("lease-a.example.com", "run-1");
+    expect(await stub.acquireLease("lease-a.example.com", "run-2", 300_000)).toBe("acquired");
+    await stub.releaseLease("lease-a.example.com", "run-2");
+  });
+
+  it("frees an expired lease (a run that died without releasing), and zones do not share a lease", async () => {
+    const stub = leaseStub("lease-b.example.com");
+    expect(await stub.acquireLease("lease-b.example.com", "dead-run", 300_000)).toBe("acquired");
+    expect(await leaseStub("lease-c.example.com").acquireLease("lease-c.example.com", "other-zone-run", 300_000)).toBe("acquired");
+    // Age the lease past its expiry, as if the dead run's 5 minutes had passed.
+    await runInDurableObject(stub, (_instance: NonceStore, state) => {
+      state.storage.sql.exec("UPDATE leases SET expires_at = ? WHERE lease_key = ?", Date.now() - 1, "lease-b.example.com");
+    });
+    expect(await stub.acquireLease("lease-b.example.com", "next-run", 300_000)).toBe("acquired");
+    // The dead run's late release cannot free the next run's lease.
+    await stub.releaseLease("lease-b.example.com", "dead-run");
+    expect(await stub.acquireLease("lease-b.example.com", "third-run", 300_000)).toBe("busy");
+  });
+});
+
 describe("POST /actuate — single-use replay protection end-to-end (real DO)", () => {
   const r2Spy = vi.mocked(actuateProvisionR2);
   const dnsSpy = vi.mocked(actuateDnsRecordUpsert);

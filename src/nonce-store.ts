@@ -51,6 +51,8 @@ export function nonceExpiresAtMs(jobTimestampMs: number): number {
 
 export type ConsumeOutcome = "fresh" | "replay";
 
+export type LeaseOutcome = "acquired" | "busy";
+
 export class NonceStore extends DurableObject {
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -59,6 +61,10 @@ export class NonceStore extends DurableObject {
     // the time consume() runs — no blockConcurrencyWhile needed.
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)",
+    );
+    // Short leases (acquireLease below). Same reasoning: idempotent and synchronous.
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS leases (lease_key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires_at INTEGER NOT NULL)",
     );
   }
 
@@ -100,5 +106,38 @@ export class NonceStore extends DurableObject {
     // race with a concurrent consume of the same nonce.
     sql.exec("INSERT INTO nonces (nonce, expires_at) VALUES (?, ?)", nonce, notAfterMs);
     return "fresh";
+  }
+
+  // ── short leases (waf-edge-sync, one per zone) ──────────────────────────────────────
+  // A SECOND use of this class, on SEPARATE instances (the caller names one instance per zone, never
+  // the "dirb-nonce" singleton), so a lease never queues behind nonce traffic. It reuses the class
+  // so an agency deployment needs no new Durable Object binding or migration.
+  //
+  // A lease is held until its holder releases it or it expires. Expiry is the safety net for a run
+  // that dies without releasing: the zone is free again after the TTL. Same atomicity as consume():
+  // no `await`, so expire -> check -> insert is one uninterruptible turn.
+
+  /**
+   * Take the lease `leaseKey` for `holder` for `ttlMs`. "busy" when another holder has an unexpired
+   * lease on that key.
+   */
+  acquireLease(leaseKey: string, holder: string, ttlMs: number): LeaseOutcome {
+    const sql = this.ctx.storage.sql;
+    const now = Date.now();
+    sql.exec("DELETE FROM leases WHERE expires_at <= ?", now);
+    const held = sql.exec("SELECT holder FROM leases WHERE lease_key = ? LIMIT 1", leaseKey).toArray();
+    if (held.length > 0) {
+      return "busy";
+    }
+    sql.exec("INSERT INTO leases (lease_key, holder, expires_at) VALUES (?, ?, ?)", leaseKey, holder, now + ttlMs);
+    return "acquired";
+  }
+
+  /**
+   * Give the lease back. Only its holder can: a run whose lease already expired and was taken by
+   * another run must not release that other run's lease.
+   */
+  releaseLease(leaseKey: string, holder: string): void {
+    this.ctx.storage.sql.exec("DELETE FROM leases WHERE lease_key = ? AND holder = ?", leaseKey, holder);
   }
 }

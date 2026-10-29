@@ -18,6 +18,7 @@
 
 // The custom-hostname module imports only a TYPE from this one, so this import makes no runtime cycle.
 import { isCustomHostnameFqdn } from "./dispatch-params-custom-hostname.js";
+import { RATE_LIMIT_MITIGATION_SECONDS, RATE_LIMIT_PERIOD_SECONDS, RATE_LIMIT_REQUESTS_MAX } from "./edge-rate-limit.js";
 
 /** Outcome of validating a parsed params object for one op. */
 export type ParamsVerdict<P> = { ok: true; params: P } | { ok: false; reason: string };
@@ -566,6 +567,25 @@ export interface WafEdgeSyncChallengeEntry {
   uas: string[];
 }
 
+/** One rate-limit threshold (Amendment A7): `requests` per `periodSeconds` per IP, then a block. */
+export interface WafEdgeSyncRateLimitThreshold {
+  /** 1..1,000,000. */
+  requests: number;
+  /** 10 or 60. */
+  periodSeconds: number;
+  /** One of 10, 60, 120, 300, 600, 3600, 86400. The actuator also checks the zone's plan allows it. */
+  mitigationSeconds: number;
+}
+
+/**
+ * The rate-limit switch (Amendment A7). Absent in the job => `{ enabled: false }`. enabled:true needs
+ * both thresholds; with enabled:false they are optional (both or neither). enabled:false leaves our two
+ * rate-limit rules present but disabled when they exist, and creates nothing.
+ */
+export type WafEdgeSyncRateLimit =
+  | { enabled: true; origin: WafEdgeSyncRateLimitThreshold; expensive: WafEdgeSyncRateLimitThreshold }
+  | { enabled: false; origin?: WafEdgeSyncRateLimitThreshold; expensive?: WafEdgeSyncRateLimitThreshold };
+
 export interface WafEdgeSyncParams {
   /** The agency zone NAME; the actuator resolves it with the agency's own token. */
   zone: string;
@@ -576,9 +596,21 @@ export interface WafEdgeSyncParams {
   reservedSlots: number;
   /** true deletes the legacy `doubleyoup-ban:*` and `doubleyoup-geo:*` rules, after this run's own writes. */
   retireLegacy: boolean;
+  /** The two rate-limit rules. Their own budget; a failure there never blocks the custom rules. */
+  rateLimit: WafEdgeSyncRateLimit;
 }
 
-const WAF_EDGE_SYNC_KEYS: readonly string[] = ["zone", "baseline", "block", "challenge", "reservedSlots", "retireLegacy"];
+const WAF_EDGE_SYNC_KEYS: readonly string[] = [
+  "zone",
+  "baseline",
+  "block",
+  "challenge",
+  "reservedSlots",
+  "retireLegacy",
+  "rateLimit",
+];
+const WAF_EDGE_SYNC_RATE_LIMIT_KEYS: readonly string[] = ["enabled", "origin", "expensive"];
+const WAF_EDGE_SYNC_RATE_LIMIT_THRESHOLD_KEYS: readonly string[] = ["requests", "periodSeconds", "mitigationSeconds"];
 const WAF_EDGE_SYNC_BASELINE_KEYS: readonly string[] = [
   "enabled",
   "excludedHosts",
@@ -955,6 +987,71 @@ function validateWafEdgeSyncList(
   return { ok: true, entries };
 }
 
+type RateLimitThresholdVerdict = { ok: true; threshold: WafEdgeSyncRateLimitThreshold } | { ok: false; reason: string };
+
+function validateRateLimitThreshold(raw: unknown, label: string): RateLimitThresholdVerdict {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: `${label} must be a JSON object` };
+  }
+  const unknownKey = unknownKeyReason(raw, WAF_EDGE_SYNC_RATE_LIMIT_THRESHOLD_KEYS, label);
+  if (unknownKey !== null) {
+    return { ok: false, reason: unknownKey };
+  }
+  const { requests, periodSeconds, mitigationSeconds } = raw;
+  if (typeof requests !== "number" || !Number.isInteger(requests) || requests < 1 || requests > RATE_LIMIT_REQUESTS_MAX) {
+    return { ok: false, reason: `${label}.requests must be an integer from 1 to ${RATE_LIMIT_REQUESTS_MAX}` };
+  }
+  if (typeof periodSeconds !== "number" || !RATE_LIMIT_PERIOD_SECONDS.includes(periodSeconds)) {
+    return { ok: false, reason: `${label}.periodSeconds must be one of ${RATE_LIMIT_PERIOD_SECONDS.join(", ")}` };
+  }
+  if (typeof mitigationSeconds !== "number" || !RATE_LIMIT_MITIGATION_SECONDS.includes(mitigationSeconds)) {
+    return { ok: false, reason: `${label}.mitigationSeconds must be one of ${RATE_LIMIT_MITIGATION_SECONDS.join(", ")}` };
+  }
+  return { ok: true, threshold: { requests, periodSeconds, mitigationSeconds } };
+}
+
+type RateLimitVerdict = { ok: true; rateLimit: WafEdgeSyncRateLimit } | { ok: false; reason: string };
+
+/** The `rateLimit` key (Amendment A7). Absent => disabled. Returns a FRESH object. */
+function validateWafEdgeSyncRateLimit(raw: unknown): RateLimitVerdict {
+  if (raw === undefined) {
+    return { ok: true, rateLimit: { enabled: false } };
+  }
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "rateLimit, when present, must be a JSON object" };
+  }
+  const unknownKey = unknownKeyReason(raw, WAF_EDGE_SYNC_RATE_LIMIT_KEYS, "rateLimit");
+  if (unknownKey !== null) {
+    return { ok: false, reason: unknownKey };
+  }
+  if (typeof raw.enabled !== "boolean") {
+    return { ok: false, reason: "rateLimit.enabled must be true or false" };
+  }
+  const hasOrigin = raw.origin !== undefined;
+  const hasExpensive = raw.expensive !== undefined;
+  if (!hasOrigin && !hasExpensive) {
+    if (raw.enabled) {
+      return { ok: false, reason: "rateLimit.enabled true needs both rateLimit.origin and rateLimit.expensive" };
+    }
+    return { ok: true, rateLimit: { enabled: false } };
+  }
+  if (!hasOrigin || !hasExpensive) {
+    return { ok: false, reason: "rateLimit takes both origin and expensive, or neither" };
+  }
+  const origin = validateRateLimitThreshold(raw.origin, "rateLimit.origin");
+  if (!origin.ok) {
+    return origin;
+  }
+  const expensive = validateRateLimitThreshold(raw.expensive, "rateLimit.expensive");
+  if (!expensive.ok) {
+    return expensive;
+  }
+  if (raw.enabled) {
+    return { ok: true, rateLimit: { enabled: true, origin: origin.threshold, expensive: expensive.threshold } };
+  }
+  return { ok: true, rateLimit: { enabled: false, origin: origin.threshold, expensive: expensive.threshold } };
+}
+
 export function validateWafEdgeSyncParams(raw: unknown): ParamsVerdict<WafEdgeSyncParams> {
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
@@ -963,7 +1060,7 @@ export function validateWafEdgeSyncParams(raw: unknown): ParamsVerdict<WafEdgeSy
   if (unknownTopKey !== null) {
     return { ok: false, reason: unknownTopKey };
   }
-  const { zone, baseline, block, challenge, reservedSlots, retireLegacy } = raw;
+  const { zone, baseline, block, challenge, reservedSlots, retireLegacy, rateLimit } = raw;
 
   if (typeof zone !== "string" || zone.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(zone)) {
     return { ok: false, reason: "zone must be a lowercase DNS zone name (e.g. example.com)" };
@@ -1027,6 +1124,10 @@ export function validateWafEdgeSyncParams(raw: unknown): ParamsVerdict<WafEdgeSy
   if (typeof retireLegacy !== "boolean") {
     return { ok: false, reason: "retireLegacy must be true or false" };
   }
+  const rateLimitVerdict = validateWafEdgeSyncRateLimit(rateLimit);
+  if (!rateLimitVerdict.ok) {
+    return rateLimitVerdict;
+  }
 
   // FRESH objects holding only the known keys, so nothing extra can ride along into the actuator.
   const blockEntries: WafEdgeSyncBlockEntry[] = [];
@@ -1056,6 +1157,7 @@ export function validateWafEdgeSyncParams(raw: unknown): ParamsVerdict<WafEdgeSy
       challenge: challengeEntries,
       reservedSlots: reservedSlotsValue,
       retireLegacy,
+      rateLimit: rateLimitVerdict.rateLimit,
     },
   };
 }
