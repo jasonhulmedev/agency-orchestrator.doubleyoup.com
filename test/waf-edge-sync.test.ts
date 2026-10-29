@@ -2022,6 +2022,31 @@ describe("waf-edge-sync: the signed dispatch path", () => {
     expect(fake.customDescriptions()).toEqual(edgeWafRulesOrderWithXmlrpc());
   });
 
+  it("A8 over the wire: {enabled:false} alone and a plan-disallowed block are 200s; a value outside the API set is a 400", async () => {
+    const fake = new FakeCloudflare(baselineRulesInOrder()).install();
+    const off = await worker.fetch(await signedRequest(rawParams({ rateLimit: { enabled: false } })), routeEnv());
+    expect(off.status).toBe(200);
+    expect(await off.json()).toMatchObject({ ok: true, rateLimit: { ok: true, created: [], patched: [], deleted: [], omittedClauses: [] } });
+
+    // 86400 s is in Cloudflare's API set but over Pro's 1 h: only the rate-limit part is refused.
+    const thresholds = { requests: 60, periodSeconds: 60, mitigationSeconds: 86400 };
+    const overPlan = await worker.fetch(
+      await signedRequest(rawParams({ rateLimit: { enabled: true, origin: thresholds, expensive: thresholds } })),
+      routeEnv(),
+    );
+    expect(overPlan.status).toBe(200);
+    expect(await overPlan.json()).toMatchObject({ ok: true, rateLimit: { ok: false, code: "invalid" } });
+    expect(fake.writes.filter((write) => write.phase === "ratelimit")).toEqual([]);
+
+    // 7200 s is not in the API set at all: a schema refusal of the whole op.
+    const outsideSet = { ...thresholds, mitigationSeconds: 7200 };
+    const refused = await worker.fetch(
+      await signedRequest(rawParams({ rateLimit: { enabled: true, origin: outsideSet, expensive: thresholds } })),
+      routeEnv(),
+    );
+    expect(refused.status).toBe(400);
+  });
+
   it("refuses invalid params with 400 and touches no Cloudflare API", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     const response = await worker.fetch(await signedRequest(rawParams({ expression: "true" })), routeEnv());
