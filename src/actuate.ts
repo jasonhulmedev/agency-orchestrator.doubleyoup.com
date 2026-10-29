@@ -130,6 +130,13 @@ import {
   type RateLimitRule,
 } from "./edge-rate-limit.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
+import {
+  EDGE_SYNC_RATE_LIMIT_RESERVE,
+  EDGE_SYNC_RUN_LIMITS,
+  EdgeSyncRunBudget,
+  type EdgeSyncCallGate,
+  type EdgeSyncRunLimits,
+} from "./edge-sync-budget.js";
 import type { CustomHostnameDeleteResult, CustomHostnameGetResult, CustomHostnameUpsertResult } from "./actuate-custom-hostname.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken, mintGoogleIdToken } from "./validators.js";
 import { errorMessage, stripTrailingSlash } from "./util.js";
@@ -997,6 +1004,17 @@ interface CloudflareDnsRecordSummary {
 }
 
 /** First Cloudflare error message from a response body, if any (for detail strings). */
+/**
+ * `init` with `signal` added only when there is one. waf-edge-sync passes a timeout signal (its run
+ * limits); every other caller passes none and sends exactly the request it sent before.
+ */
+function withOptionalSignal(init: RequestInit, signal: AbortSignal | undefined): RequestInit {
+  if (signal === undefined) {
+    return init;
+  }
+  return { ...init, signal };
+}
+
 export function cloudflareErrorMessage(body: CloudflareEnvelope | null): string {
   const message = body?.errors?.[0]?.message;
   return message ? `: ${message}` : "";
@@ -1014,13 +1032,15 @@ function dnsFailure(name: string, detail: string): DnsRecordUpsertResult {
 export async function resolveZoneId(
   token: string,
   zoneName: string,
+  signal?: AbortSignal,
 ): Promise<{ id: string; planLegacyId: string | null; accountId: string | null } | { error: string }> {
   const query = new URLSearchParams({ name: zoneName, per_page: "2" });
   let response: Response;
   try {
-    response = await fetch(`${CF_API}/zones?${query.toString()}`, {
-      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
-    });
+    response = await fetch(
+      `${CF_API}/zones?${query.toString()}`,
+      withOptionalSignal({ headers: { authorization: `Bearer ${token}`, accept: "application/json" } }, signal),
+    );
   } catch (err) {
     return { error: `could not reach Cloudflare to resolve zone "${zoneName}": ${errorMessage(err)}` };
   }
@@ -1918,12 +1938,14 @@ async function getWafPhaseEntrypoint(
   token: string,
   zoneId: string,
   phase: string,
+  signal?: AbortSignal,
 ): Promise<{ ruleset: CloudflareRuleset } | { missing: true } | { error: string }> {
   let response: Response;
   try {
-    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zoneId)}/rulesets/phases/${phase}/entrypoint`, {
-      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
-    });
+    response = await fetch(
+      `${CF_API}/zones/${encodeURIComponent(zoneId)}/rulesets/phases/${phase}/entrypoint`,
+      withOptionalSignal({ headers: { authorization: `Bearer ${token}`, accept: "application/json" } }, signal),
+    );
   } catch (err) {
     return { error: `could not reach Cloudflare to read the ${phase} rules: ${errorMessage(err)}` };
   }
@@ -1949,10 +1971,11 @@ async function writeWafRuleset(
   method: "POST" | "PATCH",
   url: string,
   body: unknown,
+  signal?: AbortSignal,
 ): Promise<{ ruleset: CloudflareRuleset } | { error: string }> {
   let response: Response;
   try {
-    response = await fetch(url, { method, headers: cloudflareHeaders(token), body: JSON.stringify(body) });
+    response = await fetch(url, withOptionalSignal({ method, headers: cloudflareHeaders(token), body: JSON.stringify(body) }, signal));
   } catch (err) {
     return { error: `could not reach Cloudflare to write the WAF rule: ${errorMessage(err)}` };
   }
@@ -2128,6 +2151,21 @@ async function upsertOneWafRule(
 }
 
 /** True for an `execute` rule that runs the Cloudflare Managed Ruleset (whatever its description). */
+/**
+ * The signal for the next call of a gated helper: undefined without a gate (the call goes as it always
+ * did), the gate's timeout signal, or the gate's reason to stop (a string).
+ */
+function nextCallSignal(gate: EdgeSyncCallGate | undefined): AbortSignal | undefined | string {
+  if (gate === undefined) {
+    return undefined;
+  }
+  const permit = gate();
+  if (!permit.ok) {
+    return permit.reason;
+  }
+  return permit.signal;
+}
+
 function executesCloudflareManagedRuleset(rule: CloudflareRulesetRule): boolean {
   if (rule.action !== "execute") {
     return false;
@@ -2160,14 +2198,23 @@ function ourManagedRuleBody(existing: CloudflareRulesetRule, enabled: boolean): 
  * a disabled one was switched off on purpose. A rollback DISABLES ours; it never deletes it, so
  * switching it back on is one run. See ManagedRulesetStatus for every outcome. The caller has already
  * checked the plan for an enable.
+ *
+ * `gate` (waf-edge-sync only) is asked before each Cloudflare call: it gives the call a timeout
+ * signal, or a reason to stop, which comes back as `{ error }` with nothing more sent. Without it
+ * (waf-rule-upsert) the calls go exactly as before.
  */
 async function reconcileManagedRuleset(
   token: string,
   zoneId: string,
   zonePath: string,
   enabled: boolean,
+  gate?: EdgeSyncCallGate,
 ): Promise<{ status: ManagedRulesetStatus } | { error: string }> {
-  const entrypoint = await getWafPhaseEntrypoint(token, zoneId, WAF_MANAGED_PHASE);
+  const readSignal = nextCallSignal(gate);
+  if (typeof readSignal === "string") {
+    return { error: readSignal };
+  }
+  const entrypoint = await getWafPhaseEntrypoint(token, zoneId, WAF_MANAGED_PHASE, readSignal);
   if ("error" in entrypoint) {
     return entrypoint;
   }
@@ -2198,11 +2245,16 @@ async function reconcileManagedRuleset(
       return { error: "Cloudflare returned our Managed Ruleset execute rule without an id — cannot switch it." };
     }
     const rulesetPath = `${zonePath}/rulesets/${encodeURIComponent(entrypoint.ruleset.id as string)}`;
+    const patchSignal = nextCallSignal(gate);
+    if (typeof patchSignal === "string") {
+      return { error: patchSignal };
+    }
     const patched = await writeWafRuleset(
       token,
       "PATCH",
       `${rulesetPath}/rules/${encodeURIComponent(ourRule.id)}`,
       ourManagedRuleBody(ourRule, enabled),
+      patchSignal,
     );
     if ("error" in patched) {
       return patched;
@@ -2228,18 +2280,28 @@ async function reconcileManagedRuleset(
   }
 
   const executeRule = buildManagedRulesetExecuteRule();
+  const createSignal = nextCallSignal(gate);
+  if (typeof createSignal === "string") {
+    return { error: createSignal };
+  }
   let written: { ruleset: CloudflareRuleset } | { error: string };
   if ("missing" in entrypoint) {
     // POST, not PUT on the entrypoint path: a racing create fails instead of replacing.
-    written = await writeWafRuleset(token, "POST", `${zonePath}/rulesets`, {
-      name: "default",
-      kind: "zone",
-      phase: WAF_MANAGED_PHASE,
-      rules: [executeRule],
-    });
+    written = await writeWafRuleset(
+      token,
+      "POST",
+      `${zonePath}/rulesets`,
+      {
+        name: "default",
+        kind: "zone",
+        phase: WAF_MANAGED_PHASE,
+        rules: [executeRule],
+      },
+      createSignal,
+    );
   } else {
     const rulesetPath = `${zonePath}/rulesets/${encodeURIComponent(entrypoint.ruleset.id as string)}`;
-    written = await writeWafRuleset(token, "POST", `${rulesetPath}/rules`, executeRule);
+    written = await writeWafRuleset(token, "POST", `${rulesetPath}/rules`, executeRule, createSignal);
   }
   if ("error" in written) {
     return written;
@@ -2401,11 +2463,16 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
 //      cap − reservedSlots, or when the PEAK (every create lands before any delete) would not fit in
 //      the cap. A run that ends with the same number of rules or fewer needs only the peak to fit;
 //   5. writes, in this order: create (new chunks, missing baseline rules, each placed relative to our
-//      other rules), gain patches (chunks that gain clauses, still holding what they will lose), the
-//      final pass in the documented order (content patches, the lose patches, and moves of OUR rules
-//      that sit before their predecessor), delete empty chunks, delete later copies of owned rules,
-//      the Managed Ruleset (on request), and LAST the legacy rules (on request). A failed write stops
-//      the custom part: `writeFailed`, with `landed`.
+//      other rules), gain patches (chunks that gain clauses, still holding what they will lose),
+//      content patches in the documented order (the lose patches among them), delete empty chunks,
+//      delete later copies of owned rules, the Managed Ruleset (on request), the legacy rules (on
+//      request), and LAST the moves of OUR rules that sit before their predecessor. A failed write
+//      stops the custom part: `writeFailed`, with `landed`.
+// RUN LIMITS (edge-sync-budget.ts). Every Cloudflare call first asks the run's budget: at most 45
+// subrequests per invocation (Workers Free allows 50) and a 100 s deadline, each call with its own
+// timeout. A refusal stops the run before that call — `writeFailed`, "... the next run continues",
+// with `landed` — and the next run continues from the zone's real state. The write order above is
+// therefore also the order of importance: bans gained and removed first, cosmetic moves last.
 // The rate-limit part (reconcileEdgeRateLimit) runs AFTER the custom part, whatever the custom part
 // did, so a refusal there never leaves rate limiting on when the job switched it off (A10).
 //
@@ -2531,10 +2598,10 @@ interface DesiredSyncRule {
 }
 
 /** DELETE one rule. Cloudflare answers with the updated ruleset, which this op does not rely on. */
-async function deleteWafRule(token: string, url: string): Promise<{ deleted: true } | { error: string }> {
+async function deleteWafRule(token: string, url: string, signal?: AbortSignal): Promise<{ deleted: true } | { error: string }> {
   let response: Response;
   try {
-    response = await fetch(url, { method: "DELETE", headers: cloudflareHeaders(token) });
+    response = await fetch(url, withOptionalSignal({ method: "DELETE", headers: cloudflareHeaders(token) }, signal));
   } catch (err) {
     return { error: `could not reach Cloudflare to delete the WAF rule: ${errorMessage(err)}` };
   }
@@ -2618,14 +2685,15 @@ export const EDGE_SYNC_DISPATCH_TIMEOUT_MS = 120 * 1000;
 /**
  * The longest a waf-edge-sync run holds its zone's lease. A run releases it as soon as it ends.
  *
- * IT MUST OUTLAST A RUN. The run is awaited inside the /actuate request (no waitUntil), so it normally
- * ends before the dispatcher gives up at EDGE_SYNC_DISPATCH_TIMEOUT_MS; this TTL is 2.5 times that.
- * When the dispatcher disconnects first, Cloudflare says the request's tasks "may be canceled"
- * (developers.cloudflare.com/workers/platform/limits/#duration) — not that they will be. Then nothing
- * here bounds the run's wall time: the Worker sets no per-request timeout on its Cloudflare API
- * calls, and the CPU limit counts CPU, not waiting. A run that outlives its lease can overlap the
- * next run; the duplicates that leaves are resolved by the run after it (never refused).
- * The orchestrator holds the zone for 5 minutes after an UNKNOWN timeout for the same reason.
+ * IT MUST OUTLAST A RUN. The run is awaited inside the /actuate request (no waitUntil). When the
+ * dispatcher disconnects, Cloudflare says the request's tasks "may be canceled"
+ * (developers.cloudflare.com/workers/platform/limits/#duration) — not that they will be — so the run
+ * bounds itself (edge-sync-budget.ts): every Cloudflare call has a timeout, and no call starts unless
+ * that timeout ends before the run's deadline, EDGE_SYNC_RUN_DEADLINE_MS (100 s). So a run ends within
+ * 100 s of its start (plus the lease release), before the 120 s dispatch timeout, and this TTL is
+ * 2.5 times the dispatch timeout. Tests pin deadline < dispatch timeout < TTL / 2. A run that still
+ * outlived its lease could overlap the next run; the duplicates that leaves are resolved by the run
+ * after it (never refused). The orchestrator holds the zone for 5 minutes after an UNKNOWN timeout.
  */
 export const EDGE_SYNC_LEASE_TTL_MS = 5 * 60 * 1000;
 
@@ -2641,12 +2709,19 @@ export const EDGE_SYNC_LEASE_TTL_MS = 5 * 60 * 1000;
  * `finally`; if a run dies without releasing it, it expires after EDGE_SYNC_LEASE_TTL_MS. Duplicates
  * that still appear (a run that outlived its lease) are resolved by the next run, not refused.
  */
-export async function actuateWafEdgeSync(params: WafEdgeSyncParams, env: Env): Promise<WafEdgeSyncResult> {
+export async function actuateWafEdgeSync(
+  params: WafEdgeSyncParams,
+  env: Env,
+  limits: EdgeSyncRunLimits = EDGE_SYNC_RUN_LIMITS,
+): Promise<WafEdgeSyncResult> {
   const zoneName = params.zone;
   const token = env.CF_DNS_API_TOKEN;
   if (!token) {
     return wafEdgeSyncRefusal(zoneName, "notConfigured", "CF_DNS_API_TOKEN is not configured on this Worker.");
   }
+  // The run's wall time and subrequests (edge-sync-budget.ts). It counts the nonce consume and both
+  // lease calls from the start.
+  const budget = new EdgeSyncRunBudget(limits);
 
   const leaseStore = env.NONCE_STORE.get(env.NONCE_STORE.idFromName(`edge-sync-lease:${zoneName}`));
   const leaseHolder = crypto.randomUUID();
@@ -2661,7 +2736,7 @@ export async function actuateWafEdgeSync(params: WafEdgeSyncParams, env: Env): P
   }
   let result: WafEdgeSyncResult;
   try {
-    result = await syncEdgeZone(params, token);
+    result = await syncEdgeZone(params, token, budget);
   } finally {
     // A failed release must not lose the run's result (the writes have happened): log it, and let
     // the lease expire on its own. This catch exists for that reason only.
@@ -2675,18 +2750,25 @@ export async function actuateWafEdgeSync(params: WafEdgeSyncParams, env: Env): P
 }
 
 /** The run, holding the zone's lease: the custom rules, then the rate-limit rules (which always run). */
-async function syncEdgeZone(params: WafEdgeSyncParams, token: string): Promise<WafEdgeSyncResult> {
+async function syncEdgeZone(params: WafEdgeSyncParams, token: string, budget: EdgeSyncRunBudget): Promise<WafEdgeSyncResult> {
   const zoneName = params.zone;
-  const zone = await resolveZoneId(token, zoneName);
+  const zonePermit = budget.beginCall();
+  if (!zonePermit.ok) {
+    return edgeSyncStopped(zoneName, zonePermit.reason, "resolve the zone", { created: [], patched: [], deleted: [] });
+  }
+  const zone = await resolveZoneId(token, zoneName, zonePermit.signal);
   if ("error" in zone) {
     return wafEdgeSyncRefusal(zoneName, "cloudflare", zone.error);
   }
   const zonePath = `${CF_API}/zones/${encodeURIComponent(zone.id)}`;
 
-  const custom = await syncCustomRules(params, token, zone.id, zone.planLegacyId, zonePath);
+  // The custom part may not spend the rate-limit part's reserve, so the off switch can still run.
+  budget.hold(EDGE_SYNC_RATE_LIMIT_RESERVE);
+  const custom = await syncCustomRules(params, token, zone.id, zone.planLegacyId, zonePath, budget);
+  budget.releaseHold(EDGE_SYNC_RATE_LIMIT_RESERVE);
   let customOutcome = "The custom rules were applied.";
   if (!custom.ok && custom.code === "writeFailed") {
-    customOutcome = "A custom-rule write failed part-way (writeFailed): see the result's landed lists.";
+    customOutcome = "The custom part stopped part-way (writeFailed): see the result's landed lists.";
   } else if (!custom.ok) {
     customOutcome = `The custom part refused (${custom.code}) and wrote nothing.`;
   }
@@ -2703,8 +2785,18 @@ async function syncEdgeZone(params: WafEdgeSyncParams, token: string): Promise<W
     excludedHosts: params.baseline.excludedHosts,
     rateLimit: params.rateLimit,
     customOutcome,
+    budget,
   });
   return { ...custom, rateLimit };
+}
+
+/**
+ * A run that stopped before `nextStep` because its subrequest budget or its time ran out
+ * (edge-sync-budget.ts). `writeFailed`, so app re-runs it; `landed` lists what did land, and the next
+ * run continues from the zone's real state.
+ */
+function edgeSyncStopped(zone: string, reason: string, nextStep: string, landed: WafEdgeSyncLanded): WafEdgeSyncWriteFailed {
+  return { ok: false, op: "waf-edge-sync", zone, code: "writeFailed", detail: `${reason}. Stopped before: ${nextStep}.`, landed };
 }
 
 /** The custom-phase part of the run (see the op's header in edge-waf-sync.ts and the spec). */
@@ -2714,6 +2806,7 @@ async function syncCustomRules(
   zoneId: string,
   planLegacyId: string | null,
   zonePath: string,
+  budget: EdgeSyncRunBudget,
 ): Promise<WafEdgeSyncCustomOutcome> {
   const zoneName = params.zone;
 
@@ -2761,7 +2854,11 @@ async function syncCustomRules(
   const cap = wafCustomRuleCapForPlan(planLegacyId);
 
   // 3. Read the custom phase once and sort its rules.
-  const entrypoint = await getWafPhaseEntrypoint(token, zoneId, WAF_PHASE);
+  const readPermit = budget.beginCall();
+  if (!readPermit.ok) {
+    return edgeSyncStopped(zoneName, readPermit.reason, "read the custom rules", { created: [], patched: [], deleted: [] });
+  }
+  const entrypoint = await getWafPhaseEntrypoint(token, zoneId, WAF_PHASE, readPermit.signal);
   if ("error" in entrypoint) {
     return wafEdgeSyncRefusal(zoneName, "cloudflare", entrypoint.error);
   }
@@ -2955,34 +3052,64 @@ async function syncCustomRules(
     }
   }
 
-  // 7. The writes.
+  // 7. The writes. Every Cloudflare call goes through the run's budget first (gatedWrite,
+  //    gatedDelete, the Managed Ruleset gate). When it refuses — subrequests or time used up — the
+  //    run stops BEFORE that call with `writeFailed` and what landed; the next run continues. So the
+  //    order below is also the order of importance: what protects comes first, cosmetic moves last.
   const created: string[] = [];
   const patched: string[] = [];
   const deleted: string[] = [];
   const legacyDeleted: string[] = [];
+  const landedSoFar = (): WafEdgeSyncLanded => ({ created: [...created], patched: [...patched], deleted: [...deleted, ...legacyDeleted] });
   const writeFailure = (detail: string): WafEdgeSyncWriteFailed => ({
     ok: false,
     op: "waf-edge-sync",
     zone: zoneName,
     code: "writeFailed",
     detail: `${detail} Re-run to resume (this op is idempotent).`,
-    landed: { created: [...created], patched: [...patched], deleted: [...deleted, ...legacyDeleted] },
+    landed: landedSoFar(),
   });
+  const stopBefore = (reason: string, nextStep: string): WafEdgeSyncWriteFailed => {
+    return edgeSyncStopped(zoneName, reason, nextStep, landedSoFar());
+  };
+  const gatedWrite = async (
+    method: "POST" | "PATCH",
+    url: string,
+    body: unknown,
+  ): Promise<{ ruleset: CloudflareRuleset } | { error: string } | { stopped: string }> => {
+    const permit = budget.beginCall();
+    if (!permit.ok) {
+      return { stopped: permit.reason };
+    }
+    return writeWafRuleset(token, method, url, body, permit.signal);
+  };
+  const gatedDelete = async (url: string): Promise<{ deleted: true } | { error: string } | { stopped: string }> => {
+    const permit = budget.beginCall();
+    if (!permit.ok) {
+      return { stopped: permit.reason };
+    }
+    return deleteWafRule(token, url, permit.signal);
+  };
   const notePatched = (description: string): void => {
     if (!created.includes(description) && !patched.includes(description)) {
       patched.push(description);
     }
   };
 
+  // A zone with no custom rules gets them all in one create, already in order: nothing to move.
+  const createsWholeEntrypoint = ruleset === null;
   if (ruleset === null) {
     // A zone with no custom rules at all: create the entrypoint holding every rule, in order. POST,
     // not PUT on the entrypoint path, so a racing create fails instead of replacing.
-    const createdEntrypoint = await writeWafRuleset(token, "POST", `${zonePath}/rulesets`, {
+    const createdEntrypoint = await gatedWrite("POST", `${zonePath}/rulesets`, {
       name: "default",
       kind: "zone",
       phase: WAF_PHASE,
       rules: desiredRules.map((desired) => desired.definition),
     });
+    if ("stopped" in createdEntrypoint) {
+      return stopBefore(createdEntrypoint.stopped, "create the zone's custom-rules entrypoint");
+    }
     if ("error" in createdEntrypoint) {
       return writeFailure(`could not create the zone's custom-rules entrypoint: ${createdEntrypoint.error}`);
     }
@@ -3010,7 +3137,10 @@ async function syncCustomRules(
         body.position = position;
       }
       const knownIds = new Set((ruleset.rules ?? []).map((rule) => rule.id ?? ""));
-      const reply = await writeWafRuleset(token, "POST", `${rulesetPath}/rules`, body);
+      const reply = await gatedWrite("POST", `${rulesetPath}/rules`, body);
+      if ("stopped" in reply) {
+        return stopBefore(reply.stopped, `create rule "${desired.description}"`);
+      }
       if ("error" in reply) {
         return writeFailure(`could not create rule "${desired.description}": ${reply.error}`);
       }
@@ -3033,7 +3163,10 @@ async function syncCustomRules(
         const existing = existingChunks[kind].get(chunkPlan.chunkNumber) as CloudflareRulesetRule;
         const ruleId = existing.id as string;
         const definition = buildEdgeChunkRule(kind, chunkPlan.chunkNumber, chunkPlan.gainClauses);
-        const reply = await writeWafRuleset(token, "PATCH", `${rulesetPath}/rules/${encodeURIComponent(ruleId)}`, { ...definition });
+        const reply = await gatedWrite("PATCH", `${rulesetPath}/rules/${encodeURIComponent(ruleId)}`, { ...definition });
+        if ("stopped" in reply) {
+          return stopBefore(reply.stopped, `add clauses to rule "${definition.description}"`);
+        }
         if ("error" in reply) {
           return writeFailure(`could not add clauses to rule "${definition.description}": ${reply.error}`);
         }
@@ -3042,42 +3175,26 @@ async function syncCustomRules(
       }
     }
 
-    // Phase C — the final pass, in documented order: each of our rules gets its final definition
-    // (the lose patches happen here, after every gain) and, when it sits before the rule of ours that
-    // should precede it, a move to just after that rule. Only our rules move; the PATCH always
-    // carries the full definition (see upsertOneWafRule for why never a position-only body).
-    for (let index = 0; index < desiredRules.length; index += 1) {
-      const desired = desiredRules[index] as DesiredSyncRule;
+    // Phase C — content patches, in documented order: each of our rules that drifted gets its final
+    // definition (the lose patches happen here, after every gain). In place: moves wait for the end.
+    for (const desired of desiredRules) {
       const ruleId = desired.ruleId as string;
       const current = (ruleset.rules ?? []).find((rule) => rule.id === ruleId);
       if (current === undefined) {
         return writeFailure(`rule "${desired.description}" is missing from our copy of the ruleset.`);
       }
-      let predecessorId: string | null = null;
-      if (index > 0) {
-        predecessorId = (desiredRules[index - 1] as DesiredSyncRule).ruleId;
-      }
-      let outOfOrder = false;
-      if (predecessorId !== null) {
-        outOfOrder = indexOfRule(ruleset, ruleId) < indexOfRule(ruleset, predecessorId);
-      }
-      const drifted = wafRuleDrifted(current, desired.definition);
-      if (!drifted && !outOfOrder) {
+      if (!wafRuleDrifted(current, desired.definition)) {
         continue;
       }
-      const body: Record<string, unknown> = { ...desired.definition };
-      if (outOfOrder) {
-        body.position = { after: predecessorId };
+      const reply = await gatedWrite("PATCH", `${rulesetPath}/rules/${encodeURIComponent(ruleId)}`, { ...desired.definition });
+      if ("stopped" in reply) {
+        return stopBefore(reply.stopped, `update rule "${desired.description}"`);
       }
-      const reply = await writeWafRuleset(token, "PATCH", `${rulesetPath}/rules/${encodeURIComponent(ruleId)}`, body);
       if ("error" in reply) {
         return writeFailure(`could not update rule "${desired.description}": ${reply.error}`);
       }
       notePatched(desired.description);
       ruleset = withRuleReplaced(ruleset, ruleId, desired.definition);
-      if (outOfOrder) {
-        ruleset = withRuleMovedAfter(ruleset, ruleId, predecessorId as string);
-      }
     }
 
     // Phase D — delete the chunks left with no clause.
@@ -3089,7 +3206,10 @@ async function syncCustomRules(
         const existing = existingChunks[kind].get(chunkPlan.chunkNumber) as CloudflareRulesetRule;
         const ruleId = existing.id as string;
         const description = edgeChunkDescription(kind, chunkPlan.chunkNumber);
-        const outcome = await deleteWafRule(token, `${rulesetPath}/rules/${encodeURIComponent(ruleId)}`);
+        const outcome = await gatedDelete(`${rulesetPath}/rules/${encodeURIComponent(ruleId)}`);
+        if ("stopped" in outcome) {
+          return stopBefore(outcome.stopped, `delete the empty rule "${description}"`);
+        }
         if ("error" in outcome) {
           return writeFailure(`could not delete the empty rule "${description}": ${outcome.error}`);
         }
@@ -3104,7 +3224,10 @@ async function syncCustomRules(
     for (const duplicate of duplicateOwnedRules) {
       const ruleId = duplicate.id as string;
       const description = duplicate.description as string;
-      const outcome = await deleteWafRule(token, `${rulesetPath}/rules/${encodeURIComponent(ruleId)}`);
+      const outcome = await gatedDelete(`${rulesetPath}/rules/${encodeURIComponent(ruleId)}`);
+      if ("stopped" in outcome) {
+        return stopBefore(outcome.stopped, `delete a duplicate of rule "${description}"`);
+      }
       if ("error" in outcome) {
         return writeFailure(`could not delete a duplicate of rule "${description}": ${outcome.error}`);
       }
@@ -3122,7 +3245,10 @@ async function syncCustomRules(
   if (params.baseline.includeManagedRuleset && managedEnableBlockedByPlan) {
     managedRuleset = "unavailable-on-plan";
   } else if (params.baseline.includeManagedRuleset) {
-    const managed = await reconcileManagedRuleset(token, zoneId, zonePath, params.baseline.enabled);
+    const managed = await reconcileManagedRuleset(token, zoneId, zonePath, params.baseline.enabled, () => budget.beginCall());
+    if ("error" in managed && budget.stopReason !== null) {
+      return stopBefore(budget.stopReason, "the Cloudflare Managed Ruleset step");
+    }
     if ("error" in managed) {
       return writeFailure(`the custom rules were applied, but the Cloudflare Managed Ruleset step failed: ${managed.error}`);
     }
@@ -3135,20 +3261,46 @@ async function syncCustomRules(
     }
   }
 
-  // LAST, and only after every write of ours succeeded: retire the legacy rules (spec step 7). A ban
-  // that moved into a chunk is therefore in force twice for a moment, never zero times.
+  // Then, only after every content write of ours succeeded: retire the legacy rules (spec step 7). A
+  // ban that moved into a chunk is therefore in force twice for a moment, never zero times.
+  const rulesetPathAfterWrites = `${zonePath}/rulesets/${encodeURIComponent(ruleset.id as string)}`;
   if (params.retireLegacy && legacyRules.length > 0) {
-    const rulesetPath = `${zonePath}/rulesets/${encodeURIComponent(ruleset.id as string)}`;
     for (const legacyRule of legacyRules) {
       const ruleId = legacyRule.id as string;
       const description = legacyRule.description as string;
-      const outcome = await deleteWafRule(token, `${rulesetPath}/rules/${encodeURIComponent(ruleId)}`);
+      const outcome = await gatedDelete(`${rulesetPathAfterWrites}/rules/${encodeURIComponent(ruleId)}`);
+      if ("stopped" in outcome) {
+        return stopBefore(outcome.stopped, `delete the legacy rule "${description}"`);
+      }
       if ("error" in outcome) {
         return writeFailure(`could not delete the legacy rule "${description}": ${outcome.error}`);
       }
       legacyDeleted.push(description);
       ruleset = withRuleRemoved(ruleset, ruleId);
     }
+  }
+
+  // LAST — moves: in documented order, each of our rules that sits before the rule of ours that should
+  // precede it moves to just after that rule. Only our rules move. A move changes which of our rules
+  // answers first, never whether a ban is in force, so it waits until everything else has landed.
+  // The PATCH carries the full definition (see upsertOneWafRule for why never a position-only body).
+  for (let index = 1; index < desiredRules.length && !createsWholeEntrypoint; index += 1) {
+    const desired = desiredRules[index] as DesiredSyncRule;
+    const ruleId = desired.ruleId as string;
+    const predecessorId = (desiredRules[index - 1] as DesiredSyncRule).ruleId as string;
+    if (indexOfRule(ruleset, ruleId) > indexOfRule(ruleset, predecessorId)) {
+      continue;
+    }
+    const body: Record<string, unknown> = { ...desired.definition, position: { after: predecessorId } };
+    const reply = await gatedWrite("PATCH", `${rulesetPathAfterWrites}/rules/${encodeURIComponent(ruleId)}`, body);
+    if ("stopped" in reply) {
+      return stopBefore(reply.stopped, `move rule "${desired.description}" into place`);
+    }
+    if ("error" in reply) {
+      return writeFailure(`could not move rule "${desired.description}" into place: ${reply.error}`);
+    }
+    notePatched(desired.description);
+    ruleset = withRuleMovedAfter(ruleset, ruleId, predecessorId);
   }
 
   return {
@@ -3186,6 +3338,8 @@ interface EdgeRateLimitInput {
   rateLimit: WafEdgeSyncRateLimit;
   /** One sentence on what the custom part of this run did, for a detail that mentions it. */
   customOutcome: string;
+  /** The run's budget: asked before every Cloudflare call (edge-sync-budget.ts). */
+  budget: EdgeSyncRunBudget;
 }
 
 /**
@@ -3275,8 +3429,28 @@ async function reconcileEdgeRateLimit(input: EdgeRateLimitInput): Promise<WafEdg
     return report();
   };
 
+  // Every Cloudflare call of this part asks the run's budget first; a refusal stops it before the call.
+  const stoppedBefore = (reason: string, nextStep: string): WafEdgeSyncRateLimitReport => {
+    return failure("writeFailed", `${reason}. Stopped before: ${nextStep}.`);
+  };
+  const gatedWrite = async (
+    method: "POST" | "PATCH",
+    url: string,
+    body: unknown,
+  ): Promise<{ ruleset: CloudflareRuleset } | { error: string } | { stopped: string }> => {
+    const permit = input.budget.beginCall();
+    if (!permit.ok) {
+      return { stopped: permit.reason };
+    }
+    return writeWafRuleset(input.token, method, url, body, permit.signal);
+  };
+
   // 2. Read the phase and find our rules by exact description.
-  const entrypoint = await getWafPhaseEntrypoint(input.token, input.zoneId, RATE_LIMIT_PHASE);
+  const readPermit = input.budget.beginCall();
+  if (!readPermit.ok) {
+    return stoppedBefore(readPermit.reason, "read the rate-limit rules");
+  }
+  const entrypoint = await getWafPhaseEntrypoint(input.token, input.zoneId, RATE_LIMIT_PHASE, readPermit.signal);
   if ("error" in entrypoint) {
     return failure("cloudflare", entrypoint.error);
   }
@@ -3308,7 +3482,11 @@ async function reconcileEdgeRateLimit(input: EdgeRateLimitInput): Promise<WafEdg
   const deleteDuplicates = async (rulesetPath: string): Promise<string | null> => {
     for (const duplicate of duplicates) {
       const description = duplicate.description as string;
-      const outcome = await deleteWafRule(input.token, `${rulesetPath}/rules/${encodeURIComponent(duplicate.id as string)}`);
+      const permit = input.budget.beginCall();
+      if (!permit.ok) {
+        return `${permit.reason}. Stopped before: delete a duplicate of rate-limit rule "${description}".`;
+      }
+      const outcome = await deleteWafRule(input.token, `${rulesetPath}/rules/${encodeURIComponent(duplicate.id as string)}`, permit.signal);
       if ("error" in outcome) {
         return `could not delete a duplicate of rate-limit rule "${description}": ${outcome.error} Re-run to resume.`;
       }
@@ -3341,7 +3519,10 @@ async function reconcileEdgeRateLimit(input: EdgeRateLimitInput): Promise<WafEdg
         }
         body = rateLimitRuleSwitchedOff(existing);
       }
-      const reply = await writeWafRuleset(input.token, "PATCH", `${rulesetPath}/rules/${encodeURIComponent(existing.id as string)}`, body);
+      const reply = await gatedWrite("PATCH", `${rulesetPath}/rules/${encodeURIComponent(existing.id as string)}`, body);
+      if ("stopped" in reply) {
+        return stoppedBefore(reply.stopped, `switch off rate-limit rule "${description}"`);
+      }
       if ("error" in reply) {
         return failure("writeFailed", `could not switch off rate-limit rule "${description}": ${reply.error} Re-run to resume.`);
       }
@@ -3376,12 +3557,15 @@ async function reconcileEdgeRateLimit(input: EdgeRateLimitInput): Promise<WafEdg
     for (const description of RATE_LIMIT_DESCRIPTIONS) {
       rules.push(desiredByDescription.get(description) as RateLimitRule);
     }
-    const reply = await writeWafRuleset(input.token, "POST", `${input.zonePath}/rulesets`, {
+    const reply = await gatedWrite("POST", `${input.zonePath}/rulesets`, {
       name: "default",
       kind: "zone",
       phase: RATE_LIMIT_PHASE,
       rules,
     });
+    if ("stopped" in reply) {
+      return stoppedBefore(reply.stopped, "create the zone's rate-limit entrypoint");
+    }
     if ("error" in reply) {
       return failure("writeFailed", `could not create the zone's rate-limit entrypoint: ${reply.error} Re-run to resume.`);
     }
@@ -3398,9 +3582,12 @@ async function reconcileEdgeRateLimit(input: EdgeRateLimitInput): Promise<WafEdg
     if (existing === undefined || !rateLimitRuleDrifted(existing, desired)) {
       continue;
     }
-    const reply = await writeWafRuleset(input.token, "PATCH", `${rulesetPath}/rules/${encodeURIComponent(existing.id as string)}`, {
+    const reply = await gatedWrite("PATCH", `${rulesetPath}/rules/${encodeURIComponent(existing.id as string)}`, {
       ...desired,
     });
+    if ("stopped" in reply) {
+      return stoppedBefore(reply.stopped, `update rate-limit rule "${description}"`);
+    }
     if ("error" in reply) {
       return failure("writeFailed", `could not update rate-limit rule "${description}": ${reply.error} Re-run to resume.`);
     }
@@ -3415,7 +3602,10 @@ async function reconcileEdgeRateLimit(input: EdgeRateLimitInput): Promise<WafEdg
       continue;
     }
     const desired = desiredByDescription.get(description) as RateLimitRule;
-    const reply = await writeWafRuleset(input.token, "POST", `${rulesetPath}/rules`, { ...desired });
+    const reply = await gatedWrite("POST", `${rulesetPath}/rules`, { ...desired });
+    if ("stopped" in reply) {
+      return stoppedBefore(reply.stopped, `create rate-limit rule "${description}"`);
+    }
     if ("error" in reply) {
       return failure("writeFailed", `could not create rate-limit rule "${description}": ${reply.error} Re-run to resume.`);
     }
