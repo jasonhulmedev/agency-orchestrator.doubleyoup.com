@@ -592,7 +592,11 @@ export interface WafEdgeSyncParams {
   baseline: WafEdgeSyncBaseline;
   block: WafEdgeSyncBlockEntry[];
   challenge: WafEdgeSyncChallengeEntry[];
-  /** 0..10 custom-rule slots the op leaves free under the plan's cap. Absent in the job => 3. */
+  /**
+   * 0..10 custom-rule slots the op leaves free under the plan's cap when a run GROWS the platform's
+   * rules (Amendment A10: a run that ends with the same number or fewer needs only its peak to fit).
+   * Absent in the job => 3.
+   */
   reservedSlots: number;
   /** true deletes the legacy `doubleyoup-ban:*` and `doubleyoup-geo:*` rules, after this run's own writes. */
   retireLegacy: boolean;
@@ -780,11 +784,42 @@ function hostBitsAreZero(groups: readonly number[], bitsPerGroup: number, prefix
 }
 
 /**
+ * The two IPv6 ranges that carry IPv4 addresses, as their first six 16-bit groups: ::/96
+ * (IPv4-compatible; it also holds the unspecified :: and the loopback ::1) and ::ffff:0:0/96
+ * (IPv4-mapped). A ban there could match IPv4 clients or nothing at all, so neither is a ban value.
+ */
+const IPV6_EMBEDDED_IPV4_RANGES: ReadonlyArray<readonly number[]> = [
+  [0, 0, 0, 0, 0, 0],
+  [0, 0, 0, 0, 0, 0xffff],
+];
+
+/**
+ * True when the IPv6 range `groups`/`prefixLength` shares any address with the /96 range
+ * `rangeGroups`: their first min(prefixLength, 96) bits are equal. So a range inside the /96, and a
+ * wider range that contains it (such as ::/24), both overlap.
+ */
+function overlapsIpv6Slash96(groups: readonly number[], prefixLength: number, rangeGroups: readonly number[]): boolean {
+  const comparedBits = Math.min(prefixLength, 96);
+  for (let index = 0; index < 6; index += 1) {
+    const bitsInGroup = Math.max(0, Math.min(16, comparedBits - index * 16));
+    if (bitsInGroup === 0) {
+      break;
+    }
+    const shift = 16 - bitsInGroup;
+    if ((groups[index] as number) >> shift !== (rangeGroups[index] as number) >> shift) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * The reason `value` is not a CANONICAL ban IP value (spec Amendment A3), or null:
  *   - IPv4: dotted decimal, no leading zeros. A host is the bare address (no "/32"). A network is
  *     "<address>/8..31" with the host bits zero.
  *   - IPv6: RFC 5952 text, no embedded dotted IPv4. A host is bare (no "/128"). A network is
- *     "<address>/24..127" with the host bits zero.
+ *     "<address>/24..127" with the host bits zero. Nothing that overlaps ::/96 or ::ffff:0:0/96
+ *     (Amendment A10), so neither ::, ::1 nor an IPv4-mapped address.
  * "0.0.0.0/0" and "::/0" fail the prefix floor. Canonical text means one ban always renders one clause.
  */
 export function canonicalEdgeIpReason(value: unknown): string | null {
@@ -827,14 +862,22 @@ export function canonicalEdgeIpReason(value: unknown): string | null {
   if (groups === null || rfc5952Ipv6Text(groups) !== addressText) {
     return `"${value}" is not a canonical IPv6 address (RFC 5952: lowercase, no leading zeros, the longest zero run as ::)`;
   }
-  if (prefixLength === null) {
-    return null;
+  if (prefixLength !== null) {
+    if (prefixLength < IPV6_NETWORK_PREFIX_MIN || prefixLength > 127) {
+      return `"${value}": an IPv6 network must be /${IPV6_NETWORK_PREFIX_MIN} to /127 (write a single host without /128)`;
+    }
+    if (!hostBitsAreZero(groups, 16, prefixLength)) {
+      return `"${value}" has host bits set — write the network address`;
+    }
   }
-  if (prefixLength < IPV6_NETWORK_PREFIX_MIN || prefixLength > 127) {
-    return `"${value}": an IPv6 network must be /${IPV6_NETWORK_PREFIX_MIN} to /127 (write a single host without /128)`;
+  let rangePrefixLength = 128;
+  if (prefixLength !== null) {
+    rangePrefixLength = prefixLength;
   }
-  if (!hostBitsAreZero(groups, 16, prefixLength)) {
-    return `"${value}" has host bits set — write the network address`;
+  for (const range of IPV6_EMBEDDED_IPV4_RANGES) {
+    if (overlapsIpv6Slash96(groups, rangePrefixLength, range)) {
+      return `"${value}" overlaps ::/96 or ::ffff:0:0/96 (the IPv6 ranges that carry IPv4 addresses) — ban the IPv4 address instead`;
+    }
   }
   return null;
 }

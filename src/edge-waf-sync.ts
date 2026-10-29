@@ -16,15 +16,21 @@
 //
 // CLAUSE TEXT IS CANONICAL (sorted, de-duplicated, fixed spacing), so one ban always renders exactly
 // one text, and a later run finds the clause again by that text:
-//   site ip   (ip.src in {1.2.3.4 10.0.0.0/8} and http.host in {"a.example.com" "b.example.com"})
-//   site ua   (http.user_agent contains "BadBot/1.0" and http.host in {"a.example.com"})
-//   site all  (http.host in {"a.example.com"} and not http.request.uri.path.extension in {"png" ...})
+//   site ip   (ip.src in {1.2.3.4 10.0.0.0/8} and lower(http.host) in {"a.example.com" "b.example.com"})
+//   site ua   (http.user_agent contains "BadBot/1.0" and lower(http.host) in {"a.example.com"})
+//   site all  (lower(http.host) in {"a.example.com"} and not http.request.uri.path.extension in {"css" ...})
 //   global    the host test becomes `not http.host in {<excludedHosts>}` (hosts: [] in the job)
+// SITE HOST TESTS IGNORE CASE (Amendment A10). Cloudflare does not lowercase `http.host` (its docs
+// match "WWW.cloudflare.com" with `lower(http.host) == "www.cloudflare.com"`), and hosts in the job
+// are lowercase, so `lower()` keeps a mixed-case Host header from slipping past a site ban. The
+// global test needs no `lower()`: a mixed-case Host is simply not an excluded host, so it is covered.
 // AN `all` CLAUSE LEAVES STATIC FILES ALONE (Amendment A9). An image, a stylesheet or a font cannot
 // pass a challenge, so "challenge everything" on a host broke a live site's logo and images when its
 // pages loaded them from that host. `http.request.uri.path.extension` is the extension after the
 // last dot, LOWERCASED by Cloudflare (`/LOGO.PNG` gives "png"), so no upper-case forms are needed.
-// The exemption is on `all` clauses only: an ip or ua ban still covers static files.
+// The list is exactly the cell nginx's static set (A10): anything else goes to PHP, and a flood of it
+// must still meet the challenge. The exemption is on `all` clauses only: an ip or ua ban still covers
+// static files.
 // A chunk's expression is its clauses, sorted, joined with " or ". `not` binds tighter than `and` and
 // `or`, and every clause with an `and` is in parentheses, so a chunk needs no further parentheses.
 //
@@ -162,23 +168,11 @@ export interface EdgeClauseEntry {
 
 export type EdgeClausesVerdict = { ok: true; clauses: string[] } | { ok: false; reason: string };
 
-/** The extensions an `all` clause exempts (Amendment A9), in the amendment's order. */
-export const EDGE_STATIC_EXTENSIONS: readonly string[] = [
-  "png",
-  "jpg",
-  "jpeg",
-  "gif",
-  "webp",
-  "avif",
-  "svg",
-  "ico",
-  "css",
-  "js",
-  "woff",
-  "woff2",
-  "ttf",
-  "map",
-];
+/**
+ * The extensions an `all` clause exempts: exactly the extensions the cell nginx serves as static
+ * files itself (Amendment A10; provision-web-node.sh). Every other path goes to PHP.
+ */
+export const EDGE_STATIC_EXTENSIONS: readonly string[] = ["css", "js", "jpg", "jpeg", "gif", "png", "webp", "svg", "woff", "woff2"];
 
 /** `not http.request.uri.path.extension in {"png" ...}` — appended to every `all` clause. */
 const STATIC_FILE_EXEMPTION = `not http.request.uri.path.extension in {${EDGE_STATIC_EXTENSIONS.map((extension) => `"${extension}"`).join(" ")}}`;
@@ -207,9 +201,9 @@ function quotedHostSetLength(hosts: readonly string[]): number {
   return length;
 }
 
-/** The host test of a site entry: `http.host in {...}`. */
+/** The host test of a site entry: `lower(http.host) in {...}` (hosts in the job are lowercase). */
 function siteHostTest(hosts: readonly string[]): string {
-  return `http.host in ${quotedHostSet(hosts)}`;
+  return `lower(http.host) in ${quotedHostSet(hosts)}`;
 }
 
 /** The host test of a global entry: every host of the zone except its infrastructure. */
@@ -321,6 +315,49 @@ export function buildEdgeClauses(
     }
   }
   return { ok: true, clauses: [...clauses].sort() };
+}
+
+// ── the clause grammar ────────────────────────────────────────────────────────────────
+// The forms buildEdgeClauses renders, as patterns. A piece of a chunk that matches none of them is
+// not one of our clauses: the chunk was edited by hand, or the splitter misread it (a string form it
+// does not know). Such a chunk is never re-joined piece by piece (see isCanonicalEdgeClause).
+const GRAMMAR_HOST_SET = String.raw`\{"[a-z0-9.-]+"(?: "[a-z0-9.-]+")*\}`;
+const GRAMMAR_SITE_TEST = String.raw`lower\(http\.host\) in ${GRAMMAR_HOST_SET}`;
+const GRAMMAR_GLOBAL_TEST = String.raw`not http\.host in ${GRAMMAR_HOST_SET}`;
+const GRAMMAR_HOST_TEST = `(?:${GRAMMAR_SITE_TEST}|${GRAMMAR_GLOBAL_TEST})`;
+const GRAMMAR_IP_SET = String.raw`\{[0-9a-f.:/]+(?: [0-9a-f.:/]+)*\}`;
+// Printable ASCII without `"` and `\` — the validator's User-Agent alphabet.
+const GRAMMAR_USER_AGENT = String.raw`"[\x20\x21\x23-\x5b\x5d-\x7e]+"`;
+const GRAMMAR_STATIC_EXEMPTION = STATIC_FILE_EXEMPTION.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const EDGE_CLAUSE_GRAMMAR: readonly RegExp[] = [
+  new RegExp(String.raw`^\(ip\.src in ${GRAMMAR_IP_SET} and ${GRAMMAR_HOST_TEST}\)$`),
+  new RegExp(String.raw`^\(http\.user_agent contains ${GRAMMAR_USER_AGENT} and ${GRAMMAR_HOST_TEST}\)$`),
+  new RegExp(String.raw`^\(${GRAMMAR_HOST_TEST} and ${GRAMMAR_STATIC_EXEMPTION}\)$`),
+];
+
+/**
+ * True when `clause` has one of the forms this module renders (not necessarily one wanted now). Only
+ * such pieces are ever written back into a chunk; a chunk with any other piece is rewritten whole
+ * (Amendment A10), so a misread fragment can never be re-joined into a different expression.
+ */
+export function isCanonicalEdgeClause(clause: string): boolean {
+  return EDGE_CLAUSE_GRAMMAR.some((pattern) => pattern.test(clause));
+}
+
+/**
+ * The clauses the planner should treat as a chunk's current content.
+ *   - A chunk whose pieces are all our clause forms: those pieces, as split.
+ *   - Any other chunk (edited by hand, or not split cleanly): only the WANTED clauses whose text it
+ *     contains. The actuator then rewrites it in ONE patch to canonical clauses only, so those wanted
+ *     clauses are in force before and after that patch, and no broken piece survives.
+ */
+export function chunkClausesForPlanning(expression: string, wantedClauses: readonly string[]): { clauses: string[]; canonical: boolean } {
+  const pieces = splitChunkExpression(expression);
+  if (pieces.length > 0 && pieces.every((piece) => isCanonicalEdgeClause(piece))) {
+    return { clauses: pieces, canonical: true };
+  }
+  const held = wantedClauses.filter((clause) => expression.includes(clause));
+  return { clauses: held, canonical: false };
 }
 
 /** A chunk expression: the clauses sorted, de-duplicated, joined with " or ". */

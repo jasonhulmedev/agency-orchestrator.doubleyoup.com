@@ -45,7 +45,9 @@ import {
   buildEdgeChunkRule,
   buildEdgeClauses,
   buildXmlrpcRule,
+  chunkClausesForPlanning,
   classifyWafRuleDescription,
+  isCanonicalEdgeClause,
   joinChunkClauses,
   planStickyChunks,
   splitChunkExpression,
@@ -231,6 +233,7 @@ const FAKE_PHASES: readonly FakePhase[] = ["custom", "managed", "ratelimit"];
  * and 1 h mitigation maximums, and no cache exclusion below Business.
  */
 const FAKE_RATE_LIMIT_PLANS: Record<string, { rules: number; maxPeriod: number; maxMitigation: number; cookie: boolean; cacheExclusion: boolean }> = {
+  free: { rules: 1, maxPeriod: 10, maxMitigation: 10, cookie: false, cacheExclusion: false },
   pro: { rules: 2, maxPeriod: 60, maxMitigation: 3600, cookie: false, cacheExclusion: false },
   business: { rules: 5, maxPeriod: 600, maxMitigation: 86400, cookie: false, cacheExclusion: true },
   enterprise: { rules: 100, maxPeriod: 65535, maxMitigation: 86400, cookie: true, cacheExclusion: true },
@@ -453,8 +456,9 @@ function quotedValues(setBody: string): string[] {
 }
 
 function hostTestMatches(hostTest: string, host: string): boolean {
-  const included = /^http\.host in \{(.*)\}$/.exec(hostTest);
-  if (included !== null) return quotedValues(included[1] as string).includes(host);
+  // Cloudflare does not lowercase http.host: the site test lowercases it, the global test does not.
+  const included = /^lower\(http\.host\) in \{(.*)\}$/.exec(hostTest);
+  if (included !== null) return quotedValues(included[1] as string).includes(host.toLowerCase());
   const excluded = /^not http\.host in \{(.*)\}$/.exec(hostTest);
   if (excluded !== null) return !quotedValues(excluded[1] as string).includes(host);
   throw new Error(`not a host test the evaluator knows: ${hostTest}`);
@@ -520,7 +524,7 @@ afterEach(() => {
 
 /** The static-file exemption every `all` clause carries (Amendment A9), as golden text. */
 const STATIC_EXEMPTION =
-  'not http.request.uri.path.extension in {"png" "jpg" "jpeg" "gif" "webp" "avif" "svg" "ico" "css" "js" "woff" "woff2" "ttf" "map"}';
+  'not http.request.uri.path.extension in {"css" "js" "jpg" "jpeg" "gif" "png" "webp" "svg" "woff" "woff2"}';
 
 describe("waf-edge-sync: golden rule text", () => {
   it("renders each clause form canonically: sorted, de-duplicated, fixed spacing", () => {
@@ -540,17 +544,23 @@ describe("waf-edge-sync: golden rule text", () => {
     expect(built).toEqual({
       ok: true,
       clauses: [
-        `(http.host in {"a.example.com" "www.a.example.com"} and ${STATIC_EXEMPTION})`,
-        '(http.user_agent contains "BadBot/1.0 (+https://bad.example)" and http.host in {"a.example.com"})',
+        '(http.user_agent contains "BadBot/1.0 (+https://bad.example)" and lower(http.host) in {"a.example.com"})',
         '(http.user_agent contains "EvilCrawler/9" and not http.host in {"cell-x.example.com" "host.example.com"})',
-        '(http.user_agent contains "ZetaBot/2.0" and http.host in {"a.example.com"})',
-        '(ip.src in {192.0.2.0/24 198.51.100.7} and http.host in {"a.example.org" "b.example.com"})',
+        '(http.user_agent contains "ZetaBot/2.0" and lower(http.host) in {"a.example.com"})',
+        '(ip.src in {192.0.2.0/24 198.51.100.7} and lower(http.host) in {"a.example.org" "b.example.com"})',
         '(ip.src in {2001:db8::/32} and not http.host in {"cell-x.example.com" "host.example.com"})',
+        `(lower(http.host) in {"a.example.com" "www.a.example.com"} and ${STATIC_EXEMPTION})`,
         `(not http.host in {"cell-x.example.com" "host.example.com"} and ${STATIC_EXEMPTION})`,
       ],
     });
-    // The custom-rule exemption and the rate-limit exclusion cover the same 14 extensions.
-    expect([...EDGE_STATIC_EXTENSIONS].sort()).toEqual([...RATE_LIMIT_STATIC_EXTENSIONS].sort());
+    // A10: both static lists are exactly the cell nginx static set.
+    const nginxStaticSet = ["css", "gif", "jpeg", "jpg", "js", "png", "svg", "webp", "woff", "woff2"];
+    expect([...EDGE_STATIC_EXTENSIONS].sort()).toEqual(nginxStaticSet);
+    expect([...RATE_LIMIT_STATIC_EXTENSIONS].sort()).toEqual(nginxStaticSet);
+    // Every form the builder renders is one the chunk parser accepts as ours.
+    if (built.ok) {
+      for (const clause of built.clauses) expect(isCanonicalEdgeClause(clause), clause).toBe(true);
+    }
   });
 
   it("A9: an `all` clause leaves static files alone, while an ip ban on the same site still covers them", () => {
@@ -567,9 +577,16 @@ describe("waf-edge-sync: golden rule text", () => {
     expect(anyClauseMatches(challenge.clauses, page)).toBe(true);
     expect(anyClauseMatches(challenge.clauses, { ...page, path: "/index.php" })).toBe(true);
     expect(anyClauseMatches(challenge.clauses, { ...page, path: "/logo.png.php" })).toBe(true);
-    for (const path of ["/wp-content/uploads/logo.png", "/LOGO.PNG", "/wp-content/themes/t/style.css", "/app.js", "/fonts/a.woff2", "/favicon.ico"]) {
+    for (const path of ["/wp-content/uploads/logo.png", "/LOGO.PNG", "/wp-content/themes/t/style.css", "/app.js", "/fonts/a.woff2"]) {
       expect(anyClauseMatches(challenge.clauses, { ...page, path }), path).toBe(false);
     }
+    // A10: extensions the cell nginx sends to PHP are challenged like pages.
+    for (const path of ["/favicon.ico", "/img/hero.avif", "/fonts/a.ttf", "/app.js.map"]) {
+      expect(anyClauseMatches(challenge.clauses, { ...page, path }), path).toBe(true);
+    }
+    // A10: the Host header's case does not matter to a site clause.
+    expect(anyClauseMatches(challenge.clauses, { ...page, host: "WWW.A.Example.COM" })).toBe(true);
+    expect(anyClauseMatches(block.clauses, { ...banned, host: "A.EXAMPLE.com", path: "/" })).toBe(true);
     // An ip ban on the SAME site still covers its static files: a banned IP stays banned.
     expect(anyClauseMatches(block.clauses, { ...banned, host: "a.example.com", path: "/wp-content/uploads/logo.png" })).toBe(true);
     expect(anyClauseMatches(block.clauses, { ...banned, host: "a.example.com", path: "/" })).toBe(true);
@@ -789,8 +806,6 @@ describe("waf-edge-sync: params validation", () => {
       "192.0.2.0/24",
       "192.0.2.4/31",
       "2001:db8::1",
-      "::1",
-      "::",
       "2001:db8::/32",
       "2001:db8:1::/48",
       "2001:d00::/24",
@@ -798,6 +813,11 @@ describe("waf-edge-sync: params validation", () => {
       "2001:db8:0:1:1:1:1:1",
       "1::1:0:0:1",
       "2001:db8:aaaa:bbbb:cccc:dddd:eeee:fffe/127",
+      // A10 boundaries: next to ::/96 and ::ffff:0:0/96, but outside both.
+      "64:ff9b::/96",
+      "::fffe:0:0/96",
+      "::1:0:0:0/80",
+      "fe80::/24",
     ];
     for (const value of canonical) {
       expect(canonicalEdgeIpReason(value), value).toBeNull();
@@ -826,6 +846,16 @@ describe("waf-edge-sync: params validation", () => {
       "1::1:0:0:0:1", // compresses the shorter run
       "2001:db8:0:1:1:1:1:1".replace("0:1:1:1:1:1", ":1:1:1:1:1"), // "::" for ONE zero group
       "::ffff:192.0.2.1", // embedded dotted IPv4
+      // A10 (review probe): nothing that overlaps ::/96 or ::ffff:0:0/96, the ranges that carry IPv4.
+      "::", // unspecified
+      "::1", // loopback, inside ::/96
+      "::/96",
+      "::ffff:0:0/96",
+      "::ffff:102:304", // ::ffff:1.2.3.4, IPv4-mapped
+      "::ffff:c000:200/120", // a network inside the mapped range
+      "::102:304", // IPv4-compatible
+      "::/24", // contains both ranges
+      "::/95",
       "2001:db8:::1",
       "1:2:3:4:5:6:7:8:9",
       "gggg::1",
@@ -855,7 +885,7 @@ describe("waf-edge-sync: deterministic splitting of an oversized entry", () => {
   it("cuts the SORTED hosts into groups of the largest size that fits, whatever order they arrive in", () => {
     const hosts = longHosts("split", 60, 100);
     const entry: EdgeClauseEntry = { hosts, ips: ["192.0.2.9"], uas: [], all: false };
-    const whole = `(ip.src in {192.0.2.9} and http.host in {${[...hosts].sort().map((host) => `"${host}"`).join(" ")}})`;
+    const whole = `(ip.src in {192.0.2.9} and lower(http.host) in {${[...hosts].sort().map((host) => `"${host}"`).join(" ")}})`;
     expect(whole.length).toBeGreaterThan(EDGE_CHUNK_MAX_LENGTH);
 
     const first = buildEdgeClauses([entry], EXCLUDED_HOSTS);
@@ -878,7 +908,7 @@ describe("waf-edge-sync: deterministic splitting of an oversized entry", () => {
     let largerOverflows = false;
     for (let start = 0; start < sortedHosts.length; start += groupSize + 1) {
       const group = sortedHosts.slice(start, start + groupSize + 1);
-      const clause = `(ip.src in {192.0.2.9} and http.host in {${group.map((host) => `"${host}"`).join(" ")}})`;
+      const clause = `(ip.src in {192.0.2.9} and lower(http.host) in {${group.map((host) => `"${host}"`).join(" ")}})`;
       if (clause.length > EDGE_CHUNK_MAX_LENGTH) largerOverflows = true;
     }
     expect(largerOverflows).toBe(true);
@@ -886,7 +916,7 @@ describe("waf-edge-sync: deterministic splitting of an oversized entry", () => {
 
   it("counts the A9 exemption when it splits: hosts that fit bare but not with the exemption are split", () => {
     const hosts: string[] = [];
-    const bareHostTest = () => `http.host in {${[...hosts].sort().map((host) => `"${host}"`).join(" ")}}`;
+    const bareHostTest = () => `lower(http.host) in {${[...hosts].sort().map((host) => `"${host}"`).join(" ")}}`;
     for (let index = 0; bareHostTest().length < 3900; index += 1) {
       hosts.push(`u${index}.${"x".repeat(50)}.example.net`);
     }
@@ -905,7 +935,7 @@ describe("waf-edge-sync: deterministic splitting of an oversized entry", () => {
     expect(covered.sort()).toEqual([...hosts].sort());
   });
 
-  it("refuses (invalid) a global clause or an IP list that cannot fit even with one host — before any API call", async () => {
+  it("refuses (invalid) a global clause or an IP list that cannot fit even with one host — before any custom write", async () => {
     const manyIpv6 = Array.from({ length: 100 }, (_, index) => `2001:db8:a${index}:bbbb:cccc:dddd:eeee:fffe/127`);
     const ipHeavy = buildEdgeClauses([{ hosts: ["a.example.com"], ips: manyIpv6, uas: [], all: false }], EXCLUDED_HOSTS);
     expect(ipHeavy.ok).toBe(false);
@@ -915,13 +945,16 @@ describe("waf-edge-sync: deterministic splitting of an oversized entry", () => {
     const globalClause = buildEdgeClauses([{ hosts: [], ips: manyIpv4, uas: [], all: false }], longExcluded);
     expect(globalClause.ok).toBe(false);
 
-    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const fake = new FakeCloudflare(baselineRulesInOrder()).install();
     const result = await actuateWafEdgeSync(
       validParams({ block: [{ key: "heavy", hosts: ["a.example.com"], ips: manyIpv6, uas: [] }] }),
       envWithToken(),
     );
     expect(result).toMatchObject({ ok: false, op: "waf-edge-sync", zone: ZONE, code: "invalid" });
-    expect(fetchSpy).not.toHaveBeenCalled();
+    // The custom phase is not even read; the rate-limit part (off in this job) ran and wrote nothing.
+    expect(fake.writes).toEqual([]);
+    expect(fake.requests.some((request) => request.includes("http_request_firewall_custom"))).toBe(false);
+    expect(result).toMatchObject({ rateLimit: { ok: true, created: [], patched: [], deleted: [] } });
   });
 });
 
@@ -999,6 +1032,7 @@ describe("waf-edge-sync: actuation", () => {
       deleted: [],
       legacyDeleted: [],
       chunks: { block: 1, challenge: 1 },
+      managedRuleset: "not-requested",
       rateLimit: { ok: true, created: [], patched: [], deleted: [], omittedClauses: [] },
     } satisfies WafEdgeSyncResult);
     expect(writeLog(fake)).toEqual(["POST entrypoint"]);
@@ -1006,12 +1040,12 @@ describe("waf-edge-sync: actuation", () => {
     const bodies = baselineBodies();
     expect(fake.customRules?.[1]).toMatchObject(bodies.country);
     expect(fake.customRules?.[0]).toMatchObject({
-      expression: '(ip.src in {192.0.2.7} and http.host in {"a.example.com"})',
+      expression: '(ip.src in {192.0.2.7} and lower(http.host) in {"a.example.com"})',
       action: "block",
       enabled: true,
     });
     expect(fake.customRules?.[4]).toMatchObject({
-      expression: `(http.host in {"a.example.com"} and ${STATIC_EXEMPTION})`,
+      expression: `(lower(http.host) in {"a.example.com"} and ${STATIC_EXEMPTION})`,
       action: "managed_challenge",
     });
 
@@ -1022,7 +1056,7 @@ describe("waf-edge-sync: actuation", () => {
     expect(fake.writes).toEqual([]);
   });
 
-  it("refuses a Free or unknown plan with planTooSmall and writes NOTHING (never a partial rule set)", async () => {
+  it("refuses a run that ADDS protection on a Free or unknown plan with planTooSmall, writing NOTHING", async () => {
     for (const plan of ["free", null, "some-new-plan"]) {
       const fake = new FakeCloudflare(baselineRulesInOrder());
       fake.plan = plan;
@@ -1033,7 +1067,6 @@ describe("waf-edge-sync: actuation", () => {
       );
       expect(result).toMatchObject({ ok: false, op: "waf-edge-sync", zone: ZONE, code: "planTooSmall" });
       expect(fake.writes).toEqual([]);
-      expect(fake.requests).toEqual(["GET /client/v4/zones"]);
       vi.restoreAllMocks();
     }
   });
@@ -1402,6 +1435,7 @@ describe("waf-edge-sync: actuation", () => {
     expect(fake.writes.findIndex((write) => write.phase === "managed")).toBeLessThan(firstLegacyDelete);
     expect(fake.managedRules?.[0]).toMatchObject({ description: MANAGED_RULESET_RULE_DESCRIPTION, action: "execute", action_parameters: { id: CLOUDFLARE_MANAGED_RULESET_ID } });
     expect(result.created).toContain(MANAGED_RULESET_RULE_DESCRIPTION);
+    expect(result.managedRuleset).toBe("deployed");
     expect(result.legacyDeleted).toEqual(["doubleyoup-ban:old1", "doubleyoup-geo:site1:frontend"]);
     expect(fake.customDescriptions()).not.toContain("doubleyoup-ban:old1");
     expect(fake.customDescriptions()).toContain("agency-keep");
@@ -1447,19 +1481,51 @@ describe("waf-edge-sync: actuation", () => {
     expect(result.legacyDeleted).toEqual([]);
   });
 
-  it("refuses a duplicated BASELINE description (ambiguous: a human must look) and a missing token, writing nothing", async () => {
+  it("A10: resolves a duplicated BASELINE description — keeps the lowest copy, patches it, deletes the others last", async () => {
+    // The lower copy of the login gate is switched off (a hand edit); the documented one sits after it.
     const baseline = baselineRulesInOrder();
-    const loginTwin = { ...(baseline[3] as FakeRule), id: "b-login-twin", enabled: false };
-    const fake = new FakeCloudflare([...baseline, loginTwin]).install();
-    const ambiguous = await actuateWafEdgeSync(
+    const loginGate = baseline[3] as FakeRule;
+    const lowerTwin: FakeRule = { ...loginGate, id: "b-login-lower-twin", enabled: false };
+    const startRules = [lowerTwin, ...baseline];
+    const fake = new FakeCloudflare(cloneRules(startRules)).install();
+    const result = await actuateWafEdgeSync(
       validParams({ block: [{ key: "ban1", hosts: ["a.example.com"], ips: ["192.0.2.7"], uas: [] }] }),
       envWithToken(),
     );
-    expect(ambiguous).toMatchObject({ ok: false, code: "ambiguous" });
-    if (!ambiguous.ok && ambiguous.code === "ambiguous") expect(ambiguous.detail).toContain(WAF_LOGIN_GATE_DESCRIPTION);
+    if (!result.ok) throw new Error(result.detail);
+    // The kept copy is the LOWEST one (the twin): switched back on and moved into place. The later
+    // copy (the old documented one) is deleted at the very end, once the kept copy is in force.
+    expect(fake.writes.at(-1)).toMatchObject({ method: "DELETE", description: WAF_LOGIN_GATE_DESCRIPTION, ruleId: loginGate.id });
+    expect(result.deleted).toEqual([WAF_LOGIN_GATE_DESCRIPTION]);
+    expect(result.patched).toContain(WAF_LOGIN_GATE_DESCRIPTION);
+    const loginCopies = (fake.customRules ?? []).filter((rule) => rule.description === WAF_LOGIN_GATE_DESCRIPTION);
+    expect(loginCopies.map((rule) => rule.id)).toEqual(["b-login-lower-twin"]);
+    expect(loginCopies[0]).toMatchObject(baselineBodies().login);
+    // At every step at least one ENABLED login gate is in force.
+    for (const state of [startRules, ...fake.snapshots]) {
+      const enabledGates = state.filter((rule) => rule.description === WAF_LOGIN_GATE_DESCRIPTION && rule.enabled !== false);
+      expect(enabledGates.length).toBeGreaterThanOrEqual(1);
+    }
+    expect(fake.customDescriptions()).toEqual([
+      "doubleyoup-edge-block:1",
+      WAF_COUNTRY_BLOCK_DESCRIPTION,
+      WAF_WPADMIN_GEO_DESCRIPTION,
+      WAF_XMLRPC_DESCRIPTION,
+      WAF_LOGIN_GATE_DESCRIPTION,
+      WAF_FRONTEND_GEO_DESCRIPTION,
+      WAF_EXEC_SKIP_DESCRIPTION,
+    ]);
+    // Converged: the next run writes nothing.
+    fake.writes = [];
+    const again = await actuateWafEdgeSync(
+      validParams({ block: [{ key: "ban1", hosts: ["a.example.com"], ips: ["192.0.2.7"], uas: [] }] }),
+      envWithToken(),
+    );
+    expect(again.ok).toBe(true);
     expect(fake.writes).toEqual([]);
-    vi.restoreAllMocks();
+  });
 
+  it("refuses a missing token, touching nothing", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     const noToken = await actuateWafEdgeSync(validParams(), {} as Env);
     expect(noToken).toEqual({
@@ -1515,7 +1581,7 @@ describe("waf-edge-sync: overlapping runs", () => {
     const freeZone = new FakeCloudflare(baselineRulesInOrder());
     freeZone.plan = "free";
     freeZone.install();
-    expect(await actuateWafEdgeSync(validParams(), envWithToken(leases))).toMatchObject({ ok: false, code: "planTooSmall" });
+    expect(await actuateWafEdgeSync(validParams({ block: [ban1] }), envWithToken(leases))).toMatchObject({ ok: false, code: "planTooSmall" });
     expect(leases.leases.has(LEASE_SLOT)).toBe(false);
     vi.restoreAllMocks();
 
@@ -1610,7 +1676,7 @@ describe("waf-edge-sync: rate limiting (Amendment A7)", () => {
   const ORIGIN_THRESHOLD = { requests: 600, periodSeconds: 60, mitigationSeconds: 600 };
   const EXPENSIVE_THRESHOLD = { requests: 60, periodSeconds: 10, mitigationSeconds: 3600 };
   const RATE_LIMIT_ON = { enabled: true, origin: ORIGIN_THRESHOLD, expensive: EXPENSIVE_THRESHOLD };
-  const STATIC_TEXT = ["css", "js", "png", "jpg", "jpeg", "gif", "webp", "avif", "svg", "ico", "woff", "woff2", "ttf", "map"]
+  const STATIC_TEXT = ["css", "js", "jpg", "jpeg", "gif", "png", "webp", "svg", "woff", "woff2"]
     .map((extension) => `ends_with(http.request.uri.path, ".${extension}")`)
     .join(" or ");
   const HOSTS_TEXT = 'not (http.host in {"cell-x.example.com" "host.example.com"}) and not (ends_with(http.host, "-media.example.com"))';
@@ -1885,6 +1951,328 @@ describe("waf-edge-sync: rate limiting (Amendment A7)", () => {
       omittedClauses: ["loggedInCookie"],
     });
     expect((fake.rateLimitRules ?? []).map((rule) => rule.id)).toEqual(["r-origin-first", "new-1"]);
+  });
+});
+
+// ── Amendment A10: the code review's findings, as regression tests ────────────────────
+
+describe("waf-edge-sync: Amendment A10 (review regressions)", () => {
+  const ban1 = { key: "ban1", hosts: ["a.example.com"], ips: ["192.0.2.7"], uas: [] };
+  const ban2 = { key: "ban2", hosts: ["a.example.com"], ips: ["192.0.2.8"], uas: [] };
+  const BASELINE_OFF = { ...(rawParams().baseline as object), enabled: false };
+
+  /** One of our rate-limit rules, switched on, inside every plan's limits (Free included). */
+  function enabledRateLimitRule(id: string): FakeRule {
+    return {
+      id,
+      description: RATE_LIMIT_ORIGIN_DESCRIPTION,
+      expression: "true",
+      action: "block",
+      enabled: true,
+      ratelimit: { characteristics: ["cf.colo.id", "ip.src"], period: 10, requests_per_period: 5, mitigation_timeout: 10, requests_to_origin: false },
+    };
+  }
+
+  /** A zone that grew our rules on Pro: the baseline with a site Under Attack chunk inside it. */
+  function zoneWithUnderAttackChunk(): FakeRule[] {
+    const underAttack = buildEdgeClauses([{ hosts: ["shop.example.org"], ips: [], uas: [], all: true }], EXCLUDED_HOSTS);
+    if (!underAttack.ok) throw new Error(underAttack.reason);
+    const chunk = { id: "c1", ...buildEdgeChunkRule("challenge", 1, underAttack.clauses) } as FakeRule;
+    const baseline = baselineRulesInOrder();
+    return [...baseline.slice(0, 3), chunk, ...baseline.slice(3)];
+  }
+
+  function agencyRules(count: number): FakeRule[] {
+    return Array.from({ length: count }, (_, index) => ({
+      id: `f${index}`,
+      description: `agency-rule-${index}`,
+      expression: "true",
+      action: "log",
+      enabled: true,
+    }));
+  }
+
+  // Finding 1 (probe scenarioCapBlocksRemoval).
+  it("a run that SHRINKS our rules is never refused by the reserved slots: Under Attack off + rollback on a full zone", async () => {
+    // Pro: 20 rules, 3 reserved. 7 of ours + 12 foreign = 19 > 17, but the run only removes.
+    const startRules = [...zoneWithUnderAttackChunk(), ...agencyRules(12)];
+    const fake = new FakeCloudflare(startRules).install();
+    const result = await actuateWafEdgeSync(validParams({ challenge: [], baseline: BASELINE_OFF }), envWithToken());
+    if (!result.ok) throw new Error(`${result.code}: ${result.detail}`);
+    expect(fake.writes.length).toBeGreaterThan(0);
+    expect(fake.writes.filter((write) => write.method === "POST")).toEqual([]);
+    expect(fake.customDescriptions()).not.toContain("doubleyoup-edge-challenge:1");
+    expect(result.deleted).toEqual(["doubleyoup-edge-challenge:1"]);
+    // Every baseline rule now carries its rolled-back definition.
+    const rolledBack = Object.values(baselineBodies(false));
+    for (const body of rolledBack) {
+      expect(fake.customRules?.find((rule) => rule.description === body.description), body.description).toMatchObject(body);
+    }
+    expect(fake.customDescriptions().filter((description) => description.startsWith("agency-rule-"))).toHaveLength(12);
+  });
+
+  it("a run that keeps the same number of rules needs only the peak to fit (a ban swapped for another on a full zone)", async () => {
+    // 13 foreign + 6 baseline + 1 chunk = 20 = the Pro cap: over cap − reservedSlots, but no growth.
+    const chunk = { id: "c1", ...buildEdgeChunkRule("block", 1, [siteIpClause("192.0.2.7", ["a.example.com"])]) } as FakeRule;
+    const fake = new FakeCloudflare([chunk, ...baselineRulesInOrder(), ...agencyRules(13)]).install();
+    const swapped = await actuateWafEdgeSync(validParams({ block: [ban2] }), envWithToken());
+    if (!swapped.ok) throw new Error(`${swapped.code}: ${swapped.detail}`);
+    // The gain patch (holding both bans), then the lose patch: no create, so the peak is today's 20.
+    expect(writeLog(fake)).toEqual(["PATCH doubleyoup-edge-block:1", "PATCH doubleyoup-edge-block:1"]);
+    // Growing on the same zone is still refused, writing nothing.
+    fake.writes = [];
+    // Two bans of about 3,000 characters each cannot share a chunk: the run must create a second one.
+    const longBanOne = { key: "long1", hosts: longHosts("grow", 15), ips: ["198.51.100.9"], uas: [] };
+    const longBanTwo = { key: "long2", hosts: longHosts("more", 15), ips: ["198.51.100.10"], uas: [] };
+    const grown = await actuateWafEdgeSync(validParams({ block: [ban2, longBanOne, longBanTwo] }), envWithToken());
+    expect(grown).toMatchObject({ ok: false, code: "capExceeded" });
+    expect(fake.writes).toEqual([]);
+  });
+
+  it("a removal-only run works on ANY plan (Free, unknown): deletes, clause removals, disables, Managed Ruleset rollback", async () => {
+    for (const plan of ["free", null, "some-new-plan"]) {
+      const fake = new FakeCloudflare(zoneWithUnderAttackChunk());
+      fake.plan = plan;
+      fake.install();
+      const result = await actuateWafEdgeSync(
+        validParams({ challenge: [], baseline: { ...BASELINE_OFF, includeManagedRuleset: true } }),
+        envWithToken(),
+      );
+      if (!result.ok) throw new Error(`${String(plan)}: ${result.code}: ${result.detail}`);
+      expect(result.deleted).toEqual(["doubleyoup-edge-challenge:1"]);
+      expect(result.managedRuleset).toBe("absent");
+      expect(fake.writes.filter((write) => write.method === "POST")).toEqual([]);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("planTooSmall still refuses, writing nothing, any run on Free that adds: a switch-on, an added clause, a Managed Ruleset enable", async () => {
+    const offBaseline = baselineRulesInOrder().map((rule) => ({ ...rule, enabled: false }));
+    const chunk = { id: "c1", ...buildEdgeChunkRule("block", 1, [siteIpClause("192.0.2.7", ["a.example.com"])]) } as FakeRule;
+    const cases: Array<{ name: string; rules: FakeRule[]; params: WafEdgeSyncParams }> = [
+      { name: "switch the baseline on", rules: offBaseline, params: validParams() },
+      { name: "add a clause to a chunk", rules: [chunk, ...baselineRulesInOrder()], params: validParams({ block: [ban1, ban2] }) },
+      {
+        name: "enable the Managed Ruleset",
+        rules: baselineRulesInOrder(),
+        params: validParams({ baseline: { ...(rawParams().baseline as object), includeManagedRuleset: true } }),
+      },
+    ];
+    for (const testCase of cases) {
+      const fake = new FakeCloudflare(testCase.rules);
+      fake.plan = "free";
+      fake.install();
+      const result = await actuateWafEdgeSync(testCase.params, envWithToken());
+      expect(result, testCase.name).toMatchObject({ ok: false, code: "planTooSmall" });
+      expect(fake.writes, testCase.name).toEqual([]);
+      vi.restoreAllMocks();
+    }
+  });
+
+  // Finding 10.
+  it("the peak refusal gives advice that works: free slots by hand or upgrade — never 'a run that creates nothing'", async () => {
+    const legacy: FakeRule[] = Array.from({ length: 10 }, (_, index) => ({
+      id: `l-${index}`,
+      description: `doubleyoup-ban:ban${index}`,
+      expression: `ip.src in {198.51.100.${index}}`,
+      action: "block",
+      enabled: true,
+    }));
+    const fake = new FakeCloudflare([...legacy, ...agencyRules(4)]).install();
+    const peak = await actuateWafEdgeSync(validParams({ block: [ban1], retireLegacy: true }), envWithToken());
+    expect(peak).toMatchObject({ ok: false, code: "capExceeded" });
+    if (peak.ok) throw new Error("expected a refusal");
+    expect(peak.detail).toContain(WAF_XMLRPC_DESCRIPTION);
+    expect(peak.detail).toContain("Free 1 slot(s)");
+    expect(peak.detail).toContain("delete foreign rules");
+    expect(peak.detail).toContain("delete legacy");
+    expect(peak.detail).toContain("upgrade the zone's plan");
+    expect(peak.detail).not.toMatch(/creates nothing/);
+    expect(fake.writes).toEqual([]);
+  });
+
+  // Finding 3 (probe scenarioRateLimitDisableBlockedByCustomFailure). Finding 8: the xmlrpc twin is resolved.
+  it("a duplicated xmlrpc rule no longer blocks anything: the twin is deleted and the rate-limit off switch runs", async () => {
+    const baseline = baselineRulesInOrder();
+    const xmlrpcTwin = { ...(baseline[2] as FakeRule), id: "dup-xmlrpc" };
+    const fake = new FakeCloudflare([...baseline, xmlrpcTwin]);
+    fake.rateLimitRules = [enabledRateLimitRule("rl1")];
+    fake.install();
+    const result = await actuateWafEdgeSync(validParams({ rateLimit: { enabled: false } }), envWithToken());
+    if (!result.ok) throw new Error(`${result.code}: ${result.detail}`);
+    expect(writeLog(fake)).toEqual([`DELETE ${WAF_XMLRPC_DESCRIPTION}`, `PATCH ${RATE_LIMIT_ORIGIN_DESCRIPTION}`]);
+    expect(fake.writes[0]?.ruleId).toBe("dup-xmlrpc");
+    expect(fake.rateLimitRules?.[0]?.enabled).toBe(false);
+    expect(result.rateLimit).toMatchObject({ ok: true, patched: [RATE_LIMIT_ORIGIN_DESCRIPTION] });
+  });
+
+  it("the rate-limit off switch runs whatever the custom part did: planTooSmall, capExceeded, invalid, cloudflare, writeFailed", async () => {
+    const cases: Array<{ name: string; code: string; setUp: (fake: FakeCloudflare) => void; params: Record<string, unknown> }> = [
+      { name: "planTooSmall", code: "planTooSmall", setUp: (fake) => (fake.plan = "free"), params: { block: [ban1] } },
+      {
+        name: "capExceeded",
+        code: "capExceeded",
+        setUp: (fake) => fake.customRules?.push(...agencyRules(11)),
+        params: { block: [ban1] },
+      },
+      {
+        name: "invalid",
+        code: "invalid",
+        setUp: () => undefined,
+        params: {
+          block: [{ key: "heavy", hosts: ["a.example.com"], ips: Array.from({ length: 100 }, (_, i) => `2001:db8:a${i}:bbbb:cccc:dddd:eeee:fffe/127`), uas: [] }],
+        },
+      },
+      { name: "cloudflare", code: "cloudflare", setUp: (fake) => (fake.failRead = "custom"), params: { block: [ban1] } },
+      {
+        name: "writeFailed",
+        code: "writeFailed",
+        setUp: (fake) => (fake.failWrite = (write) => write.phase === "custom"),
+        params: { block: [ban1] },
+      },
+    ];
+    for (const testCase of cases) {
+      const fake = new FakeCloudflare(baselineRulesInOrder());
+      fake.rateLimitRules = [enabledRateLimitRule("rl1")];
+      testCase.setUp(fake);
+      fake.install();
+      const result = await actuateWafEdgeSync(validParams({ ...testCase.params, rateLimit: { enabled: false } }), envWithToken());
+      expect(result, testCase.name).toMatchObject({ ok: false, code: testCase.code });
+      expect(result.rateLimit, testCase.name).toMatchObject({ ok: true, patched: [RATE_LIMIT_ORIGIN_DESCRIPTION] });
+      expect(fake.rateLimitRules?.[0]?.enabled, testCase.name).toBe(false);
+      // The custom phase is written only by the writeFailed case's refused write: nothing landed.
+      expect(fake.writes.filter((write) => write.phase === "custom"), testCase.name).toEqual([]);
+      vi.restoreAllMocks();
+    }
+  });
+
+  // Finding 4 (probe scenarioRateLimitDisableWithPlanInvalidThresholds).
+  it("enabled:false switches our rate-limit rules off even when its thresholds would not build for the plan", async () => {
+    const fake = new FakeCloudflare(baselineRulesInOrder());
+    fake.rateLimitRules = [enabledRateLimitRule("rl1")];
+    fake.install();
+    const tooLong = { requests: 100, periodSeconds: 60, mitigationSeconds: 86400 };
+    const result = await actuateWafEdgeSync(validParams({ rateLimit: { enabled: false, origin: tooLong, expensive: tooLong } }), envWithToken());
+    if (!result.ok) throw new Error(`${result.code}: ${result.detail}`);
+    expect(fake.rateLimitRules?.[0]?.enabled).toBe(false);
+    expect(result.rateLimit).toMatchObject({ ok: false, code: "invalid", patched: [RATE_LIMIT_ORIGIN_DESCRIPTION], created: [] });
+    expect(result.rateLimit.detail).toContain("switched off all the same");
+    // The same thresholds with enabled:true refuse the rate-limit part, writing nothing there.
+    fake.writes = [];
+    const enable = await actuateWafEdgeSync(validParams({ rateLimit: { enabled: true, origin: tooLong, expensive: tooLong } }), envWithToken());
+    if (!enable.ok) throw new Error(`${enable.code}: ${enable.detail}`);
+    expect(enable.rateLimit).toMatchObject({ ok: false, code: "invalid", created: [], patched: [] });
+    expect(fake.writes).toEqual([]);
+  });
+
+  // Finding 8: lease hygiene.
+  it("releases the lease when the run throws", async () => {
+    const leases = new FakeLeaseNamespace();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      // A response whose status cannot be read: an unexpected throw inside the run.
+      return {
+        get status(): number {
+          throw new Error("unexpected failure inside the run");
+        },
+      } as unknown as Response;
+    });
+    await expect(actuateWafEdgeSync(validParams(), envWithToken(leases))).rejects.toThrow("unexpected failure inside the run");
+    expect(leases.leases.size).toBe(0);
+  });
+
+  it("a failed lease release never loses the run's result: it is logged, and the lease expires on its own", async () => {
+    const leases = new FakeLeaseNamespace();
+    const brokenRelease = {
+      idFromName: (name: string) => leases.idFromName(name),
+      get: (instance: string) => ({
+        acquireLease: leases.get(instance).acquireLease,
+        releaseLease: async (): Promise<void> => {
+          throw new Error("Durable Object reset");
+        },
+      }),
+    };
+    const fake = new FakeCloudflare(baselineRulesInOrder()).install();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const env = { CF_DNS_API_TOKEN: TOKEN, NONCE_STORE: brokenRelease } as unknown as Env;
+    const result = await actuateWafEdgeSync(validParams({ block: [ban1] }), env);
+    if (!result.ok) throw new Error(`${result.code}: ${result.detail}`);
+    expect(result.created).toEqual(["doubleyoup-edge-block:1"]);
+    expect(writeLog(fake)).toEqual(["POST doubleyoup-edge-block:1"]);
+    expect(logged).toHaveBeenCalledTimes(1);
+    expect(String(logged.mock.calls[0]?.[0])).toContain(ZONE);
+    expect(String(logged.mock.calls[0]?.[0])).toContain("Durable Object reset");
+  });
+
+  // Finding 9.
+  it("reports the Managed Ruleset status, with waf-rule-upsert's values", async () => {
+    const fake = new FakeCloudflare(baselineRulesInOrder()).install();
+    const withManaged = { baseline: { ...(rawParams().baseline as object), includeManagedRuleset: true } };
+    const first = await actuateWafEdgeSync(validParams(withManaged), envWithToken());
+    const second = await actuateWafEdgeSync(validParams(withManaged), envWithToken());
+    const rollback = await actuateWafEdgeSync(
+      validParams({ baseline: { ...(rawParams().baseline as object), enabled: false, includeManagedRuleset: true } }),
+      envWithToken(),
+    );
+    const without = await actuateWafEdgeSync(validParams(), envWithToken());
+    const statuses = [first, second, rollback, without].map((result) => (result.ok ? result.managedRuleset : result.code));
+    expect(statuses).toEqual(["deployed", "already-deployed", "disabled", "not-requested"]);
+    expect(fake.managedRules?.[0]).toMatchObject({ description: MANAGED_RULESET_RULE_DESCRIPTION, enabled: false });
+  });
+
+  // Finding 12 is in "accepts only CANONICAL IP values". The probe's User-Agent round trip:
+  it("a User-Agent with parentheses, braces or ' or ' survives a chunk round trip; one with a quote is refused", () => {
+    expect(edgeUserAgentReason('abc" or true or "')).not.toBeNull();
+    expect(edgeUserAgentReason("a}) or (true")).toBeNull();
+    const built = buildEdgeClauses(
+      [
+        { hosts: ["a.example.com"], ips: [], uas: ["foo) or (bar", "a}) or (true"], all: false },
+        { hosts: [], ips: ["192.0.2.4"], uas: [], all: false },
+      ],
+      EXCLUDED_HOSTS,
+    );
+    if (!built.ok) throw new Error(built.reason);
+    const expression = joinChunkClauses(built.clauses);
+    expect(splitChunkExpression(expression)).toEqual(built.clauses);
+    expect(chunkClausesForPlanning(expression, built.clauses)).toEqual({ clauses: built.clauses, canonical: true });
+  });
+
+  // Finding 13.
+  it("a hand-edited chunk that does not parse into our clauses is rewritten in ONE patch to canonical clauses only", async () => {
+    const wanted = siteIpClause("192.0.2.7", ["a.example.com"]);
+    const handEdits = [
+      // A raw string: its backslash is literal, but the splitter reads it as an escape.
+      `http.request.uri.path contains r"C:\\" or ${wanted}`,
+      // An escaped quote inside a normal string: splits, but the piece is not one of ours.
+      `(http.user_agent contains "x\\" or y" and lower(http.host) in {"a.example.com"}) or ${wanted}`,
+      // One of ours next to a piece that is not.
+      `${wanted} or (ip.src in {198.51.100.1})`,
+    ];
+    for (const handEdit of handEdits) {
+      const handEdited: FakeRule = { id: "c1", description: "doubleyoup-edge-block:1", expression: handEdit, action: "block", enabled: true };
+      const startRules = [handEdited, ...baselineRulesInOrder()];
+      const fake = new FakeCloudflare(startRules).install();
+      const result = await actuateWafEdgeSync(validParams({ block: [ban1] }), envWithToken());
+      if (!result.ok) throw new Error(`${handEdit}: ${result.code}: ${result.detail}`);
+      expect(fake.writes, handEdit).toHaveLength(1);
+      expect(fake.writes[0], handEdit).toMatchObject({ method: "PATCH", ruleId: "c1" });
+      expect(fake.writes[0]?.body?.expression, handEdit).toBe(joinChunkClauses([wanted]));
+      // The wanted clause is in the chunk before and after the patch.
+      for (const state of [startRules, ...fake.snapshots]) {
+        expect(state.find((rule) => rule.id === "c1")?.expression, handEdit).toContain(wanted);
+      }
+      fake.writes = [];
+      expect((await actuateWafEdgeSync(validParams({ block: [ban1] }), envWithToken())).ok).toBe(true);
+      expect(fake.writes, handEdit).toEqual([]);
+      vi.restoreAllMocks();
+    }
+
+    // A hand-edited chunk that also GAINS a clause: still one patch, and only canonical clauses.
+    const gaining: FakeRule = { id: "c1", description: "doubleyoup-edge-block:1", expression: handEdits[0] as string, action: "block", enabled: true };
+    const fake = new FakeCloudflare([gaining, ...baselineRulesInOrder()]).install();
+    const gained = await actuateWafEdgeSync(validParams({ block: [ban1, ban2] }), envWithToken());
+    if (!gained.ok) throw new Error(`${gained.code}: ${gained.detail}`);
+    expect(writeLog(fake)).toEqual(["PATCH doubleyoup-edge-block:1"]);
+    expect(fake.writes[0]?.body?.expression).toBe(joinChunkClauses([wanted, siteIpClause("192.0.2.8", ["a.example.com"])]));
   });
 });
 

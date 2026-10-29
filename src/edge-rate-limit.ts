@@ -70,23 +70,12 @@ export const RATE_LIMIT_MITIGATION_SECONDS: readonly number[] = [10, 60, 120, 30
  */
 export const RATE_LIMIT_REQUESTS_MAX = 1_000_000;
 
-/** Static-file extensions neither rule counts (Amendment A7). */
-export const RATE_LIMIT_STATIC_EXTENSIONS: readonly string[] = [
-  "css",
-  "js",
-  "png",
-  "jpg",
-  "jpeg",
-  "gif",
-  "webp",
-  "avif",
-  "svg",
-  "ico",
-  "woff",
-  "woff2",
-  "ttf",
-  "map",
-];
+/**
+ * Static-file extensions neither rule counts: exactly the cell nginx's static set (Amendment A10),
+ * the same list as the custom rules' `all` exemption (edge-waf-sync.ts). nginx sends every other
+ * path to PHP, so those requests must count.
+ */
+export const RATE_LIMIT_STATIC_EXTENSIONS: readonly string[] = ["css", "js", "jpg", "jpeg", "gif", "png", "webp", "svg", "woff", "woff2"];
 
 /** Cloudflare's rule-expression field groups this module uses (labels as in the availability table). */
 export type RateLimitField = "host" | "path" | "query" | "verifiedBot" | "cookie";
@@ -185,6 +174,8 @@ function queryArgumentTest(name: string): string {
 function commonExclusionClauses(zone: string, excludedHosts: readonly string[]): RateLimitClause[] {
   const staticTests = RATE_LIMIT_STATIC_EXTENSIONS.map((extension) => `ends_with(http.request.uri.path, ".${extension}")`);
   return [
+    // The host exclusions compare the Host header as sent (Cloudflare does not lowercase it). That
+    // fails closed: a mixed-case Host is not excluded, so its requests are counted.
     { name: "excludedHosts", field: "host", text: `http.host in ${quotedSortedSet(excludedHosts)}` },
     // The leading "-" keeps the zone apex and a host such as media.<zone> out of the suffix (as in
     // the front-end geo rule, edge-waf-rule.ts).
