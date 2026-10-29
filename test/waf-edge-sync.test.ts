@@ -33,11 +33,13 @@ import { EDGE_SYNC_LEASE_TTL_MS, actuateWafEdgeSync, actuateWafRuleUpsert, type 
 import {
   RATE_LIMIT_EXPENSIVE_DESCRIPTION,
   RATE_LIMIT_ORIGIN_DESCRIPTION,
+  RATE_LIMIT_STATIC_EXTENSIONS,
   buildRateLimitRules,
   rateLimitRuleCapForPlan,
 } from "../src/edge-rate-limit.js";
 import {
   EDGE_CHUNK_MAX_LENGTH,
+  EDGE_STATIC_EXTENSIONS,
   WAF_SYNC_BASELINE_DESCRIPTIONS,
   WAF_XMLRPC_DESCRIPTION,
   buildEdgeChunkRule,
@@ -430,6 +432,61 @@ class FakeCloudflare {
   }
 }
 
+/** A request, as the clause evaluator below reads it. */
+interface ExampleRequest {
+  host: string;
+  path: string;
+  ip: string;
+  userAgent: string;
+}
+
+/** Cloudflare's http.request.uri.path.extension: after the last dot of the last segment, lowercased. */
+function pathExtension(path: string): string {
+  const lastSegment = path.split("/").pop() ?? "";
+  const lastDot = lastSegment.lastIndexOf(".");
+  if (lastDot <= 0) return "";
+  return lastSegment.slice(lastDot + 1).toLowerCase();
+}
+
+function quotedValues(setBody: string): string[] {
+  return [...setBody.matchAll(/"([^"]*)"/g)].map((match) => match[1] as string);
+}
+
+function hostTestMatches(hostTest: string, host: string): boolean {
+  const included = /^http\.host in \{(.*)\}$/.exec(hostTest);
+  if (included !== null) return quotedValues(included[1] as string).includes(host);
+  const excluded = /^not http\.host in \{(.*)\}$/.exec(hostTest);
+  if (excluded !== null) return !quotedValues(excluded[1] as string).includes(host);
+  throw new Error(`not a host test the evaluator knows: ${hostTest}`);
+}
+
+/**
+ * True when one of OUR canonical clause forms matches the request. A tiny evaluator for exactly the
+ * forms buildEdgeClauses renders (single IPs only); any other text throws, so a test cannot pass by
+ * a form it does not understand.
+ */
+function clauseMatches(clause: string, request: ExampleRequest): boolean {
+  const ipClause = /^\(ip\.src in \{([^}]*)\} and (.*)\)$/.exec(clause);
+  if (ipClause !== null) {
+    return (ipClause[1] as string).split(" ").includes(request.ip) && hostTestMatches(ipClause[2] as string, request.host);
+  }
+  const userAgentClause = /^\(http\.user_agent contains "([^"]*)" and (.*)\)$/.exec(clause);
+  if (userAgentClause !== null) {
+    return request.userAgent.includes(userAgentClause[1] as string) && hostTestMatches(userAgentClause[2] as string, request.host);
+  }
+  const allClause = /^\((.*) and not http\.request\.uri\.path\.extension in \{(.*)\}\)$/.exec(clause);
+  if (allClause !== null) {
+    const exempt = quotedValues(allClause[2] as string).includes(pathExtension(request.path));
+    return hostTestMatches(allClause[1] as string, request.host) && !exempt;
+  }
+  // A bare host test: the pre-A9 `all` form.
+  return hostTestMatches(clause, request.host);
+}
+
+function anyClauseMatches(clauses: readonly string[], request: ExampleRequest): boolean {
+  return clauses.some((clause) => clauseMatches(clause, request));
+}
+
 /** The clauses of every chunk rule in a phase snapshot, keyed by chunk description. */
 function chunkClauses(rules: readonly FakeRule[]): Map<string, Set<string>> {
   const chunks = new Map<string, Set<string>>();
@@ -461,6 +518,10 @@ afterEach(() => {
 
 // ── golden text ───────────────────────────────────────────────────────────────────────
 
+/** The static-file exemption every `all` clause carries (Amendment A9), as golden text. */
+const STATIC_EXEMPTION =
+  'not http.request.uri.path.extension in {"png" "jpg" "jpeg" "gif" "webp" "avif" "svg" "ico" "css" "js" "woff" "woff2" "ttf" "map"}';
+
 describe("waf-edge-sync: golden rule text", () => {
   it("renders each clause form canonically: sorted, de-duplicated, fixed spacing", () => {
     const entries: EdgeClauseEntry[] = [
@@ -479,15 +540,46 @@ describe("waf-edge-sync: golden rule text", () => {
     expect(built).toEqual({
       ok: true,
       clauses: [
+        `(http.host in {"a.example.com" "www.a.example.com"} and ${STATIC_EXEMPTION})`,
         '(http.user_agent contains "BadBot/1.0 (+https://bad.example)" and http.host in {"a.example.com"})',
         '(http.user_agent contains "EvilCrawler/9" and not http.host in {"cell-x.example.com" "host.example.com"})',
         '(http.user_agent contains "ZetaBot/2.0" and http.host in {"a.example.com"})',
         '(ip.src in {192.0.2.0/24 198.51.100.7} and http.host in {"a.example.org" "b.example.com"})',
         '(ip.src in {2001:db8::/32} and not http.host in {"cell-x.example.com" "host.example.com"})',
-        'http.host in {"a.example.com" "www.a.example.com"}',
-        'not http.host in {"cell-x.example.com" "host.example.com"}',
+        `(not http.host in {"cell-x.example.com" "host.example.com"} and ${STATIC_EXEMPTION})`,
       ],
     });
+    // The custom-rule exemption and the rate-limit exclusion cover the same 14 extensions.
+    expect([...EDGE_STATIC_EXTENSIONS].sort()).toEqual([...RATE_LIMIT_STATIC_EXTENSIONS].sort());
+  });
+
+  it("A9: an `all` clause leaves static files alone, while an ip ban on the same site still covers them", () => {
+    const siteHosts = ["www.a.example.com", "a.example.com"];
+    const challenge = buildEdgeClauses([{ hosts: siteHosts, ips: [], uas: [], all: true }], EXCLUDED_HOSTS);
+    const block = buildEdgeClauses([{ hosts: siteHosts, ips: ["192.0.2.7"], uas: [], all: false }], EXCLUDED_HOSTS);
+    const globalChallenge = buildEdgeClauses([{ hosts: [], ips: [], uas: [], all: true }], EXCLUDED_HOSTS);
+    if (!challenge.ok || !block.ok || !globalChallenge.ok) throw new Error("fixture clauses refused");
+    const visitor = { ip: "203.0.113.5", userAgent: "Mozilla/5.0 (example)" };
+    const banned = { ip: "192.0.2.7", userAgent: "Mozilla/5.0 (example)" };
+    const page = { ...visitor, host: "www.a.example.com", path: "/" };
+
+    // Site Under Attack: pages are challenged; images, styles, scripts and fonts are not.
+    expect(anyClauseMatches(challenge.clauses, page)).toBe(true);
+    expect(anyClauseMatches(challenge.clauses, { ...page, path: "/index.php" })).toBe(true);
+    expect(anyClauseMatches(challenge.clauses, { ...page, path: "/logo.png.php" })).toBe(true);
+    for (const path of ["/wp-content/uploads/logo.png", "/LOGO.PNG", "/wp-content/themes/t/style.css", "/app.js", "/fonts/a.woff2", "/favicon.ico"]) {
+      expect(anyClauseMatches(challenge.clauses, { ...page, path }), path).toBe(false);
+    }
+    // An ip ban on the SAME site still covers its static files: a banned IP stays banned.
+    expect(anyClauseMatches(block.clauses, { ...banned, host: "a.example.com", path: "/wp-content/uploads/logo.png" })).toBe(true);
+    expect(anyClauseMatches(block.clauses, { ...banned, host: "a.example.com", path: "/" })).toBe(true);
+    expect(anyClauseMatches(block.clauses, { ...visitor, host: "a.example.com", path: "/" })).toBe(false);
+    for (const clause of block.clauses) expect(clause).not.toContain("http.request.uri.path.extension");
+
+    // Global under_attack: the same exemption, every host but the zone's infrastructure.
+    expect(anyClauseMatches(globalChallenge.clauses, { ...visitor, host: "shop.example.org", path: "/cart" })).toBe(true);
+    expect(anyClauseMatches(globalChallenge.clauses, { ...visitor, host: "shop.example.org", path: "/img/hero.webp" })).toBe(false);
+    expect(anyClauseMatches(globalChallenge.clauses, { ...visitor, host: "host.example.com", path: "/" })).toBe(false);
   });
 
   it("joins a chunk's clauses sorted with ' or ', and builds the chunk and xmlrpc rule bodies", () => {
@@ -792,6 +884,27 @@ describe("waf-edge-sync: deterministic splitting of an oversized entry", () => {
     expect(largerOverflows).toBe(true);
   });
 
+  it("counts the A9 exemption when it splits: hosts that fit bare but not with the exemption are split", () => {
+    const hosts: string[] = [];
+    const bareHostTest = () => `http.host in {${[...hosts].sort().map((host) => `"${host}"`).join(" ")}}`;
+    for (let index = 0; bareHostTest().length < 3900; index += 1) {
+      hosts.push(`u${index}.${"x".repeat(50)}.example.net`);
+    }
+    expect(bareHostTest().length).toBeLessThanOrEqual(EDGE_CHUNK_MAX_LENGTH);
+    expect(`(${bareHostTest()} and ${STATIC_EXEMPTION})`.length).toBeGreaterThan(EDGE_CHUNK_MAX_LENGTH);
+
+    const built = buildEdgeClauses([{ hosts, ips: [], uas: [], all: true }], EXCLUDED_HOSTS);
+    if (!built.ok) throw new Error(built.reason);
+    expect(built.clauses).toHaveLength(2);
+    const covered: string[] = [];
+    for (const clause of built.clauses) {
+      expect(clause.length).toBeLessThanOrEqual(EDGE_CHUNK_MAX_LENGTH);
+      expect(clause.endsWith(` and ${STATIC_EXEMPTION})`)).toBe(true);
+      covered.push(...quotedValues(clause.slice(0, clause.indexOf(" and not http.request"))));
+    }
+    expect(covered.sort()).toEqual([...hosts].sort());
+  });
+
   it("refuses (invalid) a global clause or an IP list that cannot fit even with one host — before any API call", async () => {
     const manyIpv6 = Array.from({ length: 100 }, (_, index) => `2001:db8:a${index}:bbbb:cccc:dddd:eeee:fffe/127`);
     const ipHeavy = buildEdgeClauses([{ hosts: ["a.example.com"], ips: manyIpv6, uas: [], all: false }], EXCLUDED_HOSTS);
@@ -897,7 +1010,10 @@ describe("waf-edge-sync: actuation", () => {
       action: "block",
       enabled: true,
     });
-    expect(fake.customRules?.[4]).toMatchObject({ expression: 'http.host in {"a.example.com"}', action: "managed_challenge" });
+    expect(fake.customRules?.[4]).toMatchObject({
+      expression: `(http.host in {"a.example.com"} and ${STATIC_EXEMPTION})`,
+      action: "managed_challenge",
+    });
 
     // Idempotent: the same state again writes nothing.
     fake.writes = [];

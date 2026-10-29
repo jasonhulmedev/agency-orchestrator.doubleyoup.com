@@ -18,8 +18,13 @@
 // one text, and a later run finds the clause again by that text:
 //   site ip   (ip.src in {1.2.3.4 10.0.0.0/8} and http.host in {"a.example.com" "b.example.com"})
 //   site ua   (http.user_agent contains "BadBot/1.0" and http.host in {"a.example.com"})
-//   site all  http.host in {"a.example.com"}
+//   site all  (http.host in {"a.example.com"} and not http.request.uri.path.extension in {"png" ...})
 //   global    the host test becomes `not http.host in {<excludedHosts>}` (hosts: [] in the job)
+// AN `all` CLAUSE LEAVES STATIC FILES ALONE (Amendment A9). An image, a stylesheet or a font cannot
+// pass a challenge, so "challenge everything" on a host broke a live site's logo and images when its
+// pages loaded them from that host. `http.request.uri.path.extension` is the extension after the
+// last dot, LOWERCASED by Cloudflare (`/LOGO.PNG` gives "png"), so no upper-case forms are needed.
+// The exemption is on `all` clauses only: an ip or ua ban still covers static files.
 // A chunk's expression is its clauses, sorted, joined with " or ". `not` binds tighter than `and` and
 // `or`, and every clause with an `and` is in parentheses, so a chunk needs no further parentheses.
 //
@@ -157,6 +162,27 @@ export interface EdgeClauseEntry {
 
 export type EdgeClausesVerdict = { ok: true; clauses: string[] } | { ok: false; reason: string };
 
+/** The extensions an `all` clause exempts (Amendment A9), in the amendment's order. */
+export const EDGE_STATIC_EXTENSIONS: readonly string[] = [
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "avif",
+  "svg",
+  "ico",
+  "css",
+  "js",
+  "woff",
+  "woff2",
+  "ttf",
+  "map",
+];
+
+/** `not http.request.uri.path.extension in {"png" ...}` — appended to every `all` clause. */
+const STATIC_FILE_EXEMPTION = `not http.request.uri.path.extension in {${EDGE_STATIC_EXTENSIONS.map((extension) => `"${extension}"`).join(" ")}}`;
+
 /** Sorted by UTF-16 code unit (the default sort) and de-duplicated. Never locale-dependent. */
 function sortedUnique(values: readonly string[]): string[] {
   return [...new Set(values)].sort();
@@ -193,7 +219,8 @@ function globalHostTest(excludedHosts: readonly string[]): string {
 
 /**
  * The clause makers of one entry, each turning a host test into one clause: one for the IP set (when
- * there are IPs), one per User-Agent, and the bare host test for `all`.
+ * there are IPs), one per User-Agent, and for `all` the host test minus static files (A9). Splitting
+ * measures every clause through its maker, so the longer `all` clause is counted with no extra step.
  */
 function clauseMakersFor(entry: EdgeClauseEntry): Array<(hostTest: string) => string> {
   const makers: Array<(hostTest: string) => string> = [];
@@ -206,7 +233,7 @@ function clauseMakersFor(entry: EdgeClauseEntry): Array<(hostTest: string) => st
     makers.push((hostTest) => `(http.user_agent contains "${userAgent}" and ${hostTest})`);
   }
   if (entry.all) {
-    makers.push((hostTest) => hostTest);
+    makers.push((hostTest) => `(${hostTest} and ${STATIC_FILE_EXEMPTION})`);
   }
   return makers;
 }
