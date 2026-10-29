@@ -2520,6 +2520,72 @@ describe("waf-edge-sync: A10 re-review (probe3 and probe4)", () => {
   });
 });
 
+// ── waf-rule-upsert is unchanged by the run limits (byte for byte) ────────────────────
+
+/** Every fetch the spied `fetch` saw, as text: method, URL, headers, body and the init's keys. */
+function fetchTranscript(): string {
+  const lines: string[] = [];
+  for (const [input, init] of vi.mocked(globalThis.fetch).mock.calls) {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const requestInit = (init ?? {}) as RequestInit;
+    lines.push(
+      [
+        `${requestInit.method ?? "GET"} ${url}`,
+        JSON.stringify(requestInit.headers ?? null),
+        String(requestInit.body ?? ""),
+        `init keys: ${Object.keys(requestInit).join(",")}`,
+      ].join("\n"),
+    );
+  }
+  return lines.join("\n---\n");
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+describe("waf-rule-upsert: unchanged by the waf-edge-sync run limits", () => {
+  it("sends byte-for-byte the requests it sent before (no signal, same bodies), on create, drift, rollback and the Managed Ruleset", async () => {
+    const upsertParams = { zone: ZONE, enabled: true, excludedHosts: EXCLUDED_HOSTS, agentHosts: AGENT_HOSTS, includeManagedRuleset: true };
+    const transcripts: string[] = [];
+
+    // A fresh zone: the entrypoint is created with the five rules, then the Managed Ruleset.
+    const fresh = new FakeCloudflare(null).install();
+    expect((await actuateWafRuleUpsert(upsertParams, envWithToken())).ok).toBe(true);
+    transcripts.push(fetchTranscript());
+    vi.restoreAllMocks();
+
+    // Drift and a missing rule: one PATCH, one POST; our Managed Ruleset rule already on.
+    const drifted = (fresh.customRules ?? [])
+      .filter((rule) => rule.description !== WAF_FRONTEND_GEO_DESCRIPTION)
+      .map((rule) => (rule.description === WAF_LOGIN_GATE_DESCRIPTION ? { ...rule, enabled: false } : rule));
+    const second = new FakeCloudflare(drifted);
+    second.managedRules = cloneRules(fresh.managedRules ?? []);
+    second.install();
+    expect((await actuateWafRuleUpsert(upsertParams, envWithToken())).ok).toBe(true);
+    transcripts.push(fetchTranscript());
+    vi.restoreAllMocks();
+
+    // A rollback: every rule switched off, the Managed Ruleset rule disabled.
+    const third = new FakeCloudflare(second.customRules);
+    third.managedRules = cloneRules(second.managedRules ?? []);
+    third.install();
+    expect((await actuateWafRuleUpsert({ ...upsertParams, enabled: false }, envWithToken())).ok).toBe(true);
+    transcripts.push(fetchTranscript());
+
+    // The three runs did what they are for (so the recorded transcript is not trivially empty).
+    expect(transcripts[0]?.match(/^POST /gm)).toHaveLength(6);
+    expect(transcripts[1]?.match(/^PATCH /gm)).toHaveLength(1);
+    expect(transcripts[1]?.match(/^POST /gm)).toHaveLength(1);
+    expect(transcripts[2]?.match(/^PATCH /gm)).toHaveLength(4);
+    const transcript = transcripts.join("\n=====\n");
+    expect(transcript).not.toContain("signal");
+    // Recorded from the code before the run limits existed (commit 910cc49).
+    expect(await sha256Hex(transcript)).toBe("dfcb51fa72090f8504d432d919bf97696d48d11a524f1c92cc1cb0c9a70bbbf5");
+  });
+});
+
 // ── a seeded random walk over the sticky invariants ───────────────────────────────────
 
 /** mulberry32: a tiny deterministic PRNG, so a failure always reproduces. */
