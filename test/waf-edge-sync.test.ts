@@ -29,7 +29,13 @@ import {
   validateWafEdgeSyncParams,
   type WafEdgeSyncParams,
 } from "../src/dispatch-params.js";
-import { EDGE_SYNC_LEASE_TTL_MS, actuateWafEdgeSync, actuateWafRuleUpsert, type WafEdgeSyncResult } from "../src/actuate.js";
+import {
+  EDGE_SYNC_DISPATCH_TIMEOUT_MS,
+  EDGE_SYNC_LEASE_TTL_MS,
+  actuateWafEdgeSync,
+  actuateWafRuleUpsert,
+  type WafEdgeSyncResult,
+} from "../src/actuate.js";
 import {
   RATE_LIMIT_EXPENSIVE_DESCRIPTION,
   RATE_LIMIT_ORIGIN_DESCRIPTION,
@@ -2046,17 +2052,18 @@ describe("waf-edge-sync: Amendment A10 (review regressions)", () => {
     }
   });
 
-  it("planTooSmall still refuses, writing nothing, any run on Free that adds: a switch-on, an added clause, a Managed Ruleset enable", async () => {
+  it("planTooSmall still refuses, writing nothing, any run on Free that adds: a baseline switch-on or edit, an added clause", async () => {
     const offBaseline = baselineRulesInOrder().map((rule) => ({ ...rule, enabled: false }));
+    const editedBaseline = baselineRulesInOrder().map((rule) => {
+      if (rule.description !== WAF_COUNTRY_BLOCK_DESCRIPTION) return rule;
+      return { ...rule, expression: `${rule.expression ?? ""} and ip.src ne 203.0.113.1` };
+    });
     const chunk = { id: "c1", ...buildEdgeChunkRule("block", 1, [siteIpClause("192.0.2.7", ["a.example.com"])]) } as FakeRule;
     const cases: Array<{ name: string; rules: FakeRule[]; params: WafEdgeSyncParams }> = [
       { name: "switch the baseline on", rules: offBaseline, params: validParams() },
+      // The op cannot tell a widened expression from a narrowed one, so an expression change counts.
+      { name: "rewrite a hand-edited baseline block rule", rules: editedBaseline, params: validParams() },
       { name: "add a clause to a chunk", rules: [chunk, ...baselineRulesInOrder()], params: validParams({ block: [ban1, ban2] }) },
-      {
-        name: "enable the Managed Ruleset",
-        rules: baselineRulesInOrder(),
-        params: validParams({ baseline: { ...(rawParams().baseline as object), includeManagedRuleset: true } }),
-      },
     ];
     for (const testCase of cases) {
       const fake = new FakeCloudflare(testCase.rules);
@@ -2217,6 +2224,17 @@ describe("waf-edge-sync: Amendment A10 (review regressions)", () => {
     const statuses = [first, second, rollback, without].map((result) => (result.ok ? result.managedRuleset : result.code));
     expect(statuses).toEqual(["deployed", "already-deployed", "disabled", "not-requested"]);
     expect(fake.managedRules?.[0]).toMatchObject({ description: MANAGED_RULESET_RULE_DESCRIPTION, enabled: false });
+    vi.restoreAllMocks();
+
+    // Re-review probe F8: another owner's switched-off execute rule is left off and reported.
+    const handManaged = new FakeCloudflare(baselineRulesInOrder());
+    handManaged.managedRules = [
+      { id: "m9", description: "hand managed", expression: "true", action: "execute", action_parameters: { id: CLOUDFLARE_MANAGED_RULESET_ID }, enabled: false },
+    ];
+    handManaged.install();
+    const theirs = await actuateWafEdgeSync(validParams(withManaged), envWithToken());
+    expect(theirs).toMatchObject({ ok: true, managedRuleset: "present-disabled" });
+    expect(handManaged.writes).toEqual([]);
   });
 
   // Finding 12 is in "accepts only CANONICAL IP values". The probe's User-Agent round trip:
@@ -2273,6 +2291,232 @@ describe("waf-edge-sync: Amendment A10 (review regressions)", () => {
     if (!gained.ok) throw new Error(`${gained.code}: ${gained.detail}`);
     expect(writeLog(fake)).toEqual(["PATCH doubleyoup-edge-block:1"]);
     expect(fake.writes[0]?.body?.expression).toBe(joinChunkClauses([wanted, siteIpClause("192.0.2.8", ["a.example.com"])]));
+    vi.restoreAllMocks();
+
+    // Re-review probe F13: a raw string whose quote the splitter misreads, with a gained clause.
+    const shopWanted = siteIpClause("192.0.2.1", ["shop.example.org"]);
+    const shopGained = siteIpClause("192.0.2.2", ["shop.example.org"]);
+    const misread = `${shopWanted} or http.user_agent contains r"a\\" or http.host eq "b or c"`;
+    expect(splitChunkExpression(misread).length).toBeGreaterThan(2); // the splitter is fooled
+    const misreadZone = new FakeCloudflare([
+      { id: "c1", description: "doubleyoup-edge-block:1", expression: misread, action: "block", enabled: true },
+      ...baselineRulesInOrder(),
+    ]).install();
+    const shopBans = [
+      { key: "b1", hosts: ["shop.example.org"], ips: ["192.0.2.1"], uas: [] },
+      { key: "b2", hosts: ["shop.example.org"], ips: ["192.0.2.2"], uas: [] },
+    ];
+    const rewritten = await actuateWafEdgeSync(validParams({ block: shopBans }), envWithToken());
+    if (!rewritten.ok) throw new Error(`${rewritten.code}: ${rewritten.detail}`);
+    expect(writeLog(misreadZone)).toEqual(["PATCH doubleyoup-edge-block:1"]);
+    expect(misreadZone.writes[0]?.body?.expression).toBe(joinChunkClauses([shopWanted, shopGained]));
+  });
+});
+
+// ── the A10 re-review: R1, R4, R5, the lease against the dispatch timeout ──────────────
+
+describe("waf-edge-sync: A10 re-review (probe3 and probe4)", () => {
+  const shopBan = (ip: string) => ({ key: `ban${ip.replaceAll(".", "")}`, hosts: ["shop.example.org"], ips: [ip], uas: [] });
+  const shopClause = (ip: string) => siteIpClause(ip, ["shop.example.org"]);
+  const ourManagedRule = (): FakeRule => ({
+    id: "m1",
+    description: MANAGED_RULESET_RULE_DESCRIPTION,
+    expression: "true",
+    action: "execute",
+    action_parameters: { id: CLOUDFLARE_MANAGED_RULESET_ID },
+    enabled: true,
+  });
+
+  /** True when an ENABLED chunk in `rules` carries `clause` as one of our canonical clauses. */
+  function clauseInForce(rules: FakeRule[], clause: string): boolean {
+    return rules.some((rule) => {
+      if (!(rule.description ?? "").startsWith("doubleyoup-edge-") || rule.enabled === false) return false;
+      const content = chunkClausesForPlanning(rule.expression ?? "", [clause]);
+      return content.canonical && content.clauses.includes(clause);
+    });
+  }
+
+  // R1 (probe3 N1).
+  it("R1: on Free, an expired ban is removed although the job includes the Managed Ruleset (unavailable-on-plan, rule untouched)", async () => {
+    for (const plan of ["free", null]) {
+      const chunk = { id: "c1", ...buildEdgeChunkRule("block", 1, [shopClause("192.0.2.1")]) } as FakeRule;
+      const fake = new FakeCloudflare([chunk, ...baselineRulesInOrder()]);
+      fake.plan = plan;
+      fake.managedRules = [ourManagedRule()];
+      fake.install();
+      const result = await actuateWafEdgeSync(
+        validParams({ block: [], baseline: { ...(rawParams().baseline as object), includeManagedRuleset: true } }),
+        envWithToken(),
+      );
+      if (!result.ok) throw new Error(`${String(plan)}: ${result.code}: ${result.detail}`);
+      expect(result.managedRuleset).toBe("unavailable-on-plan");
+      expect(fake.customDescriptions()).not.toContain("doubleyoup-edge-block:1");
+      expect(writeLog(fake)).toEqual(["DELETE doubleyoup-edge-block:1"]);
+      // The managed phase is not even read; our deployed rule stays exactly as it was.
+      expect(fake.requests.some((request) => request.includes("http_request_firewall_managed"))).toBe(false);
+      expect(fake.managedRules).toEqual([ourManagedRule()]);
+      vi.restoreAllMocks();
+    }
+  });
+
+  // R4 (probe3 N3).
+  it("R4: on Free, a switched-off chunk that only loses a clause is rewritten (switched back on, never grown)", async () => {
+    const chunk = { id: "c1", ...buildEdgeChunkRule("block", 1, [shopClause("192.0.2.1"), shopClause("192.0.2.2")]), enabled: false } as FakeRule;
+    const fake = new FakeCloudflare([chunk, ...baselineRulesInOrder()]);
+    fake.plan = "free";
+    fake.install();
+    const result = await actuateWafEdgeSync(validParams({ block: [shopBan("192.0.2.1")] }), envWithToken());
+    if (!result.ok) throw new Error(`${result.code}: ${result.detail}`);
+    expect(writeLog(fake)).toEqual(["PATCH doubleyoup-edge-block:1"]);
+    expect(fake.customRules?.[0]).toMatchObject({ id: "c1", expression: joinChunkClauses([shopClause("192.0.2.1")]), enabled: true });
+  });
+
+  it("R4: on Free, a change to the agent skip does not block an expired-ban removal in the same run", async () => {
+    const chunk = { id: "c1", ...buildEdgeChunkRule("block", 1, [shopClause("192.0.2.1"), shopClause("192.0.2.2")]) } as FakeRule;
+    const fake = new FakeCloudflare([chunk, ...baselineRulesInOrder()]);
+    fake.plan = "free";
+    fake.install();
+    // A second agent host changes ONLY the skip (every agent host is already an excluded host).
+    const wider = { ...(rawParams().baseline as object), agentHosts: [...EXCLUDED_HOSTS] };
+    const result = await actuateWafEdgeSync(validParams({ block: [shopBan("192.0.2.1")], baseline: wider }), envWithToken());
+    if (!result.ok) throw new Error(`${result.code}: ${result.detail}`);
+    expect([...writeLog(fake)].sort()).toEqual(["PATCH doubleyoup-edge-block:1", `PATCH ${WAF_EXEC_SKIP_DESCRIPTION}`].sort());
+    expect(fake.customRules?.[0]?.expression).toBe(joinChunkClauses([shopClause("192.0.2.1")]));
+  });
+
+  // probe3 N2.
+  it("on Free, an expired-ban removal that also MOVES our rules back into order is allowed (a move adds nothing)", async () => {
+    const chunk = { id: "c1", ...buildEdgeChunkRule("block", 1, [shopClause("192.0.2.1"), shopClause("192.0.2.2")]) } as FakeRule;
+    const baseline = baselineRulesInOrder();
+    const outOfOrder = [baseline[3], baseline[0], baseline[1], baseline[2], chunk, baseline[4], baseline[5]] as FakeRule[];
+    const fake = new FakeCloudflare(outOfOrder);
+    fake.plan = "free";
+    fake.install();
+    const result = await actuateWafEdgeSync(validParams({ block: [shopBan("192.0.2.1")] }), envWithToken());
+    if (!result.ok) throw new Error(`${result.code}: ${result.detail}`);
+    expect(fake.writes.filter((write) => write.method === "POST")).toEqual([]);
+    expect(fake.customDescriptions()).toEqual([
+      "doubleyoup-edge-block:1",
+      WAF_COUNTRY_BLOCK_DESCRIPTION,
+      WAF_WPADMIN_GEO_DESCRIPTION,
+      WAF_XMLRPC_DESCRIPTION,
+      WAF_LOGIN_GATE_DESCRIPTION,
+      WAF_FRONTEND_GEO_DESCRIPTION,
+      WAF_EXEC_SKIP_DESCRIPTION,
+    ]);
+  });
+
+  // probe3 N4.
+  it("a duplicated baseline rule whose LOWER copy is off and edited: the lower copy is repaired before the live copy goes", async () => {
+    const baseline = baselineRulesInOrder();
+    const frontend = baseline[4] as FakeRule;
+    const editedLow: FakeRule = { ...frontend, id: "fg-low", enabled: false, expression: `${frontend.expression ?? ""} and http.host eq "x.example.com"` };
+    const startRules = [baseline[0], baseline[1], baseline[2], baseline[3], editedLow, { ...frontend, id: "fg-high" }, baseline[5]] as FakeRule[];
+    const fake = new FakeCloudflare(startRules).install();
+    const result = await actuateWafEdgeSync(validParams(), envWithToken());
+    if (!result.ok) throw new Error(`${result.code}: ${result.detail}`);
+    const copies = (fake.customRules ?? []).filter((rule) => rule.description === WAF_FRONTEND_GEO_DESCRIPTION);
+    expect(copies.map((rule) => rule.id)).toEqual(["fg-low"]);
+    expect(copies[0]).toMatchObject(baselineBodies().frontend);
+    // An enabled, canonical frontend geo rule is in force at every step.
+    for (const state of [startRules, ...fake.snapshots]) {
+      const live = state.some(
+        (rule) => rule.description === WAF_FRONTEND_GEO_DESCRIPTION && rule.enabled !== false && rule.expression === frontend.expression,
+      );
+      expect(live).toBe(true);
+    }
+  });
+
+  // probe3 N5.
+  it("a broken chunk holding a wanted clause only inside not(...): the clause stays in force at every step", async () => {
+    const wanted = shopClause("192.0.2.1");
+    const broken: FakeRule = { id: "c1", description: "doubleyoup-edge-block:1", expression: `not ${wanted} and ip.src in {192.0.2.99}`, action: "block", enabled: true };
+    const good = { id: "c2", ...buildEdgeChunkRule("block", 2, [wanted]) } as FakeRule;
+    const startRules = [broken, good, ...baselineRulesInOrder()];
+    const fake = new FakeCloudflare(startRules).install();
+    const result = await actuateWafEdgeSync(validParams({ block: [shopBan("192.0.2.1")] }), envWithToken());
+    if (!result.ok) throw new Error(`${result.code}: ${result.detail}`);
+    for (const state of [startRules, ...fake.snapshots]) expect(clauseInForce(state, wanted)).toBe(true);
+    const chunks = (fake.customRules ?? []).filter((rule) => (rule.description ?? "").startsWith("doubleyoup-edge-block:"));
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]?.expression).toBe(joinChunkClauses([wanted]));
+  });
+
+  // probe3 N6: pins the A10 decision that a duplicate counts as a rule in the zone.
+  it("a duplicate counts as a rule in the zone: replacing it with a needed chunk keeps the count, so only the peak applies", async () => {
+    const wanted = shopClause("192.0.2.1");
+    const chunk = { id: "c1", ...buildEdgeChunkRule("block", 1, [wanted]) } as FakeRule;
+    const duplicate = { id: "c1dup", ...buildEdgeChunkRule("block", 1, [wanted]) } as FakeRule;
+    const foreign: FakeRule[] = Array.from({ length: 10 }, (_, index) => ({
+      id: `f${index}`,
+      description: `agency-rule-${index}`,
+      expression: "true",
+      action: "log",
+      enabled: true,
+    }));
+    // 18 rules, one above cap − reservedSlots (17). The run creates a challenge chunk and deletes the duplicate.
+    const fake = new FakeCloudflare([chunk, duplicate, ...baselineRulesInOrder(), ...foreign]).install();
+    const result = await actuateWafEdgeSync(
+      validParams({ block: [shopBan("192.0.2.1")], challenge: [{ key: "u1", hosts: ["shop.example.org"], ips: [], uas: [], all: true }] }),
+      envWithToken(),
+    );
+    if (!result.ok) throw new Error(`${result.code}: ${result.detail}`);
+    expect(fake.customRules).toHaveLength(18);
+    expect(result.created).toEqual(["doubleyoup-edge-challenge:1"]);
+    expect(result.deleted).toEqual(["doubleyoup-edge-block:1"]);
+  });
+
+  // R5.
+  it("R5: the rate-limit capExceeded detail states what the custom part did", async () => {
+    const thresholds = { requests: 600, periodSeconds: 60, mitigationSeconds: 600 };
+    const rateLimitOn = { enabled: true, origin: thresholds, expensive: thresholds };
+    const foreignRateLimit: FakeRule = {
+      id: "rl-agency",
+      description: "agency-api-limit",
+      expression: 'starts_with(http.request.uri.path, "/api/")',
+      action: "managed_challenge",
+      ratelimit: { characteristics: ["cf.colo.id", "ip.src"], period: 10, requests_per_period: 50, mitigation_timeout: 0 },
+      enabled: true,
+    };
+    const applied = new FakeCloudflare(baselineRulesInOrder());
+    applied.rateLimitRules = [foreignRateLimit];
+    applied.install();
+    const afterApply = await actuateWafEdgeSync(validParams({ rateLimit: rateLimitOn }), envWithToken());
+    expect(afterApply).toMatchObject({ ok: true, rateLimit: { ok: false, code: "capExceeded" } });
+    expect(afterApply.rateLimit?.detail).toContain("The custom rules were applied.");
+    vi.restoreAllMocks();
+
+    const refused = new FakeCloudflare([...baselineRulesInOrder(), ...Array.from({ length: 12 }, (_, index) => ({
+      id: `f${index}`,
+      description: `agency-rule-${index}`,
+      expression: "true",
+      action: "log",
+      enabled: true,
+    }))]);
+    refused.rateLimitRules = [foreignRateLimit];
+    refused.install();
+    const afterRefusal = await actuateWafEdgeSync(validParams({ block: [shopBan("192.0.2.1")], rateLimit: rateLimitOn }), envWithToken());
+    expect(afterRefusal).toMatchObject({ ok: false, code: "capExceeded", rateLimit: { ok: false, code: "capExceeded" } });
+    expect(afterRefusal.rateLimit?.detail).toContain("The custom part refused (capExceeded) and wrote nothing.");
+    expect(afterRefusal.rateLimit?.detail).not.toContain("were applied");
+    vi.restoreAllMocks();
+
+    const failed = new FakeCloudflare(baselineRulesInOrder());
+    failed.rateLimitRules = [foreignRateLimit];
+    failed.failWrite = (write) => write.phase === "custom";
+    failed.install();
+    const afterFailure = await actuateWafEdgeSync(validParams({ block: [shopBan("192.0.2.1")], rateLimit: rateLimitOn }), envWithToken());
+    expect(afterFailure).toMatchObject({ ok: false, code: "writeFailed" });
+    expect(afterFailure.rateLimit?.detail).toContain("(writeFailed)");
+    expect(afterFailure.rateLimit?.detail).not.toContain("were applied");
+  });
+
+  // The lease against the dispatcher.
+  it("the lease outlasts a whole dispatch attempt: TTL >= 2 x the orchestrator's 120 s waf-edge-sync timeout", () => {
+    // Mirrors EDGE_SYNC_DISPATCH_OPTIONS.timeoutMs in the orchestrator (src/handlers/edge-sync.ts).
+    // Raising that timeout means raising EDGE_SYNC_LEASE_TTL_MS with it (see their comments).
+    expect(EDGE_SYNC_DISPATCH_TIMEOUT_MS).toBe(120_000);
+    expect(EDGE_SYNC_LEASE_TTL_MS).toBeGreaterThanOrEqual(2 * EDGE_SYNC_DISPATCH_TIMEOUT_MS);
   });
 });
 

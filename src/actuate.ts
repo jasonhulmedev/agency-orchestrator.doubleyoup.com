@@ -2391,10 +2391,12 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
 //   1. build the baseline and every clause (pure) — `invalid` for a clause or rule that cannot fit;
 //   2. read the custom entrypoint once and sort its rules into ours, legacy and foreign. A later copy
 //      of an owned description (overlapping runs, a hand copy) is deleted at the end (A10);
-//   3. plan the chunks (sticky first-fit). A run that ADDS protection (a create, added clauses, a
-//      baseline rule that ends enabled with a new definition, the Managed Ruleset enabled) on a plan
-//      with the Free allowance — Free itself, or a plan we do not know — is `planTooSmall`. A run that
-//      only deletes, removes clauses and disables runs on any plan (A10);
+//   3. plan the chunks (sticky first-fit). A run that ADDS enforcement (a create, added clauses, a
+//      baseline block or challenge rule that ends enabled with a new definition) on a plan with the
+//      Free allowance — Free itself, or a plan we do not know — is `planTooSmall`. A run that only
+//      deletes, removes clauses, disables, changes the agent skip or switches a chunk back on runs on
+//      any plan (A10). The Managed Ruleset is never an addition: below Pro an enable is reported
+//      `unavailable-on-plan`;
 //   4. count: `capExceeded` when a run that GROWS the platform's rules would leave more than
 //      cap − reservedSlots, or when the PEAK (every create lands before any delete) would not fit in
 //      the cap. A run that ends with the same number of rules or fewer needs only the peak to fit;
@@ -2605,7 +2607,26 @@ function planHasFreeAllowance(planLegacyId: string | null): boolean {
   return wafCustomRuleCapForPlan(planLegacyId) <= WAF_UNKNOWN_PLAN_RULE_CAP;
 }
 
-/** The longest a waf-edge-sync run holds its zone's lease. A run releases it as soon as it ends. */
+/**
+ * The orchestrator's timeout for ONE waf-edge-sync dispatch attempt: `EDGE_SYNC_DISPATCH_OPTIONS
+ * .timeoutMs` in orchestrator.doubleyoup.com src/handlers/edge-sync.ts (120 s). A second attempt is
+ * made only when the first cannot have reached the actuation, so one run lives inside one attempt.
+ * This Worker cannot import it (another repo): change both together. A test pins the ratio below.
+ */
+export const EDGE_SYNC_DISPATCH_TIMEOUT_MS = 120 * 1000;
+
+/**
+ * The longest a waf-edge-sync run holds its zone's lease. A run releases it as soon as it ends.
+ *
+ * IT MUST OUTLAST A RUN. The run is awaited inside the /actuate request (no waitUntil), so it normally
+ * ends before the dispatcher gives up at EDGE_SYNC_DISPATCH_TIMEOUT_MS; this TTL is 2.5 times that.
+ * When the dispatcher disconnects first, Cloudflare says the request's tasks "may be canceled"
+ * (developers.cloudflare.com/workers/platform/limits/#duration) — not that they will be. Then nothing
+ * here bounds the run's wall time: the Worker sets no per-request timeout on its Cloudflare API
+ * calls, and the CPU limit counts CPU, not waiting. A run that outlives its lease can overlap the
+ * next run; the duplicates that leaves are resolved by the run after it (never refused).
+ * The orchestrator holds the zone for 5 minutes after an UNKNOWN timeout for the same reason.
+ */
 export const EDGE_SYNC_LEASE_TTL_MS = 5 * 60 * 1000;
 
 /**
@@ -2663,6 +2684,12 @@ async function syncEdgeZone(params: WafEdgeSyncParams, token: string): Promise<W
   const zonePath = `${CF_API}/zones/${encodeURIComponent(zone.id)}`;
 
   const custom = await syncCustomRules(params, token, zone.id, zone.planLegacyId, zonePath);
+  let customOutcome = "The custom rules were applied.";
+  if (!custom.ok && custom.code === "writeFailed") {
+    customOutcome = "A custom-rule write failed part-way (writeFailed): see the result's landed lists.";
+  } else if (!custom.ok) {
+    customOutcome = `The custom part refused (${custom.code}) and wrote nothing.`;
+  }
 
   // The rate-limit rules (Amendments A7 and A10), after the custom part, WHATEVER it did: their own
   // budget, and a refusal or failure of the custom rules must never leave rate limiting on when the
@@ -2675,6 +2702,7 @@ async function syncEdgeZone(params: WafEdgeSyncParams, token: string): Promise<W
     planLegacyId: zone.planLegacyId,
     excludedHosts: params.baseline.excludedHosts,
     rateLimit: params.rateLimit,
+    customOutcome,
   });
   return { ...custom, rateLimit };
 }
@@ -2822,11 +2850,18 @@ async function syncCustomRules(
   addBaselineRule(builtBaseline.rules.frontendGeo);
   addBaselineRule(builtBaseline.rules.execSkip);
 
-  // 5. Does the run ADD anything? Creates, clauses added, a baseline rule that ends ENABLED with a
-  //    changed definition, a chunk switched back on, or the Managed Ruleset enabled. A run that only
-  //    deletes, removes clauses and disables (a rule that ends switched off enforces nothing) is
-  //    allowed on ANY plan (A10): a plan downgrade or an agency's own rules must never freeze an
-  //    expired ban or an Under Attack toggle-off in place.
+  // 5. Does the run ADD enforcement? Only these count: a create, a chunk that gains clauses, and a
+  //    baseline block or challenge rule that ends ENABLED with a changed definition (switched on, or a
+  //    new action or expression — the op cannot tell a widened expression from a narrowed one, so an
+  //    expression change counts). These never count (A10 review, R1 and R4):
+  //      - a delete, a clause removal, a disable (a rule that ends switched off enforces nothing);
+  //      - any change to a skip rule (the agent skip): a skip enforces nothing, it only exempts
+  //        requests from a later phase;
+  //      - an existing chunk switched back on, or its action put back: its clauses are bans the job
+  //        wants and an earlier run placed, and the zone's rules and clauses do not grow;
+  //      - the Managed Ruleset: below Pro it is reported `unavailable-on-plan` and never written.
+  //    A run that adds nothing is allowed on ANY plan (A10): a plan downgrade or an agency's own rules
+  //    must never freeze an expired ban or an Under Attack toggle-off in place.
   let createCount = 0;
   const additions: string[] = [];
   const existingById = new Map(existingRules.map((rule) => [rule.id ?? "", rule]));
@@ -2836,15 +2871,16 @@ async function syncCustomRules(
       additions.push(`create ${desired.description}`);
       continue;
     }
-    const current = existingById.get(desired.ruleId) as CloudflareRulesetRule;
-    if (classifyWafRuleDescription(desired.description).owner === "baseline") {
-      if (desired.definition.enabled && wafRuleDrifted(current, desired.definition)) {
-        additions.push(`change ${desired.description}`);
-      }
+    // Chunks: only their gained clauses count (the loop below), never a switch-on.
+    if (classifyWafRuleDescription(desired.description).owner !== "baseline") {
       continue;
     }
-    if (current.enabled === false || current.action !== desired.definition.action) {
-      additions.push(`switch on ${desired.description}`);
+    if (desired.definition.action === "skip" || !desired.definition.enabled) {
+      continue;
+    }
+    const current = existingById.get(desired.ruleId) as CloudflareRulesetRule;
+    if (wafRuleDrifted(current, desired.definition)) {
+      additions.push(`change ${desired.description}`);
     }
   }
   for (const kind of EDGE_CHUNK_KINDS) {
@@ -2853,9 +2889,6 @@ async function syncCustomRules(
         additions.push(`add clauses to ${edgeChunkDescription(kind, chunkPlan.chunkNumber)}`);
       }
     }
-  }
-  if (params.baseline.includeManagedRuleset && params.baseline.enabled) {
-    additions.push("enable the Managed Ruleset");
   }
   if (planHasFreeAllowance(planLegacyId) && additions.length > 0) {
     return wafEdgeSyncRefusal(
@@ -3081,10 +3114,14 @@ async function syncCustomRules(
   }
 
   // The Managed Ruleset — only on request, and only now: the agent skip is in force (waf-rule-upsert's
-  // meaning, order and status values). An enable never gets here below Pro (step 5 refuses it as an
-  // addition); a rollback runs on any plan.
+  // meaning, order and status values). An enable below Pro (or on an unknown plan) is reported
+  // `unavailable-on-plan` and writes nothing, as in waf-rule-upsert: a rule of ours already deployed
+  // there is left as it is. A rollback runs on any plan.
   let managedRuleset: ManagedRulesetStatus = "not-requested";
-  if (params.baseline.includeManagedRuleset) {
+  const managedEnableBlockedByPlan = params.baseline.enabled && !planSupportsManagedRuleset(planLegacyId);
+  if (params.baseline.includeManagedRuleset && managedEnableBlockedByPlan) {
+    managedRuleset = "unavailable-on-plan";
+  } else if (params.baseline.includeManagedRuleset) {
     const managed = await reconcileManagedRuleset(token, zoneId, zonePath, params.baseline.enabled);
     if ("error" in managed) {
       return writeFailure(`the custom rules were applied, but the Cloudflare Managed Ruleset step failed: ${managed.error}`);
@@ -3147,6 +3184,8 @@ interface EdgeRateLimitInput {
   planLegacyId: string | null;
   excludedHosts: readonly string[];
   rateLimit: WafEdgeSyncRateLimit;
+  /** One sentence on what the custom part of this run did, for a detail that mentions it. */
+  customOutcome: string;
 }
 
 /**
@@ -3326,7 +3365,7 @@ async function reconcileEdgeRateLimit(input: EdgeRateLimitInput): Promise<WafEdg
       "capExceeded",
       `wrote neither rate-limit rule: zone ${input.zoneName} (plan "${input.planLegacyId ?? "unknown"}") allows ${cap} ` +
         `rate-limit rules, and ${foreignCount} foreign + our ${RATE_LIMIT_DESCRIPTIONS.length} would make ${rulesAfterRun}. ` +
-        "Free a rate-limit slot or upgrade the zone. The custom rules were applied.",
+        `Free a rate-limit slot or upgrade the zone. ${input.customOutcome}`,
     );
   }
 
