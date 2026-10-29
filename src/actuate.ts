@@ -134,6 +134,7 @@ import {
   EDGE_SYNC_RATE_LIMIT_RESERVE,
   EDGE_SYNC_RUN_LIMITS,
   EdgeSyncRunBudget,
+  unknownWhenTimedOut,
   type EdgeSyncCallGate,
   type EdgeSyncRunLimits,
 } from "./edge-sync-budget.js";
@@ -2257,7 +2258,7 @@ async function reconcileManagedRuleset(
       patchSignal,
     );
     if ("error" in patched) {
-      return patched;
+      return unknownWhenTimedOut(patched, patchSignal);
     }
     if (enabled) {
       return { status: "re-enabled" };
@@ -2304,7 +2305,7 @@ async function reconcileManagedRuleset(
     written = await writeWafRuleset(token, "POST", `${rulesetPath}/rules`, executeRule, createSignal);
   }
   if ("error" in written) {
-    return written;
+    return unknownWhenTimedOut(written, createSignal);
   }
   return { status: "deployed" };
 }
@@ -2470,9 +2471,11 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
 //      stops the custom part: `writeFailed`, with `landed`.
 // RUN LIMITS (edge-sync-budget.ts). Every Cloudflare call first asks the run's budget: at most 45
 // subrequests per invocation (Workers Free allows 50) and a 100 s deadline, each call with its own
-// timeout. A refusal stops the run before that call — `writeFailed`, "... the next run continues",
-// with `landed` — and the next run continues from the zone's real state. The write order above is
-// therefore also the order of importance: bans gained and removed first, cosmetic moves last.
+// 15 s timeout. Three calls (subrequests and time) stay held for the rate-limit part, so the custom
+// part's calls end by 55 s. A refusal stops the run before that call — `writeFailed`, "... the next
+// run continues", with `landed` — and the next run continues from the zone's real state. The write
+// order above is therefore also the order of importance: bans gained and removed first, cosmetic
+// moves last. A write whose timeout fired is UNKNOWN: its detail says so and `landed` leaves it out.
 // The rate-limit part (reconcileEdgeRateLimit) runs AFTER the custom part, whatever the custom part
 // did, so a refusal there never leaves rate limiting on when the job switched it off (A10).
 //
@@ -3081,14 +3084,16 @@ async function syncCustomRules(
     if (!permit.ok) {
       return { stopped: permit.reason };
     }
-    return writeWafRuleset(token, method, url, body, permit.signal);
+    const reply = await writeWafRuleset(token, method, url, body, permit.signal);
+    return unknownWhenTimedOut(reply, permit.signal);
   };
   const gatedDelete = async (url: string): Promise<{ deleted: true } | { error: string } | { stopped: string }> => {
     const permit = budget.beginCall();
     if (!permit.ok) {
       return { stopped: permit.reason };
     }
-    return deleteWafRule(token, url, permit.signal);
+    const reply = await deleteWafRule(token, url, permit.signal);
+    return unknownWhenTimedOut(reply, permit.signal);
   };
   const notePatched = (description: string): void => {
     if (!created.includes(description) && !patched.includes(description)) {
@@ -3442,7 +3447,8 @@ async function reconcileEdgeRateLimit(input: EdgeRateLimitInput): Promise<WafEdg
     if (!permit.ok) {
       return { stopped: permit.reason };
     }
-    return writeWafRuleset(input.token, method, url, body, permit.signal);
+    const reply = await writeWafRuleset(input.token, method, url, body, permit.signal);
+    return unknownWhenTimedOut(reply, permit.signal);
   };
 
   // 2. Read the phase and find our rules by exact description.
@@ -3486,7 +3492,8 @@ async function reconcileEdgeRateLimit(input: EdgeRateLimitInput): Promise<WafEdg
       if (!permit.ok) {
         return `${permit.reason}. Stopped before: delete a duplicate of rate-limit rule "${description}".`;
       }
-      const outcome = await deleteWafRule(input.token, `${rulesetPath}/rules/${encodeURIComponent(duplicate.id as string)}`, permit.signal);
+      const reply = await deleteWafRule(input.token, `${rulesetPath}/rules/${encodeURIComponent(duplicate.id as string)}`, permit.signal);
+      const outcome = unknownWhenTimedOut(reply, permit.signal);
       if ("error" in outcome) {
         return `could not delete a duplicate of rate-limit rule "${description}": ${outcome.error} Re-run to resume.`;
       }

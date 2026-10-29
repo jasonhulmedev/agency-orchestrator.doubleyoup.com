@@ -39,11 +39,13 @@ import {
 import {
   EDGE_SYNC_BUDGET_REACHED,
   EDGE_SYNC_DEADLINE_REACHED,
+  EDGE_SYNC_RATE_LIMIT_RESERVE,
   EDGE_SYNC_REQUEST_TIMEOUT_MS,
   EDGE_SYNC_RUN_DEADLINE_MS,
   EDGE_SYNC_RUN_LIMITS,
   EDGE_SYNC_SUBREQUEST_BUDGET,
   EDGE_SYNC_SUBREQUESTS_BEFORE_ACTUATION,
+  EDGE_SYNC_WRITE_UNKNOWN,
   type EdgeSyncRunLimits,
 } from "../src/edge-sync-budget.js";
 import {
@@ -2666,6 +2668,13 @@ describe("waf-edge-sync: run limits (deadline, request timeout, subrequest budge
 
   it("pins the limits: deadline < dispatch timeout < lease / 2, and a request timeout well inside the deadline", () => {
     expect(EDGE_SYNC_RUN_DEADLINE_MS).toBe(100_000);
+    // The custom part's calls end by 55 s, leaving the rate-limit part its read and two writes at
+    // their full 15 s timeouts: 55 + 3 × 15 ≤ 100.
+    const customPartEndsByMs = EDGE_SYNC_RUN_DEADLINE_MS - EDGE_SYNC_RATE_LIMIT_RESERVE * EDGE_SYNC_REQUEST_TIMEOUT_MS;
+    expect(customPartEndsByMs).toBe(55_000);
+    expect(EDGE_SYNC_RATE_LIMIT_RESERVE).toBe(3);
+    expect(EDGE_SYNC_REQUEST_TIMEOUT_MS).toBe(15_000);
+    expect(55_000 + EDGE_SYNC_RATE_LIMIT_RESERVE * EDGE_SYNC_REQUEST_TIMEOUT_MS).toBeLessThanOrEqual(EDGE_SYNC_RUN_DEADLINE_MS);
     expect(EDGE_SYNC_RUN_DEADLINE_MS).toBeLessThan(EDGE_SYNC_DISPATCH_TIMEOUT_MS);
     expect(EDGE_SYNC_DISPATCH_TIMEOUT_MS).toBeLessThan(EDGE_SYNC_LEASE_TTL_MS / 2);
     expect(EDGE_SYNC_REQUEST_TIMEOUT_MS).toBeLessThanOrEqual(EDGE_SYNC_RUN_DEADLINE_MS / 4);
@@ -2836,47 +2845,114 @@ describe("waf-edge-sync: run limits (deadline, request timeout, subrequest budge
     ]);
   });
 
-  it("stops before the next call when the run's time is up, with what landed; the next run continues", async () => {
+  it("stops the custom part's calls by 55 s, with what landed; the rate-limit part still runs; the next run continues", async () => {
     const fake = new FakeCloudflare(agencyRulesOnly());
-    fake.msPerRequest = 30_000;
+    fake.msPerRequest = 10_000;
     fake.install();
     const params = validParams({ block: bans(2) });
-    // Calls start at 0 s (zone), 30 s (read), 60 s (one create); at 90 s a call could end after 100 s.
+    // Custom calls start at 0 s (zone), 10 s (read), 20, 30 and 40 s (creates, the last one ending by
+    // 55 s). A create at 50 s could end at 65 s, inside the 45 s held for the rate-limit part: refused.
     const first = await actuateWafEdgeSync(params, envWithToken(), testLimits(fake));
     expect(first).toMatchObject({ ok: false, code: "writeFailed" });
     if (first.ok || first.code !== "writeFailed") throw new Error("expected writeFailed");
     expect(first.detail.startsWith(`${EDGE_SYNC_DEADLINE_REACHED}. Stopped before: create rule`)).toBe(true);
-    expect(first.landed.created).toHaveLength(1);
-    expect(fake.writes).toHaveLength(1);
-    // The rate-limit part is out of time too: it reports the stop and sends nothing.
-    expect(first.rateLimit).toMatchObject({ ok: false, code: "writeFailed" });
-    expect(first.rateLimit?.detail).toContain(EDGE_SYNC_DEADLINE_REACHED);
-    expect(fake.requests).toHaveLength(3);
+    const createsThatLanded = fake.writes.map((write) => write.description);
+    expect(createsThatLanded).toHaveLength(3);
+    expect(first.landed).toEqual({ created: createsThatLanded, patched: [], deleted: [] });
+    // The rate-limit part runs on its own time, at 50 s: its read, and nothing to write.
+    expect(first.rateLimit).toMatchObject({ ok: true });
+    expect(fake.requests).toHaveLength(6);
+    expect(fake.requests.at(-1)).toContain("http_ratelimit");
 
     fake.msPerRequest = 0;
     const second = await actuateWafEdgeSync(params, envWithToken(), testLimits(fake));
     expect(second.ok).toBe(true);
   });
 
-  it("a Cloudflare call that hangs is cut by its timeout: writeFailed with what landed, and the next run continues", async () => {
+  it("every call at its full 15 s timeout: the rate-limit switch-off still lands, and the 100 s deadline stops only the extra work", async () => {
+    // Rate limiting on, with a later copy of our origin rule (left by overlapping runs).
     const fake = new FakeCloudflare(agencyRulesOnly());
-    let postsSeen = 0;
-    fake.hang = (method) => {
-      if (method !== "POST") return false;
-      postsSeen += 1;
-      return postsSeen === 2;
-    };
+    fake.rateLimitRules = [];
     fake.install();
-    const params = validParams({ block: bans(2) });
-    const first = await actuateWafEdgeSync(params, envWithToken(), testLimits(fake, { requestTimeoutMs: 20 }));
-    expect(first).toMatchObject({ ok: false, code: "writeFailed" });
-    if (first.ok || first.code !== "writeFailed") throw new Error("expected writeFailed");
-    expect(first.detail).toMatch(/could not create rule .*: could not reach Cloudflare to write the WAF rule: .*/);
-    expect(first.landed.created).toHaveLength(1);
+    const enabled = await actuateWafEdgeSync(validParams({ rateLimit: RATE_LIMIT_ON }), envWithToken());
+    if (!enabled.ok) throw new Error(`${enabled.code}: ${enabled.detail}`);
+    const origin = fake.rateLimitRules.find((rule) => rule.description === RATE_LIMIT_ORIGIN_DESCRIPTION) as FakeRule;
+    fake.rateLimitRules.push({ ...origin, id: "rl-later-copy" });
+    fake.customRules = agencyRulesOnly();
+    fake.writes = [];
+    fake.requests = [];
+    fake.msPerRequest = EDGE_SYNC_REQUEST_TIMEOUT_MS;
 
-    fake.hang = null;
-    const second = await actuateWafEdgeSync(params, envWithToken(), testLimits(fake, { requestTimeoutMs: 20 }));
+    // Rate limiting off, and a custom part with more work than its 55 s allow.
+    const result = await actuateWafEdgeSync(validParams({ block: bans(2) }), envWithToken(), testLimits(fake));
+    expect(result).toMatchObject({ ok: false, code: "writeFailed" });
+    if (result.ok || result.code !== "writeFailed") throw new Error("expected writeFailed");
+    // Custom: zone (0 s), read (15 s), one create (30 s); a create at 45 s could end at 60 s.
+    expect(result.detail.startsWith(`${EDGE_SYNC_DEADLINE_REACHED}. Stopped before: create rule`)).toBe(true);
+    expect(result.landed.created).toHaveLength(1);
+    // Rate limit: read (45 s), both rules switched off (60 s, 75 s). The later copy's delete would
+    // start at 90 s and could end after 100 s: stopped, for the next run.
+    expect(fake.rateLimitRules.filter((rule) => rule.id !== "rl-later-copy").every((rule) => rule.enabled === false)).toBe(true);
+    expect(result.rateLimit).toMatchObject({
+      ok: false,
+      code: "writeFailed",
+      patched: [RATE_LIMIT_ORIGIN_DESCRIPTION, RATE_LIMIT_EXPENSIVE_DESCRIPTION],
+      deleted: [],
+    });
+    expect(result.rateLimit?.detail).toBe(
+      `${EDGE_SYNC_DEADLINE_REACHED}. Stopped before: delete a duplicate of rate-limit rule "${RATE_LIMIT_ORIGIN_DESCRIPTION}".`,
+    );
+    expect(fake.clockMs).toBe(6 * EDGE_SYNC_REQUEST_TIMEOUT_MS);
+
+    fake.msPerRequest = 0;
+    const second = await actuateWafEdgeSync(validParams({ block: bans(2) }), envWithToken(), testLimits(fake));
     expect(second.ok).toBe(true);
+    expect(fake.rateLimitRules.map((rule) => rule.id)).not.toContain("rl-later-copy");
+  });
+
+  it("a write that hangs is cut by its timeout and reported UNKNOWN, kept out of landed; the next run continues", async () => {
+    const UNKNOWN_TEXT = "UNKNOWN: Cloudflare did not answer in time; the write may or may not have landed; the next run re-reads the zone.";
+    expect(EDGE_SYNC_WRITE_UNKNOWN).toBe(UNKNOWN_TEXT);
+    const params = validParams({ block: bans(2), baseline: MANAGED_ON, rateLimit: RATE_LIMIT_ON });
+    const scenarios: Array<{ name: string; hangs: (method: string, path: string) => boolean }> = [
+      { name: "custom create", hangs: (method, path) => method === "POST" && path.endsWith("/rs-custom/rules") },
+      { name: "Managed Ruleset create", hangs: (method, path) => method === "POST" && path.endsWith("/rs-managed/rules") },
+      { name: "rate-limit create", hangs: (method, path) => method === "POST" && path.endsWith("/rs-ratelimit/rules") },
+    ];
+    for (const scenario of scenarios) {
+      const fake = new FakeCloudflare(agencyRulesOnly());
+      fake.managedRules = [];
+      fake.rateLimitRules = [];
+      let hungAlready = false;
+      fake.hang = (method, path) => {
+        if (hungAlready || !scenario.hangs(method, path)) return false;
+        hungAlready = true;
+        return true;
+      };
+      fake.install();
+      const result = await actuateWafEdgeSync(params, envWithToken(), testLimits(fake, { requestTimeoutMs: 20 }));
+      expect(hungAlready, scenario.name).toBe(true);
+      const answeredWrites = fake.writes.filter((write) => write.phase !== "ratelimit").map((write) => write.description);
+      if (scenario.name === "rate-limit create") {
+        // The custom part finished; the rate-limit part reports the UNKNOWN write and lists none.
+        if (!result.ok) throw new Error(`${scenario.name}: ${result.code}: ${result.detail}`);
+        expect(result.rateLimit).toMatchObject({ ok: false, code: "writeFailed", created: [] });
+        expect(result.rateLimit?.detail, scenario.name).toContain(UNKNOWN_TEXT);
+      } else {
+        expect(result, scenario.name).toMatchObject({ ok: false, code: "writeFailed" });
+        if (result.ok || result.code !== "writeFailed") throw new Error("expected writeFailed");
+        expect(result.detail, scenario.name).toContain(UNKNOWN_TEXT);
+        // landed lists exactly the writes Cloudflare answered: the hung one is not among them.
+        expect([...result.landed.created, ...result.landed.patched], scenario.name).toEqual(answeredWrites);
+        expect(result.landed.created, scenario.name).not.toContain(MANAGED_RULESET_RULE_DESCRIPTION);
+      }
+
+      fake.hang = null;
+      const second = await actuateWafEdgeSync(params, envWithToken(), testLimits(fake, { requestTimeoutMs: 20 }));
+      if (!second.ok) throw new Error(`${scenario.name}, next run: ${second.code}: ${second.detail}`);
+      expect(second.rateLimit.ok, scenario.name).toBe(true);
+      vi.restoreAllMocks();
+    }
   });
 
   it("wanted-ban gains and removals land before cosmetic moves: a tight budget defers only the moves", async () => {

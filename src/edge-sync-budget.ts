@@ -11,8 +11,14 @@
 // every subrequest of the invocation in this one object: the nonce consume before the actuator runs,
 // the two lease calls, and every Cloudflare API call of the run.
 //
+// THE RATE-LIMIT RESERVE. The rate-limit part runs after the custom part and must still be able to
+// switch rate limiting off, however slow or large the custom part was (A10). So while the custom part
+// runs, three calls are held for it: three subrequests AND three full call timeouts. The custom part's
+// calls therefore end by 55 s (100 − 3 × 15), and the rate-limit part has 45 s of its own.
+//
 // Past either limit the run stops BEFORE the next call and reports `writeFailed` with what landed.
 // The op is idempotent and re-reads the zone, so the next run continues from the zone's real state.
+// A write whose timeout fired is UNKNOWN (see unknownWhenTimedOut): `landed` leaves it out.
 
 /** The run's own ceiling: Workers Free allows 50 subrequests per invocation; 5 stay spare. */
 export const EDGE_SYNC_SUBREQUEST_BUDGET = 45;
@@ -24,8 +30,9 @@ export const EDGE_SYNC_SUBREQUESTS_BEFORE_ACTUATION = 1;
 export const EDGE_SYNC_LEASE_SUBREQUESTS = 2;
 
 /**
- * Subrequests the custom part may not use, so the rate-limit part (and its off switch) can still
- * run after it: the rate-limit read and up to two writes.
+ * Calls held for the rate-limit part while the custom part runs, so its off switch can still run
+ * after it: the rate-limit read and up to two writes. Each held call keeps its subrequest and its
+ * full timeout (EdgeSyncRunBudget.beginCall).
  */
 export const EDGE_SYNC_RATE_LIMIT_RESERVE = 3;
 
@@ -38,6 +45,10 @@ export const EDGE_SYNC_REQUEST_TIMEOUT_MS = 15 * 1000;
 /** The stop reasons, as the result's detail begins. */
 export const EDGE_SYNC_BUDGET_REACHED = "subrequest budget reached; the next run continues";
 export const EDGE_SYNC_DEADLINE_REACHED = "run time limit reached; the next run continues";
+
+/** The error of a write whose timeout fired: it got no answer, so it may or may not have landed. */
+export const EDGE_SYNC_WRITE_UNKNOWN =
+  "UNKNOWN: Cloudflare did not answer in time; the write may or may not have landed; the next run re-reads the zone.";
 
 export interface EdgeSyncRunLimits {
   subrequestBudget: number;
@@ -84,7 +95,10 @@ export class EdgeSyncRunBudget {
     return this.refusal;
   }
 
-  /** Keep `count` subrequests for a later step: calls made before `releaseHold` cannot use them. */
+  /**
+   * Keep `count` calls for a later step until `releaseHold`: their subrequests, and their full
+   * timeouts before the deadline. Calls made in between cannot use either.
+   */
   hold(count: number): void {
     this.held += count;
   }
@@ -95,19 +109,39 @@ export class EdgeSyncRunBudget {
 
   /**
    * Called before every Cloudflare call. Counts the call and gives it a timeout signal, or refuses
-   * it: when it would pass the budget (less what is held), or when its timeout would end after the
-   * deadline (so no call can outlive the run).
+   * it: when it would pass the budget (less what is held), or when its timeout, followed by the full
+   * timeouts of the held calls, would end after the deadline. So no call can outlive the run, and a
+   * held call always has its full timeout left when its turn comes.
    */
   beginCall(): EdgeSyncCallPermit {
     if (this.used + 1 > this.limits.subrequestBudget - this.held) {
       this.refusal = EDGE_SYNC_BUDGET_REACHED;
       return { ok: false, reason: EDGE_SYNC_BUDGET_REACHED };
     }
-    if (this.limits.now() + this.limits.requestTimeoutMs > this.deadlineAtMs) {
+    const timeThisCallAndHeldCallsMayTakeMs = this.limits.requestTimeoutMs * (1 + this.held);
+    if (this.limits.now() + timeThisCallAndHeldCallsMayTakeMs > this.deadlineAtMs) {
       this.refusal = EDGE_SYNC_DEADLINE_REACHED;
       return { ok: false, reason: EDGE_SYNC_DEADLINE_REACHED };
     }
     this.used += 1;
     return { ok: true, signal: AbortSignal.timeout(this.limits.requestTimeoutMs) };
   }
+}
+
+/**
+ * A failed write whose timeout fired got no answer, so Cloudflare may or may not have applied it:
+ * its error becomes EDGE_SYNC_WRITE_UNKNOWN. The caller keeps it out of `landed`, and the next run
+ * re-reads the zone to find out. Any other reply, and any reply without a signal, passes unchanged.
+ */
+export function unknownWhenTimedOut<Reply extends object>(reply: Reply, signal: AbortSignal | undefined): Reply | { error: string } {
+  if (signal === undefined) {
+    return reply;
+  }
+  if (!("error" in reply)) {
+    return reply;
+  }
+  if (!signal.aborted) {
+    return reply;
+  }
+  return { error: EDGE_SYNC_WRITE_UNKNOWN };
 }
