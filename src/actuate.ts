@@ -133,9 +133,8 @@ import { presignS3Put, presignS3Get } from "./sigv4.js";
 import {
   EDGE_SYNC_RATE_LIMIT_RESERVE,
   EDGE_SYNC_RUN_LIMITS,
+  EDGE_SYNC_WRITE_UNKNOWN,
   EdgeSyncRunBudget,
-  unknownWhenTimedOut,
-  type EdgeSyncCallGate,
   type EdgeSyncRunLimits,
 } from "./edge-sync-budget.js";
 import type { CustomHostnameDeleteResult, CustomHostnameGetResult, CustomHostnameUpsertResult } from "./actuate-custom-hostname.js";
@@ -1004,7 +1003,6 @@ interface CloudflareDnsRecordSummary {
   type?: string;
 }
 
-/** First Cloudflare error message from a response body, if any (for detail strings). */
 /**
  * `init` with `signal` added only when there is one. waf-edge-sync passes a timeout signal (its run
  * limits); every other caller passes none and sends exactly the request it sent before.
@@ -1016,6 +1014,7 @@ function withOptionalSignal(init: RequestInit, signal: AbortSignal | undefined):
   return { ...init, signal };
 }
 
+/** First Cloudflare error message from a response body, if any (for detail strings). */
 export function cloudflareErrorMessage(body: CloudflareEnvelope | null): string {
   const message = body?.errors?.[0]?.message;
   return message ? `: ${message}` : "";
@@ -2151,22 +2150,38 @@ async function upsertOneWafRule(
   return { action, ruleId: existingId, ruleset: next };
 }
 
-/** True for an `execute` rule that runs the Cloudflare Managed Ruleset (whatever its description). */
 /**
- * The signal for the next call of a gated helper: undefined without a gate (the call goes as it always
- * did), the gate's timeout signal, or the gate's reason to stop (a string).
+ * The signal for the next call of a helper that can run under a waf-edge-sync budget: undefined
+ * without a budget (the call goes as it always did), the budget's timeout signal, or its reason to
+ * stop (a string).
  */
-function nextCallSignal(gate: EdgeSyncCallGate | undefined): AbortSignal | undefined | string {
-  if (gate === undefined) {
+function nextCallSignal(budget: EdgeSyncRunBudget | undefined): AbortSignal | undefined | string {
+  if (budget === undefined) {
     return undefined;
   }
-  const permit = gate();
+  const permit = budget.beginCall();
   if (!permit.ok) {
     return permit.reason;
   }
   return permit.signal;
 }
 
+/**
+ * A failed write of such a helper, settled by the run's budget (UNKNOWN when its timeout fired, and
+ * remembered so the lease is kept). Without a budget the reply passes unchanged.
+ */
+function settleBudgetedWrite(
+  budget: EdgeSyncRunBudget | undefined,
+  reply: { error: string },
+  signal: AbortSignal | undefined,
+): { error: string } {
+  if (budget === undefined || signal === undefined) {
+    return reply;
+  }
+  return budget.settleWrite(reply, signal);
+}
+
+/** True for an `execute` rule that runs the Cloudflare Managed Ruleset (whatever its description). */
 function executesCloudflareManagedRuleset(rule: CloudflareRulesetRule): boolean {
   if (rule.action !== "execute") {
     return false;
@@ -2200,18 +2215,18 @@ function ourManagedRuleBody(existing: CloudflareRulesetRule, enabled: boolean): 
  * switching it back on is one run. See ManagedRulesetStatus for every outcome. The caller has already
  * checked the plan for an enable.
  *
- * `gate` (waf-edge-sync only) is asked before each Cloudflare call: it gives the call a timeout
- * signal, or a reason to stop, which comes back as `{ error }` with nothing more sent. Without it
- * (waf-rule-upsert) the calls go exactly as before.
+ * `budget` (waf-edge-sync only) is asked before each Cloudflare call: it gives the call a timeout
+ * signal, or a reason to stop, which comes back as `{ error }` with nothing more sent; it also settles
+ * each failed write (UNKNOWN on a timeout). Without it (waf-rule-upsert) the calls go exactly as before.
  */
 async function reconcileManagedRuleset(
   token: string,
   zoneId: string,
   zonePath: string,
   enabled: boolean,
-  gate?: EdgeSyncCallGate,
+  budget?: EdgeSyncRunBudget,
 ): Promise<{ status: ManagedRulesetStatus } | { error: string }> {
-  const readSignal = nextCallSignal(gate);
+  const readSignal = nextCallSignal(budget);
   if (typeof readSignal === "string") {
     return { error: readSignal };
   }
@@ -2246,7 +2261,7 @@ async function reconcileManagedRuleset(
       return { error: "Cloudflare returned our Managed Ruleset execute rule without an id — cannot switch it." };
     }
     const rulesetPath = `${zonePath}/rulesets/${encodeURIComponent(entrypoint.ruleset.id as string)}`;
-    const patchSignal = nextCallSignal(gate);
+    const patchSignal = nextCallSignal(budget);
     if (typeof patchSignal === "string") {
       return { error: patchSignal };
     }
@@ -2258,7 +2273,7 @@ async function reconcileManagedRuleset(
       patchSignal,
     );
     if ("error" in patched) {
-      return unknownWhenTimedOut(patched, patchSignal);
+      return settleBudgetedWrite(budget, patched, patchSignal);
     }
     if (enabled) {
       return { status: "re-enabled" };
@@ -2281,7 +2296,7 @@ async function reconcileManagedRuleset(
   }
 
   const executeRule = buildManagedRulesetExecuteRule();
-  const createSignal = nextCallSignal(gate);
+  const createSignal = nextCallSignal(budget);
   if (typeof createSignal === "string") {
     return { error: createSignal };
   }
@@ -2305,7 +2320,7 @@ async function reconcileManagedRuleset(
     written = await writeWafRuleset(token, "POST", `${rulesetPath}/rules`, executeRule, createSignal);
   }
   if ("error" in written) {
-    return unknownWhenTimedOut(written, createSignal);
+    return settleBudgetedWrite(budget, written, createSignal);
   }
   return { status: "deployed" };
 }
@@ -2471,11 +2486,14 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
 //      stops the custom part: `writeFailed`, with `landed`.
 // RUN LIMITS (edge-sync-budget.ts). Every Cloudflare call first asks the run's budget: at most 45
 // subrequests per invocation (Workers Free allows 50) and a 100 s deadline, each call with its own
-// 15 s timeout. Three calls (subrequests and time) stay held for the rate-limit part, so the custom
-// part's calls end by 55 s. A refusal stops the run before that call — `writeFailed`, "... the next
-// run continues", with `landed` — and the next run continues from the zone's real state. The write
-// order above is therefore also the order of importance: bans gained and removed first, cosmetic
-// moves last. A write whose timeout fired is UNKNOWN: its detail says so and `landed` leaves it out.
+// 15 s timeout. Three calls (subrequests, and time plus 5 s of slack) stay held for the rate-limit
+// part, so the custom part's calls end by 50 s. A refusal stops the run before that call —
+// `writeFailed`, "... the next run continues", with `landed` — and the next run continues from the
+// zone's real state. The write order above is therefore also the order of importance: bans gained
+// and removed first, cosmetic moves last. A write whose timeout fired is UNKNOWN: its detail says so,
+// `landed` leaves it out, and the run keeps the zone's lease until it expires (see the actuator).
+// OTHER WRITERS. A delete that finds its rule already gone (404) is done, not landed. A move whose
+// rule or anchor vanished re-reads the zone and defers the rest to the next run (writeFailed).
 // The rate-limit part (reconcileEdgeRateLimit) runs AFTER the custom part, whatever the custom part
 // did, so a refusal there never leaves rate limiting on when the job switched it off (A10).
 //
@@ -2600,13 +2618,26 @@ interface DesiredSyncRule {
   ruleId: string | null;
 }
 
-/** DELETE one rule. Cloudflare answers with the updated ruleset, which this op does not rely on. */
-async function deleteWafRule(token: string, url: string, signal?: AbortSignal): Promise<{ deleted: true } | { error: string }> {
+/**
+ * DELETE one rule. Cloudflare answers with the updated ruleset, which this op does not rely on.
+ * `absent`: Cloudflare answered 404, so the rule is already gone — another writer deleted it first
+ * (the orchestrator's legacy remover deletes `doubleyoup-ban:<id>` rules too). The delete's goal
+ * holds; the caller counts it as done, but not as landed by this run.
+ */
+async function deleteWafRule(
+  token: string,
+  url: string,
+  signal?: AbortSignal,
+): Promise<{ deleted: true } | { absent: true } | { error: string }> {
   let response: Response;
   try {
     response = await fetch(url, withOptionalSignal({ method: "DELETE", headers: cloudflareHeaders(token) }, signal));
   } catch (err) {
     return { error: `could not reach Cloudflare to delete the WAF rule: ${errorMessage(err)}` };
+  }
+  if (response.status === 404) {
+    await response.text().catch(() => "");
+    return { absent: true };
   }
   if (response.status === 401 || response.status === 403) {
     await response.text().catch(() => "");
@@ -2711,6 +2742,9 @@ export const EDGE_SYNC_LEASE_TTL_MS = 5 * 60 * 1000;
  * `busy`, writing nothing, while another run holds it. The lease is released when the run ends, in
  * `finally`; if a run dies without releasing it, it expires after EDGE_SYNC_LEASE_TTL_MS. Duplicates
  * that still appear (a run that outlived its lease) are resolved by the next run, not refused.
+ * EXCEPT after an UNKNOWN write (a write whose timeout fired, which Cloudflare may still apply): then
+ * the lease is NOT released but left to expire, so no newer run can start, write and report ok before
+ * that late write lands and undoes its work. The UNKNOWN detail says so.
  */
 export async function actuateWafEdgeSync(
   params: WafEdgeSyncParams,
@@ -2741,12 +2775,19 @@ export async function actuateWafEdgeSync(
   try {
     result = await syncEdgeZone(params, token, budget);
   } finally {
-    // A failed release must not lose the run's result (the writes have happened): log it, and let
-    // the lease expire on its own. This catch exists for that reason only.
-    try {
-      await leaseStore.releaseLease(zoneName, leaseHolder);
-    } catch (err) {
-      console.error(`waf-edge-sync: could not release the lease of zone ${zoneName}; it expires on its own. ${errorMessage(err)}`);
+    if (budget.hadUnknownWrite) {
+      // A write of this run got no answer, and Cloudflare may still apply it. Keep the lease until it
+      // expires: a newer run starting now could read the zone, write and report ok, and then the late
+      // write would land and undo its work.
+      console.warn(`waf-edge-sync: a write to zone ${zoneName} ended UNKNOWN; its lease is kept until it expires.`);
+    } else {
+      // A failed release must not lose the run's result (the writes have happened): log it, and let
+      // the lease expire on its own. This catch exists for that reason only.
+      try {
+        await leaseStore.releaseLease(zoneName, leaseHolder);
+      } catch (err) {
+        console.error(`waf-edge-sync: could not release the lease of zone ${zoneName}; it expires on its own. ${errorMessage(err)}`);
+      }
     }
   }
   return result;
@@ -3085,15 +3126,40 @@ async function syncCustomRules(
       return { stopped: permit.reason };
     }
     const reply = await writeWafRuleset(token, method, url, body, permit.signal);
-    return unknownWhenTimedOut(reply, permit.signal);
+    return budget.settleWrite(reply, permit.signal);
   };
-  const gatedDelete = async (url: string): Promise<{ deleted: true } | { error: string } | { stopped: string }> => {
+  const gatedDelete = async (
+    url: string,
+  ): Promise<{ deleted: true } | { absent: true } | { error: string } | { stopped: string }> => {
     const permit = budget.beginCall();
     if (!permit.ok) {
       return { stopped: permit.reason };
     }
     const reply = await deleteWafRule(token, url, permit.signal);
-    return unknownWhenTimedOut(reply, permit.signal);
+    return budget.settleWrite(reply, permit.signal);
+  };
+  // After a failed move: re-read the rules and name the first of `ruleIds` the zone no longer holds.
+  // null when all are there, or when the re-read fails too (then the move's own error stands).
+  const firstVanishedRule = async (ruleIds: string[]): Promise<{ vanishedId: string | null } | { stopped: string }> => {
+    const permit = budget.beginCall();
+    if (!permit.ok) {
+      return { stopped: permit.reason };
+    }
+    const fresh = await getWafPhaseEntrypoint(token, zoneId, WAF_PHASE, permit.signal);
+    if ("error" in fresh) {
+      return { vanishedId: null };
+    }
+    let freshRules: CloudflareRulesetRule[] = [];
+    if (!("missing" in fresh)) {
+      freshRules = fresh.ruleset.rules ?? [];
+    }
+    for (const ruleId of ruleIds) {
+      const stillThere = freshRules.some((rule) => rule.id === ruleId);
+      if (!stillThere) {
+        return { vanishedId: ruleId };
+      }
+    }
+    return { vanishedId: null };
   };
   const notePatched = (description: string): void => {
     if (!created.includes(description) && !patched.includes(description)) {
@@ -3215,6 +3281,11 @@ async function syncCustomRules(
         if ("stopped" in outcome) {
           return stopBefore(outcome.stopped, `delete the empty rule "${description}"`);
         }
+        if ("absent" in outcome) {
+          // Already gone (another writer deleted it): done, but not by this run, so not in `landed`.
+          ruleset = withRuleRemoved(ruleset, ruleId);
+          continue;
+        }
         if ("error" in outcome) {
           return writeFailure(`could not delete the empty rule "${description}": ${outcome.error}`);
         }
@@ -3233,6 +3304,11 @@ async function syncCustomRules(
       if ("stopped" in outcome) {
         return stopBefore(outcome.stopped, `delete a duplicate of rule "${description}"`);
       }
+      if ("absent" in outcome) {
+        // Already gone (another writer deleted it): done, but not by this run, so not in `landed`.
+        ruleset = withRuleRemoved(ruleset, ruleId);
+        continue;
+      }
       if ("error" in outcome) {
         return writeFailure(`could not delete a duplicate of rule "${description}": ${outcome.error}`);
       }
@@ -3250,7 +3326,7 @@ async function syncCustomRules(
   if (params.baseline.includeManagedRuleset && managedEnableBlockedByPlan) {
     managedRuleset = "unavailable-on-plan";
   } else if (params.baseline.includeManagedRuleset) {
-    const managed = await reconcileManagedRuleset(token, zoneId, zonePath, params.baseline.enabled, () => budget.beginCall());
+    const managed = await reconcileManagedRuleset(token, zoneId, zonePath, params.baseline.enabled, budget);
     if ("error" in managed && budget.stopReason !== null) {
       return stopBefore(budget.stopReason, "the Cloudflare Managed Ruleset step");
     }
@@ -3277,6 +3353,11 @@ async function syncCustomRules(
       if ("stopped" in outcome) {
         return stopBefore(outcome.stopped, `delete the legacy rule "${description}"`);
       }
+      if ("absent" in outcome) {
+        // The orchestrator's legacy remover (or a hand edit) deleted it first: done, not landed.
+        ruleset = withRuleRemoved(ruleset, ruleId);
+        continue;
+      }
       if ("error" in outcome) {
         return writeFailure(`could not delete the legacy rule "${description}": ${outcome.error}`);
       }
@@ -3301,8 +3382,27 @@ async function syncCustomRules(
     if ("stopped" in reply) {
       return stopBefore(reply.stopped, `move rule "${desired.description}" into place`);
     }
-    if ("error" in reply) {
+    if ("error" in reply && reply.error === EDGE_SYNC_WRITE_UNKNOWN) {
       return writeFailure(`could not move rule "${desired.description}" into place: ${reply.error}`);
+    }
+    if ("error" in reply) {
+      // A move fails when its rule, or the rule it goes after, is gone: another writer deleted it
+      // during the run. Re-read to tell that from a real failure. A vanished rule is a wanted rule
+      // that only the next run's creates can restore, so this run defers the rest to it.
+      const recheck = await firstVanishedRule([ruleId, predecessorId]);
+      if ("stopped" in recheck) {
+        return stopBefore(recheck.stopped, `re-read the rules after a failed move of rule "${desired.description}"`);
+      }
+      if (recheck.vanishedId === null) {
+        return writeFailure(`could not move rule "${desired.description}" into place: ${reply.error}`);
+      }
+      const vanishedDescription = desiredRules.find((candidate) => candidate.ruleId === recheck.vanishedId)?.description;
+      return edgeSyncStopped(
+        zoneName,
+        `rule "${vanishedDescription}" vanished during the run (another writer deleted it); the next run restores it and continues`,
+        `move rule "${desired.description}" into place`,
+        landedSoFar(),
+      );
     }
     notePatched(desired.description);
     ruleset = withRuleMovedAfter(ruleset, ruleId, predecessorId);
@@ -3448,7 +3548,7 @@ async function reconcileEdgeRateLimit(input: EdgeRateLimitInput): Promise<WafEdg
       return { stopped: permit.reason };
     }
     const reply = await writeWafRuleset(input.token, method, url, body, permit.signal);
-    return unknownWhenTimedOut(reply, permit.signal);
+    return input.budget.settleWrite(reply, permit.signal);
   };
 
   // 2. Read the phase and find our rules by exact description.
@@ -3493,7 +3593,11 @@ async function reconcileEdgeRateLimit(input: EdgeRateLimitInput): Promise<WafEdg
         return `${permit.reason}. Stopped before: delete a duplicate of rate-limit rule "${description}".`;
       }
       const reply = await deleteWafRule(input.token, `${rulesetPath}/rules/${encodeURIComponent(duplicate.id as string)}`, permit.signal);
-      const outcome = unknownWhenTimedOut(reply, permit.signal);
+      const outcome = input.budget.settleWrite(reply, permit.signal);
+      if ("absent" in outcome) {
+        // Already gone (another writer deleted it): done, but not by this run, so not in `deleted`.
+        continue;
+      }
       if ("error" in outcome) {
         return `could not delete a duplicate of rate-limit rule "${description}": ${outcome.error} Re-run to resume.`;
       }

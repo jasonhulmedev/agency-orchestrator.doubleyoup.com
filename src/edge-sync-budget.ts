@@ -13,12 +13,17 @@
 //
 // THE RATE-LIMIT RESERVE. The rate-limit part runs after the custom part and must still be able to
 // switch rate limiting off, however slow or large the custom part was (A10). So while the custom part
-// runs, three calls are held for it: three subrequests AND three full call timeouts. The custom part's
-// calls therefore end by 55 s (100 − 3 × 15), and the rate-limit part has 45 s of its own.
+// runs, three calls are held for it: three subrequests AND three full call timeouts, plus 5 s of
+// slack for the work between calls. The custom part's calls therefore end by 50 s
+// (100 − 3 × 15 − 5), and the rate-limit part has 50 s of its own.
 //
 // Past either limit the run stops BEFORE the next call and reports `writeFailed` with what landed.
 // The op is idempotent and re-reads the zone, so the next run continues from the zone's real state.
-// A write whose timeout fired is UNKNOWN (see unknownWhenTimedOut): `landed` leaves it out.
+//
+// UNKNOWN WRITES. A write whose timeout fired got no answer, and Cloudflare may still apply it later
+// (EdgeSyncRunBudget.settleWrite). `landed` leaves it out, and the budget remembers it: the actuator
+// then keeps the zone's lease until it expires instead of releasing it, so no newer run can read the
+// zone, write, and report ok before that late write lands and undoes its work.
 
 /** The run's own ceiling: Workers Free allows 50 subrequests per invocation; 5 stay spare. */
 export const EDGE_SYNC_SUBREQUEST_BUDGET = 45;
@@ -42,13 +47,24 @@ export const EDGE_SYNC_RUN_DEADLINE_MS = 100 * 1000;
 /** The timeout of one Cloudflare API call. */
 export const EDGE_SYNC_REQUEST_TIMEOUT_MS = 15 * 1000;
 
+/**
+ * Time held on top of the held calls' timeouts: the run's own work between calls (parsing, planning,
+ * the lease call) takes a little time too, and must not cost the rate-limit part its last call.
+ */
+export const EDGE_SYNC_RESERVE_SLACK_MS = 5 * 1000;
+
 /** The stop reasons, as the result's detail begins. */
 export const EDGE_SYNC_BUDGET_REACHED = "subrequest budget reached; the next run continues";
 export const EDGE_SYNC_DEADLINE_REACHED = "run time limit reached; the next run continues";
 
-/** The error of a write whose timeout fired: it got no answer, so it may or may not have landed. */
+/**
+ * The error of a write whose timeout fired: it got no answer, so it may or may not have landed. The
+ * actuator keeps the lease (EDGE_SYNC_LEASE_TTL_MS in actuate.ts, 5 minutes) whenever this is reported.
+ */
 export const EDGE_SYNC_WRITE_UNKNOWN =
-  "UNKNOWN: Cloudflare did not answer in time; the write may or may not have landed; the next run re-reads the zone.";
+  "UNKNOWN: Cloudflare did not answer in time; the write may or may not have landed. The zone's lease " +
+  "is kept until it expires (5 minutes after the run began), so a late landing cannot undo a newer run; " +
+  "the next run then re-reads the zone.";
 
 export interface EdgeSyncRunLimits {
   subrequestBudget: number;
@@ -68,15 +84,14 @@ export const EDGE_SYNC_RUN_LIMITS: EdgeSyncRunLimits = {
 /** The answer to "may the next Cloudflare call go?": its timeout signal, or why the run stops. */
 export type EdgeSyncCallPermit = { ok: true; signal: AbortSignal } | { ok: false; reason: string };
 
-/** Asked before every Cloudflare call of a run (see EdgeSyncRunBudget.beginCall). */
-export type EdgeSyncCallGate = () => EdgeSyncCallPermit;
-
 export class EdgeSyncRunBudget {
   private readonly limits: EdgeSyncRunLimits;
   private readonly deadlineAtMs: number;
   private used: number;
-  private held = 0;
+  private heldCalls = 0;
+  private heldTimeMs = 0;
   private refusal: string | null = null;
+  private unknownWrite = false;
 
   /** Created when the actuator starts; the nonce and lease subrequests are counted at once. */
   constructor(limits: EdgeSyncRunLimits) {
@@ -95,53 +110,64 @@ export class EdgeSyncRunBudget {
     return this.refusal;
   }
 
+  /** True once a write of this run ended UNKNOWN (settleWrite): the lease must not be released. */
+  get hadUnknownWrite(): boolean {
+    return this.unknownWrite;
+  }
+
   /**
-   * Keep `count` calls for a later step until `releaseHold`: their subrequests, and their full
-   * timeouts before the deadline. Calls made in between cannot use either.
+   * Keep `count` calls for a later step until `releaseHold(count)`: their subrequests, and their full
+   * timeouts plus EDGE_SYNC_RESERVE_SLACK_MS before the deadline. Calls made in between cannot use
+   * either.
    */
   hold(count: number): void {
-    this.held += count;
+    this.heldCalls += count;
+    this.heldTimeMs += this.timeHeldFor(count);
   }
 
   releaseHold(count: number): void {
-    this.held -= count;
+    this.heldCalls -= count;
+    this.heldTimeMs -= this.timeHeldFor(count);
+  }
+
+  private timeHeldFor(count: number): number {
+    return count * this.limits.requestTimeoutMs + EDGE_SYNC_RESERVE_SLACK_MS;
   }
 
   /**
    * Called before every Cloudflare call. Counts the call and gives it a timeout signal, or refuses
-   * it: when it would pass the budget (less what is held), or when its timeout, followed by the full
-   * timeouts of the held calls, would end after the deadline. So no call can outlive the run, and a
-   * held call always has its full timeout left when its turn comes.
+   * it: when it would pass the budget (less the held calls), or when its timeout, followed by the time
+   * held, would end after the deadline. So no call can outlive the run, and a held call always has its
+   * full timeout left when its turn comes.
    */
   beginCall(): EdgeSyncCallPermit {
-    if (this.used + 1 > this.limits.subrequestBudget - this.held) {
+    if (this.used + 1 > this.limits.subrequestBudget - this.heldCalls) {
       this.refusal = EDGE_SYNC_BUDGET_REACHED;
       return { ok: false, reason: EDGE_SYNC_BUDGET_REACHED };
     }
-    const timeThisCallAndHeldCallsMayTakeMs = this.limits.requestTimeoutMs * (1 + this.held);
-    if (this.limits.now() + timeThisCallAndHeldCallsMayTakeMs > this.deadlineAtMs) {
+    const timeThisCallAndHeldTimeMayTakeMs = this.limits.requestTimeoutMs + this.heldTimeMs;
+    if (this.limits.now() + timeThisCallAndHeldTimeMayTakeMs > this.deadlineAtMs) {
       this.refusal = EDGE_SYNC_DEADLINE_REACHED;
       return { ok: false, reason: EDGE_SYNC_DEADLINE_REACHED };
     }
     this.used += 1;
     return { ok: true, signal: AbortSignal.timeout(this.limits.requestTimeoutMs) };
   }
-}
 
-/**
- * A failed write whose timeout fired got no answer, so Cloudflare may or may not have applied it:
- * its error becomes EDGE_SYNC_WRITE_UNKNOWN. The caller keeps it out of `landed`, and the next run
- * re-reads the zone to find out. Any other reply, and any reply without a signal, passes unchanged.
- */
-export function unknownWhenTimedOut<Reply extends object>(reply: Reply, signal: AbortSignal | undefined): Reply | { error: string } {
-  if (signal === undefined) {
-    return reply;
+  /**
+   * Called with the reply of every write, and the signal its permit gave. A failed write whose timeout
+   * fired got no answer, so Cloudflare may or may not apply it, even later: its error becomes
+   * EDGE_SYNC_WRITE_UNKNOWN, and the run remembers it (hadUnknownWrite). The caller keeps it out of
+   * `landed`. Any other reply passes unchanged.
+   */
+  settleWrite<Reply extends object>(reply: Reply, signal: AbortSignal): Reply | { error: string } {
+    if (!("error" in reply)) {
+      return reply;
+    }
+    if (!signal.aborted) {
+      return reply;
+    }
+    this.unknownWrite = true;
+    return { error: EDGE_SYNC_WRITE_UNKNOWN };
   }
-  if (!("error" in reply)) {
-    return reply;
-  }
-  if (!signal.aborted) {
-    return reply;
-  }
-  return { error: EDGE_SYNC_WRITE_UNKNOWN };
 }

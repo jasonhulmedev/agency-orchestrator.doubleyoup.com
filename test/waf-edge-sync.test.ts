@@ -41,6 +41,7 @@ import {
   EDGE_SYNC_DEADLINE_REACHED,
   EDGE_SYNC_RATE_LIMIT_RESERVE,
   EDGE_SYNC_REQUEST_TIMEOUT_MS,
+  EDGE_SYNC_RESERVE_SLACK_MS,
   EDGE_SYNC_RUN_DEADLINE_MS,
   EDGE_SYNC_RUN_LIMITS,
   EDGE_SYNC_SUBREQUEST_BUDGET,
@@ -181,6 +182,11 @@ function baselineBodies(enabled = true, xmlrpcEnabled = enabled): Record<string,
   };
 }
 
+/** Lets every lease the fake namespace holds expire now (as its TTL would). */
+function expireEveryLease(leases: FakeLeaseNamespace): void {
+  for (const lease of leases.leases.values()) lease.expiresAt = 0;
+}
+
 /** A zone whose custom phase holds one agency rule and none of ours (so its entrypoint exists). */
 function agencyRulesOnly(): FakeRule[] {
   return [{ id: "f-agency", description: "agency-log-office", expression: "ip.src in {203.0.113.0/24}", action: "log", enabled: true }];
@@ -292,6 +298,8 @@ class FakeCloudflare {
   signals: boolean[] = [];
   /** A request for which this returns true never answers: it fails only when its signal aborts. */
   hang: ((method: string, path: string) => boolean) | null = null;
+  /** Another writer acting just before each request reaches the fake (it may change the rules). */
+  beforeEachRequest: ((method: string, path: string, body: Record<string, unknown> | undefined) => void) | null = null;
   /** A fake clock (ms) that every request moves on by `msPerRequest`; tests hand `() => clockMs` to the run. */
   clockMs = 0;
   msPerRequest = 0;
@@ -306,6 +314,10 @@ class FakeCloudflare {
       this.signals.push(init?.signal instanceof AbortSignal);
       this.clockMs += this.msPerRequest;
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (this.beforeEachRequest !== null) {
+        const requestBody = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
+        this.beforeEachRequest(init?.method ?? "GET", new URL(url).pathname, requestBody);
+      }
       if (this.hang !== null && this.hang(init?.method ?? "GET", new URL(url).pathname)) {
         const signal = init?.signal;
         this.requests.push(`${init?.method ?? "GET"} ${new URL(url).pathname} (hung)`);
@@ -429,6 +441,14 @@ class FakeCloudflare {
       description = target?.find((rule) => rule.id === ruleId)?.description ?? "";
     }
     const write: FakeWrite = { method, phase, description, ruleId, body };
+    if ((method === "PATCH" || method === "DELETE") && ruleId !== null && !(target ?? []).some((rule) => rule.id === ruleId)) {
+      return jsonResponse({ success: false, errors: [{ message: "rule not found" }] }, 404);
+    }
+    const anchor = (body?.position as { before?: string; after?: string } | undefined) ?? {};
+    const anchorId = anchor.before ?? anchor.after;
+    if (anchorId !== undefined && !(target ?? []).some((rule) => rule.id === anchorId)) {
+      return jsonResponse({ success: false, errors: [{ message: `position names an unknown rule ${anchorId}` }] }, 400);
+    }
     if (this.failWrite !== null && this.failWrite(write)) {
       return jsonResponse({ success: false, errors: [{ code: 20200, message: "simulated failure" }] }, 500);
     }
@@ -2668,13 +2688,15 @@ describe("waf-edge-sync: run limits (deadline, request timeout, subrequest budge
 
   it("pins the limits: deadline < dispatch timeout < lease / 2, and a request timeout well inside the deadline", () => {
     expect(EDGE_SYNC_RUN_DEADLINE_MS).toBe(100_000);
-    // The custom part's calls end by 55 s, leaving the rate-limit part its read and two writes at
-    // their full 15 s timeouts: 55 + 3 × 15 ≤ 100.
-    const customPartEndsByMs = EDGE_SYNC_RUN_DEADLINE_MS - EDGE_SYNC_RATE_LIMIT_RESERVE * EDGE_SYNC_REQUEST_TIMEOUT_MS;
-    expect(customPartEndsByMs).toBe(55_000);
+    // The custom part's calls end by 50 s, leaving the rate-limit part its read and two writes at
+    // their full 15 s timeouts, with 5 s of slack: 50 + 3 × 15 ≤ 100.
+    const customPartEndsByMs =
+      EDGE_SYNC_RUN_DEADLINE_MS - EDGE_SYNC_RATE_LIMIT_RESERVE * EDGE_SYNC_REQUEST_TIMEOUT_MS - EDGE_SYNC_RESERVE_SLACK_MS;
+    expect(customPartEndsByMs).toBe(50_000);
     expect(EDGE_SYNC_RATE_LIMIT_RESERVE).toBe(3);
     expect(EDGE_SYNC_REQUEST_TIMEOUT_MS).toBe(15_000);
-    expect(55_000 + EDGE_SYNC_RATE_LIMIT_RESERVE * EDGE_SYNC_REQUEST_TIMEOUT_MS).toBeLessThanOrEqual(EDGE_SYNC_RUN_DEADLINE_MS);
+    expect(EDGE_SYNC_RESERVE_SLACK_MS).toBe(5_000);
+    expect(50_000 + EDGE_SYNC_RATE_LIMIT_RESERVE * EDGE_SYNC_REQUEST_TIMEOUT_MS).toBeLessThanOrEqual(EDGE_SYNC_RUN_DEADLINE_MS);
     expect(EDGE_SYNC_RUN_DEADLINE_MS).toBeLessThan(EDGE_SYNC_DISPATCH_TIMEOUT_MS);
     expect(EDGE_SYNC_DISPATCH_TIMEOUT_MS).toBeLessThan(EDGE_SYNC_LEASE_TTL_MS / 2);
     expect(EDGE_SYNC_REQUEST_TIMEOUT_MS).toBeLessThanOrEqual(EDGE_SYNC_RUN_DEADLINE_MS / 4);
@@ -2845,23 +2867,23 @@ describe("waf-edge-sync: run limits (deadline, request timeout, subrequest budge
     ]);
   });
 
-  it("stops the custom part's calls by 55 s, with what landed; the rate-limit part still runs; the next run continues", async () => {
+  it("stops the custom part's calls by 50 s, with what landed; the rate-limit part still runs; the next run continues", async () => {
     const fake = new FakeCloudflare(agencyRulesOnly());
     fake.msPerRequest = 10_000;
     fake.install();
     const params = validParams({ block: bans(2) });
-    // Custom calls start at 0 s (zone), 10 s (read), 20, 30 and 40 s (creates, the last one ending by
-    // 55 s). A create at 50 s could end at 65 s, inside the 45 s held for the rate-limit part: refused.
+    // Custom calls start at 0 s (zone), 10 s (read), 20 and 30 s (creates, the last one ending by
+    // 45 s). A create at 40 s could end at 55 s, inside the 50 s held for the rate-limit part: refused.
     const first = await actuateWafEdgeSync(params, envWithToken(), testLimits(fake));
     expect(first).toMatchObject({ ok: false, code: "writeFailed" });
     if (first.ok || first.code !== "writeFailed") throw new Error("expected writeFailed");
     expect(first.detail.startsWith(`${EDGE_SYNC_DEADLINE_REACHED}. Stopped before: create rule`)).toBe(true);
     const createsThatLanded = fake.writes.map((write) => write.description);
-    expect(createsThatLanded).toHaveLength(3);
+    expect(createsThatLanded).toHaveLength(2);
     expect(first.landed).toEqual({ created: createsThatLanded, patched: [], deleted: [] });
-    // The rate-limit part runs on its own time, at 50 s: its read, and nothing to write.
+    // The rate-limit part runs on its own time, at 40 s: its read, and nothing to write.
     expect(first.rateLimit).toMatchObject({ ok: true });
-    expect(fake.requests).toHaveLength(6);
+    expect(fake.requests).toHaveLength(5);
     expect(fake.requests.at(-1)).toContain("http_ratelimit");
 
     fake.msPerRequest = 0;
@@ -2887,7 +2909,8 @@ describe("waf-edge-sync: run limits (deadline, request timeout, subrequest budge
     const result = await actuateWafEdgeSync(validParams({ block: bans(2) }), envWithToken(), testLimits(fake));
     expect(result).toMatchObject({ ok: false, code: "writeFailed" });
     if (result.ok || result.code !== "writeFailed") throw new Error("expected writeFailed");
-    // Custom: zone (0 s), read (15 s), one create (30 s); a create at 45 s could end at 60 s.
+    // Custom: zone (0 s), read (15 s), one create (30 s, ends by 45 s); a create at 45 s could end at
+    // 60 s, after 50 s.
     expect(result.detail.startsWith(`${EDGE_SYNC_DEADLINE_REACHED}. Stopped before: create rule`)).toBe(true);
     expect(result.landed.created).toHaveLength(1);
     // Rate limit: read (45 s), both rules switched off (60 s, 75 s). The later copy's delete would
@@ -2910,9 +2933,12 @@ describe("waf-edge-sync: run limits (deadline, request timeout, subrequest budge
     expect(fake.rateLimitRules.map((rule) => rule.id)).not.toContain("rl-later-copy");
   });
 
-  it("a write that hangs is cut by its timeout and reported UNKNOWN, kept out of landed; the next run continues", async () => {
-    const UNKNOWN_TEXT = "UNKNOWN: Cloudflare did not answer in time; the write may or may not have landed; the next run re-reads the zone.";
+  it("a write that hangs is cut by its timeout and reported UNKNOWN, kept out of landed; the lease is kept; then the next run continues", async () => {
+    const UNKNOWN_TEXT =
+      "UNKNOWN: Cloudflare did not answer in time; the write may or may not have landed. The zone's lease is kept until " +
+      "it expires (5 minutes after the run began), so a late landing cannot undo a newer run; the next run then re-reads the zone.";
     expect(EDGE_SYNC_WRITE_UNKNOWN).toBe(UNKNOWN_TEXT);
+    expect(EDGE_SYNC_LEASE_TTL_MS).toBe(5 * 60 * 1000);
     const params = validParams({ block: bans(2), baseline: MANAGED_ON, rateLimit: RATE_LIMIT_ON });
     const scenarios: Array<{ name: string; hangs: (method: string, path: string) => boolean }> = [
       { name: "custom create", hangs: (method, path) => method === "POST" && path.endsWith("/rs-custom/rules") },
@@ -2930,8 +2956,13 @@ describe("waf-edge-sync: run limits (deadline, request timeout, subrequest budge
         return true;
       };
       fake.install();
-      const result = await actuateWafEdgeSync(params, envWithToken(), testLimits(fake, { requestTimeoutMs: 20 }));
+      const leases = new FakeLeaseNamespace();
+      const result = await actuateWafEdgeSync(params, envWithToken(leases), testLimits(fake, { requestTimeoutMs: 20 }));
       expect(hungAlready, scenario.name).toBe(true);
+      // The lease is NOT released: a run right after is refused until it expires.
+      expect(leases.releases, scenario.name).toBe(0);
+      const tooSoon = await actuateWafEdgeSync(params, envWithToken(leases), testLimits(fake, { requestTimeoutMs: 20 }));
+      expect(tooSoon, scenario.name).toMatchObject({ ok: false, code: "busy" });
       const answeredWrites = fake.writes.filter((write) => write.phase !== "ratelimit").map((write) => write.description);
       if (scenario.name === "rate-limit create") {
         // The custom part finished; the rate-limit part reports the UNKNOWN write and lists none.
@@ -2948,9 +2979,163 @@ describe("waf-edge-sync: run limits (deadline, request timeout, subrequest budge
       }
 
       fake.hang = null;
-      const second = await actuateWafEdgeSync(params, envWithToken(), testLimits(fake, { requestTimeoutMs: 20 }));
+      expireEveryLease(leases);
+      const second = await actuateWafEdgeSync(params, envWithToken(leases), testLimits(fake, { requestTimeoutMs: 20 }));
       if (!second.ok) throw new Error(`${scenario.name}, next run: ${second.code}: ${second.detail}`);
       expect(second.rateLimit.ok, scenario.name).toBe(true);
+      expect(leases.releases, scenario.name).toBe(1);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("F1 (review round 3): an UNKNOWN lose patch keeps the lease, so its late landing cannot undo a newer run's gain", async () => {
+    const hosts = ["shop.example.org"];
+    const kept = siteIpClause("192.0.2.1", hosts);
+    const expiring = siteIpClause("192.0.2.9", hosts);
+    const arriving = siteIpClause("192.0.2.3", hosts);
+    const chunk = { id: "c1", ...buildEdgeChunkRule("block", 1, [kept, expiring]) } as FakeRule;
+    const fake = new FakeCloudflare([chunk, ...baselineRulesInOrder()]);
+    let hungAlready = false;
+    fake.hang = (method, path) => {
+      if (hungAlready || method !== "PATCH" || !path.endsWith("/rules/c1")) return false;
+      hungAlready = true;
+      return true;
+    };
+    fake.install();
+    const leases = new FakeLeaseNamespace();
+    const limits = testLimits(fake, { requestTimeoutMs: 20 });
+    const keptBan = { key: "kept", hosts, ips: ["192.0.2.1"], uas: [] };
+    const arrivingBan = { key: "arriving", hosts, ips: ["192.0.2.3"], uas: [] };
+
+    // Run 1: the expiring ban leaves chunk 1 (a lose patch to {kept}); Cloudflare does not answer.
+    const run1 = await actuateWafEdgeSync(validParams({ block: [keptBan] }), envWithToken(leases), limits);
+    expect(run1).toMatchObject({ ok: false, code: "writeFailed", landed: { created: [], patched: [], deleted: [] } });
+    if (run1.ok) throw new Error("expected writeFailed");
+    expect(run1.detail).toContain(EDGE_SYNC_WRITE_UNKNOWN);
+    expect(leases.releases).toBe(0);
+
+    // Run 2 right after, with a new ban: refused while run 1's write may still land. Nothing written.
+    fake.hang = null;
+    const writesBefore = fake.writes.length;
+    const run2 = await actuateWafEdgeSync(validParams({ block: [keptBan, arrivingBan] }), envWithToken(leases), limits);
+    expect(run2).toMatchObject({ ok: false, code: "busy" });
+    expect(fake.writes).toHaveLength(writesBefore);
+
+    // Cloudflare now applies run 1's abandoned PATCH (chunk 1 with {kept}).
+    const late = buildEdgeChunkRule("block", 1, [kept]);
+    fake.customRules = (fake.customRules ?? []).map((rule) => (rule.id === "c1" ? ({ ...rule, ...late } as FakeRule) : rule));
+
+    // After the lease expires, the next run reads the real state and gains the new ban for good.
+    expireEveryLease(leases);
+    const run3 = await actuateWafEdgeSync(validParams({ block: [keptBan, arrivingBan] }), envWithToken(leases), limits);
+    if (!run3.ok) throw new Error(`${run3.code}: ${run3.detail}`);
+    const inForce = clausesInForce(fake.customRules ?? []);
+    expect(inForce.has(kept)).toBe(true);
+    expect(inForce.has(arriving)).toBe(true);
+    expect(inForce.has(expiring)).toBe(false);
+    expect(leases.releases).toBe(1);
+
+    // A write that FAILED with an answer is not UNKNOWN: the lease is released as usual.
+    fake.failWrite = (write) => write.method === "PATCH";
+    const failed = await actuateWafEdgeSync(validParams({ block: [keptBan] }), envWithToken(leases), limits);
+    expect(failed).toMatchObject({ ok: false, code: "writeFailed" });
+    if (failed.ok) throw new Error("expected writeFailed");
+    expect(failed.detail).not.toContain("UNKNOWN");
+    expect(leases.releases).toBe(2);
+  });
+
+  it("a delete that finds its rule already gone (404) is done: not landed, no writeFailed (legacy, duplicate, rate-limit copy)", async () => {
+    // Rate limiting on first, then a later copy of our origin rule.
+    const fake = new FakeCloudflare(baselineRulesInOrder());
+    fake.rateLimitRules = [];
+    fake.install();
+    const params = validParams({ block: bans(3), rateLimit: RATE_LIMIT_ON, retireLegacy: true });
+    const setUp = await actuateWafEdgeSync(params, envWithToken());
+    if (!setUp.ok) throw new Error(`${setUp.code}: ${setUp.detail}`);
+    const origin = fake.rateLimitRules.find((rule) => rule.description === RATE_LIMIT_ORIGIN_DESCRIPTION) as FakeRule;
+    fake.rateLimitRules.push({ ...origin, id: "rl-later-copy" });
+    // A duplicate of chunk 1, and three legacy rules for bans the chunk already carries.
+    const chunkOne = (fake.customRules ?? []).find((rule) => rule.description === "doubleyoup-edge-block:1") as FakeRule;
+    const legacy: FakeRule[] = [0, 1, 2].map((index) => ({
+      id: `l-${index}`,
+      description: `doubleyoup-ban:old${index}`,
+      expression: `ip.src in {198.51.100.${index}}`,
+      action: "block",
+      enabled: true,
+    }));
+    fake.customRules = [...(fake.customRules ?? []), { ...chunkOne, id: "c1-later-copy" }, ...legacy];
+    // Another writer (the orchestrator's legacy remover, a hand edit) deletes these just before we do.
+    const deletedByAnother = new Set(["l-1", "c1-later-copy", "rl-later-copy"]);
+    fake.beforeEachRequest = (method, path) => {
+      const ruleId = path.split("/").pop() as string;
+      if (method !== "DELETE" || !deletedByAnother.has(ruleId)) return;
+      fake.customRules = (fake.customRules ?? []).filter((rule) => rule.id !== ruleId);
+      fake.rateLimitRules = (fake.rateLimitRules ?? []).filter((rule) => rule.id !== ruleId);
+    };
+    fake.writes = [];
+    fake.requests = [];
+
+    const result = await actuateWafEdgeSync(params, envWithToken());
+    if (!result.ok) throw new Error(`${result.code}: ${result.detail}`);
+    expect(result.legacyDeleted).toEqual(["doubleyoup-ban:old0", "doubleyoup-ban:old2"]);
+    expect(result.deleted).toEqual([]);
+    expect(result.rateLimit).toMatchObject({ ok: true, deleted: [] });
+    // Our three deletes of the vanished rules reached Cloudflare and found nothing.
+    expect(fake.requests.filter((request) => /DELETE .*\/(l-1|c1-later-copy|rl-later-copy)$/.test(request))).toHaveLength(3);
+    expect(fake.customDescriptions().filter((description) => description.startsWith("doubleyoup-ban:"))).toEqual([]);
+
+    fake.beforeEachRequest = null;
+    fake.writes = [];
+    const again = await actuateWafEdgeSync(params, envWithToken());
+    expect(again.ok).toBe(true);
+    expect(fake.writes).toEqual([]);
+  });
+
+  it("a move whose rule or anchor vanished re-reads and defers to the next run; a move that just fails still fails", async () => {
+    const scenarios = ["anchor deleted", "moving rule deleted", "real failure"] as const;
+    for (const scenario of scenarios) {
+      // The login gate sits on top: it must move after the xmlrpc rule.
+      const baseline = baselineRulesInOrder();
+      const fake = new FakeCloudflare([baseline[3], baseline[0], baseline[1], baseline[2], baseline[4], baseline[5]] as FakeRule[]);
+      let actedAlready = false;
+      fake.beforeEachRequest = (method, path, body) => {
+        const position = body?.position as { after?: string } | undefined;
+        if (actedAlready || method !== "PATCH" || position?.after === undefined) return;
+        actedAlready = true;
+        let vanishing: string | null = null;
+        if (scenario === "anchor deleted") vanishing = position.after;
+        if (scenario === "moving rule deleted") vanishing = path.split("/").pop() as string;
+        if (vanishing === null) return;
+        fake.customRules = (fake.customRules ?? []).filter((rule) => rule.id !== vanishing);
+      };
+      if (scenario === "real failure") fake.failWrite = (write) => write.method === "PATCH" && write.body?.position !== undefined;
+      fake.install();
+      const leases = new FakeLeaseNamespace();
+      const result = await actuateWafEdgeSync(validParams(), envWithToken(leases));
+      expect(result, scenario).toMatchObject({ ok: false, code: "writeFailed", landed: { created: [], patched: [], deleted: [] } });
+      if (result.ok) throw new Error("expected writeFailed");
+      const moving = (baseline[3] as FakeRule).description;
+      const anchor = (baseline[2] as FakeRule).description;
+      // The failed move is followed by a re-read of the custom rules, then the rate-limit part's read.
+      expect(fake.requests.at(-3), scenario).toMatch(/^PATCH /);
+      expect(fake.requests.at(-2), scenario).toMatch(/^GET .*http_request_firewall_custom/);
+      expect(fake.requests.at(-1), scenario).toMatch(/^GET .*http_ratelimit/);
+      if (scenario === "real failure") {
+        expect(result.detail).toContain(`could not move rule "${moving}" into place`);
+        continue;
+      }
+      const vanished = scenario === "anchor deleted" ? anchor : moving;
+      expect(result.detail).toBe(
+        `rule "${vanished}" vanished during the run (another writer deleted it); the next run restores it and continues. ` +
+          `Stopped before: move rule "${moving}" into place.`,
+      );
+      expect(leases.releases, scenario).toBe(1);
+
+      // The next run restores the vanished rule and puts everything in order.
+      fake.beforeEachRequest = null;
+      const next = await actuateWafEdgeSync(validParams(), envWithToken(leases));
+      if (!next.ok) throw new Error(`${scenario}: ${next.code}: ${next.detail}`);
+      expect(fake.customDescriptions(), scenario).toEqual(baselineRulesInOrder().map((rule) => rule.description));
       vi.restoreAllMocks();
     }
   });
@@ -3088,6 +3273,140 @@ function seededRandom(seed: number): () => number {
     return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
   };
 }
+
+describe("waf-edge-sync: random walk under small budgets, failed writes, duplicates and hand moves (review round 3)", () => {
+  /** Every clause of an enabled edge chunk, keyed by kind. */
+  function clausesInForceByKind(rules: readonly FakeRule[]): Set<string> {
+    const inForce = new Set<string>();
+    for (const rule of rules) {
+      if (rule.enabled === false) continue;
+      const description = rule.description ?? "";
+      let kind: string | null = null;
+      if (description.startsWith("doubleyoup-edge-block:")) kind = "block";
+      if (description.startsWith("doubleyoup-edge-challenge:")) kind = "challenge";
+      if (kind === null) continue;
+      for (const clause of splitChunkExpression(rule.expression ?? "")) inForce.add(`${kind}|${clause}`);
+    }
+    return inForce;
+  }
+
+  for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) {
+    it(`seed ${seed}: every round converges, and no wanted clause once in force is ever absent again`, async () => {
+      const random = seededRandom(seed * 7919);
+      const pick = <T>(values: readonly T[]): T => values[Math.floor(random() * values.length)] as T;
+      const sites: string[][] = [
+        ["a.example.com"],
+        ["b.example.com", "www.b.example.com"],
+        longHosts("c", 6, 150),
+        longHosts("d", 12, 180),
+        ["shop.example.org", "www.shop.example.org"],
+      ];
+      const ips = ["192.0.2.1", "192.0.2.2", "198.51.100.0/24", "203.0.113.7", "2001:db8::/32", "10.0.0.0/8"];
+      const userAgents = ["ExampleBot/1.0", "ScraperKit/0.9"];
+      interface PoolEntry {
+        kind: "block" | "challenge";
+        key: string;
+        siteIndex: number | null;
+        ips: string[];
+        uas: string[];
+        all: boolean;
+      }
+      const pool: PoolEntry[] = [];
+      for (let index = 0; index < 24; index += 1) {
+        const kind = random() < 0.55 ? "block" : "challenge";
+        const global = random() < 0.15;
+        const shape = random();
+        let entryIps: string[] = [];
+        let entryUas: string[] = [];
+        let all = false;
+        if (kind === "challenge" && !global && shape < 0.2) all = true;
+        else if (shape < 0.6) entryIps = [pick(ips)];
+        else entryUas = [pick(userAgents)];
+        const siteIndex = global ? null : Math.floor(random() * sites.length);
+        pool.push({ kind, key: `k${index}`, siteIndex, ips: entryIps, uas: entryUas, all });
+      }
+      const fake = new FakeCloudflare(null);
+      fake.plan = "business";
+      fake.install();
+      for (let round = 0; round < 25; round += 1) {
+        // The agency's sites change now and then.
+        if (random() < 0.3) {
+          const siteIndex = Math.floor(random() * sites.length);
+          const site = sites[siteIndex] as string[];
+          if (random() < 0.5 && site.length > 1) site.pop();
+          else site.push(`x${round}.s${siteIndex}.example.net`);
+        }
+        const chosen = pool.filter(() => random() < 0.45);
+        const toEntry = (entry: PoolEntry): Record<string, unknown> => {
+          const hosts = entry.siteIndex === null ? [] : [...(sites[entry.siteIndex] as string[])];
+          const value: Record<string, unknown> = { key: entry.key, hosts, ips: entry.ips, uas: entry.uas };
+          if (entry.all) value.all = true;
+          return value;
+        };
+        const params = validParams({
+          block: chosen.filter((entry) => entry.kind === "block").map(toEntry),
+          challenge: chosen.filter((entry) => entry.kind === "challenge").map(toEntry),
+        });
+        const wantedBlock = buildEdgeClauses(params.block.map((entry) => ({ ...entry, all: false })), EXCLUDED_HOSTS);
+        const wantedChallenge = buildEdgeClauses(params.challenge.map((entry) => ({ ...entry, all: entry.all === true })), EXCLUDED_HOSTS);
+        if (!wantedBlock.ok || !wantedChallenge.ok) throw new Error("the generated entries are invalid");
+        const wanted = new Set([...wantedBlock.clauses.map((clause) => `block|${clause}`), ...wantedChallenge.clauses.map((clause) => `challenge|${clause}`)]);
+
+        // Hand edits between rounds: a duplicate of a random chunk, or a shuffle of the zone.
+        const rules = fake.customRules ?? [];
+        const chunks = rules.filter((rule) => (rule.description ?? "").startsWith("doubleyoup-edge-"));
+        if (chunks.length > 0 && random() < 0.3) {
+          const copy = { ...pick(chunks), id: `dup-${round}` } as FakeRule;
+          const at = Math.floor(random() * (rules.length + 1));
+          fake.customRules = [...rules.slice(0, at), copy, ...rules.slice(at)];
+        }
+        if ((fake.customRules ?? []).length > 2 && random() < 0.3) {
+          const shuffled = [...(fake.customRules ?? [])];
+          for (let index = shuffled.length - 1; index > 0; index -= 1) {
+            const other = Math.floor(random() * (index + 1));
+            [shuffled[index], shuffled[other]] = [shuffled[other] as FakeRule, shuffled[index] as FakeRule];
+          }
+          fake.customRules = shuffled;
+        }
+
+        const seen = new Set<string>();
+        for (const clause of clausesInForceByKind(fake.customRules ?? [])) if (wanted.has(clause)) seen.add(clause);
+        let converged = false;
+        for (let run = 0; run < 300 && !converged; run += 1) {
+          fake.snapshots = [];
+          fake.writes = [];
+          let writesUntilFailure = random() < 0.15 ? Math.floor(random() * 6) : -1;
+          fake.failWrite = (write) => {
+            if (write.phase !== "custom") return false;
+            if (writesUntilFailure === 0) {
+              writesUntilFailure = -1;
+              return true;
+            }
+            writesUntilFailure -= 1;
+            return false;
+          };
+          const subrequestBudget = 9 + Math.floor(random() * 10);
+          const result = await actuateWafEdgeSync(params, envWithToken(), { ...EDGE_SYNC_RUN_LIMITS, subrequestBudget, now: () => fake.clockMs });
+          for (const state of fake.snapshots) {
+            const inForce = clausesInForceByKind(state);
+            for (const clause of seen) expect(inForce.has(clause), `seed ${seed} round ${round} run ${run}: lost ${clause.slice(0, 80)}`).toBe(true);
+            for (const clause of inForce) if (wanted.has(clause)) seen.add(clause);
+          }
+          if (result.ok) {
+            converged = true;
+            const atEnd = clausesInForceByKind(fake.customRules ?? []);
+            for (const clause of wanted) expect(atEnd.has(clause), `seed ${seed} round ${round}: missing at the end`).toBe(true);
+            for (const clause of atEnd) expect(wanted.has(clause), `seed ${seed} round ${round}: extra at the end`).toBe(true);
+            break;
+          }
+          if (result.code !== "writeFailed") throw new Error(`seed ${seed} round ${round}: ${result.code}: ${result.detail}`);
+        }
+        expect(converged, `seed ${seed} round ${round} did not converge`).toBe(true);
+      }
+      fake.failWrite = null;
+    });
+  }
+});
 
 describe("waf-edge-sync: random add/remove sequences (property)", () => {
   it("no still-wanted clause leaves its chunk, additions land before removals, and a present clause is never absent again", async () => {
