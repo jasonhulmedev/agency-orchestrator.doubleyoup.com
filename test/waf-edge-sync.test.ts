@@ -286,6 +286,13 @@ class FakeCloudflare {
     if (this.failWrite !== null && this.failWrite(write)) {
       return jsonResponse({ success: false, errors: [{ code: 20200, message: "simulated failure" }] }, 500);
     }
+    // Cloudflare refuses an expression over 4,096 characters, so the fake does too.
+    const writtenRules = (body?.rules as Array<Record<string, unknown>> | undefined) ?? (body === undefined ? [] : [body]);
+    for (const rule of writtenRules) {
+      if (typeof rule.expression === "string" && rule.expression.length > WAF_EXPRESSION_MAX_LENGTH) {
+        return jsonResponse({ success: false, errors: [{ code: 20120, message: "expression is too long" }] }, 400);
+      }
+    }
     this.writes.push(write);
 
     let rulesetId = phase === "custom" ? "rs-custom" : "rs-managed";
@@ -912,6 +919,26 @@ describe("waf-edge-sync: actuation", () => {
       { description: "doubleyoup-geo:site1:allow-ips", action: "skip", position: positionOf("l-geo-skip") },
     ]);
     expect(result.rulesUsed).toBe(after.length);
+
+    // retireLegacy removes the legacy geo skip and nothing foreign: every foreign rule is still byte-identical.
+    fake.writes = [];
+    const retired = await actuateWafEdgeSync(
+      validParams({
+        block: [{ key: "ban1", hosts: ["a.example.com"], ips: ["192.0.2.7"], uas: [] }],
+        challenge: [{ key: "ban2", hosts: [], ips: ["198.51.100.0/24"], uas: [] }],
+        retireLegacy: true,
+      }),
+      envWithToken(),
+    );
+    if (!retired.ok) throw new Error(retired.detail);
+    expect(writeLog(fake)).toEqual(["DELETE doubleyoup-geo:site1:allow-ips"]);
+    const afterRetire = fake.customRules ?? [];
+    for (const id of foreignIds) {
+      expect(afterRetire.find((rule) => rule.id === id)).toEqual(initial.find((rule) => rule.id === id));
+    }
+    expect(retired.foreign.map((rule) => rule.description)).toEqual(["agency-allow-office", "agency-old-skip", "agency-block-path", ""]);
+    expect(retired.preempting.map((rule) => rule.description)).toEqual(["agency-allow-office"]);
+    expect(retired.legacyDeleted).toEqual(["doubleyoup-geo:site1:allow-ips"]);
   });
 
   it("patches a baseline that waf-rule-upsert wrote IN PLACE: no delete, no create of the five", async () => {
@@ -1328,7 +1355,13 @@ describe("waf-edge-sync: random add/remove sequences (property)", () => {
       if (!result.ok) throw new Error(`round ${round}: ${result.detail}`);
 
       // 1. Sticky: a clause that was in chunk X and is still wanted is in chunk X after EVERY write.
+      //    And no write — the gain writes included — ever holds a chunk over the 4,000-character budget.
       for (const snapshot of fake.snapshots) {
+        for (const rule of snapshot) {
+          if (classifyWafRuleDescription(rule.description).owner === "chunk") {
+            expect((rule.expression ?? "").length, `round ${round}: ${rule.description} over budget mid-run`).toBeLessThanOrEqual(EDGE_CHUNK_MAX_LENGTH);
+          }
+        }
         const during = chunkClauses(snapshot);
         for (const [description, clauses] of before) {
           const kind = description.startsWith("doubleyoup-edge-block:") ? "block" : "challenge";
