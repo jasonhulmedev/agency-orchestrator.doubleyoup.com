@@ -47,6 +47,9 @@ import {
   EDGE_SYNC_SUBREQUEST_BUDGET,
   EDGE_SYNC_SUBREQUESTS_BEFORE_ACTUATION,
   EDGE_SYNC_WRITE_UNKNOWN,
+  EDGE_SYNC_AMBIGUOUS_WRITE_STATUSES,
+  EDGE_SYNC_UNKNOWN_MARKER,
+  edgeSyncWriteUnknown,
   type EdgeSyncRunLimits,
 } from "../src/edge-sync-budget.js";
 import {
@@ -300,6 +303,8 @@ class FakeCloudflare {
   hang: ((method: string, path: string) => boolean) | null = null;
   /** Another writer acting just before each request reaches the fake (it may change the rules). */
   beforeEachRequest: ((method: string, path: string, body: Record<string, unknown> | undefined) => void) | null = null;
+  /** An answer to send instead of handling the request (nothing is applied), or null to handle it. May throw. */
+  respondInstead: ((method: string, path: string) => Response | null) | null = null;
   /** A fake clock (ms) that every request moves on by `msPerRequest`; tests hand `() => clockMs` to the run. */
   clockMs = 0;
   msPerRequest = 0;
@@ -317,6 +322,13 @@ class FakeCloudflare {
       if (this.beforeEachRequest !== null) {
         const requestBody = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
         this.beforeEachRequest(init?.method ?? "GET", new URL(url).pathname, requestBody);
+      }
+      if (this.respondInstead !== null) {
+        const answer = this.respondInstead(init?.method ?? "GET", new URL(url).pathname);
+        if (answer !== null) {
+          this.requests.push(`${init?.method ?? "GET"} ${new URL(url).pathname} (answered ${answer.status})`);
+          return answer;
+        }
       }
       if (this.hang !== null && this.hang(init?.method ?? "GET", new URL(url).pathname)) {
         const signal = init?.signal;
@@ -3273,6 +3285,220 @@ function seededRandom(seed: number): () => number {
     return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
   };
 }
+
+describe("waf-edge-sync: every write kind, every answer that is not definite (review round 4)", () => {
+  const THRESHOLDS = { requests: 600, periodSeconds: 60, mitigationSeconds: 600 };
+  const OTHER_THRESHOLDS = { requests: 900, periodSeconds: 60, mitigationSeconds: 600 };
+  const RATE_LIMIT_ON = { enabled: true, origin: THRESHOLDS, expensive: THRESHOLDS };
+  const RATE_LIMIT_CHANGED = { enabled: true, origin: OTHER_THRESHOLDS, expensive: OTHER_THRESHOLDS };
+  const RATE_LIMIT_OFF = { enabled: false };
+  const MANAGED_ON = { ...(rawParams().baseline as object), includeManagedRuleset: true };
+  const MANAGED_OFF = { ...(rawParams().baseline as object), includeManagedRuleset: true, enabled: false };
+  const hosts = ["shop.example.org"];
+  const ban = (ip: string) => ({ key: `b${ip.replace(/[^0-9]/g, "")}`, hosts, ips: [ip], uas: [] });
+  const kept = siteIpClause("192.0.2.1", hosts);
+  const other = siteIpClause("192.0.2.9", hosts);
+  const limitsFor = (fake: FakeCloudflare) => ({ ...EDGE_SYNC_RUN_LIMITS, requestTimeoutMs: 20, now: () => fake.clockMs });
+  const converge = async (fake: FakeCloudflare, params: WafEdgeSyncParams) => {
+    const result = await actuateWafEdgeSync(params, envWithToken());
+    if (!result.ok || !result.rateLimit.ok) throw new Error(`set-up did not converge: ${JSON.stringify(result).slice(0, 300)}`);
+  };
+  const legacyRule = { id: "l-0", description: "doubleyoup-ban:old0", expression: "ip.src in {192.0.2.1}", action: "block", enabled: true } as FakeRule;
+
+  /** One write of each kind the op makes: its set-up, its job, and how to recognise the write. */
+  interface WriteKind {
+    name: string;
+    setUp: (fake: FakeCloudflare) => Promise<void> | void;
+    params: WafEdgeSyncParams;
+    isTheWrite: (method: string, path: string) => boolean;
+  }
+  const writeKinds: WriteKind[] = [
+    { name: "custom entrypoint create", setUp: (fake) => { fake.customRules = null; }, params: validParams({ block: [ban("192.0.2.1")] }), isTheWrite: (method, path) => method === "POST" && path.endsWith("/zone-1/rulesets") },
+    { name: "custom rule create", setUp: (fake) => { fake.customRules = agencyRulesOnly(); }, params: validParams({ block: [ban("192.0.2.1")] }), isTheWrite: (method, path) => method === "POST" && path.endsWith("/rs-custom/rules") },
+    { name: "custom gain patch", setUp: (fake) => { fake.customRules = [{ id: "c1", ...buildEdgeChunkRule("block", 1, [kept]) } as FakeRule, ...baselineRulesInOrder()]; }, params: validParams({ block: [ban("192.0.2.1"), ban("192.0.2.3")] }), isTheWrite: (method, path) => method === "PATCH" && path.endsWith("/rules/c1") },
+    { name: "custom move patch", setUp: (fake) => { const baseline = baselineRulesInOrder(); fake.customRules = [baseline[3], baseline[0], baseline[1], baseline[2], baseline[4], baseline[5]] as FakeRule[]; }, params: validParams(), isTheWrite: (method, path) => method === "PATCH" && path.endsWith("/rules/b-login") },
+    { name: "empty chunk delete", setUp: (fake) => { fake.customRules = [{ id: "c1", ...buildEdgeChunkRule("block", 1, [kept]) } as FakeRule, { id: "c2", ...buildEdgeChunkRule("block", 2, [other]) } as FakeRule, ...baselineRulesInOrder()]; }, params: validParams({ block: [ban("192.0.2.1")] }), isTheWrite: (method, path) => method === "DELETE" && path.endsWith("/rules/c2") },
+    { name: "duplicate delete", setUp: (fake) => { const chunk = { id: "c1", ...buildEdgeChunkRule("block", 1, [kept]) } as FakeRule; fake.customRules = [chunk, ...baselineRulesInOrder(), { ...chunk, id: "c1-copy" }]; }, params: validParams({ block: [ban("192.0.2.1")] }), isTheWrite: (method, path) => method === "DELETE" && path.endsWith("/rules/c1-copy") },
+    { name: "legacy delete", setUp: (fake) => { fake.customRules = [{ id: "c1", ...buildEdgeChunkRule("block", 1, [kept]) } as FakeRule, ...baselineRulesInOrder(), { ...legacyRule }]; }, params: validParams({ block: [ban("192.0.2.1")], retireLegacy: true }), isTheWrite: (method, path) => method === "DELETE" && path.endsWith("/rules/l-0") },
+    { name: "Managed Ruleset entrypoint create", setUp: async (fake) => { await converge(fake, validParams({ block: [ban("192.0.2.1")] })); fake.managedRules = null; }, params: validParams({ block: [ban("192.0.2.1")], baseline: MANAGED_ON }), isTheWrite: (method, path) => method === "POST" && path.endsWith("/zone-1/rulesets") },
+    { name: "Managed Ruleset rule create", setUp: async (fake) => { await converge(fake, validParams({ block: [ban("192.0.2.1")] })); fake.managedRules = []; }, params: validParams({ block: [ban("192.0.2.1")], baseline: MANAGED_ON }), isTheWrite: (method, path) => method === "POST" && path.endsWith("/rs-managed/rules") },
+    { name: "Managed Ruleset rollback patch", setUp: async (fake) => { fake.managedRules = []; await converge(fake, validParams({ block: [ban("192.0.2.1")], baseline: MANAGED_ON })); }, params: validParams({ block: [ban("192.0.2.1")], baseline: MANAGED_OFF }), isTheWrite: (method, path) => method === "PATCH" && path.includes("/rs-managed/rules/") },
+    { name: "rate-limit entrypoint create", setUp: async (fake) => { await converge(fake, validParams({ block: [ban("192.0.2.1")] })); fake.rateLimitRules = null; }, params: validParams({ block: [ban("192.0.2.1")], rateLimit: RATE_LIMIT_ON }), isTheWrite: (method, path) => method === "POST" && path.endsWith("/zone-1/rulesets") },
+    { name: "rate-limit rule create", setUp: async (fake) => { await converge(fake, validParams({ block: [ban("192.0.2.1")] })); fake.rateLimitRules = []; }, params: validParams({ block: [ban("192.0.2.1")], rateLimit: RATE_LIMIT_ON }), isTheWrite: (method, path) => method === "POST" && path.endsWith("/rs-ratelimit/rules") },
+    { name: "rate-limit update patch", setUp: async (fake) => { fake.rateLimitRules = []; await converge(fake, validParams({ block: [ban("192.0.2.1")], rateLimit: RATE_LIMIT_ON })); }, params: validParams({ block: [ban("192.0.2.1")], rateLimit: RATE_LIMIT_CHANGED }), isTheWrite: (method, path) => method === "PATCH" && path.includes("/rs-ratelimit/rules/") },
+    { name: "rate-limit switch-off patch", setUp: async (fake) => { fake.rateLimitRules = []; await converge(fake, validParams({ block: [ban("192.0.2.1")], rateLimit: RATE_LIMIT_ON })); }, params: validParams({ block: [ban("192.0.2.1")], rateLimit: RATE_LIMIT_OFF }), isTheWrite: (method, path) => method === "PATCH" && path.includes("/rs-ratelimit/rules/") },
+    { name: "rate-limit duplicate delete", setUp: async (fake) => { fake.rateLimitRules = []; await converge(fake, validParams({ block: [ban("192.0.2.1")], rateLimit: RATE_LIMIT_ON })); const origin = (fake.rateLimitRules ?? [])[0] as FakeRule; fake.rateLimitRules = [...(fake.rateLimitRules ?? []), { ...origin, id: "rl-copy" }]; }, params: validParams({ block: [ban("192.0.2.1")], rateLimit: RATE_LIMIT_ON }), isTheWrite: (method, path) => method === "DELETE" && path.endsWith("/rules/rl-copy") },
+  ];
+
+  const envelopeAnswer = (status: number) => jsonResponse({ success: false, errors: [{ code: 10000, message: `simulated ${status}` }] }, status);
+  const htmlAnswer = (status: number) => new Response(`<html><body>${status}</body></html>`, { status, headers: { "content-type": "text/html" } });
+
+  /** How the write goes wrong: it hangs (its timeout fires), fetch throws, or a given answer comes back. */
+  interface Failure {
+    name: string;
+    apply: (fake: FakeCloudflare, kind: WriteKind) => () => boolean;
+  }
+  const onceFor = (kind: WriteKind, act: () => Response | null) => {
+    let actedAlready = false;
+    return {
+      matches: (method: string, path: string) => {
+        if (actedAlready || !kind.isTheWrite(method, path)) return false;
+        actedAlready = true;
+        return true;
+      },
+      acted: () => actedAlready,
+      act,
+    };
+  };
+  const answering = (name: string, answer: () => Response): Failure => ({
+    name,
+    apply: (fake, kind) => {
+      const once = onceFor(kind, answer);
+      fake.respondInstead = (method, path) => (once.matches(method, path) ? answer() : null);
+      return once.acted;
+    },
+  });
+  const unknownFailures: Failure[] = [
+    {
+      name: "timeout",
+      apply: (fake, kind) => {
+        const once = onceFor(kind, () => null);
+        fake.hang = (method, path) => once.matches(method, path);
+        return once.acted;
+      },
+    },
+    {
+      name: "connection lost",
+      apply: (fake, kind) => {
+        const once = onceFor(kind, () => null);
+        fake.respondInstead = (method, path) => {
+          if (once.matches(method, path)) throw new TypeError("Network connection lost.");
+          return null;
+        };
+        return once.acted;
+      },
+    },
+    ...EDGE_SYNC_AMBIGUOUS_WRITE_STATUSES.map((status) => answering(`HTTP ${status} with an API envelope`, () => envelopeAnswer(status))),
+    answering("HTTP 522 as an HTML page", () => htmlAnswer(522)),
+  ];
+  const definiteFailures: Failure[] = [
+    answering("HTTP 500 with an API envelope", () => envelopeAnswer(500)),
+    answering("HTTP 400 with an API envelope", () => envelopeAnswer(400)),
+    answering("HTTP 409 with an API envelope", () => envelopeAnswer(409)),
+  ];
+
+  it("pins the ambiguous statuses", () => {
+    expect([...EDGE_SYNC_AMBIGUOUS_WRITE_STATUSES]).toEqual([502, 503, 504, 520, 521, 522, 523, 524]);
+  });
+
+  for (const kind of writeKinds) {
+    it(`${kind.name}: no definite answer = UNKNOWN, the lease is kept, the next run is refused busy`, async () => {
+      for (const failure of unknownFailures) {
+        const fake = new FakeCloudflare(baselineRulesInOrder()).install();
+        await kind.setUp(fake);
+        const acted = failure.apply(fake, kind);
+        const leases = new FakeLeaseNamespace();
+        const result = await actuateWafEdgeSync(kind.params, envWithToken(leases), limitsFor(fake));
+        const label = `${kind.name} / ${failure.name}`;
+        expect(acted(), label).toBe(true);
+        expect(JSON.stringify(result), label).toContain(EDGE_SYNC_UNKNOWN_MARKER);
+        expect(leases.releases, label).toBe(0);
+        const next = await actuateWafEdgeSync(kind.params, envWithToken(leases), limitsFor(fake));
+        expect(next, label).toMatchObject({ ok: false, code: "busy" });
+        vi.restoreAllMocks();
+      }
+    });
+
+    it(`${kind.name}: a 500 or a 4xx from the API is a definite failure: not UNKNOWN, the lease is released, the next run finishes`, async () => {
+      for (const failure of definiteFailures) {
+        const fake = new FakeCloudflare(baselineRulesInOrder()).install();
+        await kind.setUp(fake);
+        const acted = failure.apply(fake, kind);
+        const leases = new FakeLeaseNamespace();
+        const result = await actuateWafEdgeSync(kind.params, envWithToken(leases), limitsFor(fake));
+        const label = `${kind.name} / ${failure.name}`;
+        expect(acted(), label).toBe(true);
+        expect(JSON.stringify(result), label).not.toContain(EDGE_SYNC_UNKNOWN_MARKER);
+        const failedSomewhere = !result.ok || !result.rateLimit.ok;
+        expect(failedSomewhere, label).toBe(true);
+        expect(leases.releases, label).toBe(1);
+        const next = await actuateWafEdgeSync(kind.params, envWithToken(leases), limitsFor(fake));
+        if (!next.ok) throw new Error(`${label}, next run: ${next.code}: ${next.detail}`);
+        expect(next.rateLimit.ok, label).toBe(true);
+        vi.restoreAllMocks();
+      }
+    });
+  }
+
+  it("the UNKNOWN details say why, and all begin with the marker after the step", async () => {
+    const kind = writeKinds.find((candidate) => candidate.name === "custom rule create") as WriteKind;
+    const expectedReasons: Record<string, string> = {
+      timeout: "Cloudflare did not answer in time",
+      "connection lost": "the connection failed before Cloudflare answered (could not reach Cloudflare to write the WAF rule: Network connection lost)",
+      "HTTP 502 with an API envelope": "Cloudflare answered HTTP 502, which does not say whether the write was applied",
+    };
+    for (const failure of unknownFailures.filter((candidate) => candidate.name in expectedReasons)) {
+      const fake = new FakeCloudflare(baselineRulesInOrder()).install();
+      await kind.setUp(fake);
+      failure.apply(fake, kind);
+      const result = await actuateWafEdgeSync(kind.params, envWithToken(), limitsFor(fake));
+      if (result.ok || result.code !== "writeFailed") throw new Error(`${failure.name}: expected writeFailed`);
+      expect(result.detail).toContain(`: ${edgeSyncWriteUnknown(expectedReasons[failure.name] as string)}`);
+      expect(result.landed.created).toEqual([]);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("reads keep today's behaviour: a lost connection or a 502 on a read is not UNKNOWN, and the lease is released", async () => {
+    for (const failure of ["connection lost", "HTTP 502"] as const) {
+      const fake = new FakeCloudflare(baselineRulesInOrder()).install();
+      let actedAlready = false;
+      fake.respondInstead = (method, path) => {
+        if (actedAlready || method !== "GET" || !path.includes("http_request_firewall_custom")) return null;
+        actedAlready = true;
+        if (failure === "connection lost") throw new TypeError("Network connection lost.");
+        return envelopeAnswer(502);
+      };
+      const leases = new FakeLeaseNamespace();
+      const result = await actuateWafEdgeSync(validParams({ block: [ban("192.0.2.1")] }), envWithToken(leases));
+      expect(actedAlready, failure).toBe(true);
+      expect(result.ok, failure).toBe(false);
+      expect(JSON.stringify(result), failure).not.toContain(EDGE_SYNC_UNKNOWN_MARKER);
+      expect(leases.releases, failure).toBe(1);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("L2: only the API's own 404 (a JSON envelope, success: false) means already gone; a bare or HTML 404 stays a failure", async () => {
+    const kind = writeKinds.find((candidate) => candidate.name === "legacy delete") as WriteKind;
+    const answers: Record<string, () => Response> = {
+      "bare 404": () => new Response(null, { status: 404 }),
+      "HTML 404": () => htmlAnswer(404),
+      "API 404": () => envelopeAnswer(404),
+    };
+    for (const [name, answer] of Object.entries(answers)) {
+      const fake = new FakeCloudflare(baselineRulesInOrder()).install();
+      await kind.setUp(fake);
+      const acted = answering(name, answer).apply(fake, kind);
+      const leases = new FakeLeaseNamespace();
+      const result = await actuateWafEdgeSync(kind.params, envWithToken(leases), limitsFor(fake));
+      expect(acted(), name).toBe(true);
+      expect(leases.releases, name).toBe(1);
+      expect(JSON.stringify(result), name).not.toContain(EDGE_SYNC_UNKNOWN_MARKER);
+      if (name === "API 404") {
+        // Already gone: done, not landed.
+        if (!result.ok) throw new Error(`${name}: ${result.code}: ${result.detail}`);
+        expect(result.legacyDeleted, name).toEqual([]);
+        continue;
+      }
+      expect(result, name).toMatchObject({ ok: false, code: "writeFailed", landed: { created: [], patched: [], deleted: [] } });
+      if (result.ok) throw new Error("expected writeFailed");
+      expect(result.detail, name).toContain('could not delete the legacy rule "doubleyoup-ban:old0": WAF rule delete failed with HTTP 404');
+      expect(fake.customRules?.some((rule) => rule.id === "l-0"), name).toBe(true);
+      vi.restoreAllMocks();
+    }
+  });
+});
 
 describe("waf-edge-sync: random walk under small budgets, failed writes, duplicates and hand moves (review round 3)", () => {
   /** Every clause of an enabled edge chunk, keyed by kind. */

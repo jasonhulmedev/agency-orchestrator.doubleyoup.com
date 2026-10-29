@@ -20,8 +20,9 @@
 // Past either limit the run stops BEFORE the next call and reports `writeFailed` with what landed.
 // The op is idempotent and re-reads the zone, so the next run continues from the zone's real state.
 //
-// UNKNOWN WRITES. A write whose timeout fired got no answer, and Cloudflare may still apply it later
-// (EdgeSyncRunBudget.settleWrite). `landed` leaves it out, and the budget remembers it: the actuator
+// UNKNOWN WRITES. A write with no definite answer — its timeout fired, the connection failed, or a
+// gateway status came back — may still be applied later (EdgeSyncRunBudget.settleWrite). `landed`
+// leaves it out, and the budget remembers it: the actuator
 // then keeps the zone's lease until it expires instead of releasing it, so no newer run can read the
 // zone, write, and report ok before that late write lands and undoes its work.
 
@@ -57,14 +58,58 @@ export const EDGE_SYNC_RESERVE_SLACK_MS = 5 * 1000;
 export const EDGE_SYNC_BUDGET_REACHED = "subrequest budget reached; the next run continues";
 export const EDGE_SYNC_DEADLINE_REACHED = "run time limit reached; the next run continues";
 
+/** Begins the error of every UNKNOWN write. The orchestrator's UNKNOWN marker matches it. */
+export const EDGE_SYNC_UNKNOWN_MARKER = "UNKNOWN:";
+
 /**
- * The error of a write whose timeout fired: it got no answer, so it may or may not have landed. The
- * actuator keeps the lease (EDGE_SYNC_LEASE_TTL_MS in actuate.ts, 5 minutes) whenever this is reported.
+ * The error of a write with no definite answer, after the marker and `reason`. The actuator keeps the
+ * lease (EDGE_SYNC_LEASE_TTL_MS in actuate.ts, 5 minutes) whenever one is reported.
  */
-export const EDGE_SYNC_WRITE_UNKNOWN =
-  "UNKNOWN: Cloudflare did not answer in time; the write may or may not have landed. The zone's lease " +
-  "is kept until it expires (5 minutes after the run began), so a late landing cannot undo a newer run; " +
-  "the next run then re-reads the zone.";
+export function edgeSyncWriteUnknown(reason: string): string {
+  return (
+    `${EDGE_SYNC_UNKNOWN_MARKER} ${reason}; the write may or may not have landed. The zone's lease ` +
+    "is kept until it expires (5 minutes after the run began), so a late landing cannot undo a newer run; " +
+    "the next run then re-reads the zone."
+  );
+}
+
+/** The error of a write whose timeout fired. */
+export const EDGE_SYNC_WRITE_UNKNOWN = edgeSyncWriteUnknown("Cloudflare did not answer in time");
+
+/**
+ * Answers to a write that do not say whether it was applied: the gateway and origin errors of
+ * Cloudflare's edge in front of its API (502, 503, 504, and 520 to 524). The API behind it may have
+ * applied the write, or may still apply it. A 500 or a 4xx is the API's own answer: a definite failure.
+ */
+export const EDGE_SYNC_AMBIGUOUS_WRITE_STATUSES: readonly number[] = [502, 503, 504, 520, 521, 522, 523, 524];
+
+/**
+ * A WAF write that failed, as the shared helpers in actuate.ts return it. `error` is the detail; the
+ * other two fields let settleWrite tell a definite failure from an UNKNOWN one (callers outside
+ * waf-edge-sync read `error` only).
+ */
+export interface CloudflareWriteFailure {
+  error: string;
+  /** The request got no answer at all: fetch threw (a lost connection, or the timeout fired). */
+  unanswered?: true;
+  /** The HTTP status of the answer, when an answer came. */
+  httpStatus?: number;
+}
+
+/** Why a failed write is UNKNOWN, or null when its failure is definite. */
+function unknownWriteReason(failure: CloudflareWriteFailure, signal: AbortSignal): string | null {
+  if (signal.aborted) {
+    return "Cloudflare did not answer in time";
+  }
+  if (failure.unanswered === true) {
+    const detail = failure.error.replace(/\.$/, "");
+    return `the connection failed before Cloudflare answered (${detail})`;
+  }
+  if (failure.httpStatus !== undefined && EDGE_SYNC_AMBIGUOUS_WRITE_STATUSES.includes(failure.httpStatus)) {
+    return `Cloudflare answered HTTP ${failure.httpStatus}, which does not say whether the write was applied`;
+  }
+  return null;
+}
 
 export interface EdgeSyncRunLimits {
   subrequestBudget: number;
@@ -155,19 +200,20 @@ export class EdgeSyncRunBudget {
   }
 
   /**
-   * Called with the reply of every write, and the signal its permit gave. A failed write whose timeout
-   * fired got no answer, so Cloudflare may or may not apply it, even later: its error becomes
-   * EDGE_SYNC_WRITE_UNKNOWN, and the run remembers it (hadUnknownWrite). The caller keeps it out of
-   * `landed`. Any other reply passes unchanged.
+   * Called with the reply of every write, and the signal its permit gave. A failed write with no
+   * definite answer (unknownWriteReason) may still be applied, even later: its error becomes an
+   * UNKNOWN one (edgeSyncWriteUnknown), and the run remembers it (hadUnknownWrite). The caller keeps
+   * it out of `landed`. Any other reply passes unchanged.
    */
   settleWrite<Reply extends object>(reply: Reply, signal: AbortSignal): Reply | { error: string } {
     if (!("error" in reply)) {
       return reply;
     }
-    if (!signal.aborted) {
+    const reason = unknownWriteReason(reply as CloudflareWriteFailure, signal);
+    if (reason === null) {
       return reply;
     }
     this.unknownWrite = true;
-    return { error: EDGE_SYNC_WRITE_UNKNOWN };
+    return { error: edgeSyncWriteUnknown(reason) };
   }
 }

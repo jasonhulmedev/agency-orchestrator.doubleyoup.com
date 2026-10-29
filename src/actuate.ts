@@ -133,8 +133,9 @@ import { presignS3Put, presignS3Get } from "./sigv4.js";
 import {
   EDGE_SYNC_RATE_LIMIT_RESERVE,
   EDGE_SYNC_RUN_LIMITS,
-  EDGE_SYNC_WRITE_UNKNOWN,
+  EDGE_SYNC_UNKNOWN_MARKER,
   EdgeSyncRunBudget,
+  type CloudflareWriteFailure,
   type EdgeSyncRunLimits,
 } from "./edge-sync-budget.js";
 import type { CustomHostnameDeleteResult, CustomHostnameGetResult, CustomHostnameUpsertResult } from "./actuate-custom-hostname.js";
@@ -1972,12 +1973,12 @@ async function writeWafRuleset(
   url: string,
   body: unknown,
   signal?: AbortSignal,
-): Promise<{ ruleset: CloudflareRuleset } | { error: string }> {
+): Promise<{ ruleset: CloudflareRuleset } | CloudflareWriteFailure> {
   let response: Response;
   try {
     response = await fetch(url, withOptionalSignal({ method, headers: cloudflareHeaders(token), body: JSON.stringify(body) }, signal));
   } catch (err) {
-    return { error: `could not reach Cloudflare to write the WAF rule: ${errorMessage(err)}` };
+    return { error: `could not reach Cloudflare to write the WAF rule: ${errorMessage(err)}`, unanswered: true };
   }
   if (response.status === 401 || response.status === 403) {
     await response.text().catch(() => "");
@@ -1985,7 +1986,10 @@ async function writeWafRuleset(
   }
   const envelope = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
   if (!envelope?.success) {
-    return { error: `WAF rule write failed with HTTP ${response.status}${cloudflareErrorMessage(envelope)}.` };
+    return {
+      error: `WAF rule write failed with HTTP ${response.status}${cloudflareErrorMessage(envelope)}.`,
+      httpStatus: response.status,
+    };
   }
   return { ruleset: (envelope.result ?? {}) as CloudflareRuleset };
 }
@@ -2492,7 +2496,9 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
 // zone's real state. The write order above is therefore also the order of importance: bans gained
 // and removed first, cosmetic moves last. A write whose timeout fired is UNKNOWN: its detail says so,
 // `landed` leaves it out, and the run keeps the zone's lease until it expires (see the actuator).
-// OTHER WRITERS. A delete that finds its rule already gone (404) is done, not landed. A move whose
+// The same holds for a write whose connection failed, or that got a gateway status (502, 503, 504,
+// 520 to 524). A 500 or a 4xx is a definite failure. Reads are never UNKNOWN: they change nothing.
+// OTHER WRITERS. A delete that finds its rule already gone (the API's 404) is done, not landed. A move whose
 // rule or anchor vanished re-reads the zone and defers the rest to the next run (writeFailed).
 // The rate-limit part (reconcileEdgeRateLimit) runs AFTER the custom part, whatever the custom part
 // did, so a refusal there never leaves rate limiting on when the job switched it off (A10).
@@ -2620,32 +2626,37 @@ interface DesiredSyncRule {
 
 /**
  * DELETE one rule. Cloudflare answers with the updated ruleset, which this op does not rely on.
- * `absent`: Cloudflare answered 404, so the rule is already gone — another writer deleted it first
- * (the orchestrator's legacy remover deletes `doubleyoup-ban:<id>` rules too). The delete's goal
- * holds; the caller counts it as done, but not as landed by this run.
+ * `absent`: the Cloudflare API answered 404 (its JSON envelope, `success: false`), so the rule is
+ * already gone — another writer deleted it first (the orchestrator's legacy remover deletes
+ * `doubleyoup-ban:<id>` rules too). The delete's goal holds; the caller counts it as done, but not as
+ * landed by this run. A 404 without that envelope (bare, or an HTML page from something in between)
+ * says nothing about the rule: a failure.
  */
 async function deleteWafRule(
   token: string,
   url: string,
   signal?: AbortSignal,
-): Promise<{ deleted: true } | { absent: true } | { error: string }> {
+): Promise<{ deleted: true } | { absent: true } | CloudflareWriteFailure> {
   let response: Response;
   try {
     response = await fetch(url, withOptionalSignal({ method: "DELETE", headers: cloudflareHeaders(token) }, signal));
   } catch (err) {
-    return { error: `could not reach Cloudflare to delete the WAF rule: ${errorMessage(err)}` };
-  }
-  if (response.status === 404) {
-    await response.text().catch(() => "");
-    return { absent: true };
+    return { error: `could not reach Cloudflare to delete the WAF rule: ${errorMessage(err)}`, unanswered: true };
   }
   if (response.status === 401 || response.status === 403) {
     await response.text().catch(() => "");
     return { error: WAF_RULES_DENIED_DETAIL };
   }
   const envelope = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  const isCloudflareFailureEnvelope = envelope !== null && envelope.success === false && Array.isArray(envelope.errors);
+  if (response.status === 404 && isCloudflareFailureEnvelope) {
+    return { absent: true };
+  }
   if (!envelope?.success) {
-    return { error: `WAF rule delete failed with HTTP ${response.status}${cloudflareErrorMessage(envelope)}.` };
+    return {
+      error: `WAF rule delete failed with HTTP ${response.status}${cloudflareErrorMessage(envelope)}.`,
+      httpStatus: response.status,
+    };
   }
   return { deleted: true };
 }
@@ -2742,7 +2753,7 @@ export const EDGE_SYNC_LEASE_TTL_MS = 5 * 60 * 1000;
  * `busy`, writing nothing, while another run holds it. The lease is released when the run ends, in
  * `finally`; if a run dies without releasing it, it expires after EDGE_SYNC_LEASE_TTL_MS. Duplicates
  * that still appear (a run that outlived its lease) are resolved by the next run, not refused.
- * EXCEPT after an UNKNOWN write (a write whose timeout fired, which Cloudflare may still apply): then
+ * EXCEPT after an UNKNOWN write (a write with no definite answer, which Cloudflare may still apply): then
  * the lease is NOT released but left to expire, so no newer run can start, write and report ok before
  * that late write lands and undoes its work. The UNKNOWN detail says so.
  */
@@ -3382,7 +3393,7 @@ async function syncCustomRules(
     if ("stopped" in reply) {
       return stopBefore(reply.stopped, `move rule "${desired.description}" into place`);
     }
-    if ("error" in reply && reply.error === EDGE_SYNC_WRITE_UNKNOWN) {
+    if ("error" in reply && reply.error.startsWith(EDGE_SYNC_UNKNOWN_MARKER)) {
       return writeFailure(`could not move rule "${desired.description}" into place: ${reply.error}`);
     }
     if ("error" in reply) {
