@@ -2813,6 +2813,12 @@ export function validateProvisionSshKeysParams(raw: unknown): ParamsVerdict<Prov
 // with the agency's own R2_PROVISION_API_TOKEN and sent straight to the agency's own FILE-NODE cell-agent,
 // which writes it into the site's locked wp-config. The platform sees names, ids and hosts, never a key.
 //
+// THE FILE-NODE AGENT IN THE JOB. The install job names that agent: `fileAgentUrl` and `fileAgentToken`. The
+// platform derives the token, so no agency can set it as a Worker secret. The two keys come together or not
+// at all. A job from an older platform carries neither, and the Worker then uses its own CELL_FILE_AGENT_*
+// secrets. app signs the pair only when the host is a file-agent host of the site's own cell
+// (agency-dispatch-site-binding.ts), so a key is never posted to a host outside that cell.
+//
 // THIS BLOCK IS A PINNED TWIN. The app and the agency Worker carry it byte for byte, and each repo's test
 // suite pins the sha256 of the block (from this marker up to the next section marker, the hub#58 block).
 // A change on one side only fails that side's suite. Change both twins and both pins together.
@@ -2847,6 +2853,13 @@ export interface R2SiteKeyInstallParams {
   mediaHost: string;
   /** A short unique tag for this key (lowercase letters and digits). It becomes part of the key's name. */
   label: string;
+  /**
+   * The site's FILE-NODE cell-agent, exactly `https://<lowercase host>`: no path, port, query or user part.
+   * Sent together with `fileAgentToken`, or neither is sent (a job from an older platform).
+   */
+  fileAgentUrl?: string;
+  /** The bearer token of that agent: 64 lowercase hex characters. A secret: no answer or reason repeats it. */
+  fileAgentToken?: string;
 }
 
 export interface R2SiteKeyRevokeParams {
@@ -2862,6 +2875,20 @@ const R2_MEDIA_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,45}$/;
 const R2_MEDIA_LABEL_RE = /^[a-z0-9]{1,16}$/;
 const R2_TOKEN_ID_RE = /^[a-f0-9]{32}$/;
 const R2_MEDIA_HOST_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+const R2_FILE_AGENT_URL_SCHEME = "https://";
+const R2_FILE_AGENT_TOKEN_RE = /^[a-f0-9]{64}$/;
+
+/**
+ * True for exactly `https://<lowercase DNS host>`. The host grammar has no "/", ":", "?", "#" or "@", so a path, a
+ * port, a query, a fragment and a user part are all refused, and so is a trailing slash.
+ */
+export function isR2FileAgentUrl(value: unknown): value is string {
+  if (typeof value !== "string" || !value.startsWith(R2_FILE_AGENT_URL_SCHEME)) {
+    return false;
+  }
+  const host = value.slice(R2_FILE_AGENT_URL_SCHEME.length);
+  return host.length <= 253 && R2_MEDIA_HOST_RE.test(host);
+}
 
 /** True for `doubleyoup-media-<prefix>` with a valid prefix (R2's 63-character cap is met by the 46-character prefix). */
 export function isR2MediaBucketName(name: unknown): name is string {
@@ -2903,7 +2930,7 @@ export function validateR2SiteKeyInstallParams(raw: unknown): ParamsVerdict<R2Si
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
   }
-  const { bucket, slug, prefix, mediaHost, label } = raw;
+  const { bucket, slug, prefix, mediaHost, label, fileAgentUrl, fileAgentToken } = raw;
   if (!isR2MediaBucketName(bucket)) {
     return { ok: false, reason: R2_MEDIA_BUCKET_RULE };
   }
@@ -2922,7 +2949,19 @@ export function validateR2SiteKeyInstallParams(raw: unknown): ParamsVerdict<R2Si
   if (typeof label !== "string" || !R2_MEDIA_LABEL_RE.test(label)) {
     return { ok: false, reason: "label must be 1-16 lowercase letters and digits" };
   }
-  return { ok: true, params: { bucket, slug, prefix, mediaHost, label } };
+  // A job from an older platform names no file-node agent. It stays valid, and the Worker uses its own secrets.
+  if (fileAgentUrl === undefined && fileAgentToken === undefined) {
+    return { ok: true, params: { bucket, slug, prefix, mediaHost, label } };
+  }
+  // One key without the other is refused: half a pair is a bug, and a URL must never meet another source's token.
+  // The reasons name the rule only, never the value (the token is a secret).
+  if (!isR2FileAgentUrl(fileAgentUrl)) {
+    return { ok: false, reason: "fileAgentUrl must be exactly https://<lowercase DNS host> (no path, port, query or user part), sent together with fileAgentToken" };
+  }
+  if (typeof fileAgentToken !== "string" || !R2_FILE_AGENT_TOKEN_RE.test(fileAgentToken)) {
+    return { ok: false, reason: "fileAgentToken must be 64 lowercase hex characters, sent together with fileAgentUrl" };
+  }
+  return { ok: true, params: { bucket, slug, prefix, mediaHost, label, fileAgentUrl, fileAgentToken } };
 }
 
 export function validateR2SiteKeyRevokeParams(raw: unknown): ParamsVerdict<R2SiteKeyRevokeParams> {
