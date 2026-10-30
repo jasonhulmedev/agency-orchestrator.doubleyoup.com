@@ -8,9 +8,15 @@
 //   r2-site-key-revoke    DELETE one such key.
 //
 // Everything runs on the agency's OWN R2_PROVISION_API_TOKEN (an account-owned token that can create
-// buckets and API tokens) and the agency's own file-node cell-agent. The platform holds neither of these two.
+// buckets and API tokens) and the agency's own file-node cell-agent. The platform does not hold the R2 token.
 // Caveat: the platform does hold the agency cell-agent bearer tokens (to run scripts on the agency's nodes), so "the
 // platform never sees the key" means only that no answer of this op carries it.
+//
+// WHICH FILE-NODE AGENT. The signed install job names it (fileAgentUrl + fileAgentToken): the platform derives the
+// token from the site's own cell, so no agency can configure it here. app signs the pair only for a file-agent host
+// of that cell. The job's pair wins. CELL_FILE_AGENT_URL / CELL_FILE_AGENT_TOKEN are an OPTIONAL fallback, used only
+// for a job without the pair (from a platform older than these params). With neither, the install refuses before
+// it mints. The token is never repeated in an answer.
 //
 // WHY THE KEY GOES WORKER -> FILE NODE. hub#43 (decided 2026-10-08): the platform does not hold a write key
 // to the agency's account again (no key value is handed to it). The earlier copy ran with such a key on the platform's VM and the key had
@@ -266,17 +272,41 @@ async function deleteToken(accountId: string, token: string, tokenId: string): P
   return reply.status === 200 || reply.status === 404;
 }
 
+/** The file-node cell-agent the install posts the new key to, and where the pair came from. */
+interface FileAgentTarget {
+  url: string;
+  token: string;
+  /** "job" = the signed job's fileAgentUrl + fileAgentToken; "worker-secrets" = CELL_FILE_AGENT_URL / _TOKEN. */
+  source: "job" | "worker-secrets";
+}
+
+/**
+ * The job's pair when it carries BOTH keys, else the Worker's own pair when BOTH secrets are set, else null.
+ * A pair is never mixed across the two sources: a URL from one with a token from the other would post the
+ * key with a bearer the host was never meant to get.
+ */
+function fileAgentTargetFor(params: R2SiteKeyInstallParams, env: Env): FileAgentTarget | null {
+  if (params.fileAgentUrl && params.fileAgentToken) {
+    return { url: params.fileAgentUrl, token: params.fileAgentToken, source: "job" };
+  }
+  if (env.CELL_FILE_AGENT_URL && env.CELL_FILE_AGENT_TOKEN) {
+    return { url: env.CELL_FILE_AGENT_URL, token: env.CELL_FILE_AGENT_TOKEN, source: "worker-secrets" };
+  }
+  return null;
+}
+
 export async function actuateR2SiteKeyInstall(params: R2SiteKeyInstallParams, env: Env): Promise<R2SiteKeyInstallResult> {
   const failure = (detail: string): R2SiteKeyInstallResult => ({ ok: false, op: "r2-site-key-install", bucket: params.bucket, detail });
   const token = env.R2_PROVISION_API_TOKEN;
   if (!token) {
     return failure("R2_PROVISION_API_TOKEN is not configured on this Worker.");
   }
-  const agentUrl = env.CELL_FILE_AGENT_URL;
-  const agentToken = env.CELL_FILE_AGENT_TOKEN;
-  if (!agentUrl || !agentToken) {
+  const fileAgent = fileAgentTargetFor(params, env);
+  if (fileAgent === null) {
     // Refuse BEFORE minting: a key with nowhere to go is a leak waiting to happen.
-    return failure("CELL_FILE_AGENT_URL / CELL_FILE_AGENT_TOKEN are not configured on this Worker (the file node's cell-agent).");
+    return failure(
+      "the signed job names no file-node cell-agent (fileAgentUrl / fileAgentToken), and CELL_FILE_AGENT_URL / CELL_FILE_AGENT_TOKEN are not configured on this Worker (the file node's cell-agent).",
+    );
   }
 
   const account = await resolveMediaAccount(token, env);
@@ -325,12 +355,14 @@ export async function actuateR2SiteKeyInstall(params: R2SiteKeyInstallParams, en
   const accessKeyId = tokenId;
   const secretAccessKey = await sha256Hex(record.value);
 
-  // Stage it on the file node. redirect:"manual": a redirect means a wrong CELL_FILE_AGENT_URL.
+  // Stage it on the file node. redirect:"manual": a redirect means a wrong file-agent URL, and following it would
+  // send the key and the bearer to another host. workerd's fetch has no redirect:"error" (it throws on that value),
+  // so "manual" is the only way to refuse, and the status check below refuses every 3xx and the opaque status 0.
   let response: Response;
   try {
-    response = await fetch(`${stripTrailingSlash(agentUrl)}/set-r2-target`, {
+    response = await fetch(`${stripTrailingSlash(fileAgent.url)}/set-r2-target`, {
       method: "POST",
-      headers: { authorization: `Bearer ${agentToken}`, "content-type": "application/json", accept: "application/json" },
+      headers: { authorization: `Bearer ${fileAgent.token}`, "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify({
         slug: params.slug,
         mode: "stage",
@@ -368,9 +400,14 @@ export async function actuateR2SiteKeyInstall(params: R2SiteKeyInstallParams, en
     definiteRefusal = true;
   } else if (response.status >= 400 && response.status < 500) {
     await response.body?.cancel().catch(() => {});
+    // Name the token by its SOURCE, never by its value.
+    let rejectedTokenName = "CELL_FILE_AGENT_TOKEN";
+    if (fileAgent.source === "job") {
+      rejectedTokenName = "the fileAgentToken of the signed job";
+    }
     stageDetail =
       response.status === 401 || response.status === 403
-        ? "the file-node cell-agent rejected CELL_FILE_AGENT_TOKEN (bearer auth failed)."
+        ? `the file-node cell-agent rejected ${rejectedTokenName} (bearer auth failed).`
         : `the file-node cell-agent refused the request (HTTP ${response.status}).`;
     definiteRefusal = true;
   } else {

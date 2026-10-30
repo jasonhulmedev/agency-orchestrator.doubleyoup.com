@@ -133,6 +133,9 @@ export interface Env {
   // hub#43: the agency's FILE-NODE cell-agent (where /set-r2-target runs). The r2-site-key-install op posts
   // the new per-site media key straight to it, so no answer to the platform carries the key. The web-node CELL_AGENT_*
   // above cannot be used: only the file node can write /platform/<slug>/wp-config-real.php.
+  // OPTIONAL, and no agency needs to set them: the signed install job names the site's own file-node agent and
+  // its token (fileAgentUrl + fileAgentToken), and the job's pair wins. These two are only the fallback for a job
+  // without that pair (from a platform older than those params). Use both or neither.
   CELL_FILE_AGENT_URL?: string;
   CELL_FILE_AGENT_TOKEN?: string;
   /** hub#43 L7: the Cloudflare account id R2_PROVISION_API_TOKEN must belong to. When set, the media ops refuse any other account. */

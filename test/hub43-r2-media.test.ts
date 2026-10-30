@@ -14,7 +14,8 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 // @ts-ignore (see test/hub58-ops.test.ts for why this is ignored)
 import rawDispatchParamsSource from "../src/dispatch-params.ts?raw";
 import type { Env } from "../src/env.js";
-import { DISPATCH_OPS } from "../src/dispatch-verify.js";
+import { DISPATCH_OPS, canonicalizeDispatchJob, type DispatchJob } from "../src/dispatch-verify.js";
+import worker from "../src/index.js";
 import { DISPATCH_OP_REGISTRY } from "../src/ops.js";
 import {
   r2SiteKeyNameFor,
@@ -30,7 +31,7 @@ const TWIN_BLOCK_START_MARKER = "// ── hub#43: agency-owned media";
 // The planning/47 twin block follows this one, so this block ends where that one starts (the two blocks are adjacent).
 const TWIN_BLOCK_END_MARKER = "\n// ── planning/47: the boot-script update";
 // The app's src/server/services/agency-dispatch-params-hub43.test.ts pins the SAME value.
-const TWIN_BLOCK_SHA256 = "f2b700d3ef4e712143ed625abb15a9aca3a6c2ef9712ae8115e1f364a4eea2cc";
+const TWIN_BLOCK_SHA256 = "f9b925f3a04fb2ecd9a52f8c5148bd618b3eedfb21c61c3382c8e45b07bbd140";
 
 const ACCOUNT_ID = "043e3bdaf4a6849a2d745269084c0e5f";
 const R2_TOKEN = "r2-provision-token-must-not-be-echoed";
@@ -53,6 +54,7 @@ interface RecordedCall {
   method: string;
   auth: string | null;
   body: string | null;
+  redirect: string | undefined;
 }
 
 function mockFetch(handler: (call: RecordedCall) => { status?: number; body: unknown }): RecordedCall[] {
@@ -64,6 +66,7 @@ function mockFetch(handler: (call: RecordedCall) => { status?: number; body: unk
       method: init?.method ?? "GET",
       auth: headers.get("authorization"),
       body: typeof init?.body === "string" ? init.body : null,
+      redirect: init?.redirect,
     };
     calls.push(call);
     const answer = handler(call);
@@ -81,6 +84,12 @@ const ACCOUNTS_URL = `${CF}/accounts?per_page=1`;
 const BUCKET_URL = `${CF}/accounts/${ACCOUNT_ID}/r2/buckets/${BUCKET}`;
 const TOKENS_URL = `${CF}/accounts/${ACCOUNT_ID}/tokens`;
 const STAGE_URL = `${AGENT_URL}/set-r2-target`;
+
+// file-agent-in-job: the file-node agent a signed install job names. A different host and token than the Worker's
+// own CELL_FILE_AGENT_* above, so each test can tell which pair was used.
+const JOB_AGENT_URL = "https://cell-region-file.example.org";
+const JOB_AGENT_TOKEN = "0123456789abcdef".repeat(4);
+const JOB_STAGE_URL = `${JOB_AGENT_URL}/set-r2-target`;
 
 describe("hub#43 twin block", () => {
   it("is byte-identical with the app copy (pinned sha256: change BOTH twins and BOTH pins together)", async () => {
@@ -142,6 +151,70 @@ describe("r2-site-key-install params", () => {
       expect(errorText(validateR2SiteKeyInstallParams({ ...good, label }))).toMatch(/^label must be 1-16/);
     }
     expect(validateR2SiteKeyInstallParams(null).ok).toBe(false);
+  });
+
+  it("file-agent-in-job: accepts the file-node agent pair, and still accepts a job with neither key (an older platform)", () => {
+    const withAgent = { ...good, fileAgentUrl: JOB_AGENT_URL, fileAgentToken: JOB_AGENT_TOKEN };
+    expect(validateR2SiteKeyInstallParams({ ...withAgent, extra: "dropped" })).toEqual({ ok: true, params: withAgent });
+    expect(validateR2SiteKeyInstallParams(good)).toEqual({ ok: true, params: good });
+    // The registry runs the same validator for a signed job.
+    expect(DISPATCH_OP_REGISTRY["r2-site-key-install"].validateParams(withAgent)).toEqual({ ok: true, params: withAgent });
+  });
+
+  it("file-agent-in-job: refuses every fileAgentUrl that is not exactly https://<lowercase host>, and never repeats the token", () => {
+    const badUrls: unknown[] = [
+      "",
+      "https://",
+      "http://cell-region-file.example.org",
+      "ftp://cell-region-file.example.org",
+      "https://cell-region-file.example.org/",
+      "https://cell-region-file.example.org/set-r2-target",
+      "https://cell-region-file.example.org:8443",
+      "https://user@cell-region-file.example.org",
+      "https://user:pass@cell-region-file.example.org",
+      "https://cell-region-file.example.org?x=1",
+      "https://cell-region-file.example.org#x",
+      "https://Cell-Region-File.example.org",
+      "https://cell-region-file.example.org.",
+      "https://localhost",
+      " https://cell-region-file.example.org",
+      `https://${"a".repeat(250)}.org`,
+      7,
+      null,
+    ];
+    for (const fileAgentUrl of badUrls) {
+      const reason = errorText(validateR2SiteKeyInstallParams({ ...good, fileAgentUrl, fileAgentToken: JOB_AGENT_TOKEN }));
+      expect(reason, String(fileAgentUrl)).toMatch(/^fileAgentUrl must be exactly https:\/\/<lowercase DNS host>/);
+      expect(reason).not.toContain(JOB_AGENT_TOKEN);
+    }
+  });
+
+  it("file-agent-in-job: refuses every fileAgentToken that is not 64 lowercase hex, and never repeats it", () => {
+    const badTokens: unknown[] = [
+      "",
+      JOB_AGENT_TOKEN.slice(1),
+      `${JOB_AGENT_TOKEN}0`,
+      JOB_AGENT_TOKEN.toUpperCase(),
+      "g".repeat(64),
+      `${JOB_AGENT_TOKEN.slice(0, 63)} `,
+      `${JOB_AGENT_TOKEN.slice(0, 63)}\n`,
+      7,
+      null,
+    ];
+    for (const fileAgentToken of badTokens) {
+      const reason = errorText(validateR2SiteKeyInstallParams({ ...good, fileAgentUrl: JOB_AGENT_URL, fileAgentToken }));
+      expect(reason, JSON.stringify(fileAgentToken)).toMatch(/^fileAgentToken must be 64 lowercase hex characters/);
+      if (typeof fileAgentToken === "string" && fileAgentToken.length > 0) {
+        expect(reason).not.toContain(fileAgentToken);
+      }
+    }
+  });
+
+  it("file-agent-in-job: refuses half a pair (one key without the other)", () => {
+    expect(errorText(validateR2SiteKeyInstallParams({ ...good, fileAgentUrl: JOB_AGENT_URL }))).toMatch(/^fileAgentToken must be .*sent together with fileAgentUrl/);
+    const urlMissing = errorText(validateR2SiteKeyInstallParams({ ...good, fileAgentToken: JOB_AGENT_TOKEN }));
+    expect(urlMissing).toMatch(/^fileAgentUrl must be .*sent together with fileAgentToken/);
+    expect(urlMissing).not.toContain(JOB_AGENT_TOKEN);
   });
 });
 
@@ -214,12 +287,15 @@ describe("readR2MediaState", () => {
 describe("actuateR2SiteKeyInstall", () => {
   const params = { bucket: BUCKET, slug: "acme", prefix: "acme", mediaHost: "media.example.org", label: "k1abc" };
 
-  function happyHandler(stage: { status?: number; body: unknown } = { body: { ok: true, mode: "stage", staged: { hex: "abcdef0123456789" } } }) {
+  function happyHandler(
+    stage: { status?: number; body: unknown } = { body: { ok: true, mode: "stage", staged: { hex: "abcdef0123456789" } } },
+    stageUrl: string = STAGE_URL,
+  ) {
     return (call: RecordedCall) => {
       if (call.url === ACCOUNTS_URL) return { body: { success: true, result: [{ id: ACCOUNT_ID }] } };
       if (call.url === BUCKET_URL) return { body: { success: true, result: { name: BUCKET } } };
       if (call.url === TOKENS_URL && call.method === "POST") return { body: { success: true, result: { id: TOKEN_ID, value: TOKEN_VALUE } } };
-      if (call.url === STAGE_URL) return stage;
+      if (call.url === stageUrl) return stage;
       if (call.url === `${TOKENS_URL}/${TOKEN_ID}` && call.method === "DELETE") return { body: { success: true } };
       return { status: 500, body: { success: false } };
     };
@@ -274,14 +350,124 @@ describe("actuateR2SiteKeyInstall", () => {
     expect(calls.some((call) => call.method === "DELETE")).toBe(false);
   });
 
-  it("refuses BEFORE minting when the file-node agent is not configured", async () => {
+  it("refuses BEFORE minting when the job names no file-node agent and the Worker has none configured", async () => {
     const calls = mockFetch(happyHandler());
     for (const overrides of [{ CELL_FILE_AGENT_URL: undefined }, { CELL_FILE_AGENT_TOKEN: undefined }]) {
       const result = await actuateR2SiteKeyInstall(params, env(overrides));
       expect(result).toMatchObject({ ok: false, op: "r2-site-key-install" });
+      expect(JSON.stringify(result)).toMatch(/fileAgentUrl \/ fileAgentToken/);
       expect(JSON.stringify(result)).toMatch(/CELL_FILE_AGENT/);
     }
     expect(calls).toEqual([]);
+  });
+
+  describe("file-agent-in-job: the file-node agent named by the signed job", () => {
+    const jobParams = { ...params, fileAgentUrl: JOB_AGENT_URL, fileAgentToken: JOB_AGENT_TOKEN };
+    const noWorkerSecrets = { CELL_FILE_AGENT_URL: undefined, CELL_FILE_AGENT_TOKEN: undefined };
+
+    function stageCalls(calls: RecordedCall[]): RecordedCall[] {
+      return calls.filter((call) => call.url.endsWith("/set-r2-target"));
+    }
+
+    it("the job's pair wins over the Worker's own secrets", async () => {
+      const calls = mockFetch(happyHandler(undefined, JOB_STAGE_URL));
+      const result = await actuateR2SiteKeyInstall(jobParams, env());
+      expect(result).toMatchObject({ ok: true, op: "r2-site-key-install", tokenId: TOKEN_ID });
+      const stages = stageCalls(calls);
+      expect(stages.map((call) => call.url)).toEqual([JOB_STAGE_URL]);
+      expect(stages[0]?.auth).toBe(`Bearer ${JOB_AGENT_TOKEN}`);
+      expect(stages[0]?.redirect).toBe("manual");
+      // The Worker's own file agent is never called and its token never sent.
+      expect(calls.some((call) => call.url.startsWith(AGENT_URL))).toBe(false);
+      expect(calls.some((call) => call.auth === `Bearer ${AGENT_TOKEN}`)).toBe(false);
+      for (const secret of [JOB_AGENT_TOKEN, AGENT_TOKEN, TOKEN_VALUE, R2_TOKEN]) {
+        expect(JSON.stringify(result)).not.toContain(secret);
+      }
+    });
+
+    it("the job's pair works on a Worker that has no file-agent secrets at all (no agency setup step)", async () => {
+      const calls = mockFetch(happyHandler(undefined, JOB_STAGE_URL));
+      const result = await actuateR2SiteKeyInstall(jobParams, env(noWorkerSecrets));
+      expect(result).toMatchObject({ ok: true, tokenId: TOKEN_ID });
+      expect(stageCalls(calls).map((call) => call.auth)).toEqual([`Bearer ${JOB_AGENT_TOKEN}`]);
+    });
+
+    it("a job without the pair falls back to the Worker's own secrets (a platform older than these params)", async () => {
+      const calls = mockFetch(happyHandler());
+      const result = await actuateR2SiteKeyInstall(params, env());
+      expect(result).toMatchObject({ ok: true, tokenId: TOKEN_ID });
+      const stages = stageCalls(calls);
+      expect(stages.map((call) => call.url)).toEqual([STAGE_URL]);
+      expect(stages[0]?.auth).toBe(`Bearer ${AGENT_TOKEN}`);
+    });
+
+    it("a half pair (only reachable by calling the actuator directly) is never mixed with a Worker secret", async () => {
+      // The validator refuses half a pair, so a signed job never gets here with one. If one ever did, the Worker's
+      // own WHOLE pair is used: the job's URL is never sent the Worker's token, and the other way round.
+      const calls = mockFetch(happyHandler());
+      await actuateR2SiteKeyInstall({ ...params, fileAgentUrl: JOB_AGENT_URL }, env());
+      await actuateR2SiteKeyInstall({ ...params, fileAgentToken: JOB_AGENT_TOKEN }, env());
+      const stages = stageCalls(calls);
+      expect(stages.map((call) => call.url)).toEqual([STAGE_URL, STAGE_URL]);
+      expect(stages.map((call) => call.auth)).toEqual([`Bearer ${AGENT_TOKEN}`, `Bearer ${AGENT_TOKEN}`]);
+    });
+
+    it("a rejected job token is named by its source, never by its value, and the new key is deleted again", async () => {
+      for (const status of [401, 403]) {
+        vi.restoreAllMocks();
+        const calls = mockFetch(happyHandler({ status, body: { error: "unauthorized" } }, JOB_STAGE_URL));
+        const result = await actuateR2SiteKeyInstall(jobParams, env());
+        const text = JSON.stringify(result);
+        expect(text).toContain("rejected the fileAgentToken of the signed job (bearer auth failed)");
+        expect(text).toMatch(/deleted again/);
+        expect(text).not.toContain(JOB_AGENT_TOKEN);
+        expect(calls.filter((call) => call.method === "DELETE").map((call) => call.url)).toEqual([`${TOKENS_URL}/${TOKEN_ID}`]);
+      }
+      // The Worker's own token keeps its old message.
+      vi.restoreAllMocks();
+      mockFetch(happyHandler({ status: 401, body: { error: "unauthorized" } }));
+      expect(JSON.stringify(await actuateR2SiteKeyInstall(params, env()))).toContain("rejected CELL_FILE_AGENT_TOKEN (bearer auth failed)");
+    });
+
+    it("a redirect from the job's host is refused, not followed, and the new key is deleted again", async () => {
+      const calls = mockFetch(happyHandler({ status: 302, body: {} }, JOB_STAGE_URL));
+      const result = await actuateR2SiteKeyInstall(jobParams, env());
+      expect(JSON.stringify(result)).toMatch(/redirected \(HTTP 302\): refusing to follow/);
+      expect(stageCalls(calls)).toHaveLength(1);
+      expect(calls.filter((call) => call.method === "DELETE")).toHaveLength(1);
+    });
+
+    it("the job's token is in no answer and no console line, on every path", async () => {
+      const consoleCalls: unknown[][] = [];
+      for (const method of ["log", "info", "warn", "error", "debug"] as const) {
+        vi.spyOn(console, method).mockImplementation((...args: unknown[]) => {
+          consoleCalls.push(args);
+        });
+      }
+      const stageAnswers: Array<(call: RecordedCall) => { status?: number; body: unknown }> = [
+        happyHandler(undefined, JOB_STAGE_URL),
+        happyHandler({ status: 409, body: { ok: false, refused: true, error: "set-r2-target refused: nothing written" } }, JOB_STAGE_URL),
+        happyHandler({ status: 500, body: { error: "set-r2-target failed" } }, JOB_STAGE_URL),
+        happyHandler({ status: 200, body: "<html>not json</html>" }, JOB_STAGE_URL),
+        happyHandler({ status: 404, body: { error: "no such route" } }, JOB_STAGE_URL),
+        (call) => {
+          if (call.url === JOB_STAGE_URL) throw new Error("connect ECONNRESET");
+          return happyHandler(undefined, JOB_STAGE_URL)(call);
+        },
+        (call) => {
+          if (call.url === TOKENS_URL && call.method === "POST") return { status: 403, body: { success: false } };
+          return happyHandler(undefined, JOB_STAGE_URL)(call);
+        },
+      ];
+      for (const handler of stageAnswers) {
+        // Keep the console spies: only the fetch mock is replaced between paths.
+        vi.mocked(globalThis.fetch).mockRestore?.();
+        mockFetch(handler);
+        const result = await actuateR2SiteKeyInstall(jobParams, env(noWorkerSecrets));
+        expect(JSON.stringify(result)).not.toContain(JOB_AGENT_TOKEN);
+      }
+      expect(JSON.stringify(consoleCalls)).not.toContain(JOB_AGENT_TOKEN);
+    });
   });
 
   it("refuses BEFORE minting when the bucket does not exist", async () => {
@@ -489,5 +675,76 @@ describe("M3: a key name belongs to a bucket only when the rest is the exact lab
     const revoke = await actuateR2SiteKeyRevoke({ bucket: "doubleyoup-media-docs", tokenId: "b".repeat(32) }, env());
     expect(revoke.ok).toBe(false);
     expect(JSON.stringify(revoke)).toMatch(/refusing to delete/);
+  });
+});
+
+describe("file-agent-in-job: a signed /actuate job carries the file-node agent end to end", () => {
+  function bytesToBase64(bytes: Uint8Array): string {
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary);
+  }
+
+  // A stand-in NONCE_STORE that reports every nonce fresh: this test is about the params, not replay.
+  const freshNonceStore = {
+    idFromName: () => ({}),
+    get: () => ({ consume: async () => "fresh" as const }),
+  } as unknown as Env["NONCE_STORE"];
+
+  async function signedActuateRequest(params: Record<string, unknown>): Promise<{ request: Request; publicKeyPem: string }> {
+    const keyPair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"])) as CryptoKeyPair;
+    const spki = new Uint8Array((await crypto.subtle.exportKey("spki", keyPair.publicKey)) as ArrayBuffer);
+    const publicKeyPem = `-----BEGIN PUBLIC KEY-----\n${bytesToBase64(spki)}\n-----END PUBLIC KEY-----\n`;
+    const job: DispatchJob = {
+      op: "r2-site-key-install",
+      // The app signs JSON.stringify of the VALIDATED params, so mirror that.
+      params: JSON.stringify(params),
+      accountId: "acct_test_1",
+      timestamp: new Date().toISOString(),
+      nonce: "0123456789abcdef0123456789abcdef",
+    };
+    const signatureBytes = new Uint8Array(
+      await crypto.subtle.sign({ name: "Ed25519" }, keyPair.privateKey, new TextEncoder().encode(canonicalizeDispatchJob(job))),
+    );
+    const request = new Request("http://localhost/actuate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ job, signature: bytesToBase64(signatureBytes) }),
+    });
+    return { request, publicKeyPem };
+  }
+
+  const installParams = { bucket: BUCKET, slug: "acme", prefix: "acme", mediaHost: "media.example.org", label: "k1abc" };
+
+  function stageHandler(call: RecordedCall): { status?: number; body: unknown } {
+    if (call.url === ACCOUNTS_URL) return { body: { success: true, result: [{ id: ACCOUNT_ID }] } };
+    if (call.url === BUCKET_URL) return { body: { success: true, result: { name: BUCKET } } };
+    if (call.url === TOKENS_URL && call.method === "POST") return { body: { success: true, result: { id: TOKEN_ID, value: TOKEN_VALUE } } };
+    if (call.url.endsWith("/set-r2-target")) return { body: { ok: true, mode: "stage", staged: { hex: "abcdef0123456789" } } };
+    return { status: 500, body: { success: false } };
+  }
+
+  it("posts the new key to the job's file-node agent with the job's token, and the answer carries no token", async () => {
+    const { request, publicKeyPem } = await signedActuateRequest({ ...installParams, fileAgentUrl: JOB_AGENT_URL, fileAgentToken: JOB_AGENT_TOKEN });
+    const calls = mockFetch(stageHandler);
+    const response = await worker.fetch(request, { ...env(), DY_SIGNING_PUBLIC_KEY: publicKeyPem, NONCE_STORE: freshNonceStore } as Env);
+    const text = await response.text();
+    expect(response.status).toBe(200);
+    expect(JSON.parse(text)).toMatchObject({ ok: true, op: "r2-site-key-install", tokenId: TOKEN_ID });
+    const stages = calls.filter((call) => call.url.endsWith("/set-r2-target"));
+    expect(stages.map((call) => [call.url, call.auth])).toEqual([[JOB_STAGE_URL, `Bearer ${JOB_AGENT_TOKEN}`]]);
+    expect(text).not.toContain(JOB_AGENT_TOKEN);
+  });
+
+  it("a signed job with a bad fileAgentToken is a 400 with nothing minted, and the reason does not repeat it", async () => {
+    const badToken = `${JOB_AGENT_TOKEN.slice(0, 63)}G`;
+    const { request, publicKeyPem } = await signedActuateRequest({ ...installParams, fileAgentUrl: JOB_AGENT_URL, fileAgentToken: badToken });
+    const calls = mockFetch(stageHandler);
+    const response = await worker.fetch(request, { ...env(), DY_SIGNING_PUBLIC_KEY: publicKeyPem, NONCE_STORE: freshNonceStore } as Env);
+    const text = await response.text();
+    expect(response.status).toBe(400);
+    expect(text).toMatch(/fileAgentToken must be 64 lowercase hex characters/);
+    expect(text).not.toContain(badToken);
+    expect(calls).toEqual([]);
   });
 });
