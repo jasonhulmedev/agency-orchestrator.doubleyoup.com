@@ -44,6 +44,7 @@ export default defineConfig({
             "test/session-gate.test.ts",
             "test/session-gate-minter.test.ts",
             "test/edge-gate-deploy.test.ts",
+            "test/waf-edge-sync.test.ts",
           ],
         },
       },

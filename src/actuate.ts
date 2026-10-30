@@ -51,6 +51,8 @@ import type {
   GcpInstanceRestartParams,
   ProvisionSshKeysParams,
   WafRuleUpsertParams,
+  WafEdgeSyncParams,
+  WafEdgeSyncRateLimit,
   GcpInstanceGetParams,
   GcpSubnetCreateParams,
   GcpSubnetGetParams,
@@ -94,6 +96,7 @@ import {
   WAF_MANAGED_PHASE,
   WAF_PHASE,
   WAF_RULE_DESCRIPTIONS,
+  WAF_UNKNOWN_PLAN_RULE_CAP,
   buildEdgeWafRules,
   buildManagedRulesetExecuteRule,
   edgeWafRulesInOrder,
@@ -102,7 +105,39 @@ import {
   wafRuleDrifted,
   type WafRule,
 } from "./edge-waf-rule.js";
+import {
+  buildEdgeChunkRule,
+  buildEdgeClauses,
+  chunkClausesForPlanning,
+  buildXmlrpcRule,
+  classifyWafRuleDescription,
+  edgeChunkDescription,
+  planStickyChunks,
+  splitChunkExpression,
+  type EdgeChunkKind,
+  type EdgeChunkPlan,
+  type EdgeClauseEntry,
+  type ExistingEdgeChunk,
+} from "./edge-waf-sync.js";
+import {
+  RATE_LIMIT_DESCRIPTIONS,
+  RATE_LIMIT_EXPENSIVE_DESCRIPTION,
+  RATE_LIMIT_ORIGIN_DESCRIPTION,
+  RATE_LIMIT_PHASE,
+  buildRateLimitRules,
+  rateLimitRuleCapForPlan,
+  rateLimitRuleDrifted,
+  type RateLimitRule,
+} from "./edge-rate-limit.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
+import {
+  EDGE_SYNC_RATE_LIMIT_RESERVE,
+  EDGE_SYNC_RUN_LIMITS,
+  EDGE_SYNC_UNKNOWN_MARKER,
+  EdgeSyncRunBudget,
+  type CloudflareWriteFailure,
+  type EdgeSyncRunLimits,
+} from "./edge-sync-budget.js";
 import type { CustomHostnameDeleteResult, CustomHostnameGetResult, CustomHostnameUpsertResult } from "./actuate-custom-hostname.js";
 import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessToken, mintGoogleIdToken } from "./validators.js";
 import { errorMessage, stripTrailingSlash } from "./util.js";
@@ -748,6 +783,8 @@ export type ActuateResult =
   | CachePurgeResult
   | CacheRuleUpsertResult
   | WafRuleUpsertResult
+  // hub#44 phase 2: every platform rule of an agency zone in one pass.
+  | WafEdgeSyncResult
   // hub#46 (actuate-custom-hostname.ts): customer domains as custom hostnames in the agency zone.
   | CustomHostnameUpsertResult
   | CustomHostnameGetResult
@@ -967,6 +1004,17 @@ interface CloudflareDnsRecordSummary {
   type?: string;
 }
 
+/**
+ * `init` with `signal` added only when there is one. waf-edge-sync passes a timeout signal (its run
+ * limits); every other caller passes none and sends exactly the request it sent before.
+ */
+function withOptionalSignal(init: RequestInit, signal: AbortSignal | undefined): RequestInit {
+  if (signal === undefined) {
+    return init;
+  }
+  return { ...init, signal };
+}
+
 /** First Cloudflare error message from a response body, if any (for detail strings). */
 export function cloudflareErrorMessage(body: CloudflareEnvelope | null): string {
   const message = body?.errors?.[0]?.message;
@@ -985,13 +1033,15 @@ function dnsFailure(name: string, detail: string): DnsRecordUpsertResult {
 export async function resolveZoneId(
   token: string,
   zoneName: string,
+  signal?: AbortSignal,
 ): Promise<{ id: string; planLegacyId: string | null; accountId: string | null } | { error: string }> {
   const query = new URLSearchParams({ name: zoneName, per_page: "2" });
   let response: Response;
   try {
-    response = await fetch(`${CF_API}/zones?${query.toString()}`, {
-      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
-    });
+    response = await fetch(
+      `${CF_API}/zones?${query.toString()}`,
+      withOptionalSignal({ headers: { authorization: `Bearer ${token}`, accept: "application/json" } }, signal),
+    );
   } catch (err) {
     return { error: `could not reach Cloudflare to resolve zone "${zoneName}": ${errorMessage(err)}` };
   }
@@ -1889,12 +1939,14 @@ async function getWafPhaseEntrypoint(
   token: string,
   zoneId: string,
   phase: string,
+  signal?: AbortSignal,
 ): Promise<{ ruleset: CloudflareRuleset } | { missing: true } | { error: string }> {
   let response: Response;
   try {
-    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zoneId)}/rulesets/phases/${phase}/entrypoint`, {
-      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
-    });
+    response = await fetch(
+      `${CF_API}/zones/${encodeURIComponent(zoneId)}/rulesets/phases/${phase}/entrypoint`,
+      withOptionalSignal({ headers: { authorization: `Bearer ${token}`, accept: "application/json" } }, signal),
+    );
   } catch (err) {
     return { error: `could not reach Cloudflare to read the ${phase} rules: ${errorMessage(err)}` };
   }
@@ -1920,12 +1972,13 @@ async function writeWafRuleset(
   method: "POST" | "PATCH",
   url: string,
   body: unknown,
-): Promise<{ ruleset: CloudflareRuleset } | { error: string }> {
+  signal?: AbortSignal,
+): Promise<{ ruleset: CloudflareRuleset } | CloudflareWriteFailure> {
   let response: Response;
   try {
-    response = await fetch(url, { method, headers: cloudflareHeaders(token), body: JSON.stringify(body) });
+    response = await fetch(url, withOptionalSignal({ method, headers: cloudflareHeaders(token), body: JSON.stringify(body) }, signal));
   } catch (err) {
-    return { error: `could not reach Cloudflare to write the WAF rule: ${errorMessage(err)}` };
+    return { error: `could not reach Cloudflare to write the WAF rule: ${errorMessage(err)}`, unanswered: true };
   }
   if (response.status === 401 || response.status === 403) {
     await response.text().catch(() => "");
@@ -1933,7 +1986,10 @@ async function writeWafRuleset(
   }
   const envelope = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
   if (!envelope?.success) {
-    return { error: `WAF rule write failed with HTTP ${response.status}${cloudflareErrorMessage(envelope)}.` };
+    return {
+      error: `WAF rule write failed with HTTP ${response.status}${cloudflareErrorMessage(envelope)}.`,
+      httpStatus: response.status,
+    };
   }
   return { ruleset: (envelope.result ?? {}) as CloudflareRuleset };
 }
@@ -2098,6 +2154,37 @@ async function upsertOneWafRule(
   return { action, ruleId: existingId, ruleset: next };
 }
 
+/**
+ * The signal for the next call of a helper that can run under a waf-edge-sync budget: undefined
+ * without a budget (the call goes as it always did), the budget's timeout signal, or its reason to
+ * stop (a string).
+ */
+function nextCallSignal(budget: EdgeSyncRunBudget | undefined): AbortSignal | undefined | string {
+  if (budget === undefined) {
+    return undefined;
+  }
+  const permit = budget.beginCall();
+  if (!permit.ok) {
+    return permit.reason;
+  }
+  return permit.signal;
+}
+
+/**
+ * A failed write of such a helper, settled by the run's budget (UNKNOWN when its timeout fired, and
+ * remembered so the lease is kept). Without a budget the reply passes unchanged.
+ */
+function settleBudgetedWrite(
+  budget: EdgeSyncRunBudget | undefined,
+  reply: { error: string },
+  signal: AbortSignal | undefined,
+): { error: string } {
+  if (budget === undefined || signal === undefined) {
+    return reply;
+  }
+  return budget.settleWrite(reply, signal);
+}
+
 /** True for an `execute` rule that runs the Cloudflare Managed Ruleset (whatever its description). */
 function executesCloudflareManagedRuleset(rule: CloudflareRulesetRule): boolean {
   if (rule.action !== "execute") {
@@ -2131,14 +2218,23 @@ function ourManagedRuleBody(existing: CloudflareRulesetRule, enabled: boolean): 
  * a disabled one was switched off on purpose. A rollback DISABLES ours; it never deletes it, so
  * switching it back on is one run. See ManagedRulesetStatus for every outcome. The caller has already
  * checked the plan for an enable.
+ *
+ * `budget` (waf-edge-sync only) is asked before each Cloudflare call: it gives the call a timeout
+ * signal, or a reason to stop, which comes back as `{ error }` with nothing more sent; it also settles
+ * each failed write (UNKNOWN on a timeout). Without it (waf-rule-upsert) the calls go exactly as before.
  */
 async function reconcileManagedRuleset(
   token: string,
   zoneId: string,
   zonePath: string,
   enabled: boolean,
+  budget?: EdgeSyncRunBudget,
 ): Promise<{ status: ManagedRulesetStatus } | { error: string }> {
-  const entrypoint = await getWafPhaseEntrypoint(token, zoneId, WAF_MANAGED_PHASE);
+  const readSignal = nextCallSignal(budget);
+  if (typeof readSignal === "string") {
+    return { error: readSignal };
+  }
+  const entrypoint = await getWafPhaseEntrypoint(token, zoneId, WAF_MANAGED_PHASE, readSignal);
   if ("error" in entrypoint) {
     return entrypoint;
   }
@@ -2169,14 +2265,19 @@ async function reconcileManagedRuleset(
       return { error: "Cloudflare returned our Managed Ruleset execute rule without an id — cannot switch it." };
     }
     const rulesetPath = `${zonePath}/rulesets/${encodeURIComponent(entrypoint.ruleset.id as string)}`;
+    const patchSignal = nextCallSignal(budget);
+    if (typeof patchSignal === "string") {
+      return { error: patchSignal };
+    }
     const patched = await writeWafRuleset(
       token,
       "PATCH",
       `${rulesetPath}/rules/${encodeURIComponent(ourRule.id)}`,
       ourManagedRuleBody(ourRule, enabled),
+      patchSignal,
     );
     if ("error" in patched) {
-      return patched;
+      return settleBudgetedWrite(budget, patched, patchSignal);
     }
     if (enabled) {
       return { status: "re-enabled" };
@@ -2199,21 +2300,31 @@ async function reconcileManagedRuleset(
   }
 
   const executeRule = buildManagedRulesetExecuteRule();
+  const createSignal = nextCallSignal(budget);
+  if (typeof createSignal === "string") {
+    return { error: createSignal };
+  }
   let written: { ruleset: CloudflareRuleset } | { error: string };
   if ("missing" in entrypoint) {
     // POST, not PUT on the entrypoint path: a racing create fails instead of replacing.
-    written = await writeWafRuleset(token, "POST", `${zonePath}/rulesets`, {
-      name: "default",
-      kind: "zone",
-      phase: WAF_MANAGED_PHASE,
-      rules: [executeRule],
-    });
+    written = await writeWafRuleset(
+      token,
+      "POST",
+      `${zonePath}/rulesets`,
+      {
+        name: "default",
+        kind: "zone",
+        phase: WAF_MANAGED_PHASE,
+        rules: [executeRule],
+      },
+      createSignal,
+    );
   } else {
     const rulesetPath = `${zonePath}/rulesets/${encodeURIComponent(entrypoint.ruleset.id as string)}`;
-    written = await writeWafRuleset(token, "POST", `${rulesetPath}/rules`, executeRule);
+    written = await writeWafRuleset(token, "POST", `${rulesetPath}/rules`, executeRule, createSignal);
   }
   if ("error" in written) {
-    return written;
+    return settleBudgetedWrite(budget, written, createSignal);
   }
   return { status: "deployed" };
 }
@@ -2349,6 +2460,1365 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
     otherWafRules,
     managedRuleset,
   };
+}
+
+// ── waf-edge-sync ──────────────────────────────────────────────────────────────────────
+// hub#44 phase 2 (specs/edge-security-via-worker.md): ONE op owns every platform rule in an agency
+// zone's firewall-custom phase — the six baseline rules and the packed ban chunk rules — and writes
+// them in one pass with one budget check, with the agency's own CF_DNS_API_TOKEN. The rule texts are
+// built by edge-waf-sync.ts and edge-waf-rule.ts; the job carries hosts, IP values and User-Agents.
+//
+// SEQUENCE. The zone is resolved first (`cloudflare` unless the token sees exactly this zone). Then
+// the custom part, where every refusal comes BEFORE its first write, so a refusal writes nothing:
+//   1. build the baseline and every clause (pure) — `invalid` for a clause or rule that cannot fit;
+//   2. read the custom entrypoint once and sort its rules into ours, legacy and foreign. A later copy
+//      of an owned description (overlapping runs, a hand copy) is deleted at the end (A10);
+//   3. plan the chunks (sticky first-fit). A run that ADDS enforcement (a create, added clauses, a
+//      baseline block or challenge rule that ends enabled with a new definition) on a plan with the
+//      Free allowance — Free itself, or a plan we do not know — is `planTooSmall`. A run that only
+//      deletes, removes clauses, disables, changes the agent skip or switches a chunk back on runs on
+//      any plan (A10). The Managed Ruleset is never an addition: below Pro an enable is reported
+//      `unavailable-on-plan`;
+//   4. count: `capExceeded` when a run that GROWS the platform's rules would leave more than
+//      cap − reservedSlots, or when the PEAK (every create lands before any delete) would not fit in
+//      the cap. A run that ends with the same number of rules or fewer needs only the peak to fit;
+//   5. writes, in this order: create (new chunks, missing baseline rules, each placed relative to our
+//      other rules), gain patches (chunks that gain clauses, still holding what they will lose),
+//      content patches in the documented order (the lose patches among them), delete empty chunks,
+//      delete later copies of owned rules, the Managed Ruleset (on request), the legacy rules (on
+//      request), and LAST the moves of OUR rules that sit before their predecessor. A failed write
+//      stops the custom part: `writeFailed`, with `landed`.
+// RUN LIMITS (edge-sync-budget.ts). Every Cloudflare call first asks the run's budget: at most 45
+// subrequests per invocation (Workers Free allows 50) and a 100 s deadline, each call with its own
+// 15 s timeout. Three calls (subrequests, and time plus 5 s of slack) stay held for the rate-limit
+// part, so the custom part's calls end by 50 s. A refusal stops the run before that call —
+// `writeFailed`, "... the next run continues", with `landed` — and the next run continues from the
+// zone's real state. The write order above is therefore also the order of importance: bans gained
+// and removed first, cosmetic moves last. A write whose timeout fired is UNKNOWN: its detail says so,
+// `landed` leaves it out, and the run keeps the zone's lease until it expires (see the actuator).
+// The same holds for a write whose connection failed, or that got a gateway status (502, 503, 504,
+// 520 to 524). A 500 or a 4xx is a definite failure. Reads are never UNKNOWN: they change nothing.
+// OTHER WRITERS. A delete that finds its rule already gone (the API's 404) is done, not landed. A move whose
+// rule or anchor vanished re-reads the zone and defers the rest to the next run (writeFailed).
+// The rate-limit part (reconcileEdgeRateLimit) runs AFTER the custom part, whatever the custom part
+// did, so a refusal there never leaves rate limiting on when the job switched it off (A10).
+//
+// FOREIGN rules are never written, moved or deleted. Inserting and moving ours shifts their indexes,
+// but never their order relative to each other. No baseline rule is ever deleted (Amendment A2),
+// except a later copy of one (A10).
+//
+// IDEMPOTENT: rules are found by exact description, written only on drift, and a re-run after a
+// partial apply resumes it — so the nonce-burned-before-actuation F1 rule does not bite.
+
+/** A rule of the zone's custom phase, as the result reports it. `position` is 1-based, after the run. */
+export interface WafEdgeSyncRuleReport {
+  description: string;
+  action: string;
+  position: number;
+}
+
+/**
+ * Why the op refused, writing nothing. `busy` = another run holds the zone's lease. `ambiguous` is
+ * kept for the contract but no path returns it since Amendment A10: every duplicate of an owned
+ * rule is now resolved (the lowest copy is kept, the others deleted).
+ */
+export type WafEdgeSyncRefusalCode =
+  | "planTooSmall"
+  | "capExceeded"
+  | "ambiguous"
+  | "invalid"
+  | "notConfigured"
+  | "cloudflare"
+  | "busy";
+
+/** The rule descriptions a run wrote, by kind of write. Legacy deletions count as deletes. */
+export interface WafEdgeSyncLanded {
+  created: string[];
+  patched: string[];
+  deleted: string[];
+}
+
+/** Why the rate-limit part did not apply (Amendment A7). It never changes the custom part's outcome. */
+export type WafEdgeSyncRateLimitCode = "capExceeded" | "invalid" | "cloudflare" | "writeFailed";
+
+/**
+ * The rate-limit part of a run (Amendments A7 and A10: it runs whatever the custom part did).
+ * `created`, `patched` and `deleted` list what landed, also when `ok` is false; `deleted` holds only
+ * later copies of one of our two rules (left by overlapping runs). `omittedClauses` names each clause
+ * left out because the zone's plan does not allow its field (empty when the job carried no
+ * thresholds). A disable with thresholds the plan refuses switches our rules off all the same, and
+ * reports `invalid` with the reason.
+ */
+export interface WafEdgeSyncRateLimitReport {
+  ok: boolean;
+  code?: WafEdgeSyncRateLimitCode;
+  detail?: string;
+  created: string[];
+  patched: string[];
+  deleted: string[];
+  omittedClauses: string[];
+}
+
+/** The custom-phase part of a run that applied every custom rule. */
+interface WafEdgeSyncApplied {
+  ok: true;
+  op: "waf-edge-sync";
+  zone: string;
+  plan: string;
+  cap: number;
+  reservedSlots: number;
+  /** The zone's custom-rule count after the run. */
+  rulesUsed: number;
+  foreign: WafEdgeSyncRuleReport[];
+  /** Enabled `skip` rules (foreign, or legacy `doubleyoup-geo:*`) above at least one of ours. */
+  preempting: WafEdgeSyncRuleReport[];
+  created: string[];
+  patched: string[];
+  deleted: string[];
+  legacyDeleted: string[];
+  chunks: { block: number; challenge: number };
+  /** The Cloudflare Managed Ruleset, with waf-rule-upsert's values ("not-requested" when not in the job). */
+  managedRuleset: ManagedRulesetStatus;
+}
+
+/** The custom part refused, writing nothing there. */
+interface WafEdgeSyncRefused {
+  ok: false;
+  op: "waf-edge-sync";
+  zone: string;
+  code: WafEdgeSyncRefusalCode;
+  detail: string;
+}
+
+/** A custom-phase write failed part-way; `landed` lists what did land. */
+interface WafEdgeSyncWriteFailed {
+  ok: false;
+  op: "waf-edge-sync";
+  zone: string;
+  code: "writeFailed";
+  detail: string;
+  landed: WafEdgeSyncLanded;
+}
+
+type WafEdgeSyncCustomOutcome = WafEdgeSyncApplied | WafEdgeSyncRefused | WafEdgeSyncWriteFailed;
+
+/**
+ * `rateLimit` is on every result of a run that reached the zone: the rate-limit part runs whatever
+ * the custom part did (Amendment A10). It is absent only for notConfigured, busy and a failed zone
+ * lookup, where nothing ran.
+ */
+export type WafEdgeSyncResult =
+  | (WafEdgeSyncApplied & { rateLimit: WafEdgeSyncRateLimitReport })
+  | (WafEdgeSyncRefused & { rateLimit?: WafEdgeSyncRateLimitReport })
+  | (WafEdgeSyncWriteFailed & { rateLimit?: WafEdgeSyncRateLimitReport });
+
+function wafEdgeSyncRefusal(zone: string, code: WafEdgeSyncRefusalCode, detail: string): WafEdgeSyncRefused {
+  return { ok: false, op: "waf-edge-sync", zone, code, detail };
+}
+
+/** One of our rules in its documented place, with the definition the run must leave it with. */
+interface DesiredSyncRule {
+  description: string;
+  definition: WafRule;
+  /** The id of the rule carrying this description in the zone (after phase A: always set). */
+  ruleId: string | null;
+}
+
+/**
+ * DELETE one rule. Cloudflare answers with the updated ruleset, which this op does not rely on.
+ * `absent`: the Cloudflare API answered 404 (its JSON envelope, `success: false`), so the rule is
+ * already gone — another writer deleted it first (the orchestrator's legacy remover deletes
+ * `doubleyoup-ban:<id>` rules too). The delete's goal holds; the caller counts it as done, but not as
+ * landed by this run. A 404 without that envelope (bare, or an HTML page from something in between)
+ * says nothing about the rule: a failure.
+ */
+async function deleteWafRule(
+  token: string,
+  url: string,
+  signal?: AbortSignal,
+): Promise<{ deleted: true } | { absent: true } | CloudflareWriteFailure> {
+  let response: Response;
+  try {
+    response = await fetch(url, withOptionalSignal({ method: "DELETE", headers: cloudflareHeaders(token) }, signal));
+  } catch (err) {
+    return { error: `could not reach Cloudflare to delete the WAF rule: ${errorMessage(err)}`, unanswered: true };
+  }
+  if (response.status === 401 || response.status === 403) {
+    await response.text().catch(() => "");
+    return { error: WAF_RULES_DENIED_DETAIL };
+  }
+  const envelope = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  const isCloudflareFailureEnvelope = envelope !== null && envelope.success === false && Array.isArray(envelope.errors);
+  if (response.status === 404 && isCloudflareFailureEnvelope) {
+    return { absent: true };
+  }
+  if (!envelope?.success) {
+    return {
+      error: `WAF rule delete failed with HTTP ${response.status}${cloudflareErrorMessage(envelope)}.`,
+      httpStatus: response.status,
+    };
+  }
+  return { deleted: true };
+}
+
+/** Our copy of the ruleset with `rule` inserted where a POST carrying `position` puts it. */
+function withRuleInserted(
+  ruleset: CloudflareRuleset,
+  rule: CloudflareRulesetRule,
+  position: { before: string } | { after: string } | null,
+): CloudflareRuleset {
+  const rules = [...(ruleset.rules ?? [])];
+  if (position === null) {
+    rules.push(rule);
+    return { ...ruleset, rules };
+  }
+  if ("before" in position) {
+    const anchorIndex = rules.findIndex((candidate) => candidate.id === position.before);
+    rules.splice(anchorIndex, 0, rule);
+    return { ...ruleset, rules };
+  }
+  const anchorIndex = rules.findIndex((candidate) => candidate.id === position.after);
+  rules.splice(anchorIndex + 1, 0, rule);
+  return { ...ruleset, rules };
+}
+
+/** Our copy of the ruleset with the rule `ruleId` given `definition` (the id is kept). */
+function withRuleReplaced(ruleset: CloudflareRuleset, ruleId: string, definition: WafRule): CloudflareRuleset {
+  const rules = (ruleset.rules ?? []).map((rule) => {
+    if (rule.id === ruleId) {
+      return { ...definition, id: ruleId };
+    }
+    return rule;
+  });
+  return { ...ruleset, rules };
+}
+
+/** Our copy of the ruleset without the rule `ruleId`. */
+function withRuleRemoved(ruleset: CloudflareRuleset, ruleId: string): CloudflareRuleset {
+  return { ...ruleset, rules: (ruleset.rules ?? []).filter((rule) => rule.id !== ruleId) };
+}
+
+/**
+ * The id Cloudflare gave the rule a POST just created: the rule carrying `description` whose id we
+ * did not know before. Null when the reply does not show it.
+ */
+function idOfCreatedRule(reply: CloudflareRuleset, description: string, knownIds: ReadonlySet<string>): string | null {
+  for (const rule of reply.rules ?? []) {
+    if (rule.description !== description) {
+      continue;
+    }
+    if (typeof rule.id === "string" && rule.id.length > 0 && !knownIds.has(rule.id)) {
+      return rule.id;
+    }
+  }
+  return null;
+}
+
+/** The plans Cloudflare's custom-rule allowance treats as Free: Free itself, and any plan we do not know. */
+function planHasFreeAllowance(planLegacyId: string | null): boolean {
+  return wafCustomRuleCapForPlan(planLegacyId) <= WAF_UNKNOWN_PLAN_RULE_CAP;
+}
+
+/**
+ * The orchestrator's timeout for ONE waf-edge-sync dispatch attempt: `EDGE_SYNC_DISPATCH_OPTIONS
+ * .timeoutMs` in orchestrator.doubleyoup.com src/handlers/edge-sync.ts (120 s). A second attempt is
+ * made only when the first cannot have reached the actuation, so one run lives inside one attempt.
+ * This Worker cannot import it (another repo): change both together. A test pins the ratio below.
+ */
+export const EDGE_SYNC_DISPATCH_TIMEOUT_MS = 120 * 1000;
+
+/**
+ * The longest a waf-edge-sync run holds its zone's lease. A run releases it as soon as it ends.
+ *
+ * IT MUST OUTLAST A RUN. The run is awaited inside the /actuate request (no waitUntil). When the
+ * dispatcher disconnects, Cloudflare says the request's tasks "may be canceled"
+ * (developers.cloudflare.com/workers/platform/limits/#duration) — not that they will be — so the run
+ * bounds itself (edge-sync-budget.ts): every Cloudflare call has a timeout, and no call starts unless
+ * that timeout ends before the run's deadline, EDGE_SYNC_RUN_DEADLINE_MS (100 s). So a run ends within
+ * 100 s of its start (plus the lease release), before the 120 s dispatch timeout, and this TTL is
+ * 2.5 times the dispatch timeout. Tests pin deadline < dispatch timeout < TTL / 2. A run that still
+ * outlived its lease could overlap the next run; the duplicates that leaves are resolved by the run
+ * after it (never refused). The orchestrator holds the zone for 5 minutes after an UNKNOWN timeout.
+ */
+export const EDGE_SYNC_LEASE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Sync every platform rule of one agency zone with the agency's own CF_DNS_API_TOKEN. Returns a
+ * structured result; never throws for a Cloudflare-side failure. NEVER falls back to a platform
+ * credential (there is none). Never writes a foreign rule.
+ *
+ * ONE RUN PER ZONE AT A TIME. Two overlapping runs (say, a hand run of ensure-edge-waf next to a
+ * scheduled sync) would each read the zone, then each create the same missing rule. So a run first
+ * takes a per-zone lease in the NonceStore Durable Object (one instance per zone) and refuses with
+ * `busy`, writing nothing, while another run holds it. The lease is released when the run ends, in
+ * `finally`; if a run dies without releasing it, it expires after EDGE_SYNC_LEASE_TTL_MS. Duplicates
+ * that still appear (a run that outlived its lease) are resolved by the next run, not refused.
+ * EXCEPT after an UNKNOWN write (a write with no definite answer, which Cloudflare may still apply): then
+ * the lease is NOT released but left to expire, so no newer run can start, write and report ok before
+ * that late write lands and undoes its work. The UNKNOWN detail says so.
+ */
+export async function actuateWafEdgeSync(
+  params: WafEdgeSyncParams,
+  env: Env,
+  limits: EdgeSyncRunLimits = EDGE_SYNC_RUN_LIMITS,
+): Promise<WafEdgeSyncResult> {
+  const zoneName = params.zone;
+  const token = env.CF_DNS_API_TOKEN;
+  if (!token) {
+    return wafEdgeSyncRefusal(zoneName, "notConfigured", "CF_DNS_API_TOKEN is not configured on this Worker.");
+  }
+  // The run's wall time and subrequests (edge-sync-budget.ts). It counts the nonce consume and both
+  // lease calls from the start.
+  const budget = new EdgeSyncRunBudget(limits);
+
+  const leaseStore = env.NONCE_STORE.get(env.NONCE_STORE.idFromName(`edge-sync-lease:${zoneName}`));
+  const leaseHolder = crypto.randomUUID();
+  const lease = await leaseStore.acquireLease(zoneName, leaseHolder, EDGE_SYNC_LEASE_TTL_MS);
+  if (lease === "busy") {
+    return wafEdgeSyncRefusal(
+      zoneName,
+      "busy",
+      `another waf-edge-sync run holds zone ${zoneName}'s lease — nothing was written. Re-run when it ends ` +
+        `(the lease expires after ${EDGE_SYNC_LEASE_TTL_MS / 60000} minutes at most).`,
+    );
+  }
+  let result: WafEdgeSyncResult;
+  try {
+    result = await syncEdgeZone(params, token, budget);
+  } finally {
+    if (budget.hadUnknownWrite) {
+      // A write of this run got no answer, and Cloudflare may still apply it. Keep the lease until it
+      // expires: a newer run starting now could read the zone, write and report ok, and then the late
+      // write would land and undo its work.
+      console.warn(`waf-edge-sync: a write to zone ${zoneName} ended UNKNOWN; its lease is kept until it expires.`);
+    } else {
+      // A failed release must not lose the run's result (the writes have happened): log it, and let
+      // the lease expire on its own. This catch exists for that reason only.
+      try {
+        await leaseStore.releaseLease(zoneName, leaseHolder);
+      } catch (err) {
+        console.error(`waf-edge-sync: could not release the lease of zone ${zoneName}; it expires on its own. ${errorMessage(err)}`);
+      }
+    }
+  }
+  return result;
+}
+
+/** The run, holding the zone's lease: the custom rules, then the rate-limit rules (which always run). */
+async function syncEdgeZone(params: WafEdgeSyncParams, token: string, budget: EdgeSyncRunBudget): Promise<WafEdgeSyncResult> {
+  const zoneName = params.zone;
+  const zonePermit = budget.beginCall();
+  if (!zonePermit.ok) {
+    return edgeSyncStopped(zoneName, zonePermit.reason, "resolve the zone", { created: [], patched: [], deleted: [] });
+  }
+  const zone = await resolveZoneId(token, zoneName, zonePermit.signal);
+  if ("error" in zone) {
+    return wafEdgeSyncRefusal(zoneName, "cloudflare", zone.error);
+  }
+  const zonePath = `${CF_API}/zones/${encodeURIComponent(zone.id)}`;
+
+  // The custom part may not spend the rate-limit part's reserve, so the off switch can still run.
+  budget.hold(EDGE_SYNC_RATE_LIMIT_RESERVE);
+  const custom = await syncCustomRules(params, token, zone.id, zone.planLegacyId, zonePath, budget);
+  budget.releaseHold(EDGE_SYNC_RATE_LIMIT_RESERVE);
+  let customOutcome = "The custom rules were applied.";
+  if (!custom.ok && custom.code === "writeFailed") {
+    customOutcome = "The custom part stopped part-way (writeFailed): see the result's landed lists.";
+  } else if (!custom.ok) {
+    customOutcome = `The custom part refused (${custom.code}) and wrote nothing.`;
+  }
+
+  // The rate-limit rules (Amendments A7 and A10), after the custom part, WHATEVER it did: their own
+  // budget, and a refusal or failure of the custom rules must never leave rate limiting on when the
+  // job switched it off. A rate-limit failure is reported here and never fails the run.
+  const rateLimit = await reconcileEdgeRateLimit({
+    token,
+    zoneId: zone.id,
+    zonePath,
+    zoneName,
+    planLegacyId: zone.planLegacyId,
+    excludedHosts: params.baseline.excludedHosts,
+    rateLimit: params.rateLimit,
+    customOutcome,
+    budget,
+  });
+  return { ...custom, rateLimit };
+}
+
+/**
+ * A run that stopped before `nextStep` because its subrequest budget or its time ran out
+ * (edge-sync-budget.ts). `writeFailed`, so app re-runs it; `landed` lists what did land, and the next
+ * run continues from the zone's real state.
+ */
+function edgeSyncStopped(zone: string, reason: string, nextStep: string, landed: WafEdgeSyncLanded): WafEdgeSyncWriteFailed {
+  return { ok: false, op: "waf-edge-sync", zone, code: "writeFailed", detail: `${reason}. Stopped before: ${nextStep}.`, landed };
+}
+
+/** The custom-phase part of the run (see the op's header in edge-waf-sync.ts and the spec). */
+async function syncCustomRules(
+  params: WafEdgeSyncParams,
+  token: string,
+  zoneId: string,
+  planLegacyId: string | null,
+  zonePath: string,
+  budget: EdgeSyncRunBudget,
+): Promise<WafEdgeSyncCustomOutcome> {
+  const zoneName = params.zone;
+
+  // 1. Build everything (pure), so an over-long rule is refused before any write.
+  const builtBaseline = buildEdgeWafRules({
+    zone: zoneName,
+    enabled: params.baseline.enabled,
+    excludedHosts: params.baseline.excludedHosts,
+    agentHosts: params.baseline.agentHosts,
+  });
+  if (!builtBaseline.ok) {
+    return wafEdgeSyncRefusal(zoneName, "invalid", builtBaseline.reason);
+  }
+  // `xmlrpc: "off"` keeps the rule, disabled, so positions and the cap maths never change (A2).
+  const xmlrpcEnabled = params.baseline.enabled && params.baseline.xmlrpc === "block";
+  const xmlrpcRule = buildXmlrpcRule(xmlrpcEnabled);
+
+  const blockEntries: EdgeClauseEntry[] = params.block.map((entry) => ({
+    hosts: entry.hosts,
+    ips: entry.ips,
+    uas: entry.uas,
+    all: false,
+  }));
+  const challengeEntries: EdgeClauseEntry[] = params.challenge.map((entry) => ({
+    hosts: entry.hosts,
+    ips: entry.ips,
+    uas: entry.uas,
+    all: entry.all === true,
+  }));
+  const blockClauses = buildEdgeClauses(blockEntries, params.baseline.excludedHosts);
+  if (!blockClauses.ok) {
+    return wafEdgeSyncRefusal(zoneName, "invalid", `block: ${blockClauses.reason}`);
+  }
+  const challengeClauses = buildEdgeClauses(challengeEntries, params.baseline.excludedHosts);
+  if (!challengeClauses.ok) {
+    return wafEdgeSyncRefusal(zoneName, "invalid", `challenge: ${challengeClauses.reason}`);
+  }
+  const wantedClauses: Record<EdgeChunkKind, string[]> = {
+    block: blockClauses.clauses,
+    challenge: challengeClauses.clauses,
+  };
+
+  // 2. The plan.
+  const plan = planLegacyId ?? "unknown";
+  const cap = wafCustomRuleCapForPlan(planLegacyId);
+
+  // 3. Read the custom phase once and sort its rules.
+  const readPermit = budget.beginCall();
+  if (!readPermit.ok) {
+    return edgeSyncStopped(zoneName, readPermit.reason, "read the custom rules", { created: [], patched: [], deleted: [] });
+  }
+  const entrypoint = await getWafPhaseEntrypoint(token, zoneId, WAF_PHASE, readPermit.signal);
+  if ("error" in entrypoint) {
+    return wafEdgeSyncRefusal(zoneName, "cloudflare", entrypoint.error);
+  }
+  let ruleset: CloudflareRuleset | null = null;
+  if (!("missing" in entrypoint)) {
+    ruleset = entrypoint.ruleset;
+  }
+  const existingRules = ruleset?.rules ?? [];
+
+  const existingBaseline = new Map<string, CloudflareRulesetRule>();
+  const existingChunks: Record<EdgeChunkKind, Map<number, CloudflareRulesetRule>> = {
+    block: new Map(),
+    challenge: new Map(),
+  };
+  const legacyRules: CloudflareRulesetRule[] = [];
+  // Later copies of an owned description (A10): overlapping runs, or a hand copy. The FIRST copy (the
+  // lowest position) is ours and is planned like any rule; every later copy is deleted at the end of
+  // the run, after the kept copy carries its final definition and every wanted clause is in force.
+  // Refusing instead would freeze the zone for good.
+  const duplicateOwnedRules: CloudflareRulesetRule[] = [];
+  let foreignCount = 0;
+  for (const rule of existingRules) {
+    const ownership = classifyWafRuleDescription(rule.description);
+    if (ownership.owner === "foreign") {
+      foreignCount += 1;
+      continue;
+    }
+    if (ownership.owner === "legacy") {
+      if (params.retireLegacy && (typeof rule.id !== "string" || rule.id.length === 0)) {
+        return wafEdgeSyncRefusal(zoneName, "cloudflare", `Cloudflare returned the legacy rule "${rule.description}" without an id — it cannot be retired.`);
+      }
+      legacyRules.push(rule);
+      continue;
+    }
+    // Ours from here on.
+    const description = rule.description as string;
+    if (typeof rule.id !== "string" || rule.id.length === 0) {
+      return wafEdgeSyncRefusal(zoneName, "cloudflare", `Cloudflare returned our rule "${description}" without an id — it cannot be updated.`);
+    }
+    if (ownership.owner === "baseline") {
+      if (existingBaseline.has(description)) {
+        duplicateOwnedRules.push(rule);
+        continue;
+      }
+      existingBaseline.set(description, rule);
+      continue;
+    }
+    const chunksOfKind = existingChunks[ownership.kind];
+    if (chunksOfKind.has(ownership.chunkNumber)) {
+      duplicateOwnedRules.push(rule);
+      continue;
+    }
+    chunksOfKind.set(ownership.chunkNumber, rule);
+  }
+
+  // 4. Plan the chunks, list our rules in their documented order.
+  const chunkPlans: Record<EdgeChunkKind, EdgeChunkPlan[]> = {
+    block: planStickyChunks(existingChunkInputs(existingChunks.block, wantedClauses.block), wantedClauses.block),
+    challenge: planStickyChunks(existingChunkInputs(existingChunks.challenge, wantedClauses.challenge), wantedClauses.challenge),
+  };
+
+  const desiredRules: DesiredSyncRule[] = [];
+  const addChunkRules = (kind: EdgeChunkKind): void => {
+    for (const chunkPlan of chunkPlans[kind]) {
+      if (chunkPlan.finalClauses.length === 0) {
+        continue;
+      }
+      const definition = buildEdgeChunkRule(kind, chunkPlan.chunkNumber, chunkPlan.finalClauses);
+      const existing = existingChunks[kind].get(chunkPlan.chunkNumber);
+      desiredRules.push({ description: definition.description, definition, ruleId: existing?.id ?? null });
+    }
+  };
+  const addBaselineRule = (definition: WafRule): void => {
+    const existing = existingBaseline.get(definition.description);
+    desiredRules.push({ description: definition.description, definition, ruleId: existing?.id ?? null });
+  };
+  // Top to bottom (spec step 6): block chunks, the two baseline blocks, xmlrpc, challenge chunks, the
+  // two baseline challenges, the agent skip. A ban block therefore beats every challenge, and the
+  // agent skip (a skip of a LATER phase, not a terminating action) can sit last.
+  addChunkRules("block");
+  addBaselineRule(builtBaseline.rules.countryBlock);
+  addBaselineRule(builtBaseline.rules.wpAdminGeo);
+  addBaselineRule(xmlrpcRule);
+  addChunkRules("challenge");
+  addBaselineRule(builtBaseline.rules.loginGate);
+  addBaselineRule(builtBaseline.rules.frontendGeo);
+  addBaselineRule(builtBaseline.rules.execSkip);
+
+  // 5. Does the run ADD enforcement? Only these count: a create, a chunk that gains clauses, and a
+  //    baseline block or challenge rule that ends ENABLED with a changed definition (switched on, or a
+  //    new action or expression — the op cannot tell a widened expression from a narrowed one, so an
+  //    expression change counts). These never count (A10 review, R1 and R4):
+  //      - a delete, a clause removal, a disable (a rule that ends switched off enforces nothing);
+  //      - any change to a skip rule (the agent skip): a skip enforces nothing, it only exempts
+  //        requests from a later phase;
+  //      - an existing chunk switched back on, or its action put back: its clauses are bans the job
+  //        wants and an earlier run placed, and the zone's rules and clauses do not grow;
+  //      - the Managed Ruleset: below Pro it is reported `unavailable-on-plan` and never written.
+  //    A run that adds nothing is allowed on ANY plan (A10): a plan downgrade or an agency's own rules
+  //    must never freeze an expired ban or an Under Attack toggle-off in place.
+  let createCount = 0;
+  const additions: string[] = [];
+  const existingById = new Map(existingRules.map((rule) => [rule.id ?? "", rule]));
+  for (const desired of desiredRules) {
+    if (desired.ruleId === null) {
+      createCount += 1;
+      additions.push(`create ${desired.description}`);
+      continue;
+    }
+    // Chunks: only their gained clauses count (the loop below), never a switch-on.
+    if (classifyWafRuleDescription(desired.description).owner !== "baseline") {
+      continue;
+    }
+    if (desired.definition.action === "skip" || !desired.definition.enabled) {
+      continue;
+    }
+    const current = existingById.get(desired.ruleId) as CloudflareRulesetRule;
+    if (wafRuleDrifted(current, desired.definition)) {
+      additions.push(`change ${desired.description}`);
+    }
+  }
+  for (const kind of EDGE_CHUNK_KINDS) {
+    for (const chunkPlan of chunkPlans[kind]) {
+      if (!chunkPlan.isNew && chunkPlan.gainedClauses.length > 0) {
+        additions.push(`add clauses to ${edgeChunkDescription(kind, chunkPlan.chunkNumber)}`);
+      }
+    }
+  }
+  if (planHasFreeAllowance(planLegacyId) && additions.length > 0) {
+    return wafEdgeSyncRefusal(
+      zoneName,
+      "planTooSmall",
+      `refusing to change anything: zone ${zoneName} is on plan "${plan}", which allows ${cap} custom rules, and the ` +
+        `edge-security rule set needs Pro or higher. This run would add protection (${additions.slice(0, 5).join("; ")}). ` +
+        "A run that only deletes, removes clauses or disables is allowed on any plan.",
+    );
+  }
+
+  // 6. The budget. The reservedSlots margin applies only to a run that GROWS the platform's rules
+  //    (ours plus legacy); a run that ends with the same number or fewer needs only its peak to fit.
+  let legacyAfterRun = legacyRules.length;
+  if (params.retireLegacy) {
+    legacyAfterRun = 0;
+  }
+  const ownedNow = existingBaseline.size + existingChunks.block.size + existingChunks.challenge.size + duplicateOwnedRules.length;
+  const platformNow = ownedNow + legacyRules.length;
+  const platformAfter = desiredRules.length + legacyAfterRun;
+  if (platformAfter > platformNow) {
+    const usableSlots = cap - params.reservedSlots;
+    const rulesAfterRun = foreignCount + platformAfter;
+    if (rulesAfterRun > usableSlots) {
+      return wafEdgeSyncRefusal(
+        zoneName,
+        "capExceeded",
+        `refusing to change anything: zone ${zoneName} (plan "${plan}") allows ${cap} custom rules and this op keeps ` +
+          `${params.reservedSlots} free when it grows, so ${usableSlots} are usable. The run would leave ${rulesAfterRun}: ` +
+          `${foreignCount} foreign + ${desiredRules.length} of ours (6 baseline, ${desiredRules.length - 6} ban chunks) + ` +
+          `${legacyAfterRun} legacy. Free slots, retire the legacy rules, or upgrade the zone.`,
+      );
+    }
+  }
+  // Every create lands before any delete, so the zone briefly holds all of today's rules plus the new ones.
+  if (createCount > 0) {
+    const peakRuleCount = existingRules.length + createCount;
+    if (peakRuleCount > cap) {
+      // Only steps that work: a run that creates nothing cannot free the slots, because every run
+      // must first create what is missing (a first run always creates the xmlrpc rule, for one).
+      const toCreate = desiredRules.filter((desired) => desired.ruleId === null).map((desired) => desired.description);
+      const remedies: string[] = [];
+      if (foreignCount > 0) {
+        remedies.push(`delete foreign rules the agency no longer needs (the zone has ${foreignCount})`);
+      }
+      if (duplicateOwnedRules.length > 0) {
+        remedies.push(`delete the ${duplicateOwnedRules.length} duplicate copy(ies) of our rules by hand`);
+      }
+      if (legacyRules.length > 0) {
+        remedies.push(
+          `delete legacy doubleyoup-ban:/doubleyoup-geo: rules by hand (the zone has ${legacyRules.length}; their bans are ` +
+            "off until the re-run puts them in chunks)",
+        );
+      }
+      remedies.push("upgrade the zone's plan");
+      return wafEdgeSyncRefusal(
+        zoneName,
+        "capExceeded",
+        `refusing to change anything: zone ${zoneName} (plan "${plan}") allows ${cap} custom rules, it holds ` +
+          `${existingRules.length}, and this run must create ${createCount} (${toCreate.join(", ")}) before it can delete ` +
+          `anything — ${peakRuleCount} at the peak. Free ${peakRuleCount - cap} slot(s) in the Cloudflare dashboard, then ` +
+          `re-run: ${remedies.join("; or ")}.`,
+      );
+    }
+  }
+
+  // 7. The writes. Every Cloudflare call goes through the run's budget first (gatedWrite,
+  //    gatedDelete, the Managed Ruleset gate). When it refuses — subrequests or time used up — the
+  //    run stops BEFORE that call with `writeFailed` and what landed; the next run continues. So the
+  //    order below is also the order of importance: what protects comes first, cosmetic moves last.
+  const created: string[] = [];
+  const patched: string[] = [];
+  const deleted: string[] = [];
+  const legacyDeleted: string[] = [];
+  const landedSoFar = (): WafEdgeSyncLanded => ({ created: [...created], patched: [...patched], deleted: [...deleted, ...legacyDeleted] });
+  const writeFailure = (detail: string): WafEdgeSyncWriteFailed => ({
+    ok: false,
+    op: "waf-edge-sync",
+    zone: zoneName,
+    code: "writeFailed",
+    detail: `${detail} Re-run to resume (this op is idempotent).`,
+    landed: landedSoFar(),
+  });
+  const stopBefore = (reason: string, nextStep: string): WafEdgeSyncWriteFailed => {
+    return edgeSyncStopped(zoneName, reason, nextStep, landedSoFar());
+  };
+  const gatedWrite = async (
+    method: "POST" | "PATCH",
+    url: string,
+    body: unknown,
+  ): Promise<{ ruleset: CloudflareRuleset } | { error: string } | { stopped: string }> => {
+    const permit = budget.beginCall();
+    if (!permit.ok) {
+      return { stopped: permit.reason };
+    }
+    const reply = await writeWafRuleset(token, method, url, body, permit.signal);
+    return budget.settleWrite(reply, permit.signal);
+  };
+  const gatedDelete = async (
+    url: string,
+  ): Promise<{ deleted: true } | { absent: true } | { error: string } | { stopped: string }> => {
+    const permit = budget.beginCall();
+    if (!permit.ok) {
+      return { stopped: permit.reason };
+    }
+    const reply = await deleteWafRule(token, url, permit.signal);
+    return budget.settleWrite(reply, permit.signal);
+  };
+  // After a failed move: re-read the rules and name the first of `ruleIds` the zone no longer holds.
+  // null when all are there, or when the re-read fails too (then the move's own error stands).
+  const firstVanishedRule = async (ruleIds: string[]): Promise<{ vanishedId: string | null } | { stopped: string }> => {
+    const permit = budget.beginCall();
+    if (!permit.ok) {
+      return { stopped: permit.reason };
+    }
+    const fresh = await getWafPhaseEntrypoint(token, zoneId, WAF_PHASE, permit.signal);
+    if ("error" in fresh) {
+      return { vanishedId: null };
+    }
+    let freshRules: CloudflareRulesetRule[] = [];
+    if (!("missing" in fresh)) {
+      freshRules = fresh.ruleset.rules ?? [];
+    }
+    for (const ruleId of ruleIds) {
+      const stillThere = freshRules.some((rule) => rule.id === ruleId);
+      if (!stillThere) {
+        return { vanishedId: ruleId };
+      }
+    }
+    return { vanishedId: null };
+  };
+  const notePatched = (description: string): void => {
+    if (!created.includes(description) && !patched.includes(description)) {
+      patched.push(description);
+    }
+  };
+
+  // A zone with no custom rules gets them all in one create, already in order: nothing to move.
+  const createsWholeEntrypoint = ruleset === null;
+  if (ruleset === null) {
+    // A zone with no custom rules at all: create the entrypoint holding every rule, in order. POST,
+    // not PUT on the entrypoint path, so a racing create fails instead of replacing.
+    const createdEntrypoint = await gatedWrite("POST", `${zonePath}/rulesets`, {
+      name: "default",
+      kind: "zone",
+      phase: WAF_PHASE,
+      rules: desiredRules.map((desired) => desired.definition),
+    });
+    if ("stopped" in createdEntrypoint) {
+      return stopBefore(createdEntrypoint.stopped, "create the zone's custom-rules entrypoint");
+    }
+    if ("error" in createdEntrypoint) {
+      return writeFailure(`could not create the zone's custom-rules entrypoint: ${createdEntrypoint.error}`);
+    }
+    for (const desired of desiredRules) {
+      created.push(desired.description);
+    }
+    let rulesAsCreated = createdEntrypoint.ruleset.rules;
+    if (!Array.isArray(rulesAsCreated)) {
+      rulesAsCreated = desiredRules.map((desired) => ({ ...desired.definition, id: "" }));
+    }
+    ruleset = { id: createdEntrypoint.ruleset.id, rules: rulesAsCreated };
+  } else {
+    const rulesetPath = `${zonePath}/rulesets/${encodeURIComponent(ruleset.id as string)}`;
+
+    // Phase A — creates, in documented order, each placed after the nearest of OUR rules that should
+    // precede it, else before the nearest that should follow it, else at the end.
+    for (let index = 0; index < desiredRules.length; index += 1) {
+      const desired = desiredRules[index] as DesiredSyncRule;
+      if (desired.ruleId !== null) {
+        continue;
+      }
+      const position = placementFor(desiredRules, index);
+      const body: Record<string, unknown> = { ...desired.definition };
+      if (position !== null) {
+        body.position = position;
+      }
+      const knownIds = new Set((ruleset.rules ?? []).map((rule) => rule.id ?? ""));
+      const reply = await gatedWrite("POST", `${rulesetPath}/rules`, body);
+      if ("stopped" in reply) {
+        return stopBefore(reply.stopped, `create rule "${desired.description}"`);
+      }
+      if ("error" in reply) {
+        return writeFailure(`could not create rule "${desired.description}": ${reply.error}`);
+      }
+      created.push(desired.description);
+      const newId = idOfCreatedRule(reply.ruleset, desired.description, knownIds);
+      if (newId === null) {
+        return writeFailure(`Cloudflare created rule "${desired.description}" but did not return its id.`);
+      }
+      desired.ruleId = newId;
+      ruleset = withRuleInserted(ruleset, { ...desired.definition, id: newId }, position);
+    }
+
+    // Phase B — gain patches: each existing chunk that gains clauses, still holding the ones it will
+    // lose, so every new clause is in force before any old one leaves.
+    for (const kind of EDGE_CHUNK_KINDS) {
+      for (const chunkPlan of chunkPlans[kind]) {
+        if (chunkPlan.gainClauses === null) {
+          continue;
+        }
+        const existing = existingChunks[kind].get(chunkPlan.chunkNumber) as CloudflareRulesetRule;
+        const ruleId = existing.id as string;
+        const definition = buildEdgeChunkRule(kind, chunkPlan.chunkNumber, chunkPlan.gainClauses);
+        const reply = await gatedWrite("PATCH", `${rulesetPath}/rules/${encodeURIComponent(ruleId)}`, { ...definition });
+        if ("stopped" in reply) {
+          return stopBefore(reply.stopped, `add clauses to rule "${definition.description}"`);
+        }
+        if ("error" in reply) {
+          return writeFailure(`could not add clauses to rule "${definition.description}": ${reply.error}`);
+        }
+        notePatched(definition.description);
+        ruleset = withRuleReplaced(ruleset, ruleId, definition);
+      }
+    }
+
+    // Phase C — content patches, in documented order: each of our rules that drifted gets its final
+    // definition (the lose patches happen here, after every gain). In place: moves wait for the end.
+    for (const desired of desiredRules) {
+      const ruleId = desired.ruleId as string;
+      const current = (ruleset.rules ?? []).find((rule) => rule.id === ruleId);
+      if (current === undefined) {
+        return writeFailure(`rule "${desired.description}" is missing from our copy of the ruleset.`);
+      }
+      if (!wafRuleDrifted(current, desired.definition)) {
+        continue;
+      }
+      const reply = await gatedWrite("PATCH", `${rulesetPath}/rules/${encodeURIComponent(ruleId)}`, { ...desired.definition });
+      if ("stopped" in reply) {
+        return stopBefore(reply.stopped, `update rule "${desired.description}"`);
+      }
+      if ("error" in reply) {
+        return writeFailure(`could not update rule "${desired.description}": ${reply.error}`);
+      }
+      notePatched(desired.description);
+      ruleset = withRuleReplaced(ruleset, ruleId, desired.definition);
+    }
+
+    // Phase D — delete the chunks left with no clause.
+    for (const kind of EDGE_CHUNK_KINDS) {
+      for (const chunkPlan of chunkPlans[kind]) {
+        if (chunkPlan.isNew || chunkPlan.finalClauses.length > 0) {
+          continue;
+        }
+        const existing = existingChunks[kind].get(chunkPlan.chunkNumber) as CloudflareRulesetRule;
+        const ruleId = existing.id as string;
+        const description = edgeChunkDescription(kind, chunkPlan.chunkNumber);
+        const outcome = await gatedDelete(`${rulesetPath}/rules/${encodeURIComponent(ruleId)}`);
+        if ("stopped" in outcome) {
+          return stopBefore(outcome.stopped, `delete the empty rule "${description}"`);
+        }
+        if ("absent" in outcome) {
+          // Already gone (another writer deleted it): done, but not by this run, so not in `landed`.
+          ruleset = withRuleRemoved(ruleset, ruleId);
+          continue;
+        }
+        if ("error" in outcome) {
+          return writeFailure(`could not delete the empty rule "${description}": ${outcome.error}`);
+        }
+        deleted.push(description);
+        ruleset = withRuleRemoved(ruleset, ruleId);
+      }
+    }
+
+    // Phase D, continued — the later copies of a duplicated owned rule (baseline or chunk). The kept
+    // copy carries its final definition and every wanted clause is in force by now (phases A to C), so
+    // deleting a copy cannot drop a protection.
+    for (const duplicate of duplicateOwnedRules) {
+      const ruleId = duplicate.id as string;
+      const description = duplicate.description as string;
+      const outcome = await gatedDelete(`${rulesetPath}/rules/${encodeURIComponent(ruleId)}`);
+      if ("stopped" in outcome) {
+        return stopBefore(outcome.stopped, `delete a duplicate of rule "${description}"`);
+      }
+      if ("absent" in outcome) {
+        // Already gone (another writer deleted it): done, but not by this run, so not in `landed`.
+        ruleset = withRuleRemoved(ruleset, ruleId);
+        continue;
+      }
+      if ("error" in outcome) {
+        return writeFailure(`could not delete a duplicate of rule "${description}": ${outcome.error}`);
+      }
+      deleted.push(description);
+      ruleset = withRuleRemoved(ruleset, ruleId);
+    }
+  }
+
+  // The Managed Ruleset — only on request, and only now: the agent skip is in force (waf-rule-upsert's
+  // meaning, order and status values). An enable below Pro (or on an unknown plan) is reported
+  // `unavailable-on-plan` and writes nothing, as in waf-rule-upsert: a rule of ours already deployed
+  // there is left as it is. A rollback runs on any plan.
+  let managedRuleset: ManagedRulesetStatus = "not-requested";
+  const managedEnableBlockedByPlan = params.baseline.enabled && !planSupportsManagedRuleset(planLegacyId);
+  if (params.baseline.includeManagedRuleset && managedEnableBlockedByPlan) {
+    managedRuleset = "unavailable-on-plan";
+  } else if (params.baseline.includeManagedRuleset) {
+    const managed = await reconcileManagedRuleset(token, zoneId, zonePath, params.baseline.enabled, budget);
+    if ("error" in managed && budget.stopReason !== null) {
+      return stopBefore(budget.stopReason, "the Cloudflare Managed Ruleset step");
+    }
+    if ("error" in managed) {
+      return writeFailure(`the custom rules were applied, but the Cloudflare Managed Ruleset step failed: ${managed.error}`);
+    }
+    managedRuleset = managed.status;
+    if (managed.status === "deployed") {
+      created.push(MANAGED_RULESET_RULE_DESCRIPTION);
+    }
+    if (managed.status === "re-enabled" || managed.status === "disabled") {
+      patched.push(MANAGED_RULESET_RULE_DESCRIPTION);
+    }
+  }
+
+  // Then, only after every content write of ours succeeded: retire the legacy rules (spec step 7). A
+  // ban that moved into a chunk is therefore in force twice for a moment, never zero times.
+  const rulesetPathAfterWrites = `${zonePath}/rulesets/${encodeURIComponent(ruleset.id as string)}`;
+  if (params.retireLegacy && legacyRules.length > 0) {
+    for (const legacyRule of legacyRules) {
+      const ruleId = legacyRule.id as string;
+      const description = legacyRule.description as string;
+      const outcome = await gatedDelete(`${rulesetPathAfterWrites}/rules/${encodeURIComponent(ruleId)}`);
+      if ("stopped" in outcome) {
+        return stopBefore(outcome.stopped, `delete the legacy rule "${description}"`);
+      }
+      if ("absent" in outcome) {
+        // The orchestrator's legacy remover (or a hand edit) deleted it first: done, not landed.
+        ruleset = withRuleRemoved(ruleset, ruleId);
+        continue;
+      }
+      if ("error" in outcome) {
+        return writeFailure(`could not delete the legacy rule "${description}": ${outcome.error}`);
+      }
+      legacyDeleted.push(description);
+      ruleset = withRuleRemoved(ruleset, ruleId);
+    }
+  }
+
+  // LAST — moves: in documented order, each of our rules that sits before the rule of ours that should
+  // precede it moves to just after that rule. Only our rules move. A move changes which of our rules
+  // answers first, never whether a ban is in force, so it waits until everything else has landed.
+  // The PATCH carries the full definition (see upsertOneWafRule for why never a position-only body).
+  for (let index = 1; index < desiredRules.length && !createsWholeEntrypoint; index += 1) {
+    const desired = desiredRules[index] as DesiredSyncRule;
+    const ruleId = desired.ruleId as string;
+    const predecessorId = (desiredRules[index - 1] as DesiredSyncRule).ruleId as string;
+    if (indexOfRule(ruleset, ruleId) > indexOfRule(ruleset, predecessorId)) {
+      continue;
+    }
+    const body: Record<string, unknown> = { ...desired.definition, position: { after: predecessorId } };
+    const reply = await gatedWrite("PATCH", `${rulesetPathAfterWrites}/rules/${encodeURIComponent(ruleId)}`, body);
+    if ("stopped" in reply) {
+      return stopBefore(reply.stopped, `move rule "${desired.description}" into place`);
+    }
+    if ("error" in reply && reply.error.startsWith(EDGE_SYNC_UNKNOWN_MARKER)) {
+      return writeFailure(`could not move rule "${desired.description}" into place: ${reply.error}`);
+    }
+    if ("error" in reply) {
+      // A move fails when its rule, or the rule it goes after, is gone: another writer deleted it
+      // during the run. Re-read to tell that from a real failure. A vanished rule is a wanted rule
+      // that only the next run's creates can restore, so this run defers the rest to it.
+      const recheck = await firstVanishedRule([ruleId, predecessorId]);
+      if ("stopped" in recheck) {
+        return stopBefore(recheck.stopped, `re-read the rules after a failed move of rule "${desired.description}"`);
+      }
+      if (recheck.vanishedId === null) {
+        return writeFailure(`could not move rule "${desired.description}" into place: ${reply.error}`);
+      }
+      const vanishedDescription = desiredRules.find((candidate) => candidate.ruleId === recheck.vanishedId)?.description;
+      return edgeSyncStopped(
+        zoneName,
+        `rule "${vanishedDescription}" vanished during the run (another writer deleted it); the next run restores it and continues`,
+        `move rule "${desired.description}" into place`,
+        landedSoFar(),
+      );
+    }
+    notePatched(desired.description);
+    ruleset = withRuleMovedAfter(ruleset, ruleId, predecessorId);
+  }
+
+  return {
+    ok: true,
+    op: "waf-edge-sync",
+    zone: zoneName,
+    plan,
+    cap,
+    reservedSlots: params.reservedSlots,
+    ...describeRulesAfterSync(ruleset),
+    created,
+    patched,
+    deleted,
+    legacyDeleted,
+    chunks: {
+      block: countLiveChunks(chunkPlans.block),
+      challenge: countLiveChunks(chunkPlans.challenge),
+    },
+    managedRuleset,
+  };
+}
+
+/** A rule of the http_ratelimit phase, as the ruleset API returns it (only the fields we read). */
+interface CloudflareRateLimitRule extends CloudflareRulesetRule {
+  ratelimit?: unknown;
+}
+
+interface EdgeRateLimitInput {
+  token: string;
+  zoneId: string;
+  zonePath: string;
+  zoneName: string;
+  planLegacyId: string | null;
+  excludedHosts: readonly string[];
+  rateLimit: WafEdgeSyncRateLimit;
+  /** One sentence on what the custom part of this run did, for a detail that mentions it. */
+  customOutcome: string;
+  /** The run's budget: asked before every Cloudflare call (edge-sync-budget.ts). */
+  budget: EdgeSyncRunBudget;
+}
+
+/**
+ * The PATCH body that switches one of OUR rate-limit rules off while keeping everything else it
+ * carries. Used when the job disables rate limiting without thresholds, so there is no definition to
+ * rebuild the rule from.
+ */
+function rateLimitRuleSwitchedOff(existing: CloudflareRateLimitRule): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    description: existing.description,
+    expression: existing.expression,
+    action: existing.action,
+    enabled: false,
+  };
+  if (existing.ratelimit !== undefined) {
+    body.ratelimit = existing.ratelimit;
+  }
+  if (existing.action_parameters !== undefined) {
+    body.action_parameters = existing.action_parameters;
+  }
+  return body;
+}
+
+/**
+ * Bring our two rate-limit rules to the job's state (Amendment A7). Never throws and never fails the
+ * op: every problem comes back as `ok: false` in the report, with what landed.
+ *   - enabled: both rules must fit the phase's budget (foreign rules count against it), or NEITHER is
+ *     written. Writes go: patches of our existing rules (full definition, on drift), then deletes of
+ *     later copies, then creates. So the phase never holds more than foreign + 2 rules, and a kept
+ *     rule carries its definition before its copy goes. A new rule is appended (Cloudflare's docs
+ *     place rate-limit rules at the end of the list). Our rules never move.
+ *   - disabled (or absent): our rules that exist are switched off in place, later copies are deleted,
+ *     and nothing is created.
+ * Two rules with one of our descriptions come from overlapping runs: the first (lowest position) is
+ * kept and every later copy deleted — never a refusal, which would stall rate limiting for good.
+ * Foreign rate-limit rules are never written.
+ */
+async function reconcileEdgeRateLimit(input: EdgeRateLimitInput): Promise<WafEdgeSyncRateLimitReport> {
+  const created: string[] = [];
+  const patched: string[] = [];
+  const deleted: string[] = [];
+  let omittedClauses: string[] = [];
+  const report = (): WafEdgeSyncRateLimitReport => ({ ok: true, created, patched, deleted, omittedClauses });
+  const failure = (code: WafEdgeSyncRateLimitCode, detail: string): WafEdgeSyncRateLimitReport => ({
+    ok: false,
+    code,
+    detail,
+    created: [...created],
+    patched: [...patched],
+    deleted: [...deleted],
+    omittedClauses: [...omittedClauses],
+  });
+
+  // 1. Build our two rules (pure) when the job carries thresholds; a threshold the plan does not
+  //    allow is refused here, before any rate-limit write.
+  const rateLimit = input.rateLimit;
+  let desiredByDescription: Map<string, RateLimitRule> | null = null;
+  // Thresholds that do not build for this plan refuse an ENABLE. A DISABLE still runs (Amendment
+  // A10: the off switch never depends on the thresholds), and the reason is reported afterwards.
+  let thresholdsRefusal: string | null = null;
+  if (rateLimit.origin !== undefined && rateLimit.expensive !== undefined) {
+    const built = buildRateLimitRules({
+      zone: input.zoneName,
+      planLegacyId: input.planLegacyId,
+      excludedHosts: input.excludedHosts,
+      enabled: rateLimit.enabled,
+      origin: rateLimit.origin,
+      expensive: rateLimit.expensive,
+    });
+    if (built.ok) {
+      omittedClauses = built.omittedClauses;
+      desiredByDescription = new Map([
+        [RATE_LIMIT_ORIGIN_DESCRIPTION, built.origin],
+        [RATE_LIMIT_EXPENSIVE_DESCRIPTION, built.expensive],
+      ]);
+    } else if (rateLimit.enabled) {
+      return failure("invalid", built.reason);
+    } else {
+      thresholdsRefusal = built.reason;
+    }
+  }
+  // The disabled branch's result: a refusal of the thresholds is reported even though the switch-off ran.
+  const disabledReport = (): WafEdgeSyncRateLimitReport => {
+    if (thresholdsRefusal !== null) {
+      return failure("invalid", `${thresholdsRefusal}. Our rate-limit rules were switched off all the same.`);
+    }
+    return report();
+  };
+
+  // Every Cloudflare call of this part asks the run's budget first; a refusal stops it before the call.
+  const stoppedBefore = (reason: string, nextStep: string): WafEdgeSyncRateLimitReport => {
+    return failure("writeFailed", `${reason}. Stopped before: ${nextStep}.`);
+  };
+  const gatedWrite = async (
+    method: "POST" | "PATCH",
+    url: string,
+    body: unknown,
+  ): Promise<{ ruleset: CloudflareRuleset } | { error: string } | { stopped: string }> => {
+    const permit = input.budget.beginCall();
+    if (!permit.ok) {
+      return { stopped: permit.reason };
+    }
+    const reply = await writeWafRuleset(input.token, method, url, body, permit.signal);
+    return input.budget.settleWrite(reply, permit.signal);
+  };
+
+  // 2. Read the phase and find our rules by exact description.
+  const readPermit = input.budget.beginCall();
+  if (!readPermit.ok) {
+    return stoppedBefore(readPermit.reason, "read the rate-limit rules");
+  }
+  const entrypoint = await getWafPhaseEntrypoint(input.token, input.zoneId, RATE_LIMIT_PHASE, readPermit.signal);
+  if ("error" in entrypoint) {
+    return failure("cloudflare", entrypoint.error);
+  }
+  let ruleset: CloudflareRuleset | null = null;
+  if (!("missing" in entrypoint)) {
+    ruleset = entrypoint.ruleset;
+  }
+  const existingRules = (ruleset?.rules ?? []) as CloudflareRateLimitRule[];
+  const ours = new Map<string, CloudflareRateLimitRule>();
+  const duplicates: CloudflareRateLimitRule[] = [];
+  let foreignCount = 0;
+  for (const rule of existingRules) {
+    const description = rule.description ?? "";
+    if (!RATE_LIMIT_DESCRIPTIONS.includes(description)) {
+      foreignCount += 1;
+      continue;
+    }
+    if (typeof rule.id !== "string" || rule.id.length === 0) {
+      return failure("cloudflare", `Cloudflare returned our rate-limit rule "${description}" without an id — it cannot be updated.`);
+    }
+    if (ours.has(description)) {
+      duplicates.push(rule);
+      continue;
+    }
+    ours.set(description, rule);
+  }
+
+  // Deletes every later copy of one of our rules. Called after the kept rules carry their definition.
+  const deleteDuplicates = async (rulesetPath: string): Promise<string | null> => {
+    for (const duplicate of duplicates) {
+      const description = duplicate.description as string;
+      const permit = input.budget.beginCall();
+      if (!permit.ok) {
+        return `${permit.reason}. Stopped before: delete a duplicate of rate-limit rule "${description}".`;
+      }
+      const reply = await deleteWafRule(input.token, `${rulesetPath}/rules/${encodeURIComponent(duplicate.id as string)}`, permit.signal);
+      const outcome = input.budget.settleWrite(reply, permit.signal);
+      if ("absent" in outcome) {
+        // Already gone (another writer deleted it): done, but not by this run, so not in `deleted`.
+        continue;
+      }
+      if ("error" in outcome) {
+        return `could not delete a duplicate of rate-limit rule "${description}": ${outcome.error} Re-run to resume.`;
+      }
+      deleted.push(description);
+    }
+    return null;
+  };
+
+  // 3. Disabled: switch ours off in place. Nothing is created, so the budget does not matter.
+  if (!rateLimit.enabled) {
+    if (ruleset === null) {
+      return disabledReport();
+    }
+    const rulesetPath = `${input.zonePath}/rulesets/${encodeURIComponent(ruleset.id as string)}`;
+    for (const description of RATE_LIMIT_DESCRIPTIONS) {
+      const existing = ours.get(description);
+      if (existing === undefined) {
+        continue;
+      }
+      let body: Record<string, unknown>;
+      const desired = desiredByDescription?.get(description);
+      if (desired !== undefined) {
+        if (!rateLimitRuleDrifted(existing, desired)) {
+          continue;
+        }
+        body = { ...desired };
+      } else {
+        if (existing.enabled === false) {
+          continue;
+        }
+        body = rateLimitRuleSwitchedOff(existing);
+      }
+      const reply = await gatedWrite("PATCH", `${rulesetPath}/rules/${encodeURIComponent(existing.id as string)}`, body);
+      if ("stopped" in reply) {
+        return stoppedBefore(reply.stopped, `switch off rate-limit rule "${description}"`);
+      }
+      if ("error" in reply) {
+        return failure("writeFailed", `could not switch off rate-limit rule "${description}": ${reply.error} Re-run to resume.`);
+      }
+      patched.push(description);
+    }
+    const duplicateFailure = await deleteDuplicates(rulesetPath);
+    if (duplicateFailure !== null) {
+      return failure("writeFailed", duplicateFailure);
+    }
+    return disabledReport();
+  }
+
+  // 4. Enabled: the validator guarantees thresholds, so both rules were built in step 1.
+  if (desiredByDescription === null) {
+    return failure("invalid", "rateLimit.enabled is true but the job carries no thresholds");
+  }
+  const cap = rateLimitRuleCapForPlan(input.planLegacyId);
+  const rulesAfterRun = foreignCount + RATE_LIMIT_DESCRIPTIONS.length;
+  if (rulesAfterRun > cap) {
+    return failure(
+      "capExceeded",
+      `wrote neither rate-limit rule: zone ${input.zoneName} (plan "${input.planLegacyId ?? "unknown"}") allows ${cap} ` +
+        `rate-limit rules, and ${foreignCount} foreign + our ${RATE_LIMIT_DESCRIPTIONS.length} would make ${rulesAfterRun}. ` +
+        `Free a rate-limit slot or upgrade the zone. ${input.customOutcome}`,
+    );
+  }
+
+  if (ruleset === null) {
+    // No rate-limit rules at all yet: create the entrypoint holding both. POST, not PUT on the
+    // entrypoint path, so a racing create fails instead of replacing.
+    const rules: RateLimitRule[] = [];
+    for (const description of RATE_LIMIT_DESCRIPTIONS) {
+      rules.push(desiredByDescription.get(description) as RateLimitRule);
+    }
+    const reply = await gatedWrite("POST", `${input.zonePath}/rulesets`, {
+      name: "default",
+      kind: "zone",
+      phase: RATE_LIMIT_PHASE,
+      rules,
+    });
+    if ("stopped" in reply) {
+      return stoppedBefore(reply.stopped, "create the zone's rate-limit entrypoint");
+    }
+    if ("error" in reply) {
+      return failure("writeFailed", `could not create the zone's rate-limit entrypoint: ${reply.error} Re-run to resume.`);
+    }
+    for (const description of RATE_LIMIT_DESCRIPTIONS) {
+      created.push(description);
+    }
+    return report();
+  }
+
+  const rulesetPath = `${input.zonePath}/rulesets/${encodeURIComponent(ruleset.id as string)}`;
+  for (const description of RATE_LIMIT_DESCRIPTIONS) {
+    const desired = desiredByDescription.get(description) as RateLimitRule;
+    const existing = ours.get(description);
+    if (existing === undefined || !rateLimitRuleDrifted(existing, desired)) {
+      continue;
+    }
+    const reply = await gatedWrite("PATCH", `${rulesetPath}/rules/${encodeURIComponent(existing.id as string)}`, {
+      ...desired,
+    });
+    if ("stopped" in reply) {
+      return stoppedBefore(reply.stopped, `update rate-limit rule "${description}"`);
+    }
+    if ("error" in reply) {
+      return failure("writeFailed", `could not update rate-limit rule "${description}": ${reply.error} Re-run to resume.`);
+    }
+    patched.push(description);
+  }
+  const duplicateFailure = await deleteDuplicates(rulesetPath);
+  if (duplicateFailure !== null) {
+    return failure("writeFailed", duplicateFailure);
+  }
+  for (const description of RATE_LIMIT_DESCRIPTIONS) {
+    if (ours.has(description)) {
+      continue;
+    }
+    const desired = desiredByDescription.get(description) as RateLimitRule;
+    const reply = await gatedWrite("POST", `${rulesetPath}/rules`, { ...desired });
+    if ("stopped" in reply) {
+      return stoppedBefore(reply.stopped, `create rate-limit rule "${description}"`);
+    }
+    if ("error" in reply) {
+      return failure("writeFailed", `could not create rate-limit rule "${description}": ${reply.error} Re-run to resume.`);
+    }
+    created.push(description);
+  }
+  return report();
+}
+
+const EDGE_CHUNK_KINDS: readonly EdgeChunkKind[] = ["block", "challenge"];
+
+/**
+ * The packer's view of the chunk rules of one kind: number + current clauses. A chunk that does not
+ * parse into our clause forms (edited by hand) counts only the wanted clauses its text holds, so it is
+ * rewritten in one patch to canonical clauses only (chunkClausesForPlanning, Amendment A10).
+ */
+function existingChunkInputs(chunks: ReadonlyMap<number, CloudflareRulesetRule>, wantedClauses: readonly string[]): ExistingEdgeChunk[] {
+  const inputs: ExistingEdgeChunk[] = [];
+  for (const [chunkNumber, rule] of chunks) {
+    const content = chunkClausesForPlanning(rule.expression ?? "", wantedClauses);
+    inputs.push({ chunkNumber, clauses: content.clauses });
+  }
+  return inputs;
+}
+
+/** How many chunk rules of one kind remain after the run. */
+function countLiveChunks(plans: readonly EdgeChunkPlan[]): number {
+  let count = 0;
+  for (const chunkPlan of plans) {
+    if (chunkPlan.finalClauses.length > 0) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/**
+ * Where a create of `desiredRules[index]` goes: after the nearest EXISTING rule of ours that should
+ * precede it, else before the nearest existing one that should follow it, else (none of ours exists)
+ * at the end of the phase.
+ */
+function placementFor(desiredRules: readonly DesiredSyncRule[], index: number): { before: string } | { after: string } | null {
+  for (let earlier = index - 1; earlier >= 0; earlier -= 1) {
+    const ruleId = (desiredRules[earlier] as DesiredSyncRule).ruleId;
+    if (ruleId !== null) {
+      return { after: ruleId };
+    }
+  }
+  for (let later = index + 1; later < desiredRules.length; later += 1) {
+    const ruleId = (desiredRules[later] as DesiredSyncRule).ruleId;
+    if (ruleId !== null) {
+      return { before: ruleId };
+    }
+  }
+  return null;
+}
+
+/** The result's view of the phase after the run: the rule count, the foreign rules and the pre-empting skips. */
+function describeRulesAfterSync(ruleset: CloudflareRuleset): {
+  rulesUsed: number;
+  foreign: WafEdgeSyncRuleReport[];
+  preempting: WafEdgeSyncRuleReport[];
+} {
+  const rules = ruleset.rules ?? [];
+  let lastOurIndex = -1;
+  for (let index = 0; index < rules.length; index += 1) {
+    const owner = classifyWafRuleDescription((rules[index] as CloudflareRulesetRule).description).owner;
+    if (owner === "baseline" || owner === "chunk") {
+      lastOurIndex = index;
+    }
+  }
+  const foreign: WafEdgeSyncRuleReport[] = [];
+  const preempting: WafEdgeSyncRuleReport[] = [];
+  for (let index = 0; index < rules.length; index += 1) {
+    const rule = rules[index] as CloudflareRulesetRule;
+    const owner = classifyWafRuleDescription(rule.description).owner;
+    const report: WafEdgeSyncRuleReport = {
+      description: rule.description ?? "",
+      action: rule.action ?? "",
+      position: index + 1,
+    };
+    if (owner === "foreign") {
+      foreign.push(report);
+    }
+    // An enabled skip above one of ours can stop our rule from running for the traffic it matches.
+    // Reported only: a foreign rule is never moved, and a legacy one goes only with retireLegacy.
+    const canPreempt = owner === "foreign" || owner === "legacy";
+    if (canPreempt && rule.action === "skip" && rule.enabled !== false && index < lastOurIndex) {
+      preempting.push(report);
+    }
+  }
+  return { rulesUsed: rules.length, foreign, preempting };
 }
 
 // ── wp-cli ─────────────────────────────────────────────────────────────────────────────

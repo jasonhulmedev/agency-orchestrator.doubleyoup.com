@@ -43,6 +43,9 @@ export const DISPATCH_OPS = [
   "cache-purge",
   "cache-rule-upsert",
   "waf-rule-upsert",
+  // hub#44 phase 2 — ONE op owns every platform rule in an agency zone's firewall-custom phase: the six
+  // baseline rules and the packed ban chunk rules. The job carries hosts, IPs and User-Agents, never rule text.
+  "waf-edge-sync",
   // hub#46 — a customer domain of an agency cell site, as a Cloudflare-for-SaaS custom hostname in the
   // agency's OWN zone (CF_CUSTOM_HOSTNAME_ZONE; a job never names a zone). Create-or-report, read, delete.
   "custom-hostname-upsert",

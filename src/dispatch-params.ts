@@ -16,6 +16,10 @@
 //
 // Worker-native only: plain string handling, no Node APIs.
 
+// The custom-hostname module imports only a TYPE from this one, so this import makes no runtime cycle.
+import { isCustomHostnameFqdn } from "./dispatch-params-custom-hostname.js";
+import { RATE_LIMIT_MITIGATION_SECONDS, RATE_LIMIT_PERIOD_SECONDS, RATE_LIMIT_REQUESTS_MAX } from "./edge-rate-limit.js";
+
 /** Outcome of validating a parsed params object for one op. */
 export type ParamsVerdict<P> = { ok: true; params: P } | { ok: false; reason: string };
 
@@ -506,6 +510,697 @@ export function validateWafRuleUpsertParams(raw: unknown): ParamsVerdict<WafRule
       excludedHosts: excluded.hosts,
       agentHosts: agents.hosts,
       includeManagedRuleset,
+    },
+  };
+}
+
+// ── waf-edge-sync ────────────────────────────────────────────────────────────────────
+// hub#44 phase 2 (specs/edge-security-via-worker.md). ONE op owns every platform rule in an agency
+// zone's firewall-custom phase: the six baseline rules (the five of waf-rule-upsert, with the same
+// descriptions so they are patched in place, plus `doubleyoup-xmlrpc`) and the packed ban "chunk"
+// rules (`doubleyoup-edge-block:<n>`, `doubleyoup-edge-challenge:<n>`). Every run carries the zone's
+// WHOLE desired state, never a diff, so a re-run converges.
+//
+// NARROW AUTHORITY, as for waf-rule-upsert: the job carries hosts, IP values and User-Agent strings —
+// never an expression, an action or a country list. The Worker builds every rule (edge-waf-sync.ts).
+// A ban can only ever BLOCK or CHALLENGE (the list it sits in decides which), and only on the hosts it
+// names, or on the whole zone minus `excludedHosts` (`hosts: []`). It can never touch the zone's own
+// infrastructure hosts: a site host in `excludedHosts` is refused, and a global clause exempts them.
+//
+// STRICT, at every level: an unknown key fails the job, and so does a DUPLICATE list value (app sends
+// canonical, de-duplicated params — spec Amendment A1). IP values must already be CANONICAL (A3), so
+// the same ban always renders the same clause text, which is what sticky packing finds clauses by.
+//
+// TWIN: app's agency-dispatch-params.ts enforces the same rules before it signs.
+
+/** The baseline switches of a waf-edge-sync job: waf-rule-upsert's fields plus the xmlrpc switch. */
+export interface WafEdgeSyncBaseline {
+  /**
+   * false switches the four protective baseline rules AND the xmlrpc rule off IN PLACE (rollback). The
+   * agent skip stays on. No baseline rule is ever deleted (spec Amendment A2).
+   */
+  enabled: boolean;
+  /** 1..100 hosts in the zone that no site rule may target; the front-end challenge exempts them. */
+  excludedHosts: string[];
+  /** 1..30 cell-agent hosts (each also in excludedHosts): every request to them skips the Managed Ruleset. */
+  agentHosts: string[];
+  /** The waf-rule-upsert meaning: bring OUR Managed Ruleset execute rule to `enabled`, after the custom rules. */
+  includeManagedRuleset: boolean;
+  /** "block" = the xmlrpc rule is enabled (when `enabled` is true). "off" = present but disabled. */
+  xmlrpc: "block" | "off";
+}
+
+/** One ban-like entry of the `block` list. `hosts: []` = the whole zone except excludedHosts. */
+export interface WafEdgeSyncBlockEntry {
+  key: string;
+  hosts: string[];
+  ips: string[];
+  uas: string[];
+}
+
+/** One entry of the `challenge` list. `all: true` challenges EVERY request to the entry's hosts. */
+export interface WafEdgeSyncChallengeEntry {
+  key: string;
+  hosts: string[];
+  all?: true;
+  ips: string[];
+  uas: string[];
+}
+
+/** One rate-limit threshold (Amendment A7): `requests` per `periodSeconds` per IP, then a block. */
+export interface WafEdgeSyncRateLimitThreshold {
+  /** 1..1,000,000. */
+  requests: number;
+  /** 10 or 60. */
+  periodSeconds: number;
+  /** One of 10, 60, 120, 300, 600, 3600, 86400. The actuator also checks the zone's plan allows it. */
+  mitigationSeconds: number;
+}
+
+/**
+ * The rate-limit switch (Amendment A7). Absent in the job => `{ enabled: false }`. enabled:true needs
+ * both thresholds; with enabled:false they are optional (both or neither). enabled:false leaves our two
+ * rate-limit rules present but disabled when they exist, and creates nothing.
+ */
+export type WafEdgeSyncRateLimit =
+  | { enabled: true; origin: WafEdgeSyncRateLimitThreshold; expensive: WafEdgeSyncRateLimitThreshold }
+  | { enabled: false; origin?: WafEdgeSyncRateLimitThreshold; expensive?: WafEdgeSyncRateLimitThreshold };
+
+export interface WafEdgeSyncParams {
+  /** The agency zone NAME; the actuator resolves it with the agency's own token. */
+  zone: string;
+  baseline: WafEdgeSyncBaseline;
+  block: WafEdgeSyncBlockEntry[];
+  challenge: WafEdgeSyncChallengeEntry[];
+  /**
+   * 0..10 custom-rule slots the op leaves free under the plan's cap when a run GROWS the platform's
+   * rules (Amendment A10: a run that ends with the same number or fewer needs only its peak to fit).
+   * Absent in the job => 3.
+   */
+  reservedSlots: number;
+  /** true deletes the legacy `doubleyoup-ban:*` and `doubleyoup-geo:*` rules, after this run's own writes. */
+  retireLegacy: boolean;
+  /** The two rate-limit rules. Their own budget; a failure there never blocks the custom rules. */
+  rateLimit: WafEdgeSyncRateLimit;
+}
+
+const WAF_EDGE_SYNC_KEYS: readonly string[] = [
+  "zone",
+  "baseline",
+  "block",
+  "challenge",
+  "reservedSlots",
+  "retireLegacy",
+  "rateLimit",
+];
+const WAF_EDGE_SYNC_RATE_LIMIT_KEYS: readonly string[] = ["enabled", "origin", "expensive"];
+const WAF_EDGE_SYNC_RATE_LIMIT_THRESHOLD_KEYS: readonly string[] = ["requests", "periodSeconds", "mitigationSeconds"];
+const WAF_EDGE_SYNC_BASELINE_KEYS: readonly string[] = [
+  "enabled",
+  "excludedHosts",
+  "agentHosts",
+  "includeManagedRuleset",
+  "xmlrpc",
+];
+const WAF_EDGE_SYNC_BLOCK_ENTRY_KEYS: readonly string[] = ["key", "hosts", "ips", "uas"];
+const WAF_EDGE_SYNC_CHALLENGE_ENTRY_KEYS: readonly string[] = ["key", "hosts", "all", "ips", "uas"];
+
+/** An entry key: what app derives from the ban id. Unique within its list. */
+const WAF_EDGE_SYNC_ENTRY_KEY_RE = /^[a-z0-9]{1,32}$/;
+const WAF_EDGE_SYNC_ENTRY_HOSTS_MAX = 500;
+const WAF_EDGE_SYNC_ENTRY_IPS_MAX = 100;
+const WAF_EDGE_SYNC_ENTRY_UAS_MAX = 10;
+const WAF_EDGE_SYNC_UA_MIN_LENGTH = 8;
+const WAF_EDGE_SYNC_UA_MAX_LENGTH = 256;
+const WAF_EDGE_SYNC_RESERVED_SLOTS_MAX = 10;
+export const WAF_EDGE_SYNC_RESERVED_SLOTS_DEFAULT = 3;
+
+/** The reason `raw` carries a key outside `allowedKeys`, or null. `label` names the object. */
+function unknownKeyReason(raw: Record<string, unknown>, allowedKeys: readonly string[], label: string): string | null {
+  for (const key of Object.keys(raw)) {
+    if (!allowedKeys.includes(key)) {
+      return `unknown key "${key}" in ${label} — it takes only ${allowedKeys.join(", ")}`;
+    }
+  }
+  return null;
+}
+
+// The narrowest networks a ban may name are /8 (IPv4) and /24 (IPv6): a wider value would block or
+// challenge a large share of the internet on the hosts it names.
+const IPV4_NETWORK_PREFIX_MIN = 8;
+const IPV6_NETWORK_PREFIX_MIN = 24;
+
+/** The four octets of a canonical dotted-decimal IPv4 address (no leading zeros), or null. */
+function canonicalIpv4Octets(text: string): number[] | null {
+  const parts = text.split(".");
+  if (parts.length !== 4) {
+    return null;
+  }
+  const octets: number[] = [];
+  for (const part of parts) {
+    // "0", or 1-3 digits without a leading zero: "01" is not canonical.
+    if (!/^(0|[1-9][0-9]{0,2})$/.test(part)) {
+      return null;
+    }
+    const octet = Number(part);
+    if (octet > 255) {
+      return null;
+    }
+    octets.push(octet);
+  }
+  return octets;
+}
+
+/** The eight 16-bit groups of an IPv6 address written with lowercase hex and at most one "::", or null. */
+function ipv6Groups(text: string): number[] | null {
+  // Lowercase hex and colons only: an upper-case digit or an embedded dotted IPv4 is not canonical.
+  if (text.length < 2 || text.length > 39 || !/^[0-9a-f:]+$/.test(text)) {
+    return null;
+  }
+  const groupRe = /^[0-9a-f]{1,4}$/;
+  const doubleColonIndex = text.indexOf("::");
+  if (doubleColonIndex === -1) {
+    const parts = text.split(":");
+    if (parts.length !== 8) {
+      return null;
+    }
+    const groups: number[] = [];
+    for (const part of parts) {
+      if (!groupRe.test(part)) {
+        return null;
+      }
+      groups.push(parseInt(part, 16));
+    }
+    return groups;
+  }
+  // ":::" or a second "::" is malformed.
+  if (text.indexOf("::", doubleColonIndex + 1) !== -1 || text.includes(":::")) {
+    return null;
+  }
+  const headText = text.slice(0, doubleColonIndex);
+  const tailText = text.slice(doubleColonIndex + 2);
+  let headParts: string[] = [];
+  if (headText.length > 0) {
+    headParts = headText.split(":");
+  }
+  let tailParts: string[] = [];
+  if (tailText.length > 0) {
+    tailParts = tailText.split(":");
+  }
+  // "::" stands for at least one group, so at most seven are written out.
+  if (headParts.length + tailParts.length > 7) {
+    return null;
+  }
+  const groups: number[] = [];
+  for (const part of headParts) {
+    if (!groupRe.test(part)) {
+      return null;
+    }
+    groups.push(parseInt(part, 16));
+  }
+  const zeroGroupCount = 8 - headParts.length - tailParts.length;
+  for (let index = 0; index < zeroGroupCount; index += 1) {
+    groups.push(0);
+  }
+  for (const part of tailParts) {
+    if (!groupRe.test(part)) {
+      return null;
+    }
+    groups.push(parseInt(part, 16));
+  }
+  return groups;
+}
+
+/**
+ * The RFC 5952 text of eight IPv6 groups: lowercase hex without leading zeros, and the LONGEST run of
+ * two or more zero groups written as "::" (the leftmost run on a tie). A single zero group stays "0".
+ */
+export function rfc5952Ipv6Text(groups: readonly number[]): string {
+  let bestRunStart = -1;
+  let bestRunLength = 0;
+  let runStart = -1;
+  for (let index = 0; index <= groups.length; index += 1) {
+    const isZero = index < groups.length && groups[index] === 0;
+    if (isZero) {
+      if (runStart === -1) {
+        runStart = index;
+      }
+      continue;
+    }
+    if (runStart !== -1) {
+      const runLength = index - runStart;
+      // Strictly longer only, so the LEFTMOST of two equal runs wins.
+      if (runLength > bestRunLength) {
+        bestRunStart = runStart;
+        bestRunLength = runLength;
+      }
+      runStart = -1;
+    }
+  }
+  const hexGroups = groups.map((group) => group.toString(16));
+  if (bestRunLength < 2) {
+    return hexGroups.join(":");
+  }
+  const head = hexGroups.slice(0, bestRunStart).join(":");
+  const tail = hexGroups.slice(bestRunStart + bestRunLength).join(":");
+  return `${head}::${tail}`;
+}
+
+/** True when every bit after the first `prefixLength` bits of `groups` (each `bitsPerGroup` wide) is zero. */
+function hostBitsAreZero(groups: readonly number[], bitsPerGroup: number, prefixLength: number): boolean {
+  for (let index = 0; index < groups.length; index += 1) {
+    const groupStartBit = index * bitsPerGroup;
+    const networkBitsInGroup = Math.max(0, Math.min(bitsPerGroup, prefixLength - groupStartBit));
+    const hostBitsInGroup = bitsPerGroup - networkBitsInGroup;
+    if (hostBitsInGroup === 0) {
+      continue;
+    }
+    const hostMask = 2 ** hostBitsInGroup - 1;
+    if ((groups[index] as number) % (hostMask + 1) !== 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The two IPv6 ranges that carry IPv4 addresses, as their first six 16-bit groups: ::/96
+ * (IPv4-compatible; it also holds the unspecified :: and the loopback ::1) and ::ffff:0:0/96
+ * (IPv4-mapped). A ban there could match IPv4 clients or nothing at all, so neither is a ban value.
+ */
+const IPV6_EMBEDDED_IPV4_RANGES: ReadonlyArray<readonly number[]> = [
+  [0, 0, 0, 0, 0, 0],
+  [0, 0, 0, 0, 0, 0xffff],
+];
+
+/**
+ * True when the IPv6 range `groups`/`prefixLength` shares any address with the /96 range
+ * `rangeGroups`: their first min(prefixLength, 96) bits are equal. So a range inside the /96, and a
+ * wider range that contains it (such as ::/24), both overlap.
+ */
+function overlapsIpv6Slash96(groups: readonly number[], prefixLength: number, rangeGroups: readonly number[]): boolean {
+  const comparedBits = Math.min(prefixLength, 96);
+  for (let index = 0; index < 6; index += 1) {
+    const bitsInGroup = Math.max(0, Math.min(16, comparedBits - index * 16));
+    if (bitsInGroup === 0) {
+      break;
+    }
+    const shift = 16 - bitsInGroup;
+    if ((groups[index] as number) >> shift !== (rangeGroups[index] as number) >> shift) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The reason `value` is not a CANONICAL ban IP value (spec Amendment A3), or null:
+ *   - IPv4: dotted decimal, no leading zeros. A host is the bare address (no "/32"). A network is
+ *     "<address>/8..31" with the host bits zero.
+ *   - IPv6: RFC 5952 text, no embedded dotted IPv4. A host is bare (no "/128"). A network is
+ *     "<address>/24..127" with the host bits zero. Nothing that overlaps ::/96 or ::ffff:0:0/96
+ *     (Amendment A10), so neither ::, ::1 nor an IPv4-mapped address.
+ * "0.0.0.0/0" and "::/0" fail the prefix floor. Canonical text means one ban always renders one clause.
+ */
+export function canonicalEdgeIpReason(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return "an IP value must be a string";
+  }
+  const slashIndex = value.indexOf("/");
+  let addressText = value;
+  let prefixText: string | null = null;
+  if (slashIndex !== -1) {
+    addressText = value.slice(0, slashIndex);
+    prefixText = value.slice(slashIndex + 1);
+  }
+  let prefixLength: number | null = null;
+  if (prefixText !== null) {
+    if (!/^[1-9][0-9]{0,2}$/.test(prefixText)) {
+      return `"${value}" has a malformed prefix length`;
+    }
+    prefixLength = Number(prefixText);
+  }
+
+  if (!addressText.includes(":")) {
+    const octets = canonicalIpv4Octets(addressText);
+    if (octets === null) {
+      return `"${value}" is not a canonical IPv4 address (dotted decimal, no leading zeros)`;
+    }
+    if (prefixLength === null) {
+      return null;
+    }
+    if (prefixLength < IPV4_NETWORK_PREFIX_MIN || prefixLength > 31) {
+      return `"${value}": an IPv4 network must be /${IPV4_NETWORK_PREFIX_MIN} to /31 (write a single host without /32)`;
+    }
+    if (!hostBitsAreZero(octets, 8, prefixLength)) {
+      return `"${value}" has host bits set — write the network address`;
+    }
+    return null;
+  }
+
+  const groups = ipv6Groups(addressText);
+  if (groups === null || rfc5952Ipv6Text(groups) !== addressText) {
+    return `"${value}" is not a canonical IPv6 address (RFC 5952: lowercase, no leading zeros, the longest zero run as ::)`;
+  }
+  if (prefixLength !== null) {
+    if (prefixLength < IPV6_NETWORK_PREFIX_MIN || prefixLength > 127) {
+      return `"${value}": an IPv6 network must be /${IPV6_NETWORK_PREFIX_MIN} to /127 (write a single host without /128)`;
+    }
+    if (!hostBitsAreZero(groups, 16, prefixLength)) {
+      return `"${value}" has host bits set — write the network address`;
+    }
+  }
+  let rangePrefixLength = 128;
+  if (prefixLength !== null) {
+    rangePrefixLength = prefixLength;
+  }
+  for (const range of IPV6_EMBEDDED_IPV4_RANGES) {
+    if (overlapsIpv6Slash96(groups, rangePrefixLength, range)) {
+      return `"${value}" overlaps ::/96 or ::ffff:0:0/96 (the IPv6 ranges that carry IPv4 addresses) — ban the IPv4 address instead`;
+    }
+  }
+  return null;
+}
+
+/**
+ * The reason `value` is not a User-Agent a ban may match, or null: printable ASCII, 8-256 characters,
+ * with no `"` and no `\`. The value lands inside a quoted Rules-language string, and those two are
+ * the only characters that could end or escape it.
+ */
+export function edgeUserAgentReason(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return "a User-Agent value must be a string";
+  }
+  if (value.length < WAF_EDGE_SYNC_UA_MIN_LENGTH || value.length > WAF_EDGE_SYNC_UA_MAX_LENGTH) {
+    return `a User-Agent value must be ${WAF_EDGE_SYNC_UA_MIN_LENGTH}-${WAF_EDGE_SYNC_UA_MAX_LENGTH} characters`;
+  }
+  if (!/^[\x20-\x7e]+$/.test(value)) {
+    return "a User-Agent value must be printable ASCII";
+  }
+  if (value.includes('"') || value.includes("\\")) {
+    return 'a User-Agent value must not contain " or \\';
+  }
+  return null;
+}
+
+/**
+ * Validate one string list of an entry: an array of 0..`max` distinct values, each passing
+ * `valueReason`. Returns a FRESH array, never the caller's.
+ */
+function cleanEntryList(
+  value: unknown,
+  label: string,
+  max: number,
+  valueReason: (entry: unknown) => string | null,
+): { ok: true; values: string[] } | { ok: false; reason: string } {
+  if (!Array.isArray(value) || value.length > max) {
+    return { ok: false, reason: `${label} must be an array of 0-${max} values` };
+  }
+  const values: string[] = [];
+  for (const entry of value) {
+    const reason = valueReason(entry);
+    if (reason !== null) {
+      return { ok: false, reason: `${label}: ${reason}` };
+    }
+    // Strict: a duplicate is a caller bug (app de-duplicates before signing), never silently merged.
+    if (values.includes(entry as string)) {
+      return { ok: false, reason: `${label} lists "${String(entry)}" twice` };
+    }
+    values.push(entry as string);
+  }
+  return { ok: true, values };
+}
+
+/** The reason `value` is not a site host for a ban entry, or null. Custom domains may lie outside the zone. */
+function edgeSiteHostReason(value: unknown): string | null {
+  if (!isCustomHostnameFqdn(value)) {
+    return `"${String(value)}" is not a lowercase fully-qualified host name`;
+  }
+  return null;
+}
+
+/** One validated entry of either list. `all` is false when the job left it out. */
+interface ValidEdgeEntry {
+  key: string;
+  hosts: string[];
+  ips: string[];
+  uas: string[];
+  all: boolean;
+}
+
+type EdgeEntryVerdict = { ok: true; entry: ValidEdgeEntry } | { ok: false; reason: string };
+
+/** Validate one block or challenge entry. `allowAll` is true only for the challenge list. */
+function validateWafEdgeSyncEntry(
+  raw: unknown,
+  label: string,
+  allowAll: boolean,
+  excludedHosts: readonly string[],
+): EdgeEntryVerdict {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: `${label} must be a JSON object` };
+  }
+  let allowedKeys = WAF_EDGE_SYNC_BLOCK_ENTRY_KEYS;
+  if (allowAll) {
+    allowedKeys = WAF_EDGE_SYNC_CHALLENGE_ENTRY_KEYS;
+  }
+  const unknownKey = unknownKeyReason(raw, allowedKeys, label);
+  if (unknownKey !== null) {
+    return { ok: false, reason: unknownKey };
+  }
+  const key = raw.key;
+  if (typeof key !== "string" || !WAF_EDGE_SYNC_ENTRY_KEY_RE.test(key)) {
+    return { ok: false, reason: `${label}.key must be 1-32 lowercase letters or digits` };
+  }
+  const hosts = cleanEntryList(raw.hosts, `${label}.hosts`, WAF_EDGE_SYNC_ENTRY_HOSTS_MAX, edgeSiteHostReason);
+  if (!hosts.ok) {
+    return hosts;
+  }
+  // A site rule must never reach the zone's own infrastructure (the agent API, the control plane).
+  for (const host of hosts.values) {
+    if (excludedHosts.includes(host)) {
+      return { ok: false, reason: `${label}.hosts lists "${host}", which is in baseline.excludedHosts` };
+    }
+  }
+  const ips = cleanEntryList(raw.ips, `${label}.ips`, WAF_EDGE_SYNC_ENTRY_IPS_MAX, canonicalEdgeIpReason);
+  if (!ips.ok) {
+    return ips;
+  }
+  const uas = cleanEntryList(raw.uas, `${label}.uas`, WAF_EDGE_SYNC_ENTRY_UAS_MAX, edgeUserAgentReason);
+  if (!uas.ok) {
+    return uas;
+  }
+  // `all` is either absent or literally true: `all: false` is a caller bug, not a harmless default.
+  let all = false;
+  if (raw.all !== undefined) {
+    if (raw.all !== true) {
+      return { ok: false, reason: `${label}.all, when present, must be true` };
+    }
+    all = true;
+  }
+  if (ips.values.length === 0 && uas.values.length === 0 && !all) {
+    return { ok: false, reason: `${label} needs at least one of ips, uas or all` };
+  }
+  return { ok: true, entry: { key, hosts: hosts.values, ips: ips.values, uas: uas.values, all } };
+}
+
+/** Validate a block or challenge list: an array of entries with keys unique within the list. */
+function validateWafEdgeSyncList(
+  raw: unknown,
+  listName: "block" | "challenge",
+  excludedHosts: readonly string[],
+): { ok: true; entries: ValidEdgeEntry[] } | { ok: false; reason: string } {
+  if (!Array.isArray(raw)) {
+    return { ok: false, reason: `${listName} must be an array (empty for none)` };
+  }
+  const allowAll = listName === "challenge";
+  const seenKeys: string[] = [];
+  const entries: ValidEdgeEntry[] = [];
+  for (let index = 0; index < raw.length; index += 1) {
+    const verdict = validateWafEdgeSyncEntry(raw[index], `${listName}[${index}]`, allowAll, excludedHosts);
+    if (!verdict.ok) {
+      return verdict;
+    }
+    if (seenKeys.includes(verdict.entry.key)) {
+      return { ok: false, reason: `${listName} has two entries with key "${verdict.entry.key}"` };
+    }
+    seenKeys.push(verdict.entry.key);
+    entries.push(verdict.entry);
+  }
+  return { ok: true, entries };
+}
+
+type RateLimitThresholdVerdict = { ok: true; threshold: WafEdgeSyncRateLimitThreshold } | { ok: false; reason: string };
+
+function validateRateLimitThreshold(raw: unknown, label: string): RateLimitThresholdVerdict {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: `${label} must be a JSON object` };
+  }
+  const unknownKey = unknownKeyReason(raw, WAF_EDGE_SYNC_RATE_LIMIT_THRESHOLD_KEYS, label);
+  if (unknownKey !== null) {
+    return { ok: false, reason: unknownKey };
+  }
+  const { requests, periodSeconds, mitigationSeconds } = raw;
+  if (typeof requests !== "number" || !Number.isInteger(requests) || requests < 1 || requests > RATE_LIMIT_REQUESTS_MAX) {
+    return { ok: false, reason: `${label}.requests must be an integer from 1 to ${RATE_LIMIT_REQUESTS_MAX}` };
+  }
+  if (typeof periodSeconds !== "number" || !RATE_LIMIT_PERIOD_SECONDS.includes(periodSeconds)) {
+    return { ok: false, reason: `${label}.periodSeconds must be one of ${RATE_LIMIT_PERIOD_SECONDS.join(", ")}` };
+  }
+  if (typeof mitigationSeconds !== "number" || !RATE_LIMIT_MITIGATION_SECONDS.includes(mitigationSeconds)) {
+    return { ok: false, reason: `${label}.mitigationSeconds must be one of ${RATE_LIMIT_MITIGATION_SECONDS.join(", ")}` };
+  }
+  return { ok: true, threshold: { requests, periodSeconds, mitigationSeconds } };
+}
+
+type RateLimitVerdict = { ok: true; rateLimit: WafEdgeSyncRateLimit } | { ok: false; reason: string };
+
+/** The `rateLimit` key (Amendment A7). Absent => disabled. Returns a FRESH object. */
+function validateWafEdgeSyncRateLimit(raw: unknown): RateLimitVerdict {
+  if (raw === undefined) {
+    return { ok: true, rateLimit: { enabled: false } };
+  }
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "rateLimit, when present, must be a JSON object" };
+  }
+  const unknownKey = unknownKeyReason(raw, WAF_EDGE_SYNC_RATE_LIMIT_KEYS, "rateLimit");
+  if (unknownKey !== null) {
+    return { ok: false, reason: unknownKey };
+  }
+  if (typeof raw.enabled !== "boolean") {
+    return { ok: false, reason: "rateLimit.enabled must be true or false" };
+  }
+  const hasOrigin = raw.origin !== undefined;
+  const hasExpensive = raw.expensive !== undefined;
+  if (!hasOrigin && !hasExpensive) {
+    if (raw.enabled) {
+      return { ok: false, reason: "rateLimit.enabled true needs both rateLimit.origin and rateLimit.expensive" };
+    }
+    return { ok: true, rateLimit: { enabled: false } };
+  }
+  if (!hasOrigin || !hasExpensive) {
+    return { ok: false, reason: "rateLimit takes both origin and expensive, or neither" };
+  }
+  const origin = validateRateLimitThreshold(raw.origin, "rateLimit.origin");
+  if (!origin.ok) {
+    return origin;
+  }
+  const expensive = validateRateLimitThreshold(raw.expensive, "rateLimit.expensive");
+  if (!expensive.ok) {
+    return expensive;
+  }
+  if (raw.enabled) {
+    return { ok: true, rateLimit: { enabled: true, origin: origin.threshold, expensive: expensive.threshold } };
+  }
+  return { ok: true, rateLimit: { enabled: false, origin: origin.threshold, expensive: expensive.threshold } };
+}
+
+export function validateWafEdgeSyncParams(raw: unknown): ParamsVerdict<WafEdgeSyncParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const unknownTopKey = unknownKeyReason(raw, WAF_EDGE_SYNC_KEYS, "waf-edge-sync params");
+  if (unknownTopKey !== null) {
+    return { ok: false, reason: unknownTopKey };
+  }
+  const { zone, baseline, block, challenge, reservedSlots, retireLegacy, rateLimit } = raw;
+
+  if (typeof zone !== "string" || zone.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a lowercase DNS zone name (e.g. example.com)" };
+  }
+
+  if (!isPlainObject(baseline)) {
+    return { ok: false, reason: "baseline must be a JSON object" };
+  }
+  const unknownBaselineKey = unknownKeyReason(baseline, WAF_EDGE_SYNC_BASELINE_KEYS, "baseline");
+  if (unknownBaselineKey !== null) {
+    return { ok: false, reason: unknownBaselineKey };
+  }
+  if (typeof baseline.enabled !== "boolean") {
+    return { ok: false, reason: "baseline.enabled must be true or false" };
+  }
+  // The same host rules as waf-rule-upsert: both lists lie in the zone, and every agent host is excluded.
+  const excluded = cleanWafHostList(baseline.excludedHosts, zone, "baseline.excludedHosts", WAF_EXCLUDED_HOSTS_MAX);
+  if (!excluded.ok) {
+    return excluded;
+  }
+  const agents = cleanWafHostList(baseline.agentHosts, zone, "baseline.agentHosts", WAF_AGENT_HOSTS_MAX);
+  if (!agents.ok) {
+    return agents;
+  }
+  for (const agentHost of agents.hosts) {
+    if (!excluded.hosts.includes(agentHost)) {
+      return {
+        ok: false,
+        reason: `baseline.agentHosts entry "${agentHost}" must also be in baseline.excludedHosts (the agent API must never be challenged)`,
+      };
+    }
+  }
+  if (typeof baseline.includeManagedRuleset !== "boolean") {
+    return { ok: false, reason: "baseline.includeManagedRuleset must be true or false" };
+  }
+  if (baseline.xmlrpc !== "block" && baseline.xmlrpc !== "off") {
+    return { ok: false, reason: 'baseline.xmlrpc must be "block" or "off"' };
+  }
+
+  const blockList = validateWafEdgeSyncList(block, "block", excluded.hosts);
+  if (!blockList.ok) {
+    return blockList;
+  }
+  const challengeList = validateWafEdgeSyncList(challenge, "challenge", excluded.hosts);
+  if (!challengeList.ok) {
+    return challengeList;
+  }
+
+  let reservedSlotsValue = WAF_EDGE_SYNC_RESERVED_SLOTS_DEFAULT;
+  if (reservedSlots !== undefined) {
+    if (
+      typeof reservedSlots !== "number" ||
+      !Number.isInteger(reservedSlots) ||
+      reservedSlots < 0 ||
+      reservedSlots > WAF_EDGE_SYNC_RESERVED_SLOTS_MAX
+    ) {
+      return { ok: false, reason: `reservedSlots, when present, must be an integer from 0 to ${WAF_EDGE_SYNC_RESERVED_SLOTS_MAX}` };
+    }
+    reservedSlotsValue = reservedSlots;
+  }
+  if (typeof retireLegacy !== "boolean") {
+    return { ok: false, reason: "retireLegacy must be true or false" };
+  }
+  const rateLimitVerdict = validateWafEdgeSyncRateLimit(rateLimit);
+  if (!rateLimitVerdict.ok) {
+    return rateLimitVerdict;
+  }
+
+  // FRESH objects holding only the known keys, so nothing extra can ride along into the actuator.
+  const blockEntries: WafEdgeSyncBlockEntry[] = [];
+  for (const entry of blockList.entries) {
+    blockEntries.push({ key: entry.key, hosts: entry.hosts, ips: entry.ips, uas: entry.uas });
+  }
+  const challengeEntries: WafEdgeSyncChallengeEntry[] = [];
+  for (const entry of challengeList.entries) {
+    const challengeEntry: WafEdgeSyncChallengeEntry = { key: entry.key, hosts: entry.hosts, ips: entry.ips, uas: entry.uas };
+    if (entry.all) {
+      challengeEntry.all = true;
+    }
+    challengeEntries.push(challengeEntry);
+  }
+  return {
+    ok: true,
+    params: {
+      zone,
+      baseline: {
+        enabled: baseline.enabled,
+        excludedHosts: excluded.hosts,
+        agentHosts: agents.hosts,
+        includeManagedRuleset: baseline.includeManagedRuleset,
+        xmlrpc: baseline.xmlrpc,
+      },
+      block: blockEntries,
+      challenge: challengeEntries,
+      reservedSlots: reservedSlotsValue,
+      retireLegacy,
+      rateLimit: rateLimitVerdict.rateLimit,
     },
   };
 }

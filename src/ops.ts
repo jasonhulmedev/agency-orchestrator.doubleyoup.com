@@ -26,7 +26,9 @@
 // found by its exact description and PATCHed only on drift, and (when the job includes it) only the
 // Managed Ruleset execute rule this op owns is created or switched on/off — so a re-run converges,
 // including after a PARTIAL apply (a write that failed part-way), which it resumes rather than
-// duplicates.
+// duplicates. `waf-edge-sync` (hub#44 phase 2) is idempotent the same way: every run carries the zone's
+// whole desired state, each rule is found by its exact description and written only on drift, and a
+// clause already in a chunk stays there, so a re-run of the same state writes nothing.
 //
 // ALL FIVE TEARDOWN ops — `gcp-instance-delete` / `gcp-address-delete` / `gcp-firewall-delete` /
 // `gcp-router-delete` / `gcp-network-delete` — are IDEMPOTENT, the mirror of that: Google's 404
@@ -86,6 +88,7 @@ import {
   type CachePurgeParams,
   type CacheRuleUpsertParams,
   type WafRuleUpsertParams,
+  type WafEdgeSyncParams,
   type CfTunnelCreateParams,
   type CfTunnelConfigParams,
   type CfTunnelDeleteParams,
@@ -127,6 +130,7 @@ import {
   validateCachePurgeParams,
   validateCacheRuleUpsertParams,
   validateWafRuleUpsertParams,
+  validateWafEdgeSyncParams,
   validateCfTunnelCreateParams,
   validateCfTunnelConfigParams,
   validateCfTunnelDeleteParams,
@@ -171,6 +175,7 @@ import {
   actuateCachePurge,
   actuateCacheRuleUpsert,
   actuateWafRuleUpsert,
+  actuateWafEdgeSync,
   actuateCfTunnelCreate,
   actuateCfTunnelConfig,
   actuateCfTunnelDelete,
@@ -278,6 +283,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "waf-rule-upsert": defineOp<WafRuleUpsertParams>({
     validateParams: validateWafRuleUpsertParams,
     actuate: (params, env) => actuateWafRuleUpsert(params, env),
+  }),
+  "waf-edge-sync": defineOp<WafEdgeSyncParams>({
+    validateParams: validateWafEdgeSyncParams,
+    actuate: (params, env) => actuateWafEdgeSync(params, env),
   }),
   "custom-hostname-upsert": defineOp<CustomHostnameUpsertParams>({
     validateParams: validateCustomHostnameUpsertParams,

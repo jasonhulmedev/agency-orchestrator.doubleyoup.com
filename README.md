@@ -159,7 +159,7 @@ npm run typecheck                # tsc --noEmit
   hand-rolled against Web Crypto.
 - The Direction-B signed handshake (our app → this Worker) is **live**: `POST
   /actuate` verifies an ed25519 signature + a single-use nonce before running any
-  allowlisted op (provision-r2, dns-record-upsert, cache-purge, cache-rule-upsert, waf-rule-upsert, wp-cli,
+  allowlisted op (provision-r2, dns-record-upsert, cache-purge, cache-rule-upsert, waf-rule-upsert, waf-edge-sync, wp-cli,
   db-export, db-import, gcp-instance-create, gcp-network-create,
   gcp-firewall-create, gcp-address-create, gcp-router-nat-create). `/validate`
   and `/complete` stay agency-triggered.
