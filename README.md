@@ -4,25 +4,21 @@ The **agency-side glue** for the doubleyoup agency-cloud pivot — a Cloudflare
 Worker that each agency deploys into **their own** Cloudflare account (pulled
 from our GitHub, so we never need write access to their account).
 
-This is thin, always-on glue: it does **not** run heavy jobs. In the full
-design the long-running orchestration runs on a compute box in the agency's own
-Google Cloud; the Worker just dispatches and makes light API calls.
+This is thin, always-on glue. It does **not** run heavy jobs. The platform
+orchestrator runs the long jobs and sends this Worker one signed job per action.
+The Worker acts with the agency's own credentials.
 
-## Phase 1 scope (this repo, today)
+## Scope
 
-**Onboarding + credential self-validation only — NO infrastructure
-provisioning.** The Worker:
+The Worker does three things.
 
-1. Validates each service credential the agency connected (Google Cloud, S3,
-   Stripe, R2 provisioning, and the AI provider keys) with a **real
-   authenticated call** to each provider, returning a specific, actionable
-   error for anything that's wrong.
-2. Talks back to our control-plane app over **Direction-A OAuth2** (a
-   short-lived access token minted from the agency's client credentials) to
-   prove the round-trip and signal onboarding complete.
-
-Provisioning, the inbound signed handshake (Direction B), the update pipeline,
-and everything else come in later phases.
+1. It validates each credential the agency connected, with a real call to each
+   provider.
+2. It talks to our app over Direction-A OAuth2.
+3. It runs signed Direction-B jobs (`POST /actuate`). With these jobs it builds
+   and tears down the agency's cell in the agency's own Google Cloud project. It
+   also manages DNS, tunnels, cache, WAF, custom hostnames, R2 media and Cloud
+   Run sessions in the agency's own accounts.
 
 ## How the credentials live
 
@@ -44,6 +40,10 @@ Worker never persists them anywhere else and we never hold them. See
 | `CF_CUSTOM_HOSTNAME_ZONE` | secret | hub#46 customer domains: the NAME of the agency zone that holds your customers' Cloudflare-for-SaaS custom hostnames (e.g. `example.com`, the zone of your `host.` CNAME target). The `custom-hostname-upsert` / `-get` / `-delete` ops act on this zone only; a signed job names a hostname, never a zone. They use `CF_DNS_API_TOKEN`, which then also needs **Zone → SSL and Certificates → Edit** on this zone. Set it as a secret (not a plain variable) so a redeploy keeps it. `/validate` reports, read-only, whether the token can read the zone's custom hostnames and which fallback origin the zone has (`cfDns.customHostnames`) |
 | `DY_WORKER_NAME` | secret | this Worker's own script name, as the Cloudflare dashboard shows it (e.g. `sbmstudio`). It can differ from `name` in your fork's `wrangler.toml`. The `edge-gate-deploy` op binds your cell's session gate to this Worker's `SessionGateMinter` entrypoint by this name, and refuses while it is unset. Not secret, but set it as a secret so a redeploy keeps it. `/validate` reports whether it is set (`cfDns.workersScope.workerName`) |
 | `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` | secrets | AI provider keys — set at least one (`OPENAI_API_KEY` also covers Codex) |
+| `DY_SIGNING_PUBLIC_KEY` | secret | your account's ed25519 public key from onboarding. `/actuate` checks each job with it. Unset, `/actuate` refuses every job |
+| `CELL_AGENT_URL` / `CELL_AGENT_TOKEN` | secrets | your web cell-agent URL and token, for the `wp-cli` and `db-export` ops |
+| `CELL_FILE_AGENT_URL` / `CELL_FILE_AGENT_TOKEN` | secrets (optional) | a fallback file-node agent for `r2-site-key-install`. A current job names its own agent, so most agencies do not set them |
+| `R2_EXPECTED_ACCOUNT_ID` | optional | the media ops refuse any other account |
 
 ## Where setup instructions live
 
@@ -69,7 +69,8 @@ Builds**:
    fork*, not to this upstream repo.
 2. In the Cloudflare dashboard → **Workers & Pages** → **Create** → **Connect to
    Git**, pick **your fork**, and let Cloudflare build & deploy it. Every push to
-   your fork's `main` re-deploys automatically. (`APP_BASE_URL` is already set in
+   your fork's `main` re-deploys automatically. In the Workers Builds settings, let only
+   `main` deploy to production. If you do not, a push to another branch can deploy too. (`APP_BASE_URL` is already set in
    `wrangler.toml` and points at our app.)
 3. Add your secrets via the onboarding wizard's instructions, then open the
    Worker's root URL and press **Check my setup** until every item is green.
@@ -136,6 +137,7 @@ npm run deploy
 | `POST /validate` | run every validator; returns `{ok, gcp, s3, stripe, ai, r2Provision, cfDns}`, each `{ok, detail}` |
 | `GET /whoami` | exercise Direction-A end-to-end; returns `{ok, accountId}` |
 | `POST /complete` | if all green, call our app's onboarding-complete route; returns `{ok, validation, callback}` |
+| `POST /actuate` | runs one signed Direction-B job (ed25519 signature and a single-use nonce). Only the platform calls it |
 
 > `POST /complete` re-validates and calls our app's `onboarding-complete` route
 > (now live). It stays resilient — if that callback is ever unreachable it still
@@ -146,7 +148,7 @@ npm run deploy
 ```
 cp .dev.vars.example .dev.vars   # fill in real values (git-ignored)
 npm run dev                      # wrangler dev
-npm test                         # vitest — token-exchange caching + every validator (mocked fetch)
+npm test                         # vitest — validators, signed dispatch, the op families and the session gate (mocked fetch)
 npm run typecheck                # tsc --noEmit
 ```
 
@@ -159,7 +161,8 @@ npm run typecheck                # tsc --noEmit
   hand-rolled against Web Crypto.
 - The Direction-B signed handshake (our app → this Worker) is **live**: `POST
   /actuate` verifies an ed25519 signature + a single-use nonce before running any
-  allowlisted op (provision-r2, dns-record-upsert, cache-purge, cache-rule-upsert, waf-rule-upsert, waf-edge-sync, wp-cli,
-  db-export, db-import, gcp-instance-create, gcp-network-create,
-  gcp-firewall-create, gcp-address-create, gcp-router-nat-create). `/validate`
+  op in `DISPATCH_OP_REGISTRY` (`src/ops.ts`, 55 ops on 2026-10-31). The ops cover R2 media,
+  DNS, cache, WAF, custom hostnames, Cloudflare tunnels and Workers routes, `wp-cli` and DB
+  export/import on the cell, and the cell's Google Cloud resources (instances, networks,
+  subnets, firewalls, addresses, NAT, snapshots, Cloud Run). `/validate`
   and `/complete` stay agency-triggered.
