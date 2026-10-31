@@ -65,8 +65,8 @@ import {
   CLOUD_RUN_PROBE_IMAGE,
   CLOUD_RUN_PROBE_SERVICE_NAME,
   SESSION_IMAGE_NAMES,
-  SESSION_PREFIXES_WITH_READ_ONLY_NFS,
   siteSessionNfsPathsFor,
+  siteSessionReadOnlyNfsPathsFor,
   validateGcpSubnetsListParams,
   validateGcpProjectQuotaGetParams,
   GCP_PROJECT_QUOTA_METRIC,
@@ -550,7 +550,7 @@ const CLOUD_RUN_PROBE_REF_PARAMS = { project: "dy-agency-proof", region: "austra
 // this marker up to, not including, the next section rule after it). Changing the block means changing
 // BOTH twins and BOTH pins in one go.
 const TWIN_BLOCK_START_MARKER = "// ── planning/49: the agency-side ephemeral-compute ops";
-const TWIN_BLOCK_SHA256 = "e7979f668f78996968ce0d5086952ad88079a9df38f0a49c6468a7b740b25ce4";
+const TWIN_BLOCK_SHA256 = "085e75e0412c54088e04fb6f7066bd59a2783478b687fd8382e263a5d2b34e1b";
 
 function planning49Job(op: DispatchJob["op"], params: unknown, nonce: string): DispatchJob {
   return sampleJob({ op, params: JSON.stringify(params), nonce });
@@ -3544,13 +3544,14 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
 
   it("cloudrun-service-upsert SESSION: each NFS path is one of the EXACT per-purpose paths for the service's OWN slug", () => {
     const volume = (path: string, name = "v") => ({ name, server: "10.20.0.4", path, mountPath: `/m/${name}` });
+    // A platform/<slug>-staging volume must be read-only (planning/49 Phase 4), so it carries readOnly here.
     const accept = (serviceName: string, paths: string[]) => {
-      const nfsVolumes = paths.map((path, index) => volume(path, `v${index}`));
+      const nfsVolumes = paths.map((path, index) => ({ ...volume(path, `v${index}`), readOnly: path.endsWith("-staging") }));
       const verdict = validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, image: sessionImageFor(serviceName), serviceName, nfsVolumes });
       expect(verdict.ok).toBe(true);
     };
     accept("term-docs-892769", ["/srv/dy-storage/sites/docs-892769", "/srv/dy-storage/platform/docs-892769"]);
-    accept("staging-docs-892769", ["/srv/dy-storage/sites/docs-892769", "/srv/dy-storage/platform/docs-892769-staging"]);
+    accept("staging-docs-892769", ["/srv/dy-storage/sites/docs-892769/staging", "/srv/dy-storage/platform/docs-892769-staging"]);
     accept("sterm-docs-892769", ["/srv/dy-storage/sites/docs-892769/staging", "/srv/dy-storage/platform/docs-892769-staging"]);
 
     const refuse = (serviceName: string, path: string) =>
@@ -3571,6 +3572,51 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, nfsVolumes: [{ ...volume("/srv/dy-storage/sites/docs-892769"), server: "dy-file-x-1" }] }),
       /server must be a PRIVATE/,
     );
+  });
+
+  it("cloudrun-service-upsert SESSION (planning/49 Phase 4, DS10): staging and sterm mount only sites/<slug>/staging and a read-only platform/<slug>-staging", () => {
+    const sitesStaging = "/srv/dy-storage/sites/docs-892769/staging";
+    const platformStaging = "/srv/dy-storage/platform/docs-892769-staging";
+    const volume = (path: string, name: string, readOnly?: boolean) => {
+      const entry: Record<string, unknown> = { name, server: "10.20.0.4", path, mountPath: `/m/${name}` };
+      if (readOnly !== undefined) {
+        entry.readOnly = readOnly;
+      }
+      return entry;
+    };
+    const upsert = (serviceName: string, nfsVolumes: unknown) =>
+      validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, image: sessionImageFor(serviceName), serviceName, nfsVolumes });
+
+    for (const serviceName of ["staging-docs-892769", "sterm-docs-892769"]) {
+      const prefix = serviceName.split("-")[0];
+      // The staging tree may be read-write (absent, false) or read-only; the config dir only read-only.
+      for (const sitesReadOnly of [undefined, false, true]) {
+        const verdict = upsert(serviceName, [volume(sitesStaging, "sites", sitesReadOnly), volume(platformStaging, "platform", true)]);
+        expect(verdict.ok).toBe(true);
+      }
+      // The WHOLE sites/<slug> holds the LIVE docroot: refused, also read-only.
+      for (const readOnly of [undefined, true]) {
+        expectRefused(
+          upsert(serviceName, [volume("/srv/dy-storage/sites/docs-892769", "sites", readOnly)]),
+          new RegExp(`^a ${prefix}- session for "docs-892769" may mount only \\/srv\\/dy-storage\\/sites\\/docs-892769\\/staging or \\/srv\\/dy-storage\\/platform\\/docs-892769-staging — not "\\/srv\\/dy-storage\\/sites\\/docs-892769"$`),
+        );
+      }
+      // The live public docroot and the live config dir are refused too.
+      expectRefused(upsert(serviceName, [volume("/srv/dy-storage/sites/docs-892769/public", "sites")]), /may mount only/);
+      expectRefused(upsert(serviceName, [volume("/srv/dy-storage/platform/docs-892769", "platform", true)]), /may mount only/);
+      // platform/<slug>-staging without readOnly: true is refused (absent means read-write).
+      for (const readOnly of [undefined, false]) {
+        expectRefused(
+          upsert(serviceName, [volume(sitesStaging, "sites"), volume(platformStaging, "platform", readOnly)]),
+          new RegExp(`^a ${prefix}- session must mount "\\/srv\\/dy-storage\\/platform\\/docs-892769-staging" read-only \\(readOnly: true\\)$`),
+        );
+      }
+    }
+    expect(siteSessionNfsPathsFor("staging", "docs-892769")).toEqual([sitesStaging, platformStaging]);
+    expect(siteSessionNfsPathsFor("sterm", "docs-892769")).toEqual([sitesStaging, platformStaging]);
+    for (const prefix of ["staging", "sterm", "spma"] as const) {
+      expect(siteSessionReadOnlyNfsPathsFor(prefix, "docs-892769")).toEqual([platformStaging]);
+    }
   });
 
   it("cloudrun-service-upsert SESSION (planning/49 Phase 4): pma mounts only platform/<slug>, spma only platform/<slug>-staging, both read-only", () => {
@@ -3641,7 +3687,8 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     }
     expect(SESSION_IMAGE_NAMES.term).toBe("dy-run-terminal");
     expect(SESSION_IMAGE_NAMES.sterm).toBe("dy-run-terminal");
-    expect([...SESSION_PREFIXES_WITH_READ_ONLY_NFS]).toEqual(["pma", "spma"]);
+    expect(siteSessionReadOnlyNfsPathsFor("term", "docs-892769")).toEqual([]);
+    expect(siteSessionReadOnlyNfsPathsFor("pma", "docs-892769")).toEqual(["/srv/dy-storage/platform/docs-892769"]);
     expect(siteSessionNfsPathsFor("term", "docs-892769")).toEqual(["/srv/dy-storage/sites/docs-892769", "/srv/dy-storage/platform/docs-892769"]);
   });
 
