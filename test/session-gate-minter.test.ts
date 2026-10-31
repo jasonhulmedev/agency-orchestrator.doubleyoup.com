@@ -596,7 +596,8 @@ describe("gate v2 against this minter", () => {
     const pmaHost = `pma-v2-site.${GATE_ZONE}`;
     const pmaToken = await signSessionToken(pmaHost, "v2-site", "pma");
     const pmaResponse = await gateV2.fetch(
-      new Request(`https://${pmaHost}/index.php?token=${pmaToken}`, { headers: { "x-dy-session-token": "client-forged" } }),
+      // A POST: a pma- GET with ?token= gets the gate's token-strip page and reaches neither the minter nor the origin.
+      new Request(`https://${pmaHost}/index.php?token=${pmaToken}`, { method: "POST", headers: { "x-dy-session-token": "client-forged" } }),
       bindings,
     );
     expect(pmaResponse.status).toBe(200);
@@ -622,7 +623,8 @@ describe("gate v2 against this minter", () => {
     ]) {
       const host = `${prefix}-v2-wrong.${GATE_ZONE}`;
       const token = await signSessionToken(host, "v2-wrong", purpose as string);
-      const response = await gateV2.fetch(new Request(`https://${host}/?token=${token}`), bindings);
+      // A POST, so a pma- host reaches the minter (a GET with ?token= would get the token-strip page).
+      const response = await gateV2.fetch(new Request(`https://${host}/?token=${token}`, { method: "POST" }), bindings);
       expect(response.status, prefix).toBe(503);
     }
     expect(calls).toHaveLength(0);

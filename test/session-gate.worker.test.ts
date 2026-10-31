@@ -12,8 +12,8 @@
 //
 // planning/49 Phase 4 (I3): the transition rule over REAL workerd RPC. A call with no caller proof (what any
 // other script that binds the minter can send, and what a v1 gate sends) is refused for pma-, spma- and
-// staging-, and a v2 gate's { audience, ts, mac } object crosses the binding intact. The staging token-strip
-// page (its CSP hash, its cookie) and the pma- query strip run here too.
+// staging-, and a v2 gate's { audience, ts, mac } object crosses the binding intact. The token-strip page
+// (its CSP hash, its cookie) and the pma- query strip run here too.
 
 import { exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -103,31 +103,36 @@ describe("session gate under workerd", () => {
     expect(forwarded.headers.get("cookie")).toBeNull();
   });
 
-  it("answers a staging- GET with a verified ?token= with the token-strip page: its CSP hash, its cookie, no fetch", async () => {
+  it("answers a staging- or pma- GET with a verified ?token= with the token-strip page: its CSP hash, its cookie, no fetch", async () => {
     const minter = { mintIdToken: vi.fn(async () => ({ ok: false, reason: "unavailable" })) };
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
       throw new Error("no origin fetch is allowed in this test");
     });
-    const host = "staging-docs-892769.doubleyoup.com";
-    const token = await signTerminalToken(host, "docs-892769", "staging");
-    const response = await gate.fetch(new Request(`https://${host}/wp-admin/?token=${token}&a=1`), gateEnv(minter));
-    expect(response.status).toBe(200);
-    expect(response.headers.get("set-cookie")).toMatch(/^__Host-dy_egt=.+; Path=\/; Max-Age=\d+; HttpOnly; Secure; SameSite=Lax$/);
-    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
-    const body = await response.text();
-    expect(body).toContain(`href="https://${host}/wp-admin/?a=1"`);
-    const script = /<script>(.*)<\/script>/.exec(body)?.[1] as string;
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(script)));
-    let binary = "";
-    for (const byte of digest) {
-      binary += String.fromCharCode(byte);
+    for (const [prefix, purpose] of [
+      ["staging", "staging"],
+      ["pma", "pma"],
+    ]) {
+      const host = `${prefix}-docs-892769.doubleyoup.com`;
+      const token = await signTerminalToken(host, "docs-892769", purpose);
+      const response = await gate.fetch(new Request(`https://${host}/wp-admin/?token=${token}&a=1`), gateEnv(minter));
+      expect(response.status, prefix).toBe(200);
+      expect(response.headers.get("set-cookie"), prefix).toMatch(/^__Host-dy_egt=.+; Path=\/; Max-Age=\d+; HttpOnly; Secure; SameSite=Lax$/);
+      expect(response.headers.get("referrer-policy"), prefix).toBe("no-referrer");
+      const body = await response.text();
+      expect(body, prefix).toContain(`href="https://${host}/wp-admin/?a=1"`);
+      const script = /<script>(.*)<\/script>/.exec(body)?.[1] as string;
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(script)));
+      let binary = "";
+      for (const byte of digest) {
+        binary += String.fromCharCode(byte);
+      }
+      expect(response.headers.get("content-security-policy"), prefix).toContain(`script-src 'sha256-${btoa(binary)}';`);
     }
-    expect(response.headers.get("content-security-policy")).toContain(`script-src 'sha256-${btoa(binary)}';`);
     expect(minter.mintIdToken).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("forwards a pma- request without the verified ?token=, and with it in X-DY-Session-Token", async () => {
+  it("forwards a pma- POST without the verified ?token=, and with it in X-DY-Session-Token", async () => {
     const minter = { mintIdToken: vi.fn(async () => ({ ok: true, idToken: "id-token", expiresAt: Math.floor(Date.now() / 1000) + 3600 })) };
     const sent: Request[] = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -136,7 +141,7 @@ describe("session gate under workerd", () => {
     });
     const host = "pma-docs-892769.doubleyoup.com";
     const token = await signTerminalToken(host, "docs-892769", "pma");
-    const response = await gate.fetch(new Request(`https://${host}/index.php?route=/&token=${token}&db=x`), gateEnv(minter));
+    const response = await gate.fetch(new Request(`https://${host}/index.php?route=/&token=${token}&db=x`, { method: "POST" }), gateEnv(minter));
     expect(response.status).toBe(200);
     const forwarded = sent[0] as Request;
     expect(forwarded.url).toBe(`https://pma-docs-892769${RUN_URL_SUFFIX}/index.php?route=/&db=x`);

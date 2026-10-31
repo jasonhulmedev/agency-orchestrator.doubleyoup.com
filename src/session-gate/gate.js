@@ -87,14 +87,20 @@
 // "same-origin" or "none" (typed into the address bar). Every WebSocket upgrade, with or without ?token=,
 // must carry Origin: https://<this host> (the real page opens it from this host). Otherwise 401, no fetch.
 //
-// THE STAGING TOKEN-STRIP PAGE (planning/49 Phase 4, decision DS5). A GET or HEAD on a staging- host with a
-// verified ?token= does not reach the origin. The gate sets its cookie and answers a small page of its own
-// (no-store, no external resources, a CSP that allows only the page's one inline script, no Referer). The
-// script calls location.replace() with the same URL without the session token. The browser then asks again
-// from this host's own page (Sec-Fetch-Site: same-origin) with the cookie, so the WordPress pages never
-// carry the token in the address bar, the history or a Referer. A 302 cannot do this: the browser keeps
-// Sec-Fetch-Site "cross-site" across a redirect from the app's navigation, and the cookie-only rule would
-// refuse it. On pma-, spma-, term- and sterm- hosts the token stays in the address bar (decision D4).
+// THE TOKEN-STRIP PAGE (planning/49 Phase 4: decision DS5 for staging-, and Jason's 2026-10-31 decision for
+// pma- and spma-, which replaces D4). A GET or HEAD on a pma-, spma- or staging- host with a verified
+// ?token= does not reach the origin. The gate sets its cookie and answers a small page of its own (no-store,
+// no external resources, a CSP that allows only the page's one inline script, no Referer). The script calls
+// location.replace() with the same URL without the session token. The browser then asks again from this
+// host's own page (Sec-Fetch-Site: same-origin) with the cookie. So:
+//   - the token is not left in the address bar, the history or a Referer;
+//   - a redirect from the origin (for example a 3xx on the first phpMyAdmin request) is followed from a
+//     same-origin request, so the cookie-only rule lets it through.
+// A 302 from the gate cannot do this: the browser keeps Sec-Fetch-Site "cross-site" across a redirect from
+// the app's navigation, and the cookie-only rule would refuse the next request. Any other method, and a
+// WebSocket upgrade, goes to the origin with the token removed from the query. term- and sterm- hosts never
+// get the page: the terminal container reads the token from the query of GET / and of /ws, so it stays in
+// the URL there.
 
 // The gate's httpOnly session cookie (set below, read only by this gate). The __Host- prefix makes the
 // browser accept it only with Secure, Path=/ and no Domain, so it is bound to this exact host and no
@@ -112,10 +118,12 @@ const SESSION_TOKEN_HEADER = "x-dy-session-token";
 // The query parameter that carries the session token in the URL the app opens.
 const TOKEN_QUERY_PARAMETER = "token";
 // The purposes whose container reads the session token from X-DY-Session-Token: "pma" (pma-, spma-) and
-// "staging" (staging-). A "terminal" container (term-, sterm-) reads it from the query only.
+// "staging" (staging-). The token is not needed in their URL, so these hosts also get the token-strip page
+// and a forwarded query without the token. A "terminal" container (term-, sterm-) reads the token from the
+// query only.
 const HEADER_TOKEN_PURPOSES = ["pma", "staging"];
-// The one inline script of the staging token-strip page. Constant, so the page's CSP pins its hash. It reads
-// the target from the page's own link, so no request data is ever script text.
+// The one inline script of the token-strip page. Constant, so the page's CSP pins its hash. It reads the
+// target from the page's own link, so no request data is ever script text.
 const TOKEN_STRIP_SCRIPT = 'location.replace(document.getElementById("next").href);';
 
 // Binding grammars. Checked on every request, so a mis-set binding is a config error and can never turn the
@@ -425,8 +433,8 @@ async function idTokenFor(env, audience, expectedPurpose) {
 
 // `search` (URL.search: "" or "?...") without its FIRST `token` parameter, the one
 // url.searchParams.get("token") reads. Every other parameter keeps its bytes and its order, so a later
-// `token` (phpMyAdmin's own) stays. Empty parameters ("&&") are dropped: no query parser reads them. ""
-// when nothing is left.
+// `token` (phpMyAdmin's own) stays. Empty parts ("&&", a trailing "&") may be dropped: no query parser
+// reads them as a parameter, so this is harmless. "" when nothing is left.
 function searchWithoutSessionToken(search) {
   const kept = [];
   let removed = false;
@@ -434,8 +442,10 @@ function searchWithoutSessionToken(search) {
     if (part === "") {
       continue;
     }
-    // The same decoding as url.searchParams: a part holds no "&", so it is exactly one parameter.
-    const name = new URLSearchParams(part).keys().next().value;
+    // The name exactly as url.searchParams decodes it. A part holds no "&", so it is one parameter. The
+    // URLSearchParams constructor removes ONE leading "?", so the "?" put in front keeps a "?" that is part
+    // of the name: "?token=X" is the parameter "?token", which get("token") never returns (review L1).
+    const name = new URLSearchParams("?" + part).keys().next().value;
     if (!removed && name === TOKEN_QUERY_PARAMETER) {
       removed = true;
       continue;
@@ -546,12 +556,12 @@ async function cspScriptHashSource(scriptText) {
   return "'sha256-" + btoa(binary) + "'";
 }
 
-// The staging token-strip page (see THE STAGING TOKEN-STRIP PAGE above). `nextUrl` is ABSOLUTE, on this
+// The token-strip page (see THE TOKEN-STRIP PAGE above). `nextUrl` is ABSOLUTE, on this
 // host, so no path (for example "//elsewhere.example/") can make it leave this host. The link is also the
 // way on for a browser without script.
 async function tokenStripPage(nextUrl, session) {
   const html =
-    "<!doctype html><meta charset=utf-8><title>Opening staging</title>" +
+    "<!doctype html><meta charset=utf-8><title>Opening the session</title>" +
     '<a id="next" href="' +
     escapeHtmlAttribute(nextUrl) +
     '">Continue</a><script>' +
@@ -573,9 +583,9 @@ async function tokenStripPage(nextUrl, session) {
   return new Response(html, { status: 200, headers });
 }
 
-// True for a request that gets the staging token-strip page instead of the origin.
+// True for a request that gets the token-strip page instead of the origin.
 function getsTokenStripPage(request, target, session) {
-  if (target.expectedPurpose !== "staging" || !session.fromQuery) {
+  if (!session.fromQuery || !HEADER_TOKEN_PURPOSES.includes(target.expectedPurpose)) {
     return false;
   }
   if (isWebSocketUpgrade(request)) {
