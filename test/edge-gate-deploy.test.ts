@@ -2,6 +2,9 @@
 // The fake keeps scripts in memory and answers the settings read, the content/v2 read and the multipart PUT
 // the way Cloudflare does: a secret_text binding is reported WITHOUT its value, a missing script is a 404
 // with error code 10007, and the observability settings come back with Cloudflare's defaults filled in.
+//
+// planning/49 Phase 4 (I3): gate v2 also binds the minter caller key (secret_text DY_MINTER_CALLER_KEY) and
+// its fingerprint (plain_text DY_MINTER_CALLER_FINGERPRINT), derived from DY_CLIENT_SECRET for the gate script.
 
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env.js";
@@ -25,6 +28,12 @@ const WORKER_NAME = "sbmstudio";
 const CF_TOKEN = "cf-dns-token-abc";
 const SECRET_V1 = "603807493e9f841f3f587631aad45bc075fa1cc8ec73adba4872405dc05ba367";
 const SECRET_V2 = "46d993d0738e210e275c771df8fe78ef9e98c6cf3b1faa2ed222a7d93f51b572";
+// DY_CLIENT_SECRET of the length app issues, and the caller key + fingerprint an independent HKDF/HMAC
+// implementation gives for it and GATE_SCRIPT (the vectors of test/session-gate-minter.test.ts).
+const CLIENT_SECRET = "unit-test-client-secret-not-a-real-one-0001";
+const OTHER_CLIENT_SECRET = "unit-test-client-secret-not-a-real-one-0002";
+const CALLER_KEY_HEX = "7b1eab777358b371e6e62d42117d5919b44e8e442605f2e9690861b9574abc77";
+const CALLER_KEY_FINGERPRINT = "725390655535460c";
 const PARAMS: EdgeGateDeployParams = { project: PROJECT, region: REGION, zone: ZONE, sessionSecret: SECRET_V1, keyVersion: 1 };
 const SCRIPTS_URL = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/scripts`;
 
@@ -68,7 +77,7 @@ function envWith(overrides: Partial<Env> = {}): Env {
   return {
     APP_BASE_URL: "https://app.example.test",
     DY_CLIENT_ID: "client-abc",
-    DY_CLIENT_SECRET: "secret-xyz",
+    DY_CLIENT_SECRET: CLIENT_SECRET,
     NONCE_STORE: undefined as unknown as Env["NONCE_STORE"],
     GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey,
     CF_DNS_API_TOKEN: CF_TOKEN,
@@ -77,8 +86,8 @@ function envWith(overrides: Partial<Env> = {}): Env {
   };
 }
 
-/** The bindings Cloudflare reports for a gate of `secret` (no value for the secret_text). */
-async function reportedGateBindings(secret: string, keyVersion = 1, workerName = WORKER_NAME): Promise<unknown[]> {
+/** The bindings Cloudflare reports for a v1 gate of `secret` (no value for the secret_text). */
+async function reportedV1GateBindings(secret: string, keyVersion = 1, workerName = WORKER_NAME): Promise<unknown[]> {
   return [
     { type: "secret_text", name: "DY_SESSION_SECRET" },
     { type: "plain_text", name: "DY_ZONE_SUFFIX", text: `.${ZONE}` },
@@ -86,6 +95,20 @@ async function reportedGateBindings(secret: string, keyVersion = 1, workerName =
     { type: "service", name: "DY_MINTER", service: workerName, entrypoint: "SessionGateMinter", environment: "production" },
     { type: "plain_text", name: "DY_SESSION_KEY_VERSION", text: String(keyVersion) },
     { type: "plain_text", name: "DY_SESSION_KEY_FINGERPRINT", text: await sessionKeyFingerprint(secret) },
+  ];
+}
+
+/** The bindings Cloudflare reports for a v2 gate: the v1 six plus the caller key (no value) and its fingerprint. */
+async function reportedGateBindings(
+  secret: string,
+  keyVersion = 1,
+  workerName = WORKER_NAME,
+  callerKeyFingerprint = CALLER_KEY_FINGERPRINT,
+): Promise<unknown[]> {
+  return [
+    ...(await reportedV1GateBindings(secret, keyVersion, workerName)),
+    { type: "secret_text", name: "DY_MINTER_CALLER_KEY" },
+    { type: "plain_text", name: "DY_MINTER_CALLER_FINGERPRINT", text: callerKeyFingerprint },
   ];
 }
 
@@ -258,7 +281,11 @@ async function convergedGateScript(overrides: Partial<FakeScript> = {}): Promise
 }
 
 function expectNoSecretIn(value: unknown, secret = SECRET_V1): void {
-  expect(JSON.stringify(value)).not.toContain(secret);
+  const text = JSON.stringify(value);
+  expect(text).not.toContain(secret);
+  // Neither the caller key nor its root may appear in any result either.
+  expect(text).not.toContain(CALLER_KEY_HEX);
+  expect(text).not.toContain(CLIENT_SECRET);
 }
 
 describe("edge-gate-deploy helpers", () => {
@@ -272,7 +299,7 @@ describe("edge-gate-deploy helpers", () => {
   });
 
   it("sessionGateVersionOf reads the marker of the FIRST line only", () => {
-    expect(sessionGateVersionOf(SESSION_GATE_SOURCE)).toBe(1);
+    expect(sessionGateVersionOf(SESSION_GATE_SOURCE)).toBe(2);
     expect(sessionGateVersionOf("// dy-session-gate v12\nexport default {}")).toBe(12);
     expect(sessionGateVersionOf("// dy-session-gate v3")).toBe(3);
     expect(sessionGateVersionOf("// dy-session-gate v3\r\nx")).toBe(3);
@@ -285,7 +312,7 @@ describe("edge-gate-deploy helpers", () => {
 });
 
 describe("actuateEdgeGateDeploy", () => {
-  it("creates the gate: ONE multipart PUT of the embedded script with the six bindings and every log OFF, then reads them back", async () => {
+  it("creates the gate: ONE multipart PUT of the embedded script with the eight bindings and every log OFF, then reads them back", async () => {
     const { calls } = fakeCloudflare({ scripts: { [WORKER_NAME]: minterWorkerScript() } });
 
     const result = await actuateEdgeGateDeploy(PARAMS, envWith());
@@ -296,7 +323,7 @@ describe("actuateEdgeGateDeploy", () => {
       op: "edge-gate-deploy",
       script: GATE_SCRIPT,
       status: "created",
-      gateVersion: 1,
+      gateVersion: 2,
       keyVersion: 1,
       keyFingerprint: fingerprint,
       runUrlSuffix: `-${PROJECT_NUMBER}.${REGION}.run.app`,
@@ -319,6 +346,9 @@ describe("actuateEdgeGateDeploy", () => {
         { type: "service", name: "DY_MINTER", service: WORKER_NAME, entrypoint: "SessionGateMinter" },
         { type: "plain_text", name: "DY_SESSION_KEY_VERSION", text: "1" },
         { type: "plain_text", name: "DY_SESSION_KEY_FINGERPRINT", text: fingerprint },
+        // Gate v2: the caller key for THIS gate script (the independent vector) and its fingerprint.
+        { type: "secret_text", name: "DY_MINTER_CALLER_KEY", text: CALLER_KEY_HEX },
+        { type: "plain_text", name: "DY_MINTER_CALLER_FINGERPRINT", text: CALLER_KEY_FINGERPRINT },
       ],
       // Review L7: no log, logpush job or tail may record a gate request (tokens travel in the URL and cookie).
       logpush: false,
@@ -394,7 +424,7 @@ describe("actuateEdgeGateDeploy", () => {
   });
 
   it("refuses a DOWNGRADE: a deployed gate with a higher marker version is never overwritten", async () => {
-    for (const version of [2, 99]) {
+    for (const version of [3, 99]) {
       const { calls } = fakeCloudflare({
         scripts: { [WORKER_NAME]: minterWorkerScript(), [GATE_SCRIPT]: await convergedGateScript({ source: `// dy-session-gate v${version}\nexport default {}` }) },
       });
@@ -404,7 +434,7 @@ describe("actuateEdgeGateDeploy", () => {
         op: "edge-gate-deploy",
         script: GATE_SCRIPT,
         detail:
-          `the deployed "${GATE_SCRIPT}" is session gate v${version}, newer than this Worker's v1: this fork is older than the deployed gate, ` +
+          `the deployed "${GATE_SCRIPT}" is session gate v${version}, newer than this Worker's v2: this fork is older than the deployed gate, ` +
           "so it does not overwrite it. Sync the fork, then deploy again.",
       });
       expect(calls.filter((call) => call.method !== "GET")).toHaveLength(0);
@@ -475,6 +505,15 @@ describe("actuateEdgeGateDeploy", () => {
       { env: envWith({ DY_WORKER_NAME: "<script>-sbm" }), params: PARAMS, detail: /^DY_WORKER_NAME is not a Worker script name/, mustNotContain: "<script>" },
       { env: envWith(), params: { ...PARAMS, project: "someone-else-1" }, detail: /dy-agency-proof/ },
       { env: envWith({ CF_DNS_API_TOKEN: undefined }), params: PARAMS, detail: /^CF_DNS_API_TOKEN is not configured/ },
+      // Gate v2: DY_CLIENT_SECRET is the caller key's root. Missing or short: refused, and never echoed.
+      { env: envWith({ DY_CLIENT_SECRET: undefined as unknown as string }), params: PARAMS, detail: /^DY_CLIENT_SECRET is not set on this Worker, or is shorter than 32 characters\./ },
+      { env: envWith({ DY_CLIENT_SECRET: "" }), params: PARAMS, detail: /^DY_CLIENT_SECRET is not set on this Worker, or is shorter than 32 characters\./ },
+      {
+        env: envWith({ DY_CLIENT_SECRET: "short-client-secret-31-chars-xx" }),
+        params: PARAMS,
+        detail: /^DY_CLIENT_SECRET is not set on this Worker, or is shorter than 32 characters\./,
+        mustNotContain: "short-client-secret-31-chars-xx",
+      },
     ];
     for (const refusal of refusals) {
       const fetchSpy = vi.fn();
@@ -543,6 +582,89 @@ describe("actuateEdgeGateDeploy", () => {
     expect(result.ok).toBe(false);
     expect((result as { detail: string }).detail).toBe(
       "the gate script upload failed with HTTP 400: binding DY_SESSION_SECRET value [redacted] is invalid.",
+    );
+    expectNoSecretIn(result);
+  });
+
+  it("updates a deployed v1 gate to v2: the v2 source, the eight bindings, and gateVersion 2", async () => {
+    // A v1 gate as Phase 3 left it: another source (v1), six bindings, no caller key.
+    const v1Gate: FakeScript = { format: "module", source: "// dy-session-gate v1\nexport default {}", bindings: await reportedV1GateBindings(SECRET_V1) };
+    const { calls } = fakeCloudflare({ scripts: { [WORKER_NAME]: minterWorkerScript(), [GATE_SCRIPT]: v1Gate } });
+    const result = await actuateEdgeGateDeploy(PARAMS, envWith());
+    expect(result).toMatchObject({ ok: true, status: "updated", gateVersion: 2, keyVersion: 1, keyFingerprint: await sessionKeyFingerprint(SECRET_V1) });
+    expectNoSecretIn(result);
+    const puts = calls.filter((call) => call.method === "PUT");
+    expect(puts).toHaveLength(1);
+    expect((puts[0] as RecordedCall).moduleSource).toBe(SESSION_GATE_SOURCE);
+    const sentBindings = (puts[0] as RecordedCall).metadata?.bindings as Array<Record<string, unknown>>;
+    expect(sentBindings.map((binding) => binding.name)).toEqual([
+      "DY_SESSION_SECRET",
+      "DY_ZONE_SUFFIX",
+      "DY_RUN_URL_SUFFIX",
+      "DY_MINTER",
+      "DY_SESSION_KEY_VERSION",
+      "DY_SESSION_KEY_FINGERPRINT",
+      "DY_MINTER_CALLER_KEY",
+      "DY_MINTER_CALLER_FINGERPRINT",
+    ]);
+  });
+
+  it("is unchanged only when the caller key fingerprint matches too; another fingerprint or no caller key is updated", async () => {
+    const converged = await convergedGateScript();
+    const unchanged = fakeCloudflare({ scripts: { [WORKER_NAME]: minterWorkerScript(), [GATE_SCRIPT]: converged } });
+    expect(await actuateEdgeGateDeploy(PARAMS, envWith())).toMatchObject({ ok: true, status: "unchanged", gateVersion: 2 });
+    expect(unchanged.calls.filter((call) => call.method !== "GET")).toHaveLength(0);
+    vi.unstubAllGlobals();
+
+    const cases: Array<{ name: string; existing: FakeScript; env: Env }> = [
+      // The exact v2 source and every other binding, but the fingerprint of another caller key.
+      { name: "another caller key fingerprint", existing: { ...converged, bindings: await reportedGateBindings(SECRET_V1, 1, WORKER_NAME, "0000000000000000") }, env: envWith() },
+      // The gate was deployed while the Worker had another DY_CLIENT_SECRET (a re-onboarding since).
+      { name: "DY_CLIENT_SECRET changed since the deploy", existing: converged, env: envWith({ DY_CLIENT_SECRET: OTHER_CLIENT_SECRET }) },
+      // The exact v2 source with only the v1 bindings (no caller key at all).
+      { name: "no caller key bindings", existing: { ...converged, bindings: await reportedV1GateBindings(SECRET_V1) }, env: envWith() },
+    ];
+    for (const testCase of cases) {
+      const { calls } = fakeCloudflare({ scripts: { [WORKER_NAME]: minterWorkerScript(), [GATE_SCRIPT]: testCase.existing } });
+      const result = await actuateEdgeGateDeploy(PARAMS, testCase.env);
+      expect(result, testCase.name).toMatchObject({ ok: true, status: "updated", gateVersion: 2 });
+      const puts = calls.filter((call) => call.method === "PUT");
+      expect(puts, testCase.name).toHaveLength(1);
+      const sentBindings = (puts[0] as RecordedCall).metadata?.bindings as Array<Record<string, unknown>>;
+      const sentFingerprint = sentBindings.find((binding) => binding.name === "DY_MINTER_CALLER_FINGERPRINT");
+      if (testCase.env.DY_CLIENT_SECRET === CLIENT_SECRET) {
+        expect(sentFingerprint, testCase.name).toEqual({ type: "plain_text", name: "DY_MINTER_CALLER_FINGERPRINT", text: CALLER_KEY_FINGERPRINT });
+      } else {
+        expect((sentFingerprint as { text: string }).text, testCase.name).not.toBe(CALLER_KEY_FINGERPRINT);
+      }
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("derives the caller key for THIS gate script: another region's gate gets another key", async () => {
+    const otherRegion = "australia-southeast1";
+    const otherScript = `dy-gate-${PROJECT}-${otherRegion}`;
+    const scripts: Record<string, FakeScript> = { [WORKER_NAME]: minterWorkerScript() };
+    const { calls } = fakeCloudflare({ scripts });
+    // The fake Google answers projects.get for PROJECT in any region.
+    const result = await actuateEdgeGateDeploy({ ...PARAMS, region: otherRegion }, envWith());
+    expect(result).toMatchObject({ ok: true, status: "created", script: otherScript });
+    const put = calls.find((call) => call.method === "PUT") as RecordedCall;
+    const sentBindings = put.metadata?.bindings as Array<Record<string, unknown>>;
+    const sentKey = sentBindings.find((binding) => binding.name === "DY_MINTER_CALLER_KEY") as { text: string };
+    expect(sentKey.text).toMatch(/^[0-9a-f]{64}$/);
+    expect(sentKey.text).not.toBe(CALLER_KEY_HEX);
+  });
+
+  it("redacts the caller key from a failure detail, even when Cloudflare's error quotes it", async () => {
+    fakeCloudflare({
+      scripts: { [WORKER_NAME]: minterWorkerScript() },
+      putReply: { status: 400, body: { success: false, errors: [{ code: 10021, message: `binding DY_MINTER_CALLER_KEY value ${CALLER_KEY_HEX} is invalid` }] } },
+    });
+    const result = await actuateEdgeGateDeploy(PARAMS, envWith());
+    expect(result.ok).toBe(false);
+    expect((result as { detail: string }).detail).toBe(
+      "the gate script upload failed with HTTP 400: binding DY_MINTER_CALLER_KEY value [redacted] is invalid.",
     );
     expectNoSecretIn(result);
   });

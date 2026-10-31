@@ -16,19 +16,39 @@
 // The project number is read once per isolate (Cloud Resource Manager projects.get, which needs
 // resourcemanager.projects.get — roles/browser has it) and cached; it never changes for a project.
 //
+// THE CALLER (planning/49 Phase 4 I3, decision D1 A; I4 review M2). A service binding carries no caller
+// identity, so any script in the same Cloudflare account could bind this entrypoint. Two request forms:
+//   • gate v2: { audience, ts, mac }, a caller proof made with the gate's caller key (caller-key.ts). The
+//     minter derives the key again from DY_CLIENT_SECRET and the gate script name of (its own project, the
+//     audience's region), refuses a ts more than 60 s from its clock, and compares the MAC in constant time.
+//     This form ALWAYS needs a valid proof, for every prefix.
+//   • gate v1: the bare audience string, no proof. TRANSITION RULE: served ONLY for term- and sterm-
+//     audiences, whose container verifies the session token itself, so an ID token alone opens nothing
+//     there. pma-, spma- and staging- (and any prefix added later) need the v2 proof. Drop this form once
+//     every cell's gate is v2 (planning/49 Phase 4 I8).
+// The caller is checked before any network call, so a refused caller never makes this Worker call Google.
+//
 // NEVER LOGS AND NEVER EXPLAINS: a failure returns a reason CODE, never a detail. The gate turns any failure
-// into a bare 503, and a Google error body never travels towards a browser.
+// into a bare 503, and a Google error body never travels towards a browser. "caller-refused" covers every
+// proof failure alike (no proof, a stale or future ts, a wrong MAC), so it says nothing about the key.
 
 import type { Env } from "../env.js";
 import { mintPinnedGcpIdToken, readPinnedServiceAccountKey } from "../actuate.js";
 import { mintGoogleAccessToken } from "../validators.js";
-import { isGcpRegionName, splitCloudRunSessionServiceName } from "../dispatch-params.js";
+import { edgeGateScriptNameFor, isGcpRegionName, splitCloudRunSessionServiceName } from "../dispatch-params.js";
 import { errorMessage } from "../util.js";
+import { deriveMinterCallerKey, isUsableClientSecret, verifyMinterCallerProof } from "./caller-key.js";
 
 /** What the gate gets back over RPC. A failure carries a code only. */
 export type SessionGateMintResult =
   | { ok: true; idToken: string; expiresAt: number }
-  | { ok: false; reason: "audience-refused" | "unavailable" };
+  | { ok: false; reason: "audience-refused" | "caller-refused" | "unavailable" };
+
+/**
+ * The session prefixes a call WITHOUT a caller proof (a v1 gate) may still get a token for: the terminal
+ * hosts, whose container checks the session token itself. An allow-list, so a new prefix needs the proof.
+ */
+export const KEYLESS_TRANSITION_PREFIXES: readonly string[] = ["term", "sterm"];
 
 /** The parts of an allowed audience. */
 export interface SessionGateAudience {
@@ -47,6 +67,7 @@ const RUN_APP_AUDIENCE_RE = /^https:\/\/([a-z0-9-]+)\.([a-z0-9-]+)\.run\.app$/;
 const DETERMINISTIC_URL_LABEL_MAX_LENGTH = 63;
 
 const AUDIENCE_REFUSED: SessionGateMintResult = { ok: false, reason: "audience-refused" };
+const CALLER_REFUSED: SessionGateMintResult = { ok: false, reason: "caller-refused" };
 const UNAVAILABLE: SessionGateMintResult = { ok: false, reason: "unavailable" };
 
 // Per-isolate cache: project id -> project number.
@@ -191,16 +212,94 @@ function idTokenExpiresAt(idToken: string): number | null {
   return exp;
 }
 
+/** A mint call, read from either request form. `proof` is null for the v1 form (a bare audience string). */
+interface MintRequest {
+  audience: unknown;
+  proof: { ts: unknown; mac: unknown } | null;
+}
+
 /**
- * The minter's one operation: an ID token for `audience` when it is one of this project's session service
- * URLs, else a refusal with no token. The audience shape is checked before any network call. The token and
- * its exp go back to the gate alone; nothing is logged.
+ * Read the request a gate sent: the v1 bare audience string (no proof), or the v2 object
+ * `{ audience, ts, mac }`. Null for anything else. An object ALWAYS counts as carrying a proof, even when
+ * `ts` or `mac` is missing, so it can never fall back to the keyless v1 rule.
  */
-export async function mintSessionGateIdToken(env: Env, audience: unknown): Promise<SessionGateMintResult> {
-  const parsed = parseSessionGateAudience(audience);
+function readMintRequest(request: unknown): MintRequest | null {
+  if (typeof request === "string") {
+    return { audience: request, proof: null };
+  }
+  if (typeof request !== "object" || request === null || Array.isArray(request)) {
+    return null;
+  }
+  const fields = request as Record<string, unknown>;
+  return { audience: fields.audience, proof: { ts: fields.ts, mac: fields.mac } };
+}
+
+type CallerVerdict = "allowed" | "refused" | "unavailable";
+
+/**
+ * May this caller get a token for this audience? A v1 call (no proof) only for a KEYLESS_TRANSITION_PREFIXES
+ * audience. A v2 call only with a valid proof for the gate script of (this Worker's own project, the
+ * audience's region). "unavailable" when this Worker cannot check a proof (no usable service-account key or
+ * DY_CLIENT_SECRET): that is this Worker's configuration, not the caller's fault. Makes no network call.
+ */
+async function callerVerdictFor(
+  env: Env,
+  parsed: SessionGateAudience,
+  audience: string,
+  proof: MintRequest["proof"],
+): Promise<CallerVerdict> {
+  if (proof === null) {
+    const sessionName = splitCloudRunSessionServiceName(parsed.serviceName);
+    if (sessionName !== null && KEYLESS_TRANSITION_PREFIXES.includes(sessionName.prefix)) {
+      return "allowed";
+    }
+    return "refused";
+  }
+
+  const ownProject = serviceAccountKeyProjectId(env);
+  if (ownProject === null) {
+    return "unavailable";
+  }
+  if (!isUsableClientSecret(env.DY_CLIENT_SECRET)) {
+    return "unavailable";
+  }
+  // The gate that may ask for this audience: the one edge-gate-deploy made for this project and the
+  // audience's region. A key of another region's gate does not verify, so a gate signs only for its own cell.
+  const gateScriptName = edgeGateScriptNameFor(ownProject, parsed.region);
+  const callerKey = await deriveMinterCallerKey(env.DY_CLIENT_SECRET, gateScriptName);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const proofIsValid = await verifyMinterCallerProof(callerKey, audience, proof.ts, proof.mac, nowSeconds);
+  if (!proofIsValid) {
+    return "refused";
+  }
+  return "allowed";
+}
+
+/**
+ * The minter's one operation: an ID token for the requested audience when it is one of this project's session
+ * service URLs AND the caller passes callerVerdictFor, else a refusal with no token. `request` is a v2 gate's
+ * `{ audience, ts, mac }` or a v1 gate's bare audience string. The audience shape and the caller are checked
+ * before any network call. The token and its exp go back to the gate alone; nothing is logged.
+ */
+export async function mintSessionGateIdToken(env: Env, request: unknown): Promise<SessionGateMintResult> {
+  const mintRequest = readMintRequest(request);
+  if (mintRequest === null) {
+    return AUDIENCE_REFUSED;
+  }
+  const parsed = parseSessionGateAudience(mintRequest.audience);
   if (parsed === null) {
     return AUDIENCE_REFUSED;
   }
+  const audience = mintRequest.audience as string;
+
+  const callerVerdict = await callerVerdictFor(env, parsed, audience, mintRequest.proof);
+  if (callerVerdict === "refused") {
+    return CALLER_REFUSED;
+  }
+  if (callerVerdict === "unavailable") {
+    return UNAVAILABLE;
+  }
+
   const ownProject = serviceAccountKeyProjectId(env);
   if (ownProject === null) {
     return UNAVAILABLE;
@@ -213,7 +312,7 @@ export async function mintSessionGateIdToken(env: Env, audience: unknown): Promi
     return AUDIENCE_REFUSED;
   }
 
-  const minted = await mintPinnedGcpIdToken(env, ownProject, audience as string);
+  const minted = await mintPinnedGcpIdToken(env, ownProject, audience);
   if (!minted.ok) {
     return UNAVAILABLE;
   }

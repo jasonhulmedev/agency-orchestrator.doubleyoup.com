@@ -23,6 +23,9 @@ export interface Env {
   // ── Direction-A OAuth2 client credentials (secrets) ───────────────────────
   // Issued by our app at onboarding. Exchanged for a short-lived access token
   // (client_credentials grant) that authenticates this Worker's calls back to us.
+  // planning/49 Phase 4 (I3): DY_CLIENT_SECRET is ALSO the root of each session gate's minter caller key
+  // (src/session-gate/caller-key.ts; at least 32 characters, app issues 43). After it changes, the minter
+  // refuses each gate's calls until edge-gate-deploy runs again for that gate.
   DY_CLIENT_ID: string;
   DY_CLIENT_SECRET: string;
 

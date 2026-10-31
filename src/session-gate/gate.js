@@ -1,4 +1,4 @@
-// dy-session-gate v1
+// dy-session-gate v2
 // The FIRST LINE above is the gate's marker and version. edge-gate-deploy (src/actuate-edge-gate.ts)
 // reads it back from the deployed script: a script whose source does not start with "// dy-session-gate v"
 // was not made by this platform, so it is never replaced. Raise the version whenever this file changes
@@ -28,7 +28,19 @@
 //   DY_MINTER           service      the agency Worker's SessionGateMinter entrypoint. This gate holds NO
 //                                    Google key (planning/49 decision A): it asks the agency's own Worker for
 //                                    an ID token, and the minter signs only for this project's session URLs.
-//   DY_SESSION_KEY_VERSION, DY_SESSION_KEY_FINGERPRINT  plain_text, read by edge-gate-deploy only.
+//   DY_MINTER_CALLER_KEY secret_text this gate's minter caller key, 64 lowercase hex (v2, see below).
+//   DY_SESSION_KEY_VERSION, DY_SESSION_KEY_FINGERPRINT, DY_MINTER_CALLER_FINGERPRINT  plain_text, read by
+//                                    edge-gate-deploy only.
+//
+// THE MINTER CALLER PROOF (v2; planning/49 Phase 4, decision D1 A). A service binding carries no caller
+// identity, so the minter cannot tell this gate from any other script in the account that binds it. So
+// every mint call carries a proof made with DY_MINTER_CALLER_KEY, a key only this gate and the agency
+// Worker hold (HKDF of the Worker's DY_CLIENT_SECRET, bound to this gate's script name):
+//   DY_MINTER.mintIdToken({ audience, ts, mac })
+//   ts  = Unix seconds now
+//   mac = base64url(HMAC_SHA256("v1|" + audience + "|" + ts, the 32 bytes of DY_MINTER_CALLER_KEY)), no padding
+// The minter refuses a proof more than 60 s from its clock. A v1 gate sent the bare audience string with no
+// proof; the minter serves that only for term- and sterm- (whose container checks the session token again).
 //
 // TOKEN FORMAT (v1, unchanged from syd; MUST match the orchestrator's mintSessionToken, app's
 // mintEphemeralSessionToken and the container's verifier byte for byte):
@@ -50,6 +62,12 @@
 // own Authorization header still reaches the container (a session image that does its own HTTP auth keeps
 // working).
 //
+// X-DY-Session-Token (v2): the session token this gate just verified, for a container that checks it again
+// from a header. The gate ALWAYS deletes any X-DY-Session-Token the client sent, so the container never
+// sees a header the gate did not write. It sets the header only on pma- and spma- hosts (phpMyAdmin checks
+// it before any of its own code runs, planning/49 Phase 4 decision D1 C). A terminal host (term-, sterm-)
+// keeps its own token path (the query) and gets no header; a staging- host gets none either.
+//
 // COOKIE-ONLY REQUESTS (no ?token=) are the ones a cross-site page could cause the browser to send with the
 // gate's cookie attached, so they must come from this host's own pages: Sec-Fetch-Site must be
 // "same-origin" or "none" (typed into the address bar). Every WebSocket upgrade, with or without ?token=,
@@ -63,10 +81,15 @@ const KEY_INFO_PREFIX = "doubleyoup-ephemeral-session-v1/host:";
 const HOST_KEY_BITS = 256;
 // A cached ID token is used until this many seconds before its exp, then minted again.
 const ID_TOKEN_REFRESH_MARGIN_SECONDS = 300;
+// The version tag at the start of every minter caller proof message (see THE MINTER CALLER PROOF above).
+const MINTER_CALLER_PROOF_VERSION = "v1";
+// The header that carries the verified session token to a pma- or spma- container (see X-DY-Session-Token).
+const SESSION_TOKEN_HEADER = "x-dy-session-token";
 
 // Binding grammars. Checked on every request, so a mis-set binding is a config error and can never turn the
 // gate into a proxy to some other host.
 const SESSION_SECRET_RE = /^[0-9a-f]{64}$/;
+const MINTER_CALLER_KEY_RE = /^[0-9a-f]{64}$/;
 const ZONE_SUFFIX_RE = /^(?:\.(?!-)[a-z0-9_-]{1,63}(?<!-)){2,}$/;
 const RUN_URL_SUFFIX_RE = /^-[1-9][0-9]{0,19}\.[a-z]+-[a-z0-9]+\.run\.app$/;
 
@@ -107,6 +130,9 @@ export function configurationProblem(env) {
   }
   if (!env.DY_MINTER) {
     return "DY_MINTER (the service binding to the agency Worker's SessionGateMinter) is not set";
+  }
+  if (typeof env.DY_MINTER_CALLER_KEY !== "string" || !MINTER_CALLER_KEY_RE.test(env.DY_MINTER_CALLER_KEY)) {
+    return "DY_MINTER_CALLER_KEY is not set to 64 lowercase hex characters";
   }
   return null;
 }
@@ -294,6 +320,30 @@ function cookieHeaderWithoutGateCookie(header) {
   return kept.join("; ");
 }
 
+// Decode lowercase hex to bytes. Only ever called on DY_MINTER_CALLER_KEY, which configurationProblem has
+// already checked against MINTER_CALLER_KEY_RE.
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+// The minter call for `audience` with its caller proof (see THE MINTER CALLER PROOF above):
+// { audience, ts, mac }. MUST match the agency Worker's src/session-gate/caller-key.ts byte for byte:
+// test/session-gate.test.ts pins it to an independent vector, and test/session-gate-minter.test.ts runs this
+// gate against the minter.
+async function minterRequestFor(env, audience) {
+  const ts = Math.floor(Date.now() / 1000);
+  const message = MINTER_CALLER_PROOF_VERSION + "|" + audience + "|" + ts;
+  const key = await crypto.subtle.importKey("raw", hexToBytes(env.DY_MINTER_CALLER_KEY), { name: "HMAC", hash: "SHA-256" }, false, [
+    "sign",
+  ]);
+  const macBytes = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message)));
+  return { audience, ts, mac: bytesToBase64url(macBytes) };
+}
+
 // An ID token for `audience` from the agency Worker's minter, cached per isolate until
 // ID_TOKEN_REFRESH_MARGIN_SECONDS before its exp. Null when the minter refuses, fails or answers garbage.
 async function idTokenFor(env, audience) {
@@ -302,9 +352,11 @@ async function idTokenFor(env, audience) {
   if (cached !== undefined && nowSeconds < cached.expiresAt - ID_TOKEN_REFRESH_MARGIN_SECONDS) {
     return cached.idToken;
   }
+  // A fresh proof for every mint call: the minter refuses one older than 60 s, so a cached proof is no use.
+  const mintRequest = await minterRequestFor(env, audience);
   let minted;
   try {
-    minted = await env.DY_MINTER.mintIdToken(audience);
+    minted = await env.DY_MINTER.mintIdToken(mintRequest);
   } catch (mintError) {
     // A dropped RPC, or an agency Worker without the SessionGateMinter entrypoint (a fork that has not
     // synced): fail closed, and say nothing about why to the browser.
@@ -323,10 +375,18 @@ async function idTokenFor(env, audience) {
 // Cloud Run's IAM check. The client's Authorization header passes to the container unchanged. Host
 // is dropped so the runtime sets it from the URL: Cloud Run routes by Host. A terminal host forwards no
 // Cookie header (the terminal reads none); another session host forwards its cookies minus the gate's.
-function originRequestFor(request, originUrl, idToken, target) {
+// X-DY-Session-Token: the client's is always deleted; a pma- or spma- host gets `verifiedToken`, the session
+// token this gate has just verified for this host (from the query or the gate cookie).
+function originRequestFor(request, originUrl, idToken, target, verifiedToken) {
   const originRequest = new Request(originUrl, request);
   originRequest.headers.delete("host");
   originRequest.headers.set("x-serverless-authorization", "Bearer " + idToken);
+  // Deleted on EVERY host: a container that reads this header must only ever see the value this gate wrote.
+  originRequest.headers.delete(SESSION_TOKEN_HEADER);
+  // The "pma" purpose is exactly the pma- and spma- prefixes (SESSION_PREFIXES).
+  if (target.expectedPurpose === "pma") {
+    originRequest.headers.set(SESSION_TOKEN_HEADER, verifiedToken);
+  }
   if (target.expectedPurpose === "terminal") {
     originRequest.headers.delete("cookie");
     return originRequest;
@@ -422,7 +482,7 @@ export default {
     if (idToken === null) {
       return plainResponse(503, "session gateway unavailable");
     }
-    const originRequest = originRequestFor(request, audience + url.pathname + url.search, idToken, target);
+    const originRequest = originRequestFor(request, audience + url.pathname + url.search, idToken, target, token);
 
     // Both origin fetches say redirect: "manual" EXPLICITLY: a redirect from the origin goes back to the
     // browser as it is and is never followed here, so this gate never fetches a URL the origin chose, with

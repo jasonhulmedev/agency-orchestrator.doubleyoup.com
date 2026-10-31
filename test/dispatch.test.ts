@@ -8511,19 +8511,24 @@ describe("POST /actuate route", () => {
     const job = planning49Job("edge-gate-deploy", EDGE_GATE_JOB_PARAMS, "e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9");
     const signature = await signAsApp(job, privateKey);
 
+    // planning/49 Phase 4 (I3): DY_CLIENT_SECRET is the root of the gate's caller key, so it must have the
+    // length app issues (43 characters); the deploy refuses a shorter one.
+    const clientSecret = "unit-test-client-secret-not-a-real-one-0001";
     const response = await worker.fetch(
       actuateRequest({ job, signature }),
-      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey, DY_WORKER_NAME: "sbmstudio" }),
+      envWith({ GCP_SERVICE_ACCOUNT_KEY: serviceAccountKey, DY_WORKER_NAME: "sbmstudio", DY_CLIENT_SECRET: clientSecret }),
     );
 
     expect(response.status).toBe(200);
     const text = await response.text();
     expect(text).not.toContain(EDGE_GATE_SECRET);
+    expect(text).not.toContain(clientSecret);
     expect(JSON.parse(text)).toMatchObject({
       ok: true,
       op: "edge-gate-deploy",
       script: EDGE_GATE_SCRIPT,
       status: "created",
+      gateVersion: 2,
       keyVersion: 1,
       runUrlSuffix: "-123456789012.australia-southeast2.run.app",
       minterWorker: "sbmstudio",

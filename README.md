@@ -33,7 +33,7 @@ Worker never persists them anywhere else and we never hold them. See
 | Name | Type | Purpose |
 | --- | --- | --- |
 | `APP_BASE_URL` | var | our control-plane app base, e.g. `https://app.doubleyoup.com` |
-| `DY_CLIENT_ID` / `DY_CLIENT_SECRET` | secrets | Direction-A OAuth2 client credentials issued by our app at onboarding |
+| `DY_CLIENT_ID` / `DY_CLIENT_SECRET` | secrets | Direction-A OAuth2 client credentials issued by our app at onboarding. `DY_CLIENT_SECRET` is also the root of your session gate's minter caller key: after you change it, sessions fail until the platform deploys the gate again. `/validate` reports whether each deployed gate carries the current key (`cfDns.workersScope.gateCallerKeys`) |
 | `GCP_SERVICE_ACCOUNT_KEY` | secret | the entire Google Cloud service-account JSON |
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_REGION` / `S3_BUCKET` | secrets | object-store (backup) credentials — **Cloudflare R2 recommended**, or AWS S3 (region defaults to `us-east-1`; use `auto` for R2) |
 | `S3_BACKUP_BUCKET` | secret (optional) | a SECOND bucket, used by **Tier-1 (restic) only**. Leave it unset and both backup tiers share `S3_BUCKET` (the existing behaviour). Set it when `S3_BUCKET` carries an object-lock / retention policy: restic needs **delete** (it removes its own per-run lock object, and `forget`/`prune` retention is implemented entirely by deleting), so point this at an **unlocked** bucket. Same credential covers both buckets |

@@ -12,6 +12,7 @@ import type { SessionGateEnv } from "../src/session-gate/gate.js";
 import { SESSION_GATE_SOURCE } from "../src/session-gate/gate-source.js";
 import { SESSION_GATE_COMPATIBILITY_DATE } from "../src/actuate-edge-gate.js";
 import { splitCloudRunSessionServiceName } from "../src/dispatch-params.js";
+import { minterCallerProofMac, verifyMinterCallerProof } from "../src/session-gate/caller-key.js";
 
 // What each gate version IS: the sha256 of gate.js and the compatibility date it is uploaded with
 // (SESSION_GATE_COMPATIBILITY_DATE in src/actuate-edge-gate.ts).
@@ -22,10 +23,11 @@ import { splitCloudRunSessionServiceName } from "../src/dispatch-params.js";
 // would still deploy, but it refuses to put a LOWER version over a higher one: two different gates under
 // one version number would make that downgrade guard compare the wrong things.
 //
-// v1 is not released yet (planning/49 I6 deploys it first), which is why its entry still changes with the
-// I4 review fixes. From the first deploy on, the rule above holds without exception.
+// v1 is released (planning/49 Phase 3 I6 deployed it on 2026-10-27), so from v1 on the rule above holds
+// without exception. v2 (planning/49 Phase 4 I3) adds the minter caller proof and X-DY-Session-Token.
 const GATE_VERSIONS: Record<number, { sha256: string; compatibilityDate: string }> = {
   1: { sha256: "cd5b6e3a661747e5fb4b40713a1fa4b2206cbb6b40ccf35016b54cb04623b5f7", compatibilityDate: "2026-01-01" },
+  2: { sha256: "f1f453fc1cd25f4d9ddcbed721b3780eb235521e310fccf2520d02cf2493f21e", compatibilityDate: "2026-01-01" },
 };
 
 // ── I2 vectors (orchestrator src/session-token.test.ts; the same recipe as app and the container) ──
@@ -46,6 +48,8 @@ const CELL_A_V2_SECRET = "46d993d0738e210e275c771df8fe78ef9e98c6cf3b1faa2ed222a7
 const ZONE_SUFFIX = ".sbmstudio.com.au";
 const RUN_URL_SUFFIX = "-123456789012.australia-southeast2.run.app";
 const FAR_FUTURE_EXP = 4102444800;
+// A gate's minter caller key (64 lowercase hex), as edge-gate-deploy binds it.
+const MINTER_CALLER_KEY_HEX = "7b1eab777358b371e6e62d42117d5919b44e8e442605f2e9690861b9574abc77";
 
 function base64url(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("base64url");
@@ -90,9 +94,10 @@ interface FakeMinter {
 
 function okMinter(expiresInSeconds = 3600): FakeMinter {
   return {
-    mintIdToken: vi.fn(async (audience: string) => ({
+    // Gate v2 sends { audience, ts, mac }.
+    mintIdToken: vi.fn(async (request: { audience: string }) => ({
       ok: true,
-      idToken: `id-token-for:${audience}`,
+      idToken: `id-token-for:${request.audience}`,
       expiresAt: Math.floor(Date.now() / 1000) + expiresInSeconds,
     })),
   };
@@ -104,8 +109,10 @@ function gateEnv(minter: FakeMinter, overrides: Partial<SessionGateEnv> = {}): S
     DY_ZONE_SUFFIX: ZONE_SUFFIX,
     DY_RUN_URL_SUFFIX: RUN_URL_SUFFIX,
     DY_MINTER: minter as unknown as SessionGateEnv["DY_MINTER"],
+    DY_MINTER_CALLER_KEY: MINTER_CALLER_KEY_HEX,
     DY_SESSION_KEY_VERSION: "1",
     DY_SESSION_KEY_FINGERPRINT: "0123456789abcdef",
+    DY_MINTER_CALLER_FINGERPRINT: "fedcba9876543210",
     ...overrides,
   };
 }
@@ -332,6 +339,11 @@ describe("session gate: configuration", () => {
     expect(configurationProblem(gateEnv(minter, { DY_RUN_URL_SUFFIX: "-123.evil.example" }))).toMatch(/^DY_RUN_URL_SUFFIX/);
     expect(configurationProblem(gateEnv(minter, { DY_RUN_URL_SUFFIX: "-123.australia-southeast2.run.app/x" }))).toMatch(/^DY_RUN_URL_SUFFIX/);
     expect(configurationProblem(gateEnv(minter, { DY_MINTER: undefined }))).toMatch(/^DY_MINTER/);
+    // Gate v2: the caller key must be 64 lowercase hex. The message names the binding, never a value.
+    for (const callerKey of [undefined, "", MINTER_CALLER_KEY_HEX.toUpperCase(), MINTER_CALLER_KEY_HEX.slice(2), `${MINTER_CALLER_KEY_HEX}00`]) {
+      const problem = configurationProblem(gateEnv(minter, { DY_MINTER_CALLER_KEY: callerKey }));
+      expect(problem, String(callerKey)).toBe("DY_MINTER_CALLER_KEY is not set to 64 lowercase hex characters");
+    }
   });
 
   it("answers 500 for a misconfigured gate: no minter call, no origin fetch, no value in the body", async () => {
@@ -411,7 +423,12 @@ describe("session gate: the request flow", () => {
 
     const audience = `https://pma-flow-a${RUN_URL_SUFFIX}`;
     expect(minter.mintIdToken).toHaveBeenCalledTimes(1);
-    expect(minter.mintIdToken).toHaveBeenCalledWith(audience);
+    // Gate v2: the minter gets { audience, ts, mac }, a caller proof made now with DY_MINTER_CALLER_KEY.
+    const mintRequest = minter.mintIdToken.mock.calls[0]?.[0] as { audience: string; ts: number; mac: string };
+    expect(Object.keys(mintRequest).sort()).toEqual(["audience", "mac", "ts"]);
+    expect(mintRequest.audience).toBe(audience);
+    expect(mintRequest.ts).toBe(nowSeconds);
+    expect(await verifyMinterCallerProof(Buffer.from(MINTER_CALLER_KEY_HEX, "hex"), audience, mintRequest.ts, mintRequest.mac, nowSeconds)).toBe(true);
     expect(sent).toHaveLength(1);
     const forwarded = sent[0] as Request;
     // Same path and query (the container reads ?token=), same method and body.
@@ -689,5 +706,152 @@ describe("session gate: the request flow", () => {
         expect(value).not.toContain(CELL_A_V1_SECRET);
       }
     }
+  });
+});
+
+describe("session gate v2: the minter caller proof", () => {
+  it("sends { audience, ts, mac } with the MAC of the independent vector (the minter's own recipe)", async () => {
+    // The vector of test/session-gate-minter.test.ts, computed by a separate HKDF/HMAC implementation:
+    // this caller key, this audience, this ts.
+    const vectorTs = 1793404800;
+    const vectorMac = "5IiC-CfevaYzhhg0WJdpVDZi2UQ8F4pREFuY5cjS3eE";
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(vectorTs * 1000));
+    const minter = okMinter();
+    mockOrigin();
+    const host = "pma-docs-892769.sbmstudio.com.au";
+    const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("docs-892769", { purpose: "pma" }));
+    const response = await gate.fetch(new Request(`https://${host}/?token=${token}`), gateEnv(minter));
+    expect(response.status).toBe(200);
+    const audience = "https://pma-docs-892769-123456789012.australia-southeast2.run.app";
+    expect(minter.mintIdToken).toHaveBeenCalledWith({ audience, ts: vectorTs, mac: vectorMac });
+    expect(await minterCallerProofMac(Buffer.from(MINTER_CALLER_KEY_HEX, "hex"), audience, vectorTs)).toBe(vectorMac);
+  });
+
+  it("makes a NEW proof for each mint call (the minter refuses a proof older than 60 s)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const start = Date.parse("2026-10-31T00:00:00.000Z");
+    vi.setSystemTime(new Date(start));
+    // A 400 s ID token: with the 300 s refresh margin it is minted again after 100 s.
+    const minter = okMinter(400);
+    mockOrigin();
+    const host = "term-proof-b.sbmstudio.com.au";
+    const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("proof-b"));
+    await gate.fetch(new Request(`https://${host}/?token=${token}`), gateEnv(minter));
+    vi.setSystemTime(new Date(start + 101 * 1000));
+    await gate.fetch(new Request(`https://${host}/?token=${token}`), gateEnv(minter));
+    expect(minter.mintIdToken).toHaveBeenCalledTimes(2);
+    const first = minter.mintIdToken.mock.calls[0]?.[0] as { ts: number; mac: string };
+    const second = minter.mintIdToken.mock.calls[1]?.[0] as { ts: number; mac: string };
+    expect(second.ts - first.ts).toBe(101);
+    expect(second.mac).not.toBe(first.mac);
+  });
+
+  it("answers 500 without a caller key: no minter call, no origin fetch, no key in the body", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin();
+    const host = "term-proof-c.sbmstudio.com.au";
+    const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("proof-c"));
+    const response = await gate.fetch(new Request(`https://${host}/?token=${token}`), gateEnv(minter, { DY_MINTER_CALLER_KEY: undefined }));
+    expect(response.status).toBe(500);
+    expect(await response.text()).toBe("edge gate misconfigured: DY_MINTER_CALLER_KEY is not set to 64 lowercase hex characters");
+    expect(minter.mintIdToken).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
+  });
+});
+
+describe("session gate v2: X-DY-Session-Token", () => {
+  it("pma- and spma- hosts get the verified QUERY token; a client-sent value never reaches the origin", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin();
+    const tokens: string[] = [];
+    for (const label of ["pma-hdr-a", "spma-hdr-a"]) {
+      const host = `${label}.sbmstudio.com.au`;
+      const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("hdr-a", { purpose: "pma" }));
+      tokens.push(token);
+      const response = await gate.fetch(
+        new Request(`https://${host}/index.php?token=${token}`, { headers: { "X-DY-Session-Token": "forged-by-the-client" } }),
+        gateEnv(minter),
+      );
+      expect(response.status).toBe(200);
+    }
+    expect(sent).toHaveLength(2);
+    expect((sent[0] as Request).headers.get("x-dy-session-token")).toBe(tokens[0]);
+    expect((sent[1] as Request).headers.get("x-dy-session-token")).toBe(tokens[1]);
+  });
+
+  it("a cookie-only pma- request gets the verified COOKIE token, not the client's header", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin();
+    const host = "pma-hdr-b.sbmstudio.com.au";
+    const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("hdr-b", { purpose: "pma" }));
+    const response = await gate.fetch(
+      new Request(`https://${host}/sql.php`, {
+        method: "POST",
+        headers: { cookie: `__Host-dy_egt=${token}; pma_lang=en`, "sec-fetch-site": "same-origin", "x-dy-session-token": "forged-by-the-client" },
+      }),
+      gateEnv(minter),
+    );
+    expect(response.status).toBe(200);
+    const forwarded = sent[0] as Request;
+    expect(forwarded.headers.get("x-dy-session-token")).toBe(token);
+    // The gate's own cookie still does not travel (the token goes only in the header the gate writes).
+    expect(forwarded.headers.get("cookie")).toBe("pma_lang=en");
+  });
+
+  it("term-, sterm- and staging- hosts get NO X-DY-Session-Token, and a client-sent one is deleted", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin();
+    const hosts: Array<{ label: string; purpose: string }> = [
+      { label: "term-hdr-c", purpose: "terminal" },
+      { label: "sterm-hdr-c", purpose: "terminal" },
+      { label: "staging-hdr-c", purpose: "staging" },
+    ];
+    for (const entry of hosts) {
+      const host = `${entry.label}.sbmstudio.com.au`;
+      const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("hdr-c", { purpose: entry.purpose }));
+      const response = await gate.fetch(
+        new Request(`https://${host}/?token=${token}`, { headers: { "x-dy-session-token": token } }),
+        gateEnv(minter),
+      );
+      expect(response.status, entry.label).toBe(200);
+    }
+    expect(sent).toHaveLength(3);
+    for (const forwarded of sent) {
+      expect(forwarded.headers.get("x-dy-session-token")).toBeNull();
+    }
+    // The terminal keeps its own token path: the query passes unchanged.
+    expect(new URL((sent[0] as Request).url).searchParams.get("token")).not.toBeNull();
+  });
+
+  it("a WebSocket upgrade on a term- host also loses a client-sent X-DY-Session-Token", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin(() => new Response(null, { status: 200 }));
+    const host = "term-hdr-d.sbmstudio.com.au";
+    const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("hdr-d"));
+    await gate.fetch(
+      new Request(`https://${host}/ws?token=${token}`, {
+        headers: { upgrade: "websocket", connection: "Upgrade", origin: `https://${host}`, "x-dy-session-token": "forged" },
+      }),
+      gateEnv(minter),
+    );
+    expect(sent).toHaveLength(1);
+    expect((sent[0] as Request).headers.get("x-dy-session-token")).toBeNull();
+  });
+
+  it("an invalid token on a pma- host is still a 401 at the edge: no minter call, no origin fetch", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin();
+    const host = "pma-hdr-e.sbmstudio.com.au";
+    const terminalToken = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("hdr-e"));
+    for (const request of [
+      new Request(`https://${host}/`, { headers: { "x-dy-session-token": terminalToken } }),
+      new Request(`https://${host}/?token=${terminalToken}`),
+    ]) {
+      const response = await gate.fetch(request, gateEnv(minter));
+      expect(response.status).toBe(401);
+    }
+    expect(minter.mintIdToken).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
   });
 });

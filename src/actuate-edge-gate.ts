@@ -25,6 +25,13 @@
 //   DY_SESSION_KEY_VERSION      plain_text   the job's keyVersion
 //   DY_SESSION_KEY_FINGERPRINT  plain_text   sessionKeyFingerprint(secret): the ONLY way to see later that
 //                                            the secret changed, because the secret itself is never readable
+//   DY_MINTER_CALLER_KEY        secret_text  (gate v2, planning/49 Phase 4 I3) the gate's minter caller key,
+//                                            64 lowercase hex: HKDF of THIS Worker's DY_CLIENT_SECRET for this
+//                                            gate script (src/session-gate/caller-key.ts). The gate signs every
+//                                            mint call with it; the minter derives it again to check.
+//   DY_MINTER_CALLER_FINGERPRINT plain_text  minterCallerKeyFingerprint(key), for the same reason as the
+//                                            session key fingerprint: a changed DY_CLIENT_SECRET gives another
+//                                            fingerprint, so the next deploy is "updated", never "unchanged"
 //
 // NO LOGS (review L7): session tokens travel in `?token=` and in the gate's cookie, so no Cloudflare log may
 // record a gate request. The upload sets Workers Logs / observability OFF, logpush OFF, and no tail or
@@ -34,7 +41,8 @@
 //
 // FLOW:
 //   0. PIN `project` to GCP_SERVICE_ACCOUNT_KEY's project_id; refuse when DY_WORKER_NAME is unset or not a
-//      script name (no network call before either)
+//      script name, or DY_CLIENT_SECRET cannot be the root of a caller key; derive the caller key (no
+//      network call before any of these)
 //   1. the project number (projects.get, read-only token, cached)
 //   2. GET /zones?name=<zone> -> the zone's account id
 //   3. GET .../workers/scripts/<script>/settings: a 404 carrying Cloudflare's "Worker not found" code is
@@ -47,9 +55,9 @@
 //   6. otherwise ONE multipart PUT, then read the settings back and refuse unless they are exactly the
 //      wanted ones -> "created" or "updated"
 //
-// SECRET HYGIENE: the secret goes into the upload body and nowhere else. No result carries it, and every
-// failure detail passes through withoutSecret before it leaves, in case an upstream error ever quoted it.
-// This module logs nothing.
+// SECRET HYGIENE: the session secret and the caller key go into the upload body and nowhere else. No result
+// carries either, and every failure detail passes through withoutSecrets before it leaves, in case an
+// upstream error ever quoted one. DY_CLIENT_SECRET never leaves this Worker. This module logs nothing.
 //
 // IDEMPOTENT: a re-run of a converged gate is "unchanged"; any other re-run uploads the same script with the
 // same settings.
@@ -59,6 +67,15 @@ import { type EdgeGateDeployParams, edgeGateScriptNameFor } from "./dispatch-par
 import { CF_API, type CloudflareEnvelope, cloudflareErrorMessage, readPinnedServiceAccountKey, resolveZoneId } from "./actuate.js";
 import { readProjectNumber } from "./session-gate/minter.js";
 import { SESSION_GATE_SOURCE } from "./session-gate/gate-source.js";
+import {
+  CLIENT_SECRET_MIN_LENGTH,
+  MINTER_CALLER_FINGERPRINT_BINDING,
+  MINTER_CALLER_KEY_BINDING,
+  deriveMinterCallerKey,
+  isUsableClientSecret,
+  minterCallerKeyFingerprint,
+  minterCallerKeyHex,
+} from "./session-gate/caller-key.js";
 import { errorMessage, isWorkerScriptName } from "./util.js";
 
 /** The first line of every gate this platform made starts with this, followed by the gate version. */
@@ -155,9 +172,13 @@ export async function sessionKeyFingerprint(sessionSecret: string): Promise<stri
   return hex.slice(0, SESSION_KEY_FINGERPRINT_HEX_LENGTH);
 }
 
-/** `text` with every occurrence of the secret replaced, so no failure detail can carry it. */
-function withoutSecret(text: string, sessionSecret: string): string {
-  return text.split(sessionSecret).join("[redacted]");
+/** `text` with every occurrence of each secret value replaced, so no failure detail can carry one. */
+function withoutSecrets(text: string, secretValues: string[]): string {
+  let redacted = text;
+  for (const secretValue of secretValues) {
+    redacted = redacted.split(secretValue).join("[redacted]");
+  }
+  return redacted;
 }
 
 /** One binding in the script upload metadata. */
@@ -174,6 +195,8 @@ function wantedGateBindings(input: {
   keyVersion: number;
   keyFingerprint: string;
   workerName: string;
+  callerKeyHex: string;
+  callerKeyFingerprint: string;
 }): GateBinding[] {
   return [
     { type: "secret_text", name: BINDING_SESSION_SECRET, text: input.sessionSecret },
@@ -186,6 +209,10 @@ function wantedGateBindings(input: {
     // put`) keeps this old fingerprint, and the next deploy with the same secret reports "unchanged" while
     // the gate runs the other key. Only a change made through this op is visible here.
     { type: "plain_text", name: BINDING_KEY_FINGERPRINT, text: input.keyFingerprint },
+    // Gate v2: the same rule for the caller key. A DY_MINTER_CALLER_KEY changed by hand keeps the old
+    // fingerprint and reads "unchanged"; the minter then refuses every proof, so that gate answers 503.
+    { type: "secret_text", name: MINTER_CALLER_KEY_BINDING, text: input.callerKeyHex },
+    { type: "plain_text", name: MINTER_CALLER_FINGERPRINT_BINDING, text: input.callerKeyFingerprint },
   ];
 }
 
@@ -489,8 +516,10 @@ async function uploadGateScript(token: string, accountId: string, scriptName: st
 
 export async function actuateEdgeGateDeploy(params: EdgeGateDeployParams, env: Env): Promise<EdgeGateDeployResult> {
   const script = edgeGateScriptNameFor(params.project, params.region);
+  // Every secret value the upload carries: the session secret now, the caller key once it is derived.
+  const secretValues: string[] = [params.sessionSecret];
   const failure = (detail: string, foreign?: true): EdgeGateDeployResult => {
-    const result: EdgeGateDeployResult = { ok: false, op: "edge-gate-deploy", script, detail: withoutSecret(detail, params.sessionSecret) };
+    const result: EdgeGateDeployResult = { ok: false, op: "edge-gate-deploy", script, detail: withoutSecrets(detail, secretValues) };
     if (foreign) {
       result.foreign = true;
     }
@@ -517,6 +546,19 @@ export async function actuateEdgeGateDeploy(params: EdgeGateDeployParams, env: E
   if (!token) {
     return failure("CF_DNS_API_TOKEN is not configured on this Worker.");
   }
+  if (!isUsableClientSecret(env.DY_CLIENT_SECRET)) {
+    // The rule only, never the value. Without a usable root the gate would get a key anyone could compute.
+    return failure(
+      `DY_CLIENT_SECRET is not set on this Worker, or is shorter than ${CLIENT_SECRET_MIN_LENGTH} characters. It is the root ` +
+        "of the session gate's minter caller key, so the gate is not deployed without it. Set it to the client secret the " +
+        "platform issued at onboarding.",
+    );
+  }
+  // The gate's caller key (planning/49 Phase 4 I3): bound to this gate script, so it signs only for this cell.
+  const callerKey = await deriveMinterCallerKey(env.DY_CLIENT_SECRET, script);
+  const callerKeyHex = minterCallerKeyHex(callerKey);
+  secretValues.push(callerKeyHex);
+  const callerKeyFingerprint = await minterCallerKeyFingerprint(callerKey);
   const gateVersion = sessionGateVersionOf(SESSION_GATE_SOURCE);
   if (gateVersion === null) {
     // Unreachable while test/session-gate.test.ts passes; never upload a gate a later deploy cannot recognise.
@@ -578,7 +620,8 @@ export async function actuateEdgeGateDeploy(params: EdgeGateDeployParams, env: E
     );
   }
 
-  // 5. Unchanged: exactly the embedded gate, with exactly the wanted settings.
+  // 5. Unchanged: exactly the embedded gate, with exactly the wanted settings. The wanted bindings include
+  // both fingerprints, so a changed session secret OR a changed caller key is "updated", never "unchanged".
   const keyFingerprint = await sessionKeyFingerprint(params.sessionSecret);
   const wanted = wantedGateBindings({
     sessionSecret: params.sessionSecret,
@@ -587,6 +630,8 @@ export async function actuateEdgeGateDeploy(params: EdgeGateDeployParams, env: E
     keyVersion: params.keyVersion,
     keyFingerprint,
     workerName,
+    callerKeyHex,
+    callerKeyFingerprint,
   });
   const success = (status: EdgeGateDeployStatus): EdgeGateDeployResult => ({
     ok: true,
