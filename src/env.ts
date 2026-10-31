@@ -25,7 +25,8 @@ export interface Env {
   // (client_credentials grant) that authenticates this Worker's calls back to us.
   // planning/49 Phase 4 (I3): DY_CLIENT_SECRET is ALSO the root of each session gate's minter caller key
   // (src/session-gate/caller-key.ts; at least 32 characters, app issues 43). After it changes, the minter
-  // refuses each gate's calls until edge-gate-deploy runs again for that gate.
+  // refuses each gate's calls until edge-gate-deploy runs again for that gate. It is not secret from our
+  // app: app-client.ts sends it to app's /oauth/token on every token exchange.
   DY_CLIENT_ID: string;
   DY_CLIENT_SECRET: string;
 

@@ -48,7 +48,7 @@ export type SessionGateMintResult =
  * The session prefixes a call WITHOUT a caller proof (a v1 gate) may still get a token for: the terminal
  * hosts, whose container checks the session token itself. An allow-list, so a new prefix needs the proof.
  */
-export const KEYLESS_TRANSITION_PREFIXES: readonly string[] = ["term", "sterm"];
+export const KEYLESS_TRANSITION_PREFIXES: readonly string[] = Object.freeze(["term", "sterm"]);
 
 /** The parts of an allowed audience. */
 export interface SessionGateAudience {

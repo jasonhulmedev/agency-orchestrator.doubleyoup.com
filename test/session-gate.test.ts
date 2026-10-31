@@ -24,10 +24,11 @@ import { minterCallerProofMac, verifyMinterCallerProof } from "../src/session-ga
 // one version number would make that downgrade guard compare the wrong things.
 //
 // v1 is released (planning/49 Phase 3 I6 deployed it on 2026-10-27), so from v1 on the rule above holds
-// without exception. v2 (planning/49 Phase 4 I3) adds the minter caller proof and X-DY-Session-Token.
+// without exception. v2 (planning/49 Phase 4 I3) adds the minter caller proof with its version-skew retry,
+// X-DY-Session-Token, the ?token= fallback to the cookie, and the staging token-strip page.
 const GATE_VERSIONS: Record<number, { sha256: string; compatibilityDate: string }> = {
   1: { sha256: "cd5b6e3a661747e5fb4b40713a1fa4b2206cbb6b40ccf35016b54cb04623b5f7", compatibilityDate: "2026-01-01" },
-  2: { sha256: "f1f453fc1cd25f4d9ddcbed721b3780eb235521e310fccf2520d02cf2493f21e", compatibilityDate: "2026-01-01" },
+  2: { sha256: "b7645b2df93fd20068d653063e1a58301d4ee59147031f200a23f736257e2398", compatibilityDate: "2026-01-01" },
 };
 
 // ── I2 vectors (orchestrator src/session-token.test.ts; the same recipe as app and the container) ──
@@ -431,8 +432,10 @@ describe("session gate: the request flow", () => {
     expect(await verifyMinterCallerProof(Buffer.from(MINTER_CALLER_KEY_HEX, "hex"), audience, mintRequest.ts, mintRequest.mac, nowSeconds)).toBe(true);
     expect(sent).toHaveLength(1);
     const forwarded = sent[0] as Request;
-    // Same path and query (the container reads ?token=), same method and body.
-    expect(forwarded.url).toBe(`${audience}/static/app.js?token=${token}&x=1`);
+    // Same path, method and body. The verified ?token= leaves the query: a pma- container reads the token
+    // from X-DY-Session-Token.
+    expect(forwarded.url).toBe(`${audience}/static/app.js?x=1`);
+    expect(forwarded.headers.get("x-dy-session-token")).toBe(token);
     expect(forwarded.method).toBe("POST");
     expect(await forwarded.text()).toBe("request body");
     // Only the gate's ID token reaches Cloud Run's IAM check: it replaces the client's
@@ -531,7 +534,7 @@ describe("session gate: the request flow", () => {
     expect(response.headers.get("location")).toBe("https://elsewhere.example/steal");
     // ONE fetch, to the origin, with redirect: manual: the gate itself never requested elsewhere.example.
     expect(sent).toHaveLength(1);
-    expect((sent[0] as Request).url).toBe(`https://pma-flow-j${RUN_URL_SUFFIX}/?token=${token}`);
+    expect((sent[0] as Request).url).toBe(`https://pma-flow-j${RUN_URL_SUFFIX}/`);
     expect(originRedirectModes).toEqual(["manual"]);
   });
 
@@ -799,29 +802,56 @@ describe("session gate v2: X-DY-Session-Token", () => {
     expect(forwarded.headers.get("cookie")).toBe("pma_lang=en");
   });
 
-  it("term-, sterm- and staging- hosts get NO X-DY-Session-Token, and a client-sent one is deleted", async () => {
+  it("term- and sterm- hosts get NO X-DY-Session-Token, a client-sent one is deleted, and the query keeps the token", async () => {
     const minter = okMinter();
     const sent = mockOrigin();
-    const hosts: Array<{ label: string; purpose: string }> = [
-      { label: "term-hdr-c", purpose: "terminal" },
-      { label: "sterm-hdr-c", purpose: "terminal" },
-      { label: "staging-hdr-c", purpose: "staging" },
-    ];
-    for (const entry of hosts) {
-      const host = `${entry.label}.sbmstudio.com.au`;
-      const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("hdr-c", { purpose: entry.purpose }));
+    const tokens: string[] = [];
+    for (const label of ["term-hdr-c", "sterm-hdr-c"]) {
+      const host = `${label}.sbmstudio.com.au`;
+      const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("hdr-c"));
+      tokens.push(token);
       const response = await gate.fetch(
         new Request(`https://${host}/?token=${token}`, { headers: { "x-dy-session-token": token } }),
         gateEnv(minter),
       );
-      expect(response.status, entry.label).toBe(200);
+      expect(response.status, label).toBe(200);
     }
-    expect(sent).toHaveLength(3);
+    expect(sent).toHaveLength(2);
     for (const forwarded of sent) {
       expect(forwarded.headers.get("x-dy-session-token")).toBeNull();
     }
     // The terminal keeps its own token path: the query passes unchanged.
-    expect(new URL((sent[0] as Request).url).searchParams.get("token")).not.toBeNull();
+    expect(new URL((sent[0] as Request).url).searchParams.get("token")).toBe(tokens[0]);
+    expect(new URL((sent[1] as Request).url).searchParams.get("token")).toBe(tokens[1]);
+  });
+
+  it("staging- hosts get the verified token in X-DY-Session-Token too (from the cookie, and from a non-GET ?token=)", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin();
+    const host = "staging-hdr-f.sbmstudio.com.au";
+    const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("hdr-f", { purpose: "staging" }));
+    const viaCookie = await gate.fetch(
+      new Request(`https://${host}/wp-admin/`, {
+        headers: { cookie: `__Host-dy_egt=${token}; wordpress_test_cookie=1`, "sec-fetch-site": "same-origin", "x-dy-session-token": "forged" },
+      }),
+      gateEnv(minter),
+    );
+    expect(viaCookie.status).toBe(200);
+    const viaQuery = await gate.fetch(
+      new Request(`https://${host}/wp-admin/admin-ajax.php?token=${token}&action=x`, {
+        method: "POST",
+        body: "a=1",
+        headers: { "x-dy-session-token": "forged" },
+      }),
+      gateEnv(minter),
+    );
+    expect(viaQuery.status).toBe(200);
+    expect(sent).toHaveLength(2);
+    expect((sent[0] as Request).headers.get("x-dy-session-token")).toBe(token);
+    expect((sent[0] as Request).headers.get("cookie")).toBe("wordpress_test_cookie=1");
+    expect((sent[1] as Request).headers.get("x-dy-session-token")).toBe(token);
+    expect((sent[1] as Request).url).toBe(`https://staging-hdr-f${RUN_URL_SUFFIX}/wp-admin/admin-ajax.php?action=x`);
+    expect(await (sent[1] as Request).text()).toBe("a=1");
   });
 
   it("a WebSocket upgrade on a term- host also loses a client-sent X-DY-Session-Token", async () => {
@@ -852,6 +882,425 @@ describe("session gate v2: X-DY-Session-Token", () => {
       expect(response.status).toBe(401);
     }
     expect(minter.mintIdToken).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
+  });
+});
+
+describe("session gate v2: a ?token= that does not verify counts as no token (phpMyAdmin's own CSRF token)", () => {
+  // phpMyAdmin's GET forms and links carry its own CSRF `token`. Such a request is COOKIE-ONLY: the cookie
+  // must verify, and Sec-Fetch-Site must be same-origin or none.
+  const CSRF_LIKE = "4a7b2c9d8e1f0a3b6c5d4e7f8a9b0c1d";
+
+  it("serves ?token=<csrf-like> with a valid cookie from this host's own page, keeps the CSRF token, and sets no cookie", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin();
+    const cases: Array<{ label: string; purpose: string; header: boolean }> = [
+      { label: "pma-csrf-a", purpose: "pma", header: true },
+      { label: "spma-csrf-a", purpose: "pma", header: true },
+      { label: "staging-csrf-a", purpose: "staging", header: true },
+      { label: "term-csrf-a", purpose: "terminal", header: false },
+    ];
+    for (const testCase of cases) {
+      const host = `${testCase.label}.sbmstudio.com.au`;
+      const cookieToken = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("csrf-a", { purpose: testCase.purpose }));
+      for (const fetchSite of ["same-origin", "none"]) {
+        const response = await gate.fetch(
+          new Request(`https://${host}/index.php?route=/database/structure&db=wp&token=${CSRF_LIKE}`, {
+            headers: { cookie: `__Host-dy_egt=${cookieToken}`, "sec-fetch-site": fetchSite },
+          }),
+          gateEnv(minter),
+        );
+        expect(response.status, `${testCase.label} ${fetchSite}`).toBe(200);
+        expect(response.headers.get("set-cookie"), testCase.label).toBeNull();
+      }
+      const forwarded = sent[sent.length - 1] as Request;
+      // The CSRF token is not the session token, so it passes to the container unchanged.
+      expect(forwarded.url, testCase.label).toBe(`https://${testCase.label}${RUN_URL_SUFFIX}/index.php?route=/database/structure&db=wp&token=${CSRF_LIKE}`);
+      if (testCase.header) {
+        expect(forwarded.headers.get("x-dy-session-token"), testCase.label).toBe(cookieToken);
+      } else {
+        expect(forwarded.headers.get("x-dy-session-token"), testCase.label).toBeNull();
+      }
+    }
+    expect(sent).toHaveLength(8);
+  });
+
+  it("401s the same ?token=<csrf-like> request from another site, a sibling host or with no Sec-Fetch-Site: no minter call, no fetch", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin();
+    for (const [label, purpose] of [
+      ["pma-csrf-b", "pma"],
+      ["staging-csrf-b", "staging"],
+      ["term-csrf-b", "terminal"],
+    ] as const) {
+      const host = `${label}.sbmstudio.com.au`;
+      const cookieToken = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("csrf-b", { purpose }));
+      for (const fetchSite of ["cross-site", "same-site", null]) {
+        const headers: Record<string, string> = { cookie: `__Host-dy_egt=${cookieToken}` };
+        if (fetchSite !== null) {
+          headers["sec-fetch-site"] = fetchSite;
+        }
+        for (const query of [`?token=${CSRF_LIKE}`, "?token=junk", "?token=", `?db=wp&token=${CSRF_LIKE}`]) {
+          const response = await gate.fetch(new Request(`https://${host}/index.php${query}`, { headers }), gateEnv(minter));
+          expect(response.status, `${label} ${String(fetchSite)} ${query}`).toBe(401);
+        }
+      }
+    }
+    expect(minter.mintIdToken).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
+  });
+
+  it("401s a ?token= that does not verify when there is no valid cookie, even from this host's own page", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin();
+    const host = "pma-csrf-c.sbmstudio.com.au";
+    const otherHostToken = await signSessionToken(CELL_A_V1_SECRET, "pma-other.sbmstudio.com.au", terminalClaims("other", { purpose: "pma" }));
+    for (const cookie of [null, "__Host-dy_egt=junk", `__Host-dy_egt=${otherHostToken}`]) {
+      const headers: Record<string, string> = { "sec-fetch-site": "same-origin" };
+      if (cookie !== null) {
+        headers.cookie = cookie;
+      }
+      const response = await gate.fetch(new Request(`https://${host}/?token=${CSRF_LIKE}`, { headers }), gateEnv(minter));
+      expect(response.status, String(cookie)).toBe(401);
+    }
+    expect(minter.mintIdToken).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
+  });
+
+  it("never sets a cookie from a ?token= that does not verify, even a token valid for another host", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin();
+    const host = "pma-csrf-d.sbmstudio.com.au";
+    const cookieToken = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("csrf-d", { purpose: "pma" }));
+    const otherHostToken = await signSessionToken(CELL_A_V1_SECRET, "pma-other.sbmstudio.com.au", terminalClaims("other", { purpose: "pma" }));
+    const response = await gate.fetch(
+      new Request(`https://${host}/?token=${otherHostToken}`, { headers: { cookie: `__Host-dy_egt=${cookieToken}`, "sec-fetch-site": "same-origin" } }),
+      gateEnv(minter),
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("set-cookie")).toBeNull();
+    expect((sent[0] as Request).headers.get("x-dy-session-token")).toBe(cookieToken);
+  });
+
+  it("a ?token= that verifies wins over a valid older cookie, and replaces it", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin();
+    const host = "pma-csrf-e.sbmstudio.com.au";
+    const olderToken = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("csrf-e", { purpose: "pma", uid: 1 }));
+    const freshToken = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("csrf-e", { purpose: "pma", uid: 2 }));
+    const response = await gate.fetch(
+      new Request(`https://${host}/?token=${freshToken}`, { headers: { cookie: `__Host-dy_egt=${olderToken}`, "sec-fetch-site": "cross-site" } }),
+      gateEnv(minter),
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("set-cookie")).toMatch(new RegExp(`^__Host-dy_egt=${freshToken.replace(/[.]/g, "\\.")};`));
+    expect((sent[0] as Request).headers.get("x-dy-session-token")).toBe(freshToken);
+  });
+
+  it("a WebSocket with ?token=<junk> rides on a valid cookie only with this host's Origin", async () => {
+    const minter = okMinter();
+    const upgradeAnswer = new Response(null, { status: 200 });
+    const sent = mockOrigin(() => upgradeAnswer);
+    const host = "term-csrf-f.sbmstudio.com.au";
+    const cookieToken = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("csrf-f"));
+    const headers = { upgrade: "websocket", connection: "Upgrade", cookie: `__Host-dy_egt=${cookieToken}` };
+    const served = await gate.fetch(new Request(`https://${host}/ws?token=junk`, { headers: { ...headers, origin: `https://${host}` } }), gateEnv(minter));
+    expect(served).toBe(upgradeAnswer);
+    const refused = await gate.fetch(new Request(`https://${host}/ws?token=junk`, { headers: { ...headers, origin: "https://evil.example" } }), gateEnv(minter));
+    expect(refused.status).toBe(401);
+    expect(sent).toHaveLength(1);
+  });
+});
+
+describe("session gate v2: a verified ?token= leaves the origin's query on pma-, spma- and staging- hosts", () => {
+  it("removes only the first `token` parameter and keeps every other parameter's bytes and order", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin();
+    const host = "pma-strip-a.sbmstudio.com.au";
+    const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("strip-a", { purpose: "pma" }));
+    const cases: Array<{ query: string; forwarded: string }> = [
+      { query: `?token=${token}`, forwarded: "" },
+      { query: `?route=/sql&token=${token}&db=wp`, forwarded: "?route=/sql&db=wp" },
+      { query: `?a=%7E&token=${token}&b=x+y&c`, forwarded: "?a=%7E&b=x+y&c" },
+      { query: `?token=${token}&token=csrf-own`, forwarded: "?token=csrf-own" },
+      { query: `?&token=${token}&&a=1&`, forwarded: "?a=1" },
+      // The same decoding as url.searchParams: a percent-encoded name is still `token`.
+      { query: `?tok%65n=${token}&a=1`, forwarded: "?a=1" },
+    ];
+    for (const testCase of cases) {
+      const response = await gate.fetch(new Request(`https://${host}/index.php${testCase.query}`), gateEnv(minter));
+      expect(response.status, testCase.query).toBe(200);
+      expect((sent[sent.length - 1] as Request).url, testCase.query).toBe(`https://pma-strip-a${RUN_URL_SUFFIX}/index.php${testCase.forwarded}`);
+    }
+  });
+
+  it("spma- and a staging- WebSocket lose it too; term- and sterm- keep it (the terminal reads only the query)", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin(() => new Response(null, { status: 200 }));
+    const cases: Array<{ label: string; purpose: string; webSocket: boolean; keeps: boolean }> = [
+      { label: "spma-strip-b", purpose: "pma", webSocket: false, keeps: false },
+      { label: "staging-strip-b", purpose: "staging", webSocket: true, keeps: false },
+      { label: "term-strip-b", purpose: "terminal", webSocket: false, keeps: true },
+      { label: "sterm-strip-b", purpose: "terminal", webSocket: true, keeps: true },
+    ];
+    for (const testCase of cases) {
+      const host = `${testCase.label}.sbmstudio.com.au`;
+      const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("strip-b", { purpose: testCase.purpose }));
+      const headers: Record<string, string> = {};
+      if (testCase.webSocket) {
+        headers.upgrade = "websocket";
+        headers.connection = "Upgrade";
+        headers.origin = `https://${host}`;
+      }
+      await gate.fetch(new Request(`https://${host}/x?token=${token}&k=v`, { headers }), gateEnv(minter));
+      const forwardedQuery = new URL((sent[sent.length - 1] as Request).url).search;
+      if (testCase.keeps) {
+        expect(forwardedQuery, testCase.label).toBe(`?token=${token}&k=v`);
+      } else {
+        expect(forwardedQuery, testCase.label).toBe("?k=v");
+      }
+    }
+    expect(sent).toHaveLength(4);
+  });
+});
+
+/** Decode the five entities the gate's escapeHtmlAttribute writes. */
+function decodeHtmlAttribute(text: string): string {
+  return text.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+
+async function cspHashOf(scriptText: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(scriptText)));
+  return `'sha256-${Buffer.from(digest).toString("base64")}'`;
+}
+
+describe("session gate v2: the staging token-strip page (DS5)", () => {
+  const STRIP_SCRIPT = 'location.replace(document.getElementById("next").href);';
+
+  it("answers a staging- GET with a verified ?token= with the page and the cookie: no minter call, no origin fetch", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-31T00:00:00.000Z"));
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const minter = okMinter();
+    const sent = mockOrigin();
+    const host = "staging-page-a.sbmstudio.com.au";
+    const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("page-a", { purpose: "staging", exp: nowSeconds + 3600 }));
+    const response = await gate.fetch(
+      new Request(`https://${host}/wp-admin/edit.php?token=${token}&post_type=page`, {
+        headers: { "sec-fetch-site": "cross-site", "sec-fetch-mode": "navigate", "sec-fetch-dest": "document" },
+      }),
+      gateEnv(minter),
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("set-cookie")).toBe(`__Host-dy_egt=${token}; Path=/; Max-Age=3600; HttpOnly; Secure; SameSite=Lax`);
+    expect(response.headers.get("content-security-policy")).toBe(
+      `default-src 'none'; script-src ${await cspHashOf(STRIP_SCRIPT)}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+    );
+    const body = await response.text();
+    expect(body).toBe(
+      "<!doctype html><meta charset=utf-8><title>Opening staging</title>" +
+        `<a id="next" href="https://${host}/wp-admin/edit.php?post_type=page">Continue</a>` +
+        `<script>${STRIP_SCRIPT}</script>`,
+    );
+    // The page itself never carries the token, and loads nothing.
+    expect(body).not.toContain(token);
+    expect(body).not.toMatch(/\bsrc=/);
+    expect(minter.mintIdToken).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
+  });
+
+  it("the page's next request (same-origin, the cookie, no token) reaches the origin with the token in X-DY-Session-Token", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin(() => new Response("<html>wp-admin</html>", { headers: { "content-type": "text/html" } }));
+    const host = "staging-page-b.sbmstudio.com.au";
+    const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("page-b", { purpose: "staging" }));
+    const page = await gate.fetch(new Request(`https://${host}/?token=${token}`, { headers: { "sec-fetch-site": "cross-site" } }), gateEnv(minter));
+    const cookiePair = (page.headers.get("set-cookie") as string).split(";")[0] as string;
+    const nextUrl = decodeHtmlAttribute(/href="([^"]*)"/.exec(await page.text())?.[1] as string);
+    expect(nextUrl).toBe(`https://${host}/`);
+
+    const next = await gate.fetch(
+      new Request(nextUrl, { headers: { cookie: cookiePair, "sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate" } }),
+      gateEnv(minter),
+    );
+    expect(next.status).toBe(200);
+    expect(await next.text()).toBe("<html>wp-admin</html>");
+    expect(next.headers.get("set-cookie")).toBeNull();
+    expect(sent).toHaveLength(1);
+    const forwarded = sent[0] as Request;
+    expect(forwarded.url).toBe(`https://staging-page-b${RUN_URL_SUFFIX}/`);
+    expect(forwarded.headers.get("x-dy-session-token")).toBe(token);
+    expect(forwarded.headers.get("cookie")).toBeNull();
+  });
+
+  it("HEAD gets the page too; POST, a WebSocket and the other hosts do not", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin(() => new Response(null, { status: 200, headers: { "x-origin": "1" } }));
+    const host = "staging-page-c.sbmstudio.com.au";
+    const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("page-c", { purpose: "staging" }));
+    const head = await gate.fetch(new Request(`https://${host}/?token=${token}`, { method: "HEAD" }), gateEnv(minter));
+    expect(head.headers.get("content-security-policy")).not.toBeNull();
+    expect(sent).toHaveLength(0);
+
+    const post = await gate.fetch(new Request(`https://${host}/wp-login.php?token=${token}`, { method: "POST", body: "log=a" }), gateEnv(minter));
+    expect(post.headers.get("x-origin")).toBe("1");
+    expect(post.headers.get("set-cookie")).not.toBeNull();
+    const socket = await gate.fetch(
+      new Request(`https://${host}/ws?token=${token}`, { headers: { upgrade: "websocket", connection: "Upgrade", origin: `https://${host}` } }),
+      gateEnv(minter),
+    );
+    expect(socket.headers.get("x-origin")).toBe("1");
+    for (const [label, purpose] of [
+      ["pma-page-c", "pma"],
+      ["spma-page-c", "pma"],
+      ["term-page-c", "terminal"],
+      ["sterm-page-c", "terminal"],
+    ] as const) {
+      const otherHost = `${label}.sbmstudio.com.au`;
+      const otherToken = await signSessionToken(CELL_A_V1_SECRET, otherHost, terminalClaims("page-c", { purpose }));
+      const response = await gate.fetch(new Request(`https://${otherHost}/?token=${otherToken}`), gateEnv(minter));
+      expect(response.headers.get("x-origin"), label).toBe("1");
+      expect(response.headers.get("content-security-policy"), label).toBeNull();
+    }
+    expect(sent).toHaveLength(6);
+  });
+
+  it("the next URL is absolute on this host, and escaped: a path cannot send the browser elsewhere", async () => {
+    const minter = okMinter();
+    mockOrigin();
+    const host = "staging-page-d.sbmstudio.com.au";
+    const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("page-d", { purpose: "staging" }));
+    const cases: Array<{ path: string; next: string }> = [
+      { path: `//evil.example/?token=${token}`, next: `https://${host}//evil.example/` },
+      { path: `/a'b/?x=1&token=${token}&y=2`, next: `https://${host}/a'b/?x=1&y=2` },
+      { path: `/%22%3E%3Cscript%3E?token=${token}`, next: `https://${host}/%22%3E%3Cscript%3E` },
+    ];
+    for (const testCase of cases) {
+      const response = await gate.fetch(new Request(`https://${host}${testCase.path}`), gateEnv(minter));
+      const body = await response.text();
+      const rawHref = /<a id="next" href="([^"]*)">/.exec(body)?.[1] as string;
+      expect(rawHref, testCase.path).not.toMatch(/['<>]/);
+      const nextUrl = decodeHtmlAttribute(rawHref);
+      expect(nextUrl, testCase.path).toBe(testCase.next);
+      expect(new URL(nextUrl).host, testCase.path).toBe(host);
+      // Exactly one script element: the constant one.
+      expect(body.match(/<script>/g), testCase.path).toHaveLength(1);
+      expect(body.endsWith(`<script>${STRIP_SCRIPT}</script>`), testCase.path).toBe(true);
+    }
+  });
+
+  it("a staging- ?token= that does not verify gets no page: the cookie-only rule decides", async () => {
+    const minter = okMinter();
+    const sent = mockOrigin();
+    const host = "staging-page-e.sbmstudio.com.au";
+    const cookieToken = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("page-e", { purpose: "staging" }));
+    const crossSite = await gate.fetch(
+      new Request(`https://${host}/?token=junk`, { headers: { cookie: `__Host-dy_egt=${cookieToken}`, "sec-fetch-site": "cross-site" } }),
+      gateEnv(minter),
+    );
+    expect(crossSite.status).toBe(401);
+    const sameOrigin = await gate.fetch(
+      new Request(`https://${host}/?token=junk`, { headers: { cookie: `__Host-dy_egt=${cookieToken}`, "sec-fetch-site": "same-origin" } }),
+      gateEnv(minter),
+    );
+    expect(sameOrigin.status).toBe(200);
+    expect(sameOrigin.headers.get("content-security-policy")).toBeNull();
+    expect(sameOrigin.headers.get("set-cookie")).toBeNull();
+    expect(sent).toHaveLength(1);
+    expect((sent[0] as Request).url).toBe(`https://staging-page-e${RUN_URL_SUFFIX}/?token=junk`);
+  });
+});
+
+describe("session gate v2: version skew (review M1)", () => {
+  /** An agency Worker rolled back below gate v2 (c0a9586): its minter reads only a bare audience string. */
+  function rolledBackMinter(): FakeMinter {
+    return {
+      mintIdToken: vi.fn(async (request: unknown) => {
+        // c0a9586 parseSessionGateAudience: typeof audience !== "string" -> null -> "audience-refused".
+        if (typeof request !== "string") {
+          return { ok: false, reason: "audience-refused" };
+        }
+        return { ok: true, idToken: `id-token-for:${request}`, expiresAt: Math.floor(Date.now() / 1000) + 3600 };
+      }),
+    };
+  }
+
+  it("term- and sterm- ask once more with the bare audience, and open", async () => {
+    for (const label of ["term-skew-a", "sterm-skew-a"]) {
+      const minter = rolledBackMinter();
+      const sent = mockOrigin();
+      const host = `${label}.sbmstudio.com.au`;
+      const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("skew-a"));
+      const response = await gate.fetch(new Request(`https://${host}/?token=${token}`), gateEnv(minter));
+      expect(response.status, label).toBe(200);
+      const audience = `https://${label}${RUN_URL_SUFFIX}`;
+      expect(minter.mintIdToken).toHaveBeenCalledTimes(2);
+      expect(minter.mintIdToken.mock.calls[0]?.[0]).toMatchObject({ audience });
+      expect(minter.mintIdToken.mock.calls[1]?.[0]).toBe(audience);
+      expect(sent).toHaveLength(1);
+      expect((sent[0] as Request).headers.get("x-serverless-authorization")).toBe(`Bearer id-token-for:${audience}`);
+    }
+  });
+
+  it("pma-, spma- and staging- never ask without the proof: a bare 503, one minter call, no origin fetch", async () => {
+    for (const [label, purpose] of [
+      ["pma-skew-b", "pma"],
+      ["spma-skew-b", "pma"],
+      ["staging-skew-b", "staging"],
+    ] as const) {
+      const minter = rolledBackMinter();
+      const sent = mockOrigin();
+      const host = `${label}.sbmstudio.com.au`;
+      const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("skew-b", { purpose }));
+      // A cookie-only request from the host's own page, so a staging- host reaches the minter (a GET with
+      // ?token= would get the token-strip page and no minter call).
+      const response = await gate.fetch(
+        new Request(`https://${host}/`, { headers: { cookie: `__Host-dy_egt=${token}`, "sec-fetch-site": "same-origin" } }),
+        gateEnv(minter),
+      );
+      expect(response.status, label).toBe(503);
+      expect(minter.mintIdToken, label).toHaveBeenCalledTimes(1);
+      expect(typeof minter.mintIdToken.mock.calls[0]?.[0], label).toBe("object");
+      expect(sent, label).toHaveLength(0);
+    }
+  });
+
+  it("a term- host does NOT ask again after caller-refused, unavailable, a garbage answer or a dropped call", async () => {
+    const answers: Array<() => Promise<unknown>> = [
+      async () => ({ ok: false, reason: "caller-refused" }),
+      async () => ({ ok: false, reason: "unavailable" }),
+      async () => ({ ok: false }),
+      async () => null,
+      async () => {
+        throw new Error("RPC dropped");
+      },
+    ];
+    let index = 0;
+    for (const answer of answers) {
+      index += 1;
+      const minter: FakeMinter = { mintIdToken: vi.fn(answer) };
+      const sent = mockOrigin();
+      const host = `term-skew-c${index}.sbmstudio.com.au`;
+      const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims(`skew-c${index}`));
+      const response = await gate.fetch(new Request(`https://${host}/?token=${token}`), gateEnv(minter));
+      expect(response.status, String(index)).toBe(503);
+      expect(minter.mintIdToken, String(index)).toHaveBeenCalledTimes(1);
+      expect(sent).toHaveLength(0);
+    }
+  });
+
+  it("asks only once more: a second audience-refused is a 503", async () => {
+    const minter: FakeMinter = { mintIdToken: vi.fn(async () => ({ ok: false, reason: "audience-refused" })) };
+    const sent = mockOrigin();
+    const host = "term-skew-d.sbmstudio.com.au";
+    const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("skew-d"));
+    const response = await gate.fetch(new Request(`https://${host}/?token=${token}`), gateEnv(minter));
+    expect(response.status).toBe(503);
+    expect(minter.mintIdToken).toHaveBeenCalledTimes(2);
     expect(sent).toHaveLength(0);
   });
 });

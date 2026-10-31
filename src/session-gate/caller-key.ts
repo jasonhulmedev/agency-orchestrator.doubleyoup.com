@@ -2,7 +2,7 @@
 //
 // WHY: a Workers service binding carries no caller identity. Any Worker script in the same Cloudflare account
 // can bind this Worker's SessionGateMinter entrypoint and ask it for Google ID tokens (I4 review M2). So the
-// gate proves who it is on every mint call with a key that only the gate and this Worker hold:
+// gate proves who it is on every mint call with a key that no other script in the account can compute:
 //
 //   key   = HKDF-SHA256(ikm = the UTF-8 text of DY_CLIENT_SECRET, empty salt,
 //                       info = "dy-session-minter-caller/v1:" + <gate script name>, 32 bytes)
@@ -10,10 +10,16 @@
 //
 // <gate script name> is the derived `dy-gate-<project>-<region>` (edgeGateScriptNameFor). ts is Unix seconds.
 //
-// THE ROOT is DY_CLIENT_SECRET: an agency-only, high-entropy secret that every fork already has (app issues
-// 32 random bytes as 43 base64url characters at onboarding and keeps only a scrypt hash of it). A Worker
-// script cannot read another script's secrets, so another script in the account cannot compute the key.
-// The key is bound to ONE gate script, so it signs only for that gate's (project, region).
+// THE ROOT is DY_CLIENT_SECRET: a high-entropy secret that every fork already has (app issues 32 random
+// bytes as 43 base64url characters at onboarding and keeps only a scrypt hash of it). A Worker script cannot
+// read another script's secrets, so another script in the account cannot compute the key. The key is bound
+// to ONE gate script, so it signs only for that gate's (project, region).
+//
+// TRUST EDGE (review L2): DY_CLIENT_SECRET is NOT known to this Worker alone. app-client.ts sends it to our
+// app's /oauth/token on every token exchange, so our app sees it in transit (and keeps its hash at rest).
+// Whoever can read it there can compute every caller key of this Worker. That alone mints nothing: a caller
+// must also run a script in the agency's Cloudflare account that binds the minter. The caller key protects
+// the minter from the OTHER scripts of the account, not from our app.
 //
 // edge-gate-deploy puts the key into the gate as the secret_text binding DY_MINTER_CALLER_KEY (64 lowercase
 // hex) and a NON-secret fingerprint of it as DY_MINTER_CALLER_FINGERPRINT. The minter derives the same key

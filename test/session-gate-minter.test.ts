@@ -9,7 +9,7 @@
 
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env.js";
-import { mintSessionGateIdToken, parseSessionGateAudience, readProjectNumber } from "../src/session-gate/minter.js";
+import { KEYLESS_TRANSITION_PREFIXES, mintSessionGateIdToken, parseSessionGateAudience, readProjectNumber } from "../src/session-gate/minter.js";
 import {
   CLIENT_SECRET_MIN_LENGTH,
   deriveMinterCallerKey,
@@ -352,6 +352,16 @@ describe("the minter caller key (planning/49 Phase 4 I3): the recipe, pinned", (
       expect(await verifyMinterCallerProof(key, VECTOR_AUDIENCE, ts, mac, now), `${String(ts)} ${String(mac)}`).toBe(false);
     }
   });
+
+  it("verifyMinterCallerProof refuses a ts that is negative, -0, above MAX_SAFE_INTEGER or infinite, even with its own MAC", async () => {
+    const key = await deriveMinterCallerKey(CLIENT_SECRET, VECTOR_GATE_SCRIPT);
+    // Each MAC is the right one for its own ts (the message holds `${ts}`), so only the ts check can refuse.
+    // -0 is the instant 0 (its message says "0"): at a real clock it is about 1.8e9 s of skew.
+    for (const ts of [-1, -VECTOR_TS, -0, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER + 1, 2 ** 60, Number.MAX_VALUE, Infinity, -Infinity]) {
+      const ownMac = await hmac(key, `v1|${VECTOR_AUDIENCE}|${ts}`);
+      expect(await verifyMinterCallerProof(key, VECTOR_AUDIENCE, ts, ownMac, VECTOR_TS), String(ts)).toBe(false);
+    }
+  });
 });
 
 describe("mintSessionGateIdToken: the caller proof (gate v2)", () => {
@@ -391,6 +401,13 @@ describe("mintSessionGateIdToken: the caller proof (gate v2)", () => {
       { name: "no mac", request: { audience, ts: now } },
       { name: "no ts", request: { audience, mac: valid.mac } },
       { name: "an object with no proof at all", request: { audience } },
+      { name: "a negative ts", request: await proofRequest(rightKey, audience, -1) },
+      { name: "a negative ts of now", request: await proofRequest(rightKey, audience, -now) },
+      { name: "a ts of -0", request: await proofRequest(rightKey, audience, -0) },
+      { name: "a ts above MAX_SAFE_INTEGER", request: await proofRequest(rightKey, audience, Number.MAX_SAFE_INTEGER + 1) },
+      { name: "a ts of MAX_SAFE_INTEGER", request: await proofRequest(rightKey, audience, Number.MAX_SAFE_INTEGER) },
+      { name: "a ts of Infinity", request: await proofRequest(rightKey, audience, Infinity) },
+      { name: "a ts of -Infinity", request: await proofRequest(rightKey, audience, -Infinity) },
     ];
     for (const testCase of refused) {
       expect(await mintSessionGateIdToken(env, testCase.request), testCase.name).toEqual({ ok: false, reason: "caller-refused" });
@@ -441,6 +458,13 @@ describe("mintSessionGateIdToken: the caller proof (gate v2)", () => {
 });
 
 describe("mintSessionGateIdToken: the transition rule for a call WITHOUT a proof (gate v1)", () => {
+  it("the keyless allow-list is exactly term and sterm, and frozen", () => {
+    expect(KEYLESS_TRANSITION_PREFIXES).toEqual(["term", "sterm"]);
+    expect(Object.isFrozen(KEYLESS_TRANSITION_PREFIXES)).toBe(true);
+    expect(() => (KEYLESS_TRANSITION_PREFIXES as string[]).push("pma")).toThrow(TypeError);
+    expect(KEYLESS_TRANSITION_PREFIXES).toEqual(["term", "sterm"]);
+  });
+
   it("serves term- and sterm- only; pma-, spma- and staging- are refused before any network call", async () => {
     const projectId = "dy-minter-keyless";
     const env = envForProject(projectId);

@@ -12,7 +12,8 @@
 //
 // planning/49 Phase 4 (I3): the transition rule over REAL workerd RPC. A call with no caller proof (what any
 // other script that binds the minter can send, and what a v1 gate sends) is refused for pma-, spma- and
-// staging-, and a v2 gate's { audience, ts, mac } object crosses the binding intact.
+// staging-, and a v2 gate's { audience, ts, mac } object crosses the binding intact. The staging token-strip
+// page (its CSP hash, its cookie) and the pma- query strip run here too.
 
 import { exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -43,9 +44,9 @@ function bytesToBase64url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/** A v1 terminal token for `host`, signed with the host key (Web Crypto: this file runs in workerd). */
-async function signTerminalToken(host: string, slug: string): Promise<string> {
-  const claims = { siteId: "site_test_1", slug, purpose: "terminal", uid: 119076, exp: 4102444800 };
+/** A v1 session token for `host`, signed with the host key (Web Crypto: this file runs in workerd). */
+async function signTerminalToken(host: string, slug: string, purpose = "terminal"): Promise<string> {
+  const claims = { siteId: "site_test_1", slug, purpose, uid: 119076, exp: 4102444800 };
   const payload = bytesToBase64url(new TextEncoder().encode(JSON.stringify(claims)));
   const hostKey = await deriveHostKey(CELL_A_V1_SECRET, host);
   const key = await crypto.subtle.importKey("raw", hostKey, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -100,6 +101,46 @@ describe("session gate under workerd", () => {
     expect(forwarded.headers.get("authorization")).toBe("Bearer client");
     // A terminal host forwards no Cookie header at all.
     expect(forwarded.headers.get("cookie")).toBeNull();
+  });
+
+  it("answers a staging- GET with a verified ?token= with the token-strip page: its CSP hash, its cookie, no fetch", async () => {
+    const minter = { mintIdToken: vi.fn(async () => ({ ok: false, reason: "unavailable" })) };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      throw new Error("no origin fetch is allowed in this test");
+    });
+    const host = "staging-docs-892769.doubleyoup.com";
+    const token = await signTerminalToken(host, "docs-892769", "staging");
+    const response = await gate.fetch(new Request(`https://${host}/wp-admin/?token=${token}&a=1`), gateEnv(minter));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("set-cookie")).toMatch(/^__Host-dy_egt=.+; Path=\/; Max-Age=\d+; HttpOnly; Secure; SameSite=Lax$/);
+    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+    const body = await response.text();
+    expect(body).toContain(`href="https://${host}/wp-admin/?a=1"`);
+    const script = /<script>(.*)<\/script>/.exec(body)?.[1] as string;
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(script)));
+    let binary = "";
+    for (const byte of digest) {
+      binary += String.fromCharCode(byte);
+    }
+    expect(response.headers.get("content-security-policy")).toContain(`script-src 'sha256-${btoa(binary)}';`);
+    expect(minter.mintIdToken).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("forwards a pma- request without the verified ?token=, and with it in X-DY-Session-Token", async () => {
+    const minter = { mintIdToken: vi.fn(async () => ({ ok: true, idToken: "id-token", expiresAt: Math.floor(Date.now() / 1000) + 3600 })) };
+    const sent: Request[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      sent.push(input as Request);
+      return new Response("origin");
+    });
+    const host = "pma-docs-892769.doubleyoup.com";
+    const token = await signTerminalToken(host, "docs-892769", "pma");
+    const response = await gate.fetch(new Request(`https://${host}/index.php?route=/&token=${token}&db=x`), gateEnv(minter));
+    expect(response.status).toBe(200);
+    const forwarded = sent[0] as Request;
+    expect(forwarded.url).toBe(`https://pma-docs-892769${RUN_URL_SUFFIX}/index.php?route=/&db=x`);
+    expect(forwarded.headers.get("x-dy-session-token")).toBe(token);
   });
 });
 

@@ -57,7 +57,8 @@
 //
 // SECRET HYGIENE: the session secret and the caller key go into the upload body and nowhere else. No result
 // carries either, and every failure detail passes through withoutSecrets before it leaves, in case an
-// upstream error ever quoted one. DY_CLIENT_SECRET never leaves this Worker. This module logs nothing.
+// upstream error ever quoted one. This module sends DY_CLIENT_SECRET nowhere (only app-client.ts sends it,
+// to our app's /oauth/token; see the TRUST EDGE in src/session-gate/caller-key.ts). This module logs nothing.
 //
 // IDEMPOTENT: a re-run of a converged gate is "unchanged"; any other re-run uploads the same script with the
 // same settings.

@@ -14,7 +14,8 @@
 //   browser -> https://<label>.<zone>/...?token=<session token>
 //           -> this gate: verify the token AT THE EDGE. Invalid or absent: 401, NO origin fetch, so a
 //              bot never wakes the scale-to-zero container, and no minter call.
-//           -> fetch https://<label><DY_RUN_URL_SUFFIX>/... (same method, path, query, body) with
+//           -> fetch https://<label><DY_RUN_URL_SUFFIX>/... (same method, path, query and body; on a pma-,
+//              spma- or staging- host the query loses the session token, see X-DY-Session-Token) with
 //              X-Serverless-Authorization: Bearer <Google ID token for that URL>
 //           -> Cloud Run (ingress all, IAM-authenticated, no allUsers). The container verifies the
 //              session token AGAIN (infra cell-run/terminal-image/server/token.js).
@@ -34,13 +35,17 @@
 //
 // THE MINTER CALLER PROOF (v2; planning/49 Phase 4, decision D1 A). A service binding carries no caller
 // identity, so the minter cannot tell this gate from any other script in the account that binds it. So
-// every mint call carries a proof made with DY_MINTER_CALLER_KEY, a key only this gate and the agency
-// Worker hold (HKDF of the Worker's DY_CLIENT_SECRET, bound to this gate's script name):
+// every mint call carries a proof made with DY_MINTER_CALLER_KEY: the HKDF of the agency Worker's
+// DY_CLIENT_SECRET, bound to this gate's script name. A Worker script cannot read another script's secrets,
+// so no other script in the account can make the proof:
 //   DY_MINTER.mintIdToken({ audience, ts, mac })
 //   ts  = Unix seconds now
 //   mac = base64url(HMAC_SHA256("v1|" + audience + "|" + ts, the 32 bytes of DY_MINTER_CALLER_KEY)), no padding
 // The minter refuses a proof more than 60 s from its clock. A v1 gate sent the bare audience string with no
 // proof; the minter serves that only for term- and sterm- (whose container checks the session token again).
+// VERSION SKEW (review M1): an agency Worker rolled back below this gate's release reads only the bare
+// string, and answers the object with "audience-refused". For a term- or sterm- host ONLY, the gate then
+// asks once more with the bare string (see idTokenFor). pma-, spma- and staging- never ask without the proof.
 //
 // TOKEN FORMAT (v1, unchanged from syd; MUST match the orchestrator's mintSessionToken, app's
 // mintEphemeralSessionToken and the container's verifier byte for byte):
@@ -55,23 +60,41 @@
 // WHAT THE CONTAINER NEEDS, and so what forwarding keeps: the terminal reads the token ONLY from the
 // `token` query parameter, on GET / and on the WebSocket upgrade /ws?token=... (infra terminal-image/server
 // index.js). It reads no cookie and no Authorization header, and its page inlines every asset, so the real
-// page makes exactly two requests: GET /?token=T, then the WebSocket /ws?token=T to location.host. So the
-// path and query pass unchanged. A terminal host (term-, sterm-) forwards NO Cookie header at all; the other
-// session hosts forward their cookies without the gate's own. The ID token goes in
+// page makes exactly two requests: GET /?token=T, then the WebSocket /ws?token=T to location.host. So on a
+// terminal host (term-, sterm-) the path and query pass unchanged, and NO Cookie header is forwarded. The
+// other session hosts forward their cookies without the gate's own. The ID token goes in
 // X-Serverless-Authorization: when both headers are present, Cloud Run checks only that one, so the client's
 // own Authorization header still reaches the container (a session image that does its own HTTP auth keeps
 // working).
 //
 // X-DY-Session-Token (v2): the session token this gate just verified, for a container that checks it again
 // from a header. The gate ALWAYS deletes any X-DY-Session-Token the client sent, so the container never
-// sees a header the gate did not write. It sets the header only on pma- and spma- hosts (phpMyAdmin checks
-// it before any of its own code runs, planning/49 Phase 4 decision D1 C). A terminal host (term-, sterm-)
-// keeps its own token path (the query) and gets no header; a staging- host gets none either.
+// sees a header the gate did not write. It sets the header on pma-, spma- and staging- hosts (phpMyAdmin
+// and the staging image check it before any of their own code runs, planning/49 Phase 4 decision D1 C and
+// DS3). On those hosts a verified ?token= is also REMOVED from the query the origin gets: the container
+// has the token in the header, Cloud Run and the web server do not log it, and phpMyAdmin does not read it
+// as its own CSRF `token`. A terminal host (term-, sterm-) keeps its own token path (the query) and gets no
+// header.
 //
-// COOKIE-ONLY REQUESTS (no ?token=) are the ones a cross-site page could cause the browser to send with the
-// gate's cookie attached, so they must come from this host's own pages: Sec-Fetch-Site must be
+// WHICH TOKEN COUNTS. A ?token= that verifies for this host is the session token, and wins over the cookie
+// (a fresh token over a stale one). A ?token= that does NOT verify is not a session token: phpMyAdmin's GET
+// forms and links send their own CSRF `token`. That request is then a COOKIE-ONLY request, under the rule
+// below, and the gate sets no cookie from it. So a cross-site link with ?token=<anything> gets no further
+// than a cross-site link with no token.
+//
+// COOKIE-ONLY REQUESTS (no verified ?token=) are the ones a cross-site page could cause the browser to send
+// with the gate's cookie attached, so they must come from this host's own pages: Sec-Fetch-Site must be
 // "same-origin" or "none" (typed into the address bar). Every WebSocket upgrade, with or without ?token=,
 // must carry Origin: https://<this host> (the real page opens it from this host). Otherwise 401, no fetch.
+//
+// THE STAGING TOKEN-STRIP PAGE (planning/49 Phase 4, decision DS5). A GET or HEAD on a staging- host with a
+// verified ?token= does not reach the origin. The gate sets its cookie and answers a small page of its own
+// (no-store, no external resources, a CSP that allows only the page's one inline script, no Referer). The
+// script calls location.replace() with the same URL without the session token. The browser then asks again
+// from this host's own page (Sec-Fetch-Site: same-origin) with the cookie, so the WordPress pages never
+// carry the token in the address bar, the history or a Referer. A 302 cannot do this: the browser keeps
+// Sec-Fetch-Site "cross-site" across a redirect from the app's navigation, and the cookie-only rule would
+// refuse it. On pma-, spma-, term- and sterm- hosts the token stays in the address bar (decision D4).
 
 // The gate's httpOnly session cookie (set below, read only by this gate). The __Host- prefix makes the
 // browser accept it only with Secure, Path=/ and no Domain, so it is bound to this exact host and no
@@ -83,8 +106,17 @@ const HOST_KEY_BITS = 256;
 const ID_TOKEN_REFRESH_MARGIN_SECONDS = 300;
 // The version tag at the start of every minter caller proof message (see THE MINTER CALLER PROOF above).
 const MINTER_CALLER_PROOF_VERSION = "v1";
-// The header that carries the verified session token to a pma- or spma- container (see X-DY-Session-Token).
+// The header that carries the verified session token to a pma-, spma- or staging- container (see
+// X-DY-Session-Token).
 const SESSION_TOKEN_HEADER = "x-dy-session-token";
+// The query parameter that carries the session token in the URL the app opens.
+const TOKEN_QUERY_PARAMETER = "token";
+// The purposes whose container reads the session token from X-DY-Session-Token: "pma" (pma-, spma-) and
+// "staging" (staging-). A "terminal" container (term-, sterm-) reads it from the query only.
+const HEADER_TOKEN_PURPOSES = ["pma", "staging"];
+// The one inline script of the staging token-strip page. Constant, so the page's CSP pins its hash. It reads
+// the target from the page's own link, so no request data is ever script text.
+const TOKEN_STRIP_SCRIPT = 'location.replace(document.getElementById("next").href);';
 
 // Binding grammars. Checked on every request, so a mis-set binding is a config error and can never turn the
 // gate into a proxy to some other host.
@@ -344,9 +376,26 @@ async function minterRequestFor(env, audience) {
   return { audience, ts, mac: bytesToBase64url(macBytes) };
 }
 
+// One call to the minter. Its answer, or null when the call itself fails.
+async function callMinter(env, mintRequest) {
+  try {
+    return await env.DY_MINTER.mintIdToken(mintRequest);
+  } catch (mintError) {
+    // A dropped RPC, or an agency Worker without the SessionGateMinter entrypoint (a fork that has not
+    // synced): fail closed, and say nothing about why to the browser.
+    return null;
+  }
+}
+
+// True when the minter refused the audience itself (not the caller, and not for lack of a key).
+function isAudienceRefusal(minted) {
+  return Boolean(minted) && minted.ok === false && minted.reason === "audience-refused";
+}
+
 // An ID token for `audience` from the agency Worker's minter, cached per isolate until
 // ID_TOKEN_REFRESH_MARGIN_SECONDS before its exp. Null when the minter refuses, fails or answers garbage.
-async function idTokenFor(env, audience) {
+// `expectedPurpose` is the host's purpose (resolveHostTarget).
+async function idTokenFor(env, audience, expectedPurpose) {
   const nowSeconds = Math.floor(Date.now() / 1000);
   const cached = idTokenCache.get(audience);
   if (cached !== undefined && nowSeconds < cached.expiresAt - ID_TOKEN_REFRESH_MARGIN_SECONDS) {
@@ -354,14 +403,19 @@ async function idTokenFor(env, audience) {
   }
   // A fresh proof for every mint call: the minter refuses one older than 60 s, so a cached proof is no use.
   const mintRequest = await minterRequestFor(env, audience);
-  let minted;
-  try {
-    minted = await env.DY_MINTER.mintIdToken(mintRequest);
-  } catch (mintError) {
-    // A dropped RPC, or an agency Worker without the SessionGateMinter entrypoint (a fork that has not
-    // synced): fail closed, and say nothing about why to the browser.
-    return null;
+  let minted = await callMinter(env, mintRequest);
+
+  // VERSION SKEW (review M1). An agency Worker rolled back below this gate's release reads only a bare
+  // audience string, so it answers the object with "audience-refused". Its edge-gate-deploy refuses to put
+  // an older gate back, so without this step such a rollback would break every terminal on the cell. So a
+  // terminal host (term-, sterm-) asks ONCE more, the v1 way: the bare audience, no proof. The minter serves
+  // that keyless form only for the terminal hosts, whose container checks the session token itself. Never
+  // for pma-, spma- or staging-: they need the proof on every call, so the gate never asks for their ID
+  // token without it. "caller-refused" (a wrong caller key) and "unavailable" are never asked again.
+  if (expectedPurpose === "terminal" && isAudienceRefusal(minted)) {
+    minted = await callMinter(env, audience);
   }
+
   if (!minted || minted.ok !== true || typeof minted.idToken !== "string" || typeof minted.expiresAt !== "number") {
     return null;
   }
@@ -369,22 +423,46 @@ async function idTokenFor(env, audience) {
   return minted.idToken;
 }
 
-// The request to the Cloud Run origin: the same method, headers and body as the browser's, to the same path
-// and query on `originUrl`. The gate's ID token REPLACES any X-Serverless-Authorization the
-// client sent, and Cloud Run checks only that header when it is present, so only the gate's ID token decides
-// Cloud Run's IAM check. The client's Authorization header passes to the container unchanged. Host
+// `search` (URL.search: "" or "?...") without its FIRST `token` parameter, the one
+// url.searchParams.get("token") reads. Every other parameter keeps its bytes and its order, so a later
+// `token` (phpMyAdmin's own) stays. Empty parameters ("&&") are dropped: no query parser reads them. ""
+// when nothing is left.
+function searchWithoutSessionToken(search) {
+  const kept = [];
+  let removed = false;
+  for (const part of search.slice(1).split("&")) {
+    if (part === "") {
+      continue;
+    }
+    // The same decoding as url.searchParams: a part holds no "&", so it is exactly one parameter.
+    const name = new URLSearchParams(part).keys().next().value;
+    if (!removed && name === TOKEN_QUERY_PARAMETER) {
+      removed = true;
+      continue;
+    }
+    kept.push(part);
+  }
+  if (kept.length === 0) {
+    return "";
+  }
+  return "?" + kept.join("&");
+}
+
+// The request to the Cloud Run origin: the same method, headers and body as the browser's, to `originUrl`
+// (the same path; the query as the fetch handler chose it). The gate's ID token REPLACES any
+// X-Serverless-Authorization the client sent, and Cloud Run checks only that header when it is present, so
+// only the gate's ID token decides Cloud Run's IAM check. The client's Authorization header passes to the container unchanged. Host
 // is dropped so the runtime sets it from the URL: Cloud Run routes by Host. A terminal host forwards no
 // Cookie header (the terminal reads none); another session host forwards its cookies minus the gate's.
-// X-DY-Session-Token: the client's is always deleted; a pma- or spma- host gets `verifiedToken`, the session
-// token this gate has just verified for this host (from the query or the gate cookie).
+// X-DY-Session-Token: the client's is always deleted; a pma-, spma- or staging- host gets `verifiedToken`,
+// the session token this gate has just verified for this host (from the query or the gate cookie).
 function originRequestFor(request, originUrl, idToken, target, verifiedToken) {
   const originRequest = new Request(originUrl, request);
   originRequest.headers.delete("host");
   originRequest.headers.set("x-serverless-authorization", "Bearer " + idToken);
   // Deleted on EVERY host: a container that reads this header must only ever see the value this gate wrote.
   originRequest.headers.delete(SESSION_TOKEN_HEADER);
-  // The "pma" purpose is exactly the pma- and spma- prefixes (SESSION_PREFIXES).
-  if (target.expectedPurpose === "pma") {
+  if (HEADER_TOKEN_PURPOSES.includes(target.expectedPurpose)) {
     originRequest.headers.set(SESSION_TOKEN_HEADER, verifiedToken);
   }
   if (target.expectedPurpose === "terminal") {
@@ -425,12 +503,12 @@ function isWebSocketUpgrade(request) {
 }
 
 // True when the request may be served from what it carries, by where it came from (see COOKIE-ONLY
-// REQUESTS above). `hasQueryToken`: the session token is in the URL, not only in the cookie.
-function requestContextAllowed(request, host, hasQueryToken) {
+// REQUESTS above). `hasVerifiedQueryToken`: the URL carries this host's session token, verified.
+function requestContextAllowed(request, host, hasVerifiedQueryToken) {
   if (isWebSocketUpgrade(request)) {
     return request.headers.get("Origin") === "https://" + host;
   }
-  if (hasQueryToken) {
+  if (hasVerifiedQueryToken) {
     return true;
   }
   const fetchSite = request.headers.get("Sec-Fetch-Site");
@@ -439,6 +517,72 @@ function requestContextAllowed(request, host, hasQueryToken) {
 
 function plainResponse(status, text) {
   return new Response(text, { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+}
+
+// The gate's Set-Cookie value for a session token that came in the URL. It lives no longer than the token,
+// and the gate re-checks exp on every request anyway.
+function gateCookieFor(session) {
+  const remainingSeconds = Math.max(0, session.claims.exp - Math.floor(Date.now() / 1000));
+  return `${COOKIE_NAME}=${session.token}; Path=/; Max-Age=${remainingSeconds}; HttpOnly; Secure; SameSite=Lax`;
+}
+
+// Escape text for a double-quoted HTML attribute value.
+function escapeHtmlAttribute(text) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// The CSP source of a script: 'sha256-' + base64(SHA-256(the script text)), standard base64 with padding.
+async function cspScriptHashSource(scriptText) {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(scriptText)));
+  let binary = "";
+  for (let i = 0; i < digest.length; i++) {
+    binary += String.fromCharCode(digest[i]);
+  }
+  return "'sha256-" + btoa(binary) + "'";
+}
+
+// The staging token-strip page (see THE STAGING TOKEN-STRIP PAGE above). `nextUrl` is ABSOLUTE, on this
+// host, so no path (for example "//elsewhere.example/") can make it leave this host. The link is also the
+// way on for a browser without script.
+async function tokenStripPage(nextUrl, session) {
+  const html =
+    "<!doctype html><meta charset=utf-8><title>Opening staging</title>" +
+    '<a id="next" href="' +
+    escapeHtmlAttribute(nextUrl) +
+    '">Continue</a><script>' +
+    TOKEN_STRIP_SCRIPT +
+    "</script>";
+  const contentSecurityPolicy =
+    "default-src 'none'; script-src " +
+    (await cspScriptHashSource(TOKEN_STRIP_SCRIPT)) +
+    "; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+  const headers = new Headers({
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "content-security-policy": contentSecurityPolicy,
+    // The page's URL holds the token: no Referer may carry it to the next request.
+    "referrer-policy": "no-referrer",
+    "x-content-type-options": "nosniff",
+  });
+  headers.append("Set-Cookie", gateCookieFor(session));
+  return new Response(html, { status: 200, headers });
+}
+
+// True for a request that gets the staging token-strip page instead of the origin.
+function getsTokenStripPage(request, target, session) {
+  if (target.expectedPurpose !== "staging" || !session.fromQuery) {
+    return false;
+  }
+  if (isWebSocketUpgrade(request)) {
+    return false;
+  }
+  // A page load. Any other method goes to the origin (without the token): a page must not drop its body.
+  return request.method === "GET" || request.method === "HEAD";
 }
 
 export default {
@@ -458,31 +602,53 @@ export default {
       return plainResponse(404, "not found");
     }
 
-    // The token comes from ?token= (minted into the URL) or, on follow-up requests, the gate's cookie. A
-    // fresh query token wins over a stale cookie.
-    const queryToken = url.searchParams.get("token");
-    const cookieToken = readCookie(request, COOKIE_NAME);
-    const token = queryToken || cookieToken;
+    // The session token comes from ?token= (minted into the URL) or, on follow-up requests, the gate's
+    // cookie (see WHICH TOKEN COUNTS above).
+    const hostKey = await deriveHostKey(env.DY_SESSION_SECRET, target.host);
+    let session = null;
+    const queryToken = url.searchParams.get(TOKEN_QUERY_PARAMETER);
+    if (queryToken !== null) {
+      const queryClaims = await verifyToken(queryToken, hostKey, target.expectedPurpose, target.slug);
+      if (queryClaims !== null) {
+        session = { token: queryToken, claims: queryClaims, fromQuery: true };
+      }
+    }
 
-    if (!requestContextAllowed(request, target.host, Boolean(queryToken))) {
+    if (!requestContextAllowed(request, target.host, session !== null)) {
       // A cookie-only request from another site, or a WebSocket from another origin: 401 at the edge, with
       // no minter call and no origin fetch.
       return unauthorized();
     }
 
-    const hostKey = await deriveHostKey(env.DY_SESSION_SECRET, target.host);
-    const claims = await verifyToken(token, hostKey, target.expectedPurpose, target.slug);
-    if (!claims) {
-      // Invalid or absent token: 401 at the edge, and DELIBERATELY no origin fetch and no minter call.
-      return unauthorized();
+    if (session === null) {
+      const cookieToken = readCookie(request, COOKIE_NAME);
+      const cookieClaims = await verifyToken(cookieToken, hostKey, target.expectedPurpose, target.slug);
+      if (cookieClaims === null) {
+        // Invalid or absent token: 401 at the edge, and DELIBERATELY no origin fetch and no minter call.
+        return unauthorized();
+      }
+      session = { token: cookieToken, claims: cookieClaims, fromQuery: false };
+    }
+
+    // On a pma-, spma- or staging- host the container reads the token from X-DY-Session-Token, so a verified
+    // ?token= leaves the query. A terminal reads it from the query, so its query passes unchanged.
+    let originSearch = url.search;
+    if (session.fromQuery && HEADER_TOKEN_PURPOSES.includes(target.expectedPurpose)) {
+      originSearch = searchWithoutSessionToken(url.search);
+    }
+
+    if (getsTokenStripPage(request, target, session)) {
+      // No minter call and no origin fetch: the next request, from this page, rides on the cookie.
+      return tokenStripPage("https://" + target.host + url.pathname + originSearch, session);
     }
 
     const audience = "https://" + target.label + env.DY_RUN_URL_SUFFIX;
-    const idToken = await idTokenFor(env, audience);
+    const idToken = await idTokenFor(env, audience, target.expectedPurpose);
     if (idToken === null) {
       return plainResponse(503, "session gateway unavailable");
     }
-    const originRequest = originRequestFor(request, audience + url.pathname + url.search, idToken, target, token);
+    const originUrl = audience + url.pathname + originSearch;
+    const originRequest = originRequestFor(request, originUrl, idToken, target, session.token);
 
     // Both origin fetches say redirect: "manual" EXPLICITLY: a redirect from the origin goes back to the
     // browser as it is and is never followed here, so this gate never fetches a URL the origin chose, with
@@ -494,19 +660,15 @@ export default {
       return fetch(originRequest, { redirect: "manual" });
     }
 
-    // Normal HTTP. When the token came in the URL, set a short-lived httpOnly cookie so follow-up requests
-    // and redirects that drop ?token= re-authenticate off it. It lives no longer than the token, and the
-    // gate re-checks exp on every request.
+    // Normal HTTP. When the token came in the URL (and verified), set a short-lived httpOnly cookie so
+    // follow-up requests and redirects that drop ?token= re-authenticate off it. A cookie is never set from
+    // a ?token= that did not verify.
     const originResponse = await fetch(originRequest, { redirect: "manual" });
-    if (!queryToken) {
+    if (!session.fromQuery) {
       return originResponse;
     }
     const response = new Response(originResponse.body, originResponse);
-    const remainingSeconds = Math.max(0, claims.exp - Math.floor(Date.now() / 1000));
-    response.headers.append(
-      "Set-Cookie",
-      `${COOKIE_NAME}=${token}; Path=/; Max-Age=${remainingSeconds}; HttpOnly; Secure; SameSite=Lax`,
-    );
+    response.headers.append("Set-Cookie", gateCookieFor(session));
     return response;
   },
 };

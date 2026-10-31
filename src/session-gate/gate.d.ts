@@ -34,7 +34,8 @@ export interface SessionGateEnv {
   DY_SESSION_SECRET?: string;
   DY_ZONE_SUFFIX?: string;
   DY_RUN_URL_SUFFIX?: string;
-  DY_MINTER?: { mintIdToken(request: SessionGateMintRequest): Promise<unknown> };
+  /** The object form with the caller proof; the bare audience string only in the version-skew retry. */
+  DY_MINTER?: { mintIdToken(request: SessionGateMintRequest | string): Promise<unknown> };
   DY_MINTER_CALLER_KEY?: string;
   DY_SESSION_KEY_VERSION?: string;
   DY_SESSION_KEY_FINGERPRINT?: string;
