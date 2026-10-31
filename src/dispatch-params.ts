@@ -4128,12 +4128,19 @@ export const CLOUD_RUN_PROBE_IMAGE =
  * lives in that project and region.
  */
 export const SESSION_IMAGE_REPO = "australia-southeast1-docker.pkg.dev/doubleyoup/dy-run-public";
-/** The image name in SESSION_IMAGE_REPO that each session prefix may run. */
+/**
+ * The image name in SESSION_IMAGE_REPO that each session prefix may run.
+ *
+ * pma and spma run `dy-run-pma` (planning/49 Phase 4), the platform's image derived from stock
+ * phpMyAdmin, never the stock image. The stock image verifies nothing, so anyone holding an ID token
+ * for the service would get the site's DB. dy-run-pma verifies the session token itself, and it reads
+ * the DB credentials from its read-only `platform/<slug>` mount, so no password travels in env.
+ */
 export const SESSION_IMAGE_NAMES: Readonly<Record<CloudRunSessionServicePrefix, string>> = {
   term: "dy-run-terminal",
   sterm: "dy-run-terminal",
-  pma: "phpmyadmin",
-  spma: "phpmyadmin",
+  pma: "dy-run-pma",
+  spma: "dy-run-pma",
   staging: "dy-run-wp",
 };
 /** The ONLY ports the probe may test: MariaDB on the data node and NFS on the file node. */
@@ -4253,16 +4260,19 @@ export function splitCloudRunSessionServiceName(
 }
 
 /**
- * The EXACT NFS export paths a session service may mount (hub#93 §2, §3), per purpose. They are the
- * paths the session recipes mount today (infra cell-run/provision-terminal.sh, provision-staging.sh,
- * provision-staging-terminal.sh), all under the same slug as the service:
+ * The EXACT NFS export paths a session service may mount (hub#93 §2, §3), per purpose, all under the
+ * same slug as the service:
  *   term    sites/<slug>, platform/<slug>
- *   staging sites/<slug>, platform/<slug>-staging
+ *   staging sites/<slug>/staging, platform/<slug>-staging
  *   sterm   sites/<slug>/staging, platform/<slug>-staging
- *   pma, spma  none (phpMyAdmin mounts nothing).
+ *   pma     platform/<slug>          (planning/49 Phase 4: the image reads the DB credentials here)
+ *   spma    platform/<slug>-staging
  * EXACT paths, not a prefix test: a prefix test on `sites/<slug>` would also admit `sites/<slug>-x`,
- * which is ANOTHER site's tree. And a staging service gets no path to the LIVE `platform/<slug>`, which
- * holds the live DB password.
+ * which is ANOTHER site's tree. A staging service gets no path to the LIVE `platform/<slug>`, which
+ * holds the live DB password, and no path to the whole `sites/<slug>`, which holds the LIVE docroot
+ * (planning/49 Phase 4, DS10: the host runner's provision-staging.sh mounts the whole tree; the agency
+ * path does not). A pma or spma service gets no `sites/` tree: it needs the DB credentials only, never
+ * the site's files. siteSessionReadOnlyNfsPathsFor lists the paths that must also be read-only.
  */
 export function siteSessionNfsPathsFor(prefix: CloudRunSessionServicePrefix, slug: string): string[] {
   const sitesPath = `${SITE_STORAGE_ROOT}/sites/${slug}`;
@@ -4271,11 +4281,36 @@ export function siteSessionNfsPathsFor(prefix: CloudRunSessionServicePrefix, slu
   if (prefix === "term") {
     return [sitesPath, platformPath];
   }
-  if (prefix === "staging") {
-    return [sitesPath, stagingPlatformPath];
-  }
-  if (prefix === "sterm") {
+  if (prefix === "staging" || prefix === "sterm") {
     return [`${sitesPath}/staging`, stagingPlatformPath];
+  }
+  if (prefix === "pma") {
+    return [platformPath];
+  }
+  if (prefix === "spma") {
+    return [stagingPlatformPath];
+  }
+  return [];
+}
+
+/**
+ * The NFS export paths a session service must mount with `readOnly: true` (planning/49 Phase 4), per
+ * purpose. Each is a `platform/` config dir: it holds a DB password and the platform's config for the
+ * site, and the session only READS it. phpMyAdmin is a large web app the user drives, and a staging site
+ * or shell runs the tenant's own code, so a read-only mount means a flaw there can read the dir but
+ * never rewrite it.
+ *   term    none (unchanged: the terminal's mounts stay as they are)
+ *   pma     platform/<slug>
+ *   staging, sterm, spma   platform/<slug>-staging (staging and sterm still write sites/<slug>/staging)
+ */
+export function siteSessionReadOnlyNfsPathsFor(prefix: CloudRunSessionServicePrefix, slug: string): string[] {
+  const platformPath = `${SITE_STORAGE_ROOT}/platform/${slug}`;
+  const stagingPlatformPath = `${SITE_STORAGE_ROOT}/platform/${slug}-staging`;
+  if (prefix === "pma") {
+    return [platformPath];
+  }
+  if (prefix === "staging" || prefix === "sterm" || prefix === "spma") {
+    return [stagingPlatformPath];
   }
   return [];
 }
@@ -4527,8 +4562,10 @@ function cleanCloudRunProbe(value: unknown): { ok: true; probe: CloudRunProbeSpe
 //          saga's `dy-cell-<region>` + `dy-cell-<region>-run-s<NNN>`, or a hand-built cell's registry
 //          names (planning/49 Phase 3: syd's `dy-vpc` + `dy-subnet-run-syd-s<NNN>`). Each NFS volume's
 //          `server` must be a private literal and its `path` one of the EXACT per-purpose paths for the
-//          service's OWN slug (siteSessionNfsPathsFor). `maxInstances` must be exactly 1: one writer per
-//          NFS mount, and the per-site /24 is sized for one instance per service (hub#93 G1).
+//          service's OWN slug (siteSessionNfsPathsFor). A `platform/` config dir of a pma or staging
+//          purpose must be read-only (siteSessionReadOnlyNfsPathsFor). `maxInstances` must be
+//          exactly 1: one writer per NFS mount, and the per-site /24 is sized for one instance per
+//          service (hub#93 G1).
 //       2. app ONLY, before it signs (agency-dispatch-site-binding.ts): slug -> Site -> Cell must match
 //          the job's project, region and account, the slot must be Site.runSlot, its subnet must be
 //          confirmed created, `network` must be the cell's effective network and `subnet` its effective
@@ -4750,6 +4787,7 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
       return { ok: false, reason: "serviceName must be <prefix>-<slug> with a site slug ([a-z0-9-], alphanumeric at both ends)" };
     }
     const allowedPaths = siteSessionNfsPathsFor(sessionName.prefix, sessionName.slug);
+    const readOnlyPaths = siteSessionReadOnlyNfsPathsFor(sessionName.prefix, sessionName.slug);
     for (const volume of cleanedNfsVolumes.nfsVolumes ?? []) {
       if (!allowedPaths.includes(volume.path)) {
         let allowedText = "no NFS volume at all";
@@ -4759,6 +4797,14 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
         return {
           ok: false,
           reason: `a ${sessionName.prefix}- session for "${sessionName.slug}" may mount ${allowedText} — not "${volume.path}"`,
+        };
+      }
+      // An absent readOnly means read-write, so only an explicit `true` passes.
+      const mustBeReadOnly = readOnlyPaths.includes(volume.path);
+      if (mustBeReadOnly && volume.readOnly !== true) {
+        return {
+          ok: false,
+          reason: `a ${sessionName.prefix}- session must mount "${volume.path}" read-only (readOnly: true)`,
         };
       }
     }
