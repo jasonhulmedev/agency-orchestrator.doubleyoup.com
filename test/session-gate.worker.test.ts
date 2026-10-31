@@ -7,8 +7,13 @@
 //   • the SessionGateMinter named entrypoint answers over workerd RPC. `exports.SessionGateMinter` (ctx.exports,
 //     on by compatibility date 2025-11-17) is a loopback service binding to that entrypoint: the same kind of
 //     binding edge-gate-deploy gives the gate as DY_MINTER, here to this Worker's own main module.
-// The test env has no GCP_SERVICE_ACCOUNT_KEY, so the minter never reaches Google: a refused audience and an
-// unavailable mint are the two answers it can give here, and both prove the RPC path.
+// The test env has no GCP_SERVICE_ACCOUNT_KEY, so the minter never reaches Google: a refused audience, a refused
+// caller and an unavailable mint are the answers it can give here, and each proves the RPC path.
+//
+// planning/49 Phase 4 (I3): the transition rule over REAL workerd RPC. A call with no caller proof (what any
+// other script that binds the minter can send, and what a v1 gate sends) is refused for pma-, spma- and
+// staging-, and a v2 gate's { audience, ts, mac } object crosses the binding intact. The token-strip page
+// (its CSP hash, its cookie) and the pma- query strip run here too.
 
 import { exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -28,6 +33,8 @@ const CELL_A_V1_TERM_DOCS_HOST_KEY = "O7kn2G9wDF-pw1Lk7t6Czb5_OiclM_Y_2mY_zYYBYR
 const CELL_A_V1_CHAIN_TOKEN =
   "eyJzaXRlSWQiOiJzaXRlX3Rlc3RfMSIsInNsdWciOiJkb2NzLTg5Mjc2OSIsInB1cnBvc2UiOiJ0ZXJtaW5hbCIsInVpZCI6MTE5MDc2LCJleHAiOjQxMDI0NDQ4MDB9.KPl03eKG2FrOdwSKC6wYVlNDrftjrNQeqqDMNk7L2wE";
 const RUN_URL_SUFFIX = "-123456789012.australia-southeast2.run.app";
+// A gate's minter caller key (64 lowercase hex), as edge-gate-deploy binds it.
+const MINTER_CALLER_KEY_HEX = "7b1eab777358b371e6e62d42117d5919b44e8e442605f2e9690861b9574abc77";
 
 function bytesToBase64url(bytes: Uint8Array): string {
   let binary = "";
@@ -37,9 +44,9 @@ function bytesToBase64url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/** A v1 terminal token for `host`, signed with the host key (Web Crypto: this file runs in workerd). */
-async function signTerminalToken(host: string, slug: string): Promise<string> {
-  const claims = { siteId: "site_test_1", slug, purpose: "terminal", uid: 119076, exp: 4102444800 };
+/** A v1 session token for `host`, signed with the host key (Web Crypto: this file runs in workerd). */
+async function signTerminalToken(host: string, slug: string, purpose = "terminal"): Promise<string> {
+  const claims = { siteId: "site_test_1", slug, purpose, uid: 119076, exp: 4102444800 };
   const payload = bytesToBase64url(new TextEncoder().encode(JSON.stringify(claims)));
   const hostKey = await deriveHostKey(CELL_A_V1_SECRET, host);
   const key = await crypto.subtle.importKey("raw", hostKey, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -53,6 +60,7 @@ function gateEnv(minter: unknown): SessionGateEnv {
     DY_ZONE_SUFFIX: ".doubleyoup.com",
     DY_RUN_URL_SUFFIX: RUN_URL_SUFFIX,
     DY_MINTER: minter as SessionGateEnv["DY_MINTER"],
+    DY_MINTER_CALLER_KEY: MINTER_CALLER_KEY_HEX,
   };
 }
 
@@ -94,6 +102,51 @@ describe("session gate under workerd", () => {
     // A terminal host forwards no Cookie header at all.
     expect(forwarded.headers.get("cookie")).toBeNull();
   });
+
+  it("answers a staging- or pma- GET with a verified ?token= with the token-strip page: its CSP hash, its cookie, no fetch", async () => {
+    const minter = { mintIdToken: vi.fn(async () => ({ ok: false, reason: "unavailable" })) };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      throw new Error("no origin fetch is allowed in this test");
+    });
+    for (const [prefix, purpose] of [
+      ["staging", "staging"],
+      ["pma", "pma"],
+    ]) {
+      const host = `${prefix}-docs-892769.doubleyoup.com`;
+      const token = await signTerminalToken(host, "docs-892769", purpose);
+      const response = await gate.fetch(new Request(`https://${host}/wp-admin/?token=${token}&a=1`), gateEnv(minter));
+      expect(response.status, prefix).toBe(200);
+      expect(response.headers.get("set-cookie"), prefix).toMatch(/^__Host-dy_egt=.+; Path=\/; Max-Age=\d+; HttpOnly; Secure; SameSite=Lax$/);
+      expect(response.headers.get("referrer-policy"), prefix).toBe("no-referrer");
+      const body = await response.text();
+      expect(body, prefix).toContain(`href="https://${host}/wp-admin/?a=1"`);
+      const script = /<script>(.*)<\/script>/.exec(body)?.[1] as string;
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(script)));
+      let binary = "";
+      for (const byte of digest) {
+        binary += String.fromCharCode(byte);
+      }
+      expect(response.headers.get("content-security-policy"), prefix).toContain(`script-src 'sha256-${btoa(binary)}';`);
+    }
+    expect(minter.mintIdToken).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("forwards a pma- POST without the verified ?token=, and with it in X-DY-Session-Token", async () => {
+    const minter = { mintIdToken: vi.fn(async () => ({ ok: true, idToken: "id-token", expiresAt: Math.floor(Date.now() / 1000) + 3600 })) };
+    const sent: Request[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      sent.push(input as Request);
+      return new Response("origin");
+    });
+    const host = "pma-docs-892769.doubleyoup.com";
+    const token = await signTerminalToken(host, "docs-892769", "pma");
+    const response = await gate.fetch(new Request(`https://${host}/index.php?route=/&token=${token}&db=x`, { method: "POST" }), gateEnv(minter));
+    expect(response.status).toBe(200);
+    const forwarded = sent[0] as Request;
+    expect(forwarded.url).toBe(`https://pma-docs-892769${RUN_URL_SUFFIX}/index.php?route=/&db=x`);
+    expect(forwarded.headers.get("x-dy-session-token")).toBe(token);
+  });
 });
 
 describe("SessionGateMinter over workerd RPC", () => {
@@ -104,6 +157,27 @@ describe("SessionGateMinter over workerd RPC", () => {
 
   it("is unavailable, with no detail, when this Worker has no service-account key", async () => {
     expect(await minterBinding.mintIdToken(`https://term-x${RUN_URL_SUFFIX}`)).toEqual({ ok: false, reason: "unavailable" });
+  });
+
+  it("refuses a call with NO caller proof for pma-, spma- and staging- (the transition rule), and lets term- and sterm- through it", async () => {
+    for (const prefix of ["pma", "spma", "staging"]) {
+      expect(await minterBinding.mintIdToken(`https://${prefix}-x${RUN_URL_SUFFIX}`), prefix).toEqual({ ok: false, reason: "caller-refused" });
+    }
+    // term- and sterm- pass the caller check without a proof; this Worker then has no key to mint with.
+    for (const prefix of ["term", "sterm"]) {
+      expect(await minterBinding.mintIdToken(`https://${prefix}-x${RUN_URL_SUFFIX}`), prefix).toEqual({ ok: false, reason: "unavailable" });
+    }
+  });
+
+  it("takes a v2 { audience, ts, mac } object over RPC without an error", async () => {
+    // The object crosses the binding and goes to the proof check. With no service-account key here the minter
+    // cannot check a proof, so the answer is "unavailable" (test/session-gate-minter.test.ts checks the proof
+    // itself, and that an object never falls back to the keyless rule, under Node).
+    const ts = Math.floor(Date.now() / 1000);
+    for (const prefix of ["term", "pma"]) {
+      const proof = { audience: `https://${prefix}-x${RUN_URL_SUFFIX}`, ts, mac: "A".repeat(43) };
+      expect(await minterBinding.mintIdToken(proof), prefix).toEqual({ ok: false, reason: "unavailable" });
+    }
   });
 
   it("is the gate's DY_MINTER: a valid session gets a bare 503 when no ID token can be minted, and no origin fetch", async () => {

@@ -1095,3 +1095,100 @@ describe("mintGoogleAccessToken", () => {
     expect(claims.scope).toBe("https://www.googleapis.com/auth/cloud-platform");
   });
 });
+
+// ── planning/49 Phase 4 (I3): the session gate's minter caller key, read back ───────────────────────
+
+describe("validateCfDns: the session gates' minter caller keys (advisory)", () => {
+  // DY_CLIENT_SECRET of the length app issues; the fingerprint is the independent vector for the gate
+  // dy-gate-dy-agency-proof-australia-southeast2 (test/session-gate-minter.test.ts).
+  const clientSecret = "unit-test-client-secret-not-a-real-one-0001";
+  const matchingFingerprint = "725390655535460c";
+  const gateEnv: Env = {
+    ...baseEnv,
+    CF_DNS_API_TOKEN: "cf-dns-token",
+    DY_WORKER_NAME: "sbmstudio",
+    DY_CLIENT_SECRET: clientSecret,
+    // Only project_id is read for this row.
+    GCP_SERVICE_ACCOUNT_KEY: JSON.stringify({ project_id: "dy-agency-proof" }),
+  };
+  const scriptsUrl = "https://api.cloudflare.com/client/v4/accounts/acc1/workers/scripts";
+
+  function settingsWith(bindings: unknown[]): Response {
+    return jsonResponse({ success: true, result: { bindings } });
+  }
+
+  function baseRoutes(scriptsList: unknown[]): Route[] {
+    return [
+      { match: (u) => u === "https://api.cloudflare.com/client/v4/zones?per_page=1", respond: () => jsonResponse({ success: true, result: [{ id: "z1", name: "sbmstudio.com.au" }] }) },
+      { match: (u) => u === "https://api.cloudflare.com/client/v4/accounts?per_page=1", respond: () => jsonResponse({ success: true, result: [{ id: "acc1" }] }) },
+      { match: (u) => u.startsWith("https://api.cloudflare.com/client/v4/accounts/acc1/cfd_tunnel"), respond: () => jsonResponse({ success: true, result: [] }) },
+      { match: (u) => u.includes("/rulesets/phases/"), respond: () => jsonResponse({ success: false, errors: [{ code: 10003 }] }, 404) },
+      { match: (u) => u === scriptsUrl, respond: () => jsonResponse({ success: true, result: scriptsList }) },
+      { match: (u) => u === "https://api.cloudflare.com/client/v4/zones/z1/workers/routes", respond: () => jsonResponse({ success: true, result: [] }) },
+    ];
+  }
+
+  it("reports each of this project's gates: matches, differs, has no caller key (v1), or unknown; other scripts are skipped", async () => {
+    const fetchMock = routedFetch([
+      { match: (u) => u === `${scriptsUrl}/dy-gate-dy-agency-proof-australia-southeast2/settings`, respond: () => settingsWith([{ type: "secret_text", name: "DY_MINTER_CALLER_KEY" }, { type: "plain_text", name: "DY_MINTER_CALLER_FINGERPRINT", text: matchingFingerprint }]) },
+      { match: (u) => u === `${scriptsUrl}/dy-gate-dy-agency-proof-australia-southeast1/settings`, respond: () => settingsWith([{ type: "plain_text", name: "DY_MINTER_CALLER_FINGERPRINT", text: matchingFingerprint }]) },
+      { match: (u) => u === `${scriptsUrl}/dy-gate-dy-agency-proof-us-central1/settings`, respond: () => settingsWith([{ type: "plain_text", name: "DY_SESSION_KEY_FINGERPRINT", text: "0123456789abcdef" }]) },
+      { match: (u) => u === `${scriptsUrl}/dy-gate-dy-agency-proof-asia-east1/settings`, respond: () => jsonResponse({ success: false }, 500) },
+      ...baseRoutes([
+        { id: "sbmstudio" },
+        { id: "dy-edge-gate" },
+        { id: "dy-gate-dy-agency-proof-australia-southeast2" },
+        { id: "dy-gate-dy-agency-proof-australia-southeast1" },
+        { id: "dy-gate-dy-agency-proof-us-central1" },
+        { id: "dy-gate-dy-agency-proof-asia-east1" },
+        // Another project whose id starts with this one's: never this project's gate.
+        { id: "dy-gate-dy-agency-proof-x-europe-west1" },
+      ]),
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await validateCfDns(gateEnv);
+    expect(result.ok).toBe(true);
+    expect(result.workersScope?.gateCallerKeys).toEqual([
+      { script: "dy-gate-dy-agency-proof-asia-east1", state: "unknown" },
+      // The australia-southeast2 fingerprint on the australia-southeast1 gate: each gate has its own key.
+      { script: "dy-gate-dy-agency-proof-australia-southeast1", state: "differs" },
+      { script: "dy-gate-dy-agency-proof-australia-southeast2", state: "matches" },
+      { script: "dy-gate-dy-agency-proof-us-central1", state: "not-bound" },
+    ]);
+    expect(result.detail).toContain("Session gate minter caller key: dy-gate-dy-agency-proof-asia-east1 unknown");
+    expect(result.detail).toContain("dy-gate-dy-agency-proof-australia-southeast1 DIFFERS (the minter refuses this gate's calls until edge-gate-deploy runs again)");
+    expect(result.detail).toContain("dy-gate-dy-agency-proof-australia-southeast2 matches");
+    expect(result.detail).toContain("dy-gate-dy-agency-proof-us-central1 has no caller key (gate v1");
+    expect(result.detail).not.toContain(clientSecret);
+    expect(result.detail).not.toContain("dy-gate-dy-agency-proof-x-europe-west1");
+    // Read-only: every call is a GET, and only this project's four gates had their settings read.
+    for (const call of fetchMock.mock.calls) {
+      const [, init] = call as unknown as [string, RequestInit | undefined];
+      expect(init?.method ?? "GET").toBe("GET");
+    }
+    const settingsReads = fetchMock.mock.calls.map((call) => String(call[0])).filter((url) => url.endsWith("/settings"));
+    expect(settingsReads).toHaveLength(4);
+  });
+
+  it("says when there is no gate yet, and does not check without a usable DY_CLIENT_SECRET or service-account key", async () => {
+    vi.stubGlobal("fetch", routedFetch(baseRoutes([{ id: "sbmstudio" }])));
+    const noGate = await validateCfDns(gateEnv);
+    expect(noGate.workersScope?.gateCallerKeys).toEqual([]);
+    expect(noGate.detail).toContain('Session gate minter caller key: no session gate of project "dy-agency-proof" in the account yet');
+    vi.unstubAllGlobals();
+
+    const gateList = [{ id: "dy-gate-dy-agency-proof-australia-southeast2" }];
+    for (const overrides of [{ DY_CLIENT_SECRET: "too-short" }, { GCP_SERVICE_ACCOUNT_KEY: undefined }]) {
+      const fetchMock = routedFetch(baseRoutes(gateList));
+      vi.stubGlobal("fetch", fetchMock);
+      const result = await validateCfDns({ ...gateEnv, ...overrides });
+      expect(result.ok).toBe(true);
+      expect(result.workersScope?.gateCallerKeys).toBeUndefined();
+      expect(result.detail).toMatch(/Session gate minter caller key: not checked/);
+      expect(result.detail).not.toContain("too-short");
+      // No gate settings were read.
+      expect(fetchMock.mock.calls.map((call) => String(call[0])).filter((url) => url.endsWith("/settings"))).toHaveLength(0);
+      vi.unstubAllGlobals();
+    }
+  });
+});

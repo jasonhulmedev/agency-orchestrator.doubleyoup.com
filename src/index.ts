@@ -62,10 +62,14 @@ export { NonceStore } from "./nonce-store.js";
  *
  * One RPC method. It mints from the agency's own key ONLY for this project's session service URLs and
  * returns the token and its exp, or a reason code with no token (src/session-gate/minter.ts). It never logs.
+ *
+ * planning/49 Phase 4 (I3): a binding carries no caller identity, so the caller proves itself. `request` is
+ * a v2 gate's `{ audience, ts, mac }` (a caller proof, src/session-gate/caller-key.ts), checked for every
+ * audience. A v1 gate's bare audience string carries no proof and is served for term- and sterm- only.
  */
 export class SessionGateMinter extends WorkerEntrypoint<Env> {
-  async mintIdToken(audience: unknown): Promise<SessionGateMintResult> {
-    return mintSessionGateIdToken(this.env, audience);
+  async mintIdToken(request: unknown): Promise<SessionGateMintResult> {
+    return mintSessionGateIdToken(this.env, request);
   }
 }
 

@@ -12,7 +12,14 @@ import type { Env } from "./env.js";
 import { signS3Request } from "./sigv4.js";
 import { errorMessage, extractXmlTag, isWorkerScriptName, stripTrailingSlash } from "./util.js";
 import { probeCustomHostnameScope, type CustomHostnameScopeReport } from "./actuate-custom-hostname.js";
-import { cellRunServiceAccountFor } from "./dispatch-params.js";
+import { cellRunServiceAccountFor, edgeGateScriptNameFor, isGcpRegionName } from "./dispatch-params.js";
+import {
+  CLIENT_SECRET_MIN_LENGTH,
+  MINTER_CALLER_FINGERPRINT_BINDING,
+  deriveMinterCallerKey,
+  isUsableClientSecret,
+  minterCallerKeyFingerprint,
+} from "./session-gate/caller-key.js";
 
 export interface ValidationResult {
   ok: boolean;
@@ -66,6 +73,28 @@ export interface WorkersScopeReport {
    * by that name and refuses without it. A presence check only (the deploy checks that the script exists).
    */
   workerName: "set" | "unset";
+  /**
+   * planning/49 Phase 4 (I3): this project's session gates in the account (`dy-gate-<project>-<region>`, at
+   * most GATE_CALLER_KEY_CHECK_LIMIT), each with how its DY_MINTER_CALLER_FINGERPRINT binding compares with
+   * the caller key this Worker derives from DY_CLIENT_SECRET. ABSENT when the check could not run (the
+   * scripts list was not read, or there is no readable GCP_SERVICE_ACCOUNT_KEY or usable DY_CLIENT_SECRET).
+   */
+  gateCallerKeys?: GateCallerKeyReport[];
+}
+
+/**
+ * One deployed session gate's minter caller key, by its fingerprint binding:
+ *   matches    the minter accepts this gate's proofs;
+ *   differs    the minter refuses this gate's proofs (for example, DY_CLIENT_SECRET changed after the deploy)
+ *              until edge-gate-deploy runs again;
+ *   not-bound  no caller key: a v1 gate, which gets ID tokens for term- and sterm- only;
+ *   unknown    its settings could not be read.
+ */
+export type GateCallerKeyState = "matches" | "differs" | "not-bound" | "unknown";
+
+export interface GateCallerKeyReport {
+  script: string;
+  state: GateCallerKeyState;
 }
 
 export interface AllValidations {
@@ -512,12 +541,16 @@ async function probeWafRulesScope(token: string, zoneId: string | undefined): Pr
   }
 }
 
-/** One READ-ONLY Workers probe: GET `url` with the token and classify the answer. Never throws. */
-async function probeWorkersRead(token: string, url: string): Promise<{ state: WorkersReadState; status: string }> {
+/**
+ * One READ-ONLY Workers probe: GET `url` with the token and classify the answer. Never throws. A 200 also
+ * returns its parsed JSON body (null when it is not JSON), so the scripts list can be read without a second call.
+ */
+async function probeWorkersRead(token: string, url: string): Promise<{ state: WorkersReadState; status: string; body?: unknown }> {
   try {
     const response = await fetch(url, { headers: { authorization: `Bearer ${token}`, accept: "application/json" } });
     if (response.status === 200) {
-      return { state: "read-ok", status: "HTTP 200" };
+      const body: unknown = await response.json().catch(() => null);
+      return { state: "read-ok", status: "HTTP 200", body };
     }
     if (response.status === 401 || response.status === 403) {
       return { state: "denied", status: `HTTP ${response.status}` };
@@ -526,6 +559,151 @@ async function probeWorkersRead(token: string, url: string): Promise<{ state: Wo
   } catch (err) {
     return { state: "unknown", status: `not sent: ${errorMessage(err)}` };
   }
+}
+
+/** The most session gates /validate reads back (one settings GET each). There is one gate per (project, region). */
+const GATE_CALLER_KEY_CHECK_LIMIT = 10;
+
+/** The project id inside GCP_SERVICE_ACCOUNT_KEY, or null when the key is absent or unreadable. */
+function serviceAccountKeyProjectIdOf(env: Env): string | null {
+  if (!env.GCP_SERVICE_ACCOUNT_KEY) {
+    return null;
+  }
+  // JSON.parse has no non-throwing form.
+  let key: ServiceAccountKey | null;
+  try {
+    key = JSON.parse(env.GCP_SERVICE_ACCOUNT_KEY) as ServiceAccountKey | null;
+  } catch {
+    return null;
+  }
+  if (key === null || typeof key !== "object" || typeof key.project_id !== "string" || key.project_id.length === 0) {
+    return null;
+  }
+  return key.project_id;
+}
+
+/**
+ * The names in a Workers scripts list that are session gates of `project`: exactly
+ * `dy-gate-<project>-<region>` (edgeGateScriptNameFor) for a region name, sorted. Null when the body is not
+ * a scripts list.
+ */
+function sessionGateScriptNamesIn(scriptsListBody: unknown, project: string): string[] | null {
+  if (scriptsListBody === null || typeof scriptsListBody !== "object") {
+    return null;
+  }
+  const scripts = (scriptsListBody as { result?: unknown }).result;
+  if (!Array.isArray(scripts)) {
+    return null;
+  }
+  // The derived name with an empty region is the part every gate of this project starts with.
+  const namePrefix = edgeGateScriptNameFor(project, "");
+  const gateNames: string[] = [];
+  for (const entry of scripts) {
+    const name = (entry as { id?: unknown } | null)?.id;
+    if (typeof name !== "string" || !name.startsWith(namePrefix)) {
+      continue;
+    }
+    const region = name.slice(namePrefix.length);
+    // A region name has exactly one hyphen, so another project whose id starts with this one ("p-x" after
+    // "p") never matches here.
+    if (!isGcpRegionName(region) || edgeGateScriptNameFor(project, region) !== name) {
+      continue;
+    }
+    gateNames.push(name);
+  }
+  gateNames.sort();
+  return gateNames;
+}
+
+/** Read one gate's DY_MINTER_CALLER_FINGERPRINT binding and compare it with `expectedFingerprint`. Never throws. */
+async function gateCallerKeyStateOf(token: string, accountId: string, script: string, expectedFingerprint: string): Promise<GateCallerKeyState> {
+  let response: Response;
+  try {
+    response = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(script)}/settings`,
+      { headers: { authorization: `Bearer ${token}`, accept: "application/json" } },
+    );
+  } catch {
+    return "unknown";
+  }
+  const body = (await response.json().catch(() => null)) as { success?: unknown; result?: { bindings?: unknown } } | null;
+  const bindings = body?.result?.bindings;
+  if (response.status !== 200 || body?.success !== true || !Array.isArray(bindings)) {
+    return "unknown";
+  }
+  for (const entry of bindings) {
+    const binding = entry as { type?: unknown; name?: unknown; text?: unknown } | null;
+    if (binding?.name !== MINTER_CALLER_FINGERPRINT_BINDING) {
+      continue;
+    }
+    if (binding.type === "plain_text" && binding.text === expectedFingerprint) {
+      return "matches";
+    }
+    return "differs";
+  }
+  return "not-bound";
+}
+
+/** One gate's caller key state as row text. */
+function gateCallerKeyText(report: GateCallerKeyReport): string {
+  if (report.state === "matches") {
+    return `${report.script} matches`;
+  }
+  if (report.state === "differs") {
+    return `${report.script} DIFFERS (the minter refuses this gate's calls until edge-gate-deploy runs again)`;
+  }
+  if (report.state === "not-bound") {
+    return `${report.script} has no caller key (gate v1: it gets ID tokens for term- and sterm- only until edge-gate-deploy updates it)`;
+  }
+  return `${report.script} unknown (its settings could not be read)`;
+}
+
+/**
+ * planning/49 Phase 4 (I3): READ-ONLY check that each of this project's deployed session gates carries the
+ * minter caller key this Worker derives from DY_CLIENT_SECRET, by comparing its DY_MINTER_CALLER_FINGERPRINT
+ * binding (a secret_text value cannot be read back). Reuses the scripts list the scope probe already read,
+ * plus one settings GET per gate. ADVISORY: never changes `ok`. Says nothing about the key but its fingerprint
+ * state.
+ */
+async function probeGateCallerKeys(
+  token: string,
+  accountId: string | undefined,
+  scriptsListBody: unknown,
+  env: Env,
+): Promise<{ detail: string; reports?: GateCallerKeyReport[] }> {
+  const head = "Session gate minter caller key";
+  const project = serviceAccountKeyProjectIdOf(env);
+  if (project === null) {
+    return { detail: `${head}: not checked (no readable GCP_SERVICE_ACCOUNT_KEY, so the gate names are unknown)` };
+  }
+  if (!isUsableClientSecret(env.DY_CLIENT_SECRET)) {
+    return {
+      detail:
+        `${head}: not checked — DY_CLIENT_SECRET is not set or is shorter than ${CLIENT_SECRET_MIN_LENGTH} characters; ` +
+        "the edge-gate deploy refuses without it",
+    };
+  }
+  const gateNames = sessionGateScriptNamesIn(scriptsListBody, project);
+  if (accountId === undefined || gateNames === null) {
+    return { detail: `${head}: not checked (the account's Workers scripts list was not read)` };
+  }
+  if (gateNames.length === 0) {
+    return { detail: `${head}: no session gate of project "${project}" in the account yet`, reports: [] };
+  }
+
+  const checkedNames = gateNames.slice(0, GATE_CALLER_KEY_CHECK_LIMIT);
+  const reports: GateCallerKeyReport[] = [];
+  for (const script of checkedNames) {
+    const callerKey = await deriveMinterCallerKey(env.DY_CLIENT_SECRET, script);
+    const expectedFingerprint = await minterCallerKeyFingerprint(callerKey);
+    const state = await gateCallerKeyStateOf(token, accountId, script, expectedFingerprint);
+    reports.push({ script, state });
+  }
+  let detail = `${head}: ${reports.map(gateCallerKeyText).join("; ")}`;
+  if (gateNames.length > checkedNames.length) {
+    detail += `; ${gateNames.length - checkedNames.length} more gate(s) not checked`;
+  }
+  return { detail, reports };
 }
 
 /**
@@ -538,8 +716,9 @@ async function probeWorkersRead(token: string, url: string): Promise<{ state: Wo
 async function probeWorkersScope(
   token: string,
   zone: { id: string | undefined; name: string | undefined },
-  workerName: string | undefined,
+  env: Env,
 ): Promise<{ detail: string; report: WorkersScopeReport }> {
+  const workerName = env.DY_WORKER_NAME;
   const editNote =
     "A read cannot prove Workers Scripts: Edit or Workers Routes: Edit; those are exercised on the first edge-gate deploy and route upsert.";
 
@@ -557,7 +736,10 @@ async function probeWorkersScope(
     accountId = undefined;
   }
 
-  let scripts: { state: WorkersReadState; status: string } = { state: "unknown", status: "the token's account could not be resolved" };
+  let scripts: { state: WorkersReadState; status: string; body?: unknown } = {
+    state: "unknown",
+    status: "the token's account could not be resolved",
+  };
   if (accountId) {
     scripts = await probeWorkersRead(token, `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/workers/scripts`);
   }
@@ -581,9 +763,15 @@ async function probeWorkersScope(
       workerNameText = `DY_WORKER_NAME: set ("${workerName}")`;
     }
   }
+  // planning/49 Phase 4 (I3): does each deployed gate carry this Worker's minter caller key?
+  const callerKeys = await probeGateCallerKeys(token, accountId, scripts.body, env);
+  const report: WorkersScopeReport = { scripts: scripts.state, routes: routes.state, workerName: workerNameState };
+  if (callerKeys.reports !== undefined) {
+    report.gateCallerKeys = callerKeys.reports;
+  }
   return {
-    detail: `Session edge gate (advisory, does not affect this check): ${scriptsText}; ${routesText}; ${workerNameText}. ${editNote}`,
-    report: { scripts: scripts.state, routes: routes.state, workerName: workerNameState },
+    detail: `Session edge gate (advisory, does not affect this check): ${scriptsText}; ${routesText}; ${workerNameText}; ${callerKeys.detail}. ${editNote}`,
+    report,
   };
 }
 
@@ -636,7 +824,7 @@ export async function validateCfDns(env: Env): Promise<ValidationResult> {
         // validates green, but a missing scope or fallback origin shows here, not on a customer's domain.
         const customHostnames = await probeCustomHostnameScope(env);
         // planning/49 Phase 3: the session edge gate's Workers scopes. Same non-fatal pattern.
-        const workers = await probeWorkersScope(env.CF_DNS_API_TOKEN, { id: body.result[0]?.id, name: zoneName }, env.DY_WORKER_NAME);
+        const workers = await probeWorkersScope(env.CF_DNS_API_TOKEN, { id: body.result[0]?.id, name: zoneName }, env);
         return {
           ok: true,
           detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch. ${tunnelStatus} ${cacheRulesStatus} ${wafRulesStatus} ${customHostnames.detail} ${workers.detail}`,

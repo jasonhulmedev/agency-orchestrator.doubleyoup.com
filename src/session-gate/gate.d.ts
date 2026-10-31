@@ -20,14 +20,26 @@ export interface SessionTokenClaims {
   exp: number;
 }
 
+/** What gate v2 sends to the minter: the audience and its caller proof (see the header of gate.js). */
+export interface SessionGateMintRequest {
+  audience: string;
+  /** Unix seconds when the proof was made. */
+  ts: number;
+  /** base64url(HMAC-SHA256(caller key, "v1|" + audience + "|" + ts)), no padding. */
+  mac: string;
+}
+
 /** The gate's bindings (see the header of gate.js). */
 export interface SessionGateEnv {
   DY_SESSION_SECRET?: string;
   DY_ZONE_SUFFIX?: string;
   DY_RUN_URL_SUFFIX?: string;
-  DY_MINTER?: { mintIdToken(audience: string): Promise<unknown> };
+  /** The object form with the caller proof; the bare audience string only in the version-skew retry. */
+  DY_MINTER?: { mintIdToken(request: SessionGateMintRequest | string): Promise<unknown> };
+  DY_MINTER_CALLER_KEY?: string;
   DY_SESSION_KEY_VERSION?: string;
   DY_SESSION_KEY_FINGERPRINT?: string;
+  DY_MINTER_CALLER_FINGERPRINT?: string;
 }
 
 export function configurationProblem(env: SessionGateEnv): string | null;
