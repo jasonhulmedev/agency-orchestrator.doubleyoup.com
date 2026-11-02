@@ -4265,7 +4265,9 @@ export function splitCloudRunSessionServiceName(
  *   term    sites/<slug>, platform/<slug>
  *   staging sites/<slug>/staging, platform/<slug>-staging
  *   sterm   sites/<slug>/staging, platform/<slug>-staging
- *   pma     platform/<slug>          (planning/49 Phase 4: the image reads the DB credentials here)
+ *   pma     platform/<slug>          (planning/49 Phase 4: the image reads the DB credentials here),
+ *           and platform/<slug>-staging when it also lists the staging DB (hub#223 D3, see
+ *           pmaSessionStagingServerReason)
  *   spma    platform/<slug>-staging
  * EXACT paths, not a prefix test: a prefix test on `sites/<slug>` would also admit `sites/<slug>-x`,
  * which is ANOTHER site's tree. A staging service gets no path to the LIVE `platform/<slug>`, which
@@ -4285,7 +4287,7 @@ export function siteSessionNfsPathsFor(prefix: CloudRunSessionServicePrefix, slu
     return [`${sitesPath}/staging`, stagingPlatformPath];
   }
   if (prefix === "pma") {
-    return [platformPath];
+    return [platformPath, stagingPlatformPath];
   }
   if (prefix === "spma") {
     return [stagingPlatformPath];
@@ -4300,19 +4302,121 @@ export function siteSessionNfsPathsFor(prefix: CloudRunSessionServicePrefix, slu
  * or shell runs the tenant's own code, so a read-only mount means a flaw there can read the dir but
  * never rewrite it.
  *   term    none (unchanged: the terminal's mounts stay as they are)
- *   pma     platform/<slug>
+ *   pma     platform/<slug> and platform/<slug>-staging
  *   staging, sterm, spma   platform/<slug>-staging (staging and sterm still write sites/<slug>/staging)
  */
 export function siteSessionReadOnlyNfsPathsFor(prefix: CloudRunSessionServicePrefix, slug: string): string[] {
   const platformPath = `${SITE_STORAGE_ROOT}/platform/${slug}`;
   const stagingPlatformPath = `${SITE_STORAGE_ROOT}/platform/${slug}-staging`;
   if (prefix === "pma") {
-    return [platformPath];
+    return [platformPath, stagingPlatformPath];
   }
   if (prefix === "staging" || prefix === "sterm" || prefix === "spma") {
     return [stagingPlatformPath];
   }
   return [];
+}
+
+/**
+ * The reason a staging- session's NFS volumes are not its one allowed shape, or null when they are
+ * (hub#223, D3). The loop in validateCloudRunServiceUpsertParams already refuses any path that is not
+ * one of the two staging paths of this slug. This adds the count and the pairing:
+ *   - EXACTLY two volumes. A staging WordPress with no docroot or no config cannot serve, and a third
+ *     volume could only repeat an allowed path at a second mount point.
+ *   - each staging path exactly ONCE: the staging tree (sites/<slug>/staging) and the staging config
+ *     dir (platform/<slug>-staging).
+ *   - both from the SAME server. The twin cannot know the cell's file node; app binds each server to it
+ *     before it signs. Two different servers would mean one of them is not that file node.
+ */
+function stagingSessionNfsVolumesReason(slug: string, nfsVolumes: CloudRunNfsVolume[] | undefined): string | null {
+  const requiredPaths = siteSessionNfsPathsFor("staging", slug);
+  const shapeRule =
+    `a staging- session for "${slug}" must mount exactly two NFS volumes, ${requiredPaths.join(" and ")}, ` +
+    "each once and both from the cell's file node";
+  if (nfsVolumes === undefined || nfsVolumes.length !== requiredPaths.length) {
+    return shapeRule;
+  }
+  for (const requiredPath of requiredPaths) {
+    const volumesWithPath = nfsVolumes.filter((volume) => volume.path === requiredPath);
+    if (volumesWithPath.length !== 1) {
+      return shapeRule;
+    }
+  }
+  const firstServer = nfsVolumes[0].server;
+  for (const volume of nfsVolumes) {
+    if (volume.server !== firstServer) {
+      return `${shapeRule} — not from two different servers`;
+    }
+  }
+  return null;
+}
+
+/**
+ * The env names of the shared pma's SECOND server entry: the site's staging DB (hub#223, D3). The first
+ * entry is the live DB and keeps the single-server env unchanged (DY_WPCONFIG_REAL and the rest), so a pma
+ * without these names behaves exactly as before.
+ *   DY_STAGING_WPCONFIG_REAL  exactly /platform/<slug>-staging/wp-config-real.php. The image reads the
+ *                             dedicated staging user from it, as the site user, from the read-only
+ *                             platform/<slug>-staging mount (decision D2: no DB password in the env).
+ *   DY_STAGING_DB_NAME        exactly siteStagingDatabaseNameFor(slug). The image limits the entry to this
+ *                             schema and refuses a staging config that names another one.
+ */
+export const PMA_STAGING_SERVER_ENV_NAMES = ["DY_STAGING_WPCONFIG_REAL", "DY_STAGING_DB_NAME"] as const;
+
+/**
+ * The staging schema of a site on its cell's data node: the live DB name plus "_staging". The live DB
+ * name is the slug with each "-" mapped to "_" (MariaDB identifiers and the cell-agent take
+ * [A-Za-z0-9_] only; the orchestrator's cellDbIdentifiers, infra cell-agent clone-staging-db.sh). The
+ * longest slug (46) gives 54 characters, under MariaDB's 64.
+ */
+export function siteStagingDatabaseNameFor(slug: string): string {
+  const liveDatabaseName = slug.replace(/-/g, "_");
+  return `${liveDatabaseName}_staging`;
+}
+
+/**
+ * The reason a pma- session's staging server entry is wrong, or null when it is right or absent
+ * (hub#223, D3: one shared pma lists prod and staging). The rule:
+ *   - both PMA_STAGING_SERVER_ENV_NAMES, or neither. Half an entry is refused.
+ *   - DY_STAGING_DB_NAME is this site's staging schema. A staging entry on any other schema (the live
+ *     one, another site's) is refused.
+ *   - DY_STAGING_WPCONFIG_REAL is this site's staging config, nothing else.
+ *   - the read-only platform/<slug>-staging volume is mounted when, and only when, the entry is present.
+ *     A pma that does not list staging gets no path to the staging config.
+ * No value is put in a reason: the env of a session service is never echoed (planning/49 §5.2).
+ */
+function pmaSessionStagingServerReason(
+  slug: string,
+  env: CloudRunEnvVar[] | undefined,
+  nfsVolumes: CloudRunNfsVolume[] | undefined,
+): string | null {
+  const envEntries = env ?? [];
+  const wpConfigEntry = envEntries.find((entry) => entry.name === "DY_STAGING_WPCONFIG_REAL");
+  const databaseNameEntry = envEntries.find((entry) => entry.name === "DY_STAGING_DB_NAME");
+  const stagingPlatformPath = `${SITE_STORAGE_ROOT}/platform/${slug}-staging`;
+  const mountsStagingPlatform = (nfsVolumes ?? []).some((volume) => volume.path === stagingPlatformPath);
+
+  if (wpConfigEntry === undefined && databaseNameEntry === undefined) {
+    if (mountsStagingPlatform) {
+      return `a pma- session may mount ${stagingPlatformPath} only when it lists the staging DB (${PMA_STAGING_SERVER_ENV_NAMES.join(" and ")})`;
+    }
+    return null;
+  }
+  if (wpConfigEntry === undefined || databaseNameEntry === undefined) {
+    return `a pma- session's staging server entry needs both ${PMA_STAGING_SERVER_ENV_NAMES.join(" and ")}, or neither`;
+  }
+  const stagingDatabaseName = siteStagingDatabaseNameFor(slug);
+  if (databaseNameEntry.value !== stagingDatabaseName) {
+    return `a pma- session's staging server entry must use the schema ${stagingDatabaseName} (DY_STAGING_DB_NAME), not another schema`;
+  }
+  const stagingWpConfigPath = `/platform/${slug}-staging/wp-config-real.php`;
+  if (wpConfigEntry.value !== stagingWpConfigPath) {
+    return `a pma- session's staging server entry must read ${stagingWpConfigPath} (DY_STAGING_WPCONFIG_REAL), not another file`;
+  }
+  if (!mountsStagingPlatform) {
+    return `a pma- session that lists the staging DB must mount ${stagingPlatformPath} read-only`;
+  }
+  return null;
 }
 
 /** True when `value` is an absolute POSIX path that contains no "." or ".." segment. */
@@ -4565,7 +4669,9 @@ function cleanCloudRunProbe(value: unknown): { ok: true; probe: CloudRunProbeSpe
 //          service's OWN slug (siteSessionNfsPathsFor). A `platform/` config dir of a pma or staging
 //          purpose must be read-only (siteSessionReadOnlyNfsPathsFor). `maxInstances` must be
 //          exactly 1: one writer per NFS mount, and the per-site /24 is sized for one instance per
-//          service (hub#93 G1).
+//          service (hub#93 G1). hub#223 D3: a staging- session mounts exactly its two staging volumes
+//          from one server (stagingSessionNfsVolumesReason), and a pma- session may list the site's
+//          staging DB as a second server entry, on `<slug>_staging` only (pmaSessionStagingServerReason).
 //       2. app ONLY, before it signs (agency-dispatch-site-binding.ts): slug -> Site -> Cell must match
 //          the job's project, region and account, the slot must be Site.runSlot, its subnet must be
 //          confirmed created, `network` must be the cell's effective network and `subnet` its effective
@@ -4806,6 +4912,18 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
           ok: false,
           reason: `a ${sessionName.prefix}- session must mount "${volume.path}" read-only (readOnly: true)`,
         };
+      }
+    }
+    if (sessionName.prefix === "staging") {
+      const stagingVolumesReason = stagingSessionNfsVolumesReason(sessionName.slug, cleanedNfsVolumes.nfsVolumes);
+      if (stagingVolumesReason !== null) {
+        return { ok: false, reason: stagingVolumesReason };
+      }
+    }
+    if (sessionName.prefix === "pma") {
+      const stagingServerReason = pmaSessionStagingServerReason(sessionName.slug, cleanedEnv.env, cleanedNfsVolumes.nfsVolumes);
+      if (stagingServerReason !== null) {
+        return { ok: false, reason: stagingServerReason };
       }
     }
   }
