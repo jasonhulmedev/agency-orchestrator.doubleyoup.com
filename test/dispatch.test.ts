@@ -67,6 +67,8 @@ import {
   SESSION_IMAGE_NAMES,
   siteSessionNfsPathsFor,
   siteSessionReadOnlyNfsPathsFor,
+  siteStagingDatabaseNameFor,
+  PMA_STAGING_SERVER_ENV_NAMES,
   validateGcpSubnetsListParams,
   validateGcpProjectQuotaGetParams,
   GCP_PROJECT_QUOTA_METRIC,
@@ -550,7 +552,7 @@ const CLOUD_RUN_PROBE_REF_PARAMS = { project: "dy-agency-proof", region: "austra
 // this marker up to, not including, the next section rule after it). Changing the block means changing
 // BOTH twins and BOTH pins in one go.
 const TWIN_BLOCK_START_MARKER = "// ── planning/49: the agency-side ephemeral-compute ops";
-const TWIN_BLOCK_SHA256 = "085e75e0412c54088e04fb6f7066bd59a2783478b687fd8382e263a5d2b34e1b";
+const TWIN_BLOCK_SHA256 = "d6960be2a45c57fd16037dad1bc6f83ae618c52bdb8aace81b72f40ad87e2d3f";
 
 function planning49Job(op: DispatchJob["op"], params: unknown, nonce: string): DispatchJob {
   return sampleJob({ op, params: JSON.stringify(params), nonce });
@@ -3514,7 +3516,18 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     // planning/49 Phase 4: pma runs the platform's derived image, never the stock phpMyAdmin.
     expectRefused(withImage("pma-docs-892769", repo + "/phpmyadmin" + digest), /^a pma- session service must run .*\/dy-run-pma@sha256:<64 hex>/);
     expectRefused(withImage("spma-docs-892769", repo + "/phpmyadmin" + digest), /^a spma- session service must run .*\/dy-run-pma@sha256:<64 hex>/);
-    expect(withImage("staging-docs-892769", repo + "/dy-run-wp" + digest).ok).toBe(true);
+    // A staging- session must also carry its two staging volumes (hub#223), so this check adds them.
+    const stagingVolumes = [
+      { name: "sites", server: "10.20.0.4", path: "/srv/dy-storage/sites/docs-892769/staging", mountPath: "/sites/docs-892769/staging" },
+      { name: "platstaging", server: "10.20.0.4", path: "/srv/dy-storage/platform/docs-892769-staging", mountPath: "/platform/docs-892769-staging", readOnly: true },
+    ];
+    const stagingVerdict = validateCloudRunServiceUpsertParams({
+      ...SITE_SESSION_PARAMS,
+      serviceName: "staging-docs-892769",
+      image: repo + "/dy-run-wp" + digest,
+      nfsVolumes: stagingVolumes,
+    });
+    expect(stagingVerdict.ok).toBe(true);
     const reason = /^a term- session service must run australia-southeast1-docker\.pkg\.dev\/doubleyoup\/dy-run-public\/dy-run-terminal@sha256:<64 hex> \(the platform's public session image repo, planning\/49 §4\.5\)$/;
     // Another registry, with the right name.
     expectRefused(withImage("term-docs-892769", "docker.io/library/dy-run-terminal" + digest), reason);
@@ -3619,6 +3632,63 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     }
   });
 
+  it("cloudrun-service-upsert SESSION (hub#223): a staging- upsert is exactly the pinned dy-run-wp and its two staging volumes from one file node", () => {
+    const sitesStaging = "/srv/dy-storage/sites/docs-892769/staging";
+    const platformStaging = "/srv/dy-storage/platform/docs-892769-staging";
+    const stagingVolumes = [
+      { name: "sites", server: "10.20.0.4", path: sitesStaging, mountPath: "/sites/docs-892769/staging" },
+      { name: "platstaging", server: "10.20.0.4", path: platformStaging, mountPath: "/platform/docs-892769-staging", readOnly: true },
+    ];
+    const stagingUpsert = (overrides: Record<string, unknown>) =>
+      validateCloudRunServiceUpsertParams({
+        ...SITE_SESSION_PARAMS,
+        serviceName: "staging-docs-892769",
+        image: sessionImageFor("staging-docs-892769"),
+        nfsVolumes: stagingVolumes,
+        ...overrides,
+      });
+    const shapeRefusal = /^a staging- session for "docs-892769" must mount exactly two NFS volumes, /;
+
+    // The valid spec passes and the volumes survive into the signed params unchanged.
+    const verdict = stagingUpsert({});
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) {
+      expect(verdict.params.serviceName).toBe("staging-docs-892769");
+      expect(verdict.params.nfsVolumes).toEqual(stagingVolumes);
+    }
+
+    // Production's tree and production's config dir are refused.
+    expectRefused(stagingUpsert({ nfsVolumes: [stagingVolumes[0], { ...stagingVolumes[1], path: "/srv/dy-storage/platform/docs-892769" }] }), /may mount only/);
+    expectRefused(stagingUpsert({ nfsVolumes: [{ ...stagingVolumes[0], path: "/srv/dy-storage/sites/docs-892769" }, stagingVolumes[1]] }), /may mount only/);
+    // Another site's staging paths are refused, the prefix trap too.
+    expectRefused(stagingUpsert({ nfsVolumes: [{ ...stagingVolumes[0], path: "/srv/dy-storage/sites/geelongns/staging" }, stagingVolumes[1]] }), /may mount only/);
+    expectRefused(stagingUpsert({ nfsVolumes: [stagingVolumes[0], { ...stagingVolumes[1], path: "/srv/dy-storage/platform/docs-892769-x-staging" }] }), /may mount only/);
+
+    // A third volume is refused, also when it repeats an allowed path at another mount point.
+    const thirdVolume = { ...stagingVolumes[0], name: "extra", mountPath: "/extra" };
+    expectRefused(stagingUpsert({ nfsVolumes: [...stagingVolumes, thirdVolume] }), shapeRefusal);
+    // One volume, no volume, or the same path twice is refused.
+    expectRefused(stagingUpsert({ nfsVolumes: [stagingVolumes[0]] }), shapeRefusal);
+    expectRefused(stagingUpsert({ nfsVolumes: undefined }), shapeRefusal);
+    expectRefused(stagingUpsert({ nfsVolumes: [stagingVolumes[0], { ...stagingVolumes[0], name: "again", mountPath: "/again" }] }), shapeRefusal);
+    // The two volumes must come from the same server (app binds that server to the cell's file node).
+    expectRefused(
+      stagingUpsert({ nfsVolumes: [stagingVolumes[0], { ...stagingVolumes[1], server: "10.20.0.9" }] }),
+      /^a staging- session for "docs-892769" must mount exactly two NFS volumes, .* — not from two different servers$/,
+    );
+
+    // An unpinned image is refused: another image name, another repo, a tag instead of a digest.
+    const digest = "@sha256:" + "a".repeat(64);
+    for (const image of [
+      `${SESSION_IMAGE_REPO_FOR_TESTS}/dy-run-terminal${digest}`,
+      `${SESSION_IMAGE_REPO_FOR_TESTS}/dy-run-pma${digest}`,
+      `docker.io/library/wordpress${digest}`,
+      `${SESSION_IMAGE_REPO_FOR_TESTS}/dy-run-wp:latest`,
+    ]) {
+      expectRefused(stagingUpsert({ image }), /^a staging- session service must run .*\/dy-run-wp@sha256:<64 hex>/);
+    }
+  });
+
   it("cloudrun-service-upsert SESSION (planning/49 Phase 4): pma mounts only platform/<slug>, spma only platform/<slug>-staging, both read-only", () => {
     const volume = (path: string, readOnly?: boolean) => {
       const entry: Record<string, unknown> = { name: "platform", server: "10.20.0.4", path, mountPath: "/platform/docs-892769" };
@@ -3641,10 +3711,10 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(upsert("pma-docs-892769", undefined).ok).toBe(true);
 
     // Any other path is refused: the site's files, the staging config, another site's config, the parent.
-    const pathRefusal = /^a pma- session for "docs-892769" may mount only \/srv\/dy-storage\/platform\/docs-892769 — not /;
+    const pathRefusal =
+      /^a pma- session for "docs-892769" may mount only \/srv\/dy-storage\/platform\/docs-892769 or \/srv\/dy-storage\/platform\/docs-892769-staging — not /;
     for (const path of [
       "/srv/dy-storage/sites/docs-892769",
-      "/srv/dy-storage/platform/docs-892769-staging",
       "/srv/dy-storage/platform/docs-892769-x",
       "/srv/dy-storage/platform/geelongns",
       "/srv/dy-storage/platform",
@@ -3671,6 +3741,77 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     }
   });
 
+  it("cloudrun-service-upsert SESSION (hub#223 D3): one shared pma lists prod and staging; a staging entry on another schema is refused", () => {
+    const liveVolume = { name: "platform", server: "10.20.0.4", path: "/srv/dy-storage/platform/docs-892769", mountPath: "/platform/docs-892769", readOnly: true };
+    const stagingVolume = {
+      name: "platstaging",
+      server: "10.20.0.4",
+      path: "/srv/dy-storage/platform/docs-892769-staging",
+      mountPath: "/platform/docs-892769-staging",
+      readOnly: true,
+    };
+    // The single-server env of planning/49 Phase 4, unchanged, plus the staging entry.
+    const liveEnv = [
+      { name: "RUN_AS_UID", value: "200001" },
+      { name: "RUN_AS_GID", value: "200001" },
+      { name: "DY_SLUG", value: "docs-892769" },
+      { name: "DY_PUBLIC_HOST", value: "pma-docs-892769.example.com" },
+      { name: "DY_WPCONFIG_REAL", value: "/platform/docs-892769/wp-config-real.php" },
+      { name: "DY_DB_HOST", value: "10.20.0.2" },
+    ];
+    const stagingEntry = [
+      { name: "DY_STAGING_WPCONFIG_REAL", value: "/platform/docs-892769-staging/wp-config-real.php" },
+      { name: "DY_STAGING_DB_NAME", value: "docs_892769_staging" },
+    ];
+    const pmaUpsert = (env: unknown, nfsVolumes: unknown) =>
+      validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, serviceName: "pma-docs-892769", image: sessionImageFor("pma-docs-892769"), env, nfsVolumes });
+
+    expect(siteStagingDatabaseNameFor("docs-892769")).toBe("docs_892769_staging");
+    expect(siteStagingDatabaseNameFor("lawnsbydavid")).toBe("lawnsbydavid_staging");
+    expect(PMA_STAGING_SERVER_ENV_NAMES).toEqual(["DY_STAGING_WPCONFIG_REAL", "DY_STAGING_DB_NAME"]);
+
+    // Two servers: prod and staging, each config dir read-only. The env survives into the signed params.
+    const twoServerVerdict = pmaUpsert([...liveEnv, ...stagingEntry], [liveVolume, stagingVolume]);
+    expect(twoServerVerdict.ok).toBe(true);
+    if (twoServerVerdict.ok) {
+      expect(twoServerVerdict.params.env).toEqual([...liveEnv, ...stagingEntry]);
+      expect(twoServerVerdict.params.nfsVolumes).toEqual([liveVolume, stagingVolume]);
+    }
+    // One server (prod only) still passes exactly as before.
+    expect(pmaUpsert(liveEnv, [liveVolume]).ok).toBe(true);
+
+    // A staging entry on another schema is refused: the live schema, another site's, a near miss.
+    const schemaRefusal = /^a pma- session's staging server entry must use the schema docs_892769_staging \(DY_STAGING_DB_NAME\), not another schema$/;
+    for (const otherSchema of ["docs_892769", "geelongns_staging", "docs_892769_staging2", "docs-892769_staging", "DOCS_892769_STAGING", ""]) {
+      const env = [...liveEnv, stagingEntry[0], { name: "DY_STAGING_DB_NAME", value: otherSchema }];
+      // The anchored reason also proves that no env value is echoed (planning/49 §5.2).
+      expectRefused(pmaUpsert(env, [liveVolume, stagingVolume]), schemaRefusal);
+    }
+    // The staging config must be this site's staging config.
+    for (const otherConfig of ["/platform/docs-892769/wp-config-real.php", "/platform/geelongns-staging/wp-config-real.php"]) {
+      expectRefused(
+        pmaUpsert([...liveEnv, { name: "DY_STAGING_WPCONFIG_REAL", value: otherConfig }, stagingEntry[1]], [liveVolume, stagingVolume]),
+        /^a pma- session's staging server entry must read \/platform\/docs-892769-staging\/wp-config-real\.php \(DY_STAGING_WPCONFIG_REAL\), not another file$/,
+      );
+    }
+    // Half an entry is refused.
+    const halfRefusal = /^a pma- session's staging server entry needs both DY_STAGING_WPCONFIG_REAL and DY_STAGING_DB_NAME, or neither$/;
+    expectRefused(pmaUpsert([...liveEnv, stagingEntry[0]], [liveVolume, stagingVolume]), halfRefusal);
+    expectRefused(pmaUpsert([...liveEnv, stagingEntry[1]], [liveVolume, stagingVolume]), halfRefusal);
+    // The staging config dir is mounted when, and only when, the staging entry is present, and read-only.
+    expectRefused(pmaUpsert([...liveEnv, ...stagingEntry], [liveVolume]), /^a pma- session that lists the staging DB must mount \/srv\/dy-storage\/platform\/docs-892769-staging read-only$/);
+    expectRefused(pmaUpsert(liveEnv, [liveVolume, stagingVolume]), /^a pma- session may mount \/srv\/dy-storage\/platform\/docs-892769-staging only when it lists the staging DB /);
+    expectRefused(
+      pmaUpsert([...liveEnv, ...stagingEntry], [liveVolume, { ...stagingVolume, readOnly: false }]),
+      /^a pma- session must mount "\/srv\/dy-storage\/platform\/docs-892769-staging" read-only \(readOnly: true\)$/,
+    );
+    // Another site's staging config dir is refused by the path rule.
+    expectRefused(
+      pmaUpsert([...liveEnv, ...stagingEntry], [liveVolume, { ...stagingVolume, path: "/srv/dy-storage/platform/geelongns-staging" }]),
+      /may mount only/,
+    );
+  });
+
   it("cloudrun-service-upsert SESSION (planning/49 Phase 4): the terminal's volumes are unchanged (read-write stays allowed)", () => {
     const terminalVolumes = (readOnly?: boolean) =>
       ["/srv/dy-storage/sites/docs-892769", "/srv/dy-storage/platform/docs-892769"].map((path, index) => {
@@ -3688,7 +3829,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(SESSION_IMAGE_NAMES.term).toBe("dy-run-terminal");
     expect(SESSION_IMAGE_NAMES.sterm).toBe("dy-run-terminal");
     expect(siteSessionReadOnlyNfsPathsFor("term", "docs-892769")).toEqual([]);
-    expect(siteSessionReadOnlyNfsPathsFor("pma", "docs-892769")).toEqual(["/srv/dy-storage/platform/docs-892769"]);
+    expect(siteSessionReadOnlyNfsPathsFor("pma", "docs-892769")).toEqual(["/srv/dy-storage/platform/docs-892769", "/srv/dy-storage/platform/docs-892769-staging"]);
     expect(siteSessionNfsPathsFor("term", "docs-892769")).toEqual(["/srv/dy-storage/sites/docs-892769", "/srv/dy-storage/platform/docs-892769"]);
   });
 
