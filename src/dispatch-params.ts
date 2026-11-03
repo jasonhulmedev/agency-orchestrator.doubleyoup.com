@@ -74,7 +74,22 @@ export interface DnsRecordUpsertParams {
   content: string;
   proxied: "true" | "false";
   ttl: string;
+  /**
+   * Optional guard (doubleyoup#277): the state the user saw in the preview. The actuator refuses
+   * the write when the zone no longer holds exactly this state. Absent => no guard (the old behaviour).
+   */
+  expect?: DnsRecordUpsertExpect;
 }
+
+/**
+ * What the record set for type + name must hold right before the write:
+ *   - `{ absent: true }`: no record of this type + name exists (the preview showed a create);
+ *   - `{ recordId, content }`: exactly this one record exists, with this content (the preview showed
+ *     an update of it).
+ * `absent` is a real JSON boolean, not the "true"/"false" string convention, because the only legal
+ * value is `true`: there is no formatting the two runtimes could disagree on.
+ */
+export type DnsRecordUpsertExpect = { absent: true } | { recordId: string; content: string };
 
 // One DNS label: 1-63 chars of [a-z0-9_-], not starting or ending with "-". Underscore is
 // allowed because service/verification names need it (_dmarc, _acme-challenge, ...).
@@ -93,12 +108,62 @@ const DNS_TTL_AUTO = 1;
 const DNS_TTL_MIN = 30;
 const DNS_TTL_MAX = 86_400;
 const DNS_CONTENT_MAX_LENGTH = 4096;
+// A Cloudflare DNS record id: Cloudflare's 32-char lowercase-hex identifier. It goes into a URL
+// path only through encodeURIComponent, but the strict grammar keeps junk out of the signed job.
+const DNS_RECORD_ID_RE = /^[a-f0-9]{32}$/;
+
+/** True when `content` is a usable DNS record content string (the upsert's content rule). */
+function isValidDnsRecordContent(content: unknown): content is string {
+  if (typeof content !== "string") {
+    return false;
+  }
+  if (content.length === 0 || content.length > DNS_CONTENT_MAX_LENGTH) {
+    return false;
+  }
+  return content.trim() === content;
+}
+
+/**
+ * Validate the optional `expect` guard of dns-record-upsert. Strict on purpose: an unknown key, a
+ * mix of the two forms or `absent: false` is refused rather than ignored, because a guard that a
+ * typo silently drops would let the write overwrite a record the user never confirmed.
+ */
+function validateDnsRecordUpsertExpect(raw: unknown): ParamsVerdict<DnsRecordUpsertExpect> {
+  const shapeReason = 'expect must be { "absent": true } or { "recordId": "<32-hex id>", "content": "<content>" }';
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: shapeReason };
+  }
+  const keys = Object.keys(raw).sort();
+
+  const isAbsentForm = keys.length === 1 && keys[0] === "absent";
+  if (isAbsentForm) {
+    if (raw.absent !== true) {
+      return { ok: false, reason: "expect.absent must be the boolean true" };
+    }
+    return { ok: true, params: { absent: true } };
+  }
+
+  const isRecordForm = keys.length === 2 && keys[0] === "content" && keys[1] === "recordId";
+  if (!isRecordForm) {
+    return { ok: false, reason: shapeReason };
+  }
+  if (typeof raw.recordId !== "string" || !DNS_RECORD_ID_RE.test(raw.recordId)) {
+    return { ok: false, reason: "expect.recordId must be a Cloudflare DNS record id (32 lowercase hex chars)" };
+  }
+  if (!isValidDnsRecordContent(raw.content)) {
+    return {
+      ok: false,
+      reason: `expect.content must be a non-empty string (max ${DNS_CONTENT_MAX_LENGTH} chars, no leading/trailing whitespace)`,
+    };
+  }
+  return { ok: true, params: { recordId: raw.recordId, content: raw.content } };
+}
 
 export function validateDnsRecordUpsertParams(raw: unknown): ParamsVerdict<DnsRecordUpsertParams> {
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
   }
-  const { zone, type, name, content, proxied, ttl } = raw;
+  const { zone, type, name, content, proxied, ttl, expect } = raw;
 
   if (typeof zone !== "string" || zone.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(zone)) {
     return { ok: false, reason: "zone must be a lowercase DNS zone name (e.g. example.com)" };
@@ -116,12 +181,7 @@ export function validateDnsRecordUpsertParams(raw: unknown): ParamsVerdict<DnsRe
   if (!nameIsInZone) {
     return { ok: false, reason: "name must be within zone (equal to it or a subdomain of it)" };
   }
-  if (
-    typeof content !== "string" ||
-    content.length === 0 ||
-    content.length > DNS_CONTENT_MAX_LENGTH ||
-    content.trim() !== content
-  ) {
+  if (!isValidDnsRecordContent(content)) {
     return {
       ok: false,
       reason: `content must be a non-empty string (max ${DNS_CONTENT_MAX_LENGTH} chars, no leading/trailing whitespace)`,
@@ -146,10 +206,57 @@ export function validateDnsRecordUpsertParams(raw: unknown): ParamsVerdict<DnsRe
 
   // Return a FRESH object holding only the known keys — never the caller's object — so an
   // extra key in the parsed params can never ride along into the actuator.
-  return {
-    ok: true,
-    params: { zone, type: type as DnsRecordType, name, content, proxied, ttl },
-  };
+  const params: DnsRecordUpsertParams = { zone, type: type as DnsRecordType, name, content, proxied, ttl };
+
+  // No `expect` key => no guard, exactly the params (and behaviour) of the op before the guard existed.
+  if (expect === undefined) {
+    return { ok: true, params };
+  }
+  const expectVerdict = validateDnsRecordUpsertExpect(expect);
+  if (!expectVerdict.ok) {
+    return expectVerdict;
+  }
+  params.expect = expectVerdict.params;
+  return { ok: true, params };
+}
+
+// ── dns-record-get ───────────────────────────────────────────────────────────────────
+// Read the records at ONE name in an agency zone (doubleyoup#277): the app shows the user a diff
+// before a dns-record-upsert and verifies the result after it. Read-only. The same grammars as
+// dns-record-upsert; `type` is optional (absent => every record at the name, of any type).
+
+export interface DnsRecordGetParams {
+  /** The zone NAME (e.g. "example.com") — resolved to a zone id by the actuator. */
+  zone: string;
+  /** Fully-qualified record name, within `zone`. */
+  name: string;
+  type?: DnsRecordType;
+}
+
+export function validateDnsRecordGetParams(raw: unknown): ParamsVerdict<DnsRecordGetParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { zone, name, type } = raw;
+  if (typeof zone !== "string" || zone.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a lowercase DNS zone name (e.g. example.com)" };
+  }
+  if (typeof name !== "string" || name.length > DNS_NAME_MAX_LENGTH || !DNS_RECORD_NAME_RE.test(name)) {
+    return { ok: false, reason: "name must be a lowercase fully-qualified DNS record name" };
+  }
+  const nameWithoutWildcard = name.startsWith("*.") ? name.slice(2) : name;
+  const nameIsInZone = nameWithoutWildcard === zone || nameWithoutWildcard.endsWith(`.${zone}`);
+  if (!nameIsInZone) {
+    return { ok: false, reason: "name must be within zone (equal to it or a subdomain of it)" };
+  }
+
+  if (type === undefined) {
+    return { ok: true, params: { zone, name } };
+  }
+  if (typeof type !== "string" || !(DNS_RECORD_TYPES as readonly string[]).includes(type)) {
+    return { ok: false, reason: `type must be one of ${DNS_RECORD_TYPES.join(", ")}` };
+  }
+  return { ok: true, params: { zone, name, type: type as DnsRecordType } };
 }
 
 // ── cache-purge ──────────────────────────────────────────────────────────────────────

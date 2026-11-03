@@ -40,6 +40,8 @@ import type { Env } from "./env.js";
 export const DISPATCH_OPS = [
   "provision-r2",
   "dns-record-upsert",
+  // doubleyoup#277: read the records at one name (the app's preview diff and post-change check).
+  "dns-record-get",
   "cache-purge",
   "cache-rule-upsert",
   "waf-rule-upsert",
