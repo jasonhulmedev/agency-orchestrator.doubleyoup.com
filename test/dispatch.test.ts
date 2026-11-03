@@ -143,6 +143,8 @@ import {
   mergeMetadataItems,
   substituteMetadataPlaceholders,
   cloudRunProbeInvokeTuning,
+  DNS_GUARDED_LEASE_TTL_MS,
+  DNS_GUARDED_REQUEST_TIMEOUT_MS,
 } from "../src/actuate.js";
 import { GOOGLE_SCOPE_CLOUD_PLATFORM } from "../src/validators.js";
 
@@ -4061,10 +4063,56 @@ describe("POST /actuate route", () => {
   // (real actuators, fetch mocked), NOT replay defense — that has dedicated real-DO tests
   // under the workers pool (test/nonce-store.worker.test.ts). It always reports the nonce as
   // fresh so actuation proceeds.
+  // Its lease methods always grant the lease: the guarded dns-record-upsert tests that need a real
+  // "busy" use RecordingLeaseStore below.
   const freshNonceStore = {
     idFromName: () => ({}),
-    get: () => ({ consume: async () => "fresh" as const }),
+    get: () => ({
+      consume: async () => "fresh" as const,
+      acquireLease: async () => "acquired" as const,
+      releaseLease: async () => undefined,
+    }),
   } as unknown as Env["NONCE_STORE"];
+
+  // A NONCE_STORE with working leases (one lease table per instance name, as the real Durable Object
+  // has). It records every acquire so a test can see which instance and key a run locked.
+  class RecordingLeaseStore {
+    leases = new Map<string, string>();
+    acquires: Array<{ instance: string; leaseKey: string; ttlMs: number; outcome: "acquired" | "busy" }> = [];
+    releases: Array<{ instance: string; leaseKey: string }> = [];
+
+    idFromName(name: string): string {
+      return name;
+    }
+
+    get(instance: string) {
+      return {
+        consume: async () => "fresh" as const,
+        acquireLease: async (leaseKey: string, holder: string, ttlMs: number): Promise<"acquired" | "busy"> => {
+          const slot = `${instance}|${leaseKey}`;
+          let outcome: "acquired" | "busy" = "acquired";
+          if (this.leases.has(slot)) {
+            outcome = "busy";
+          } else {
+            this.leases.set(slot, holder);
+          }
+          this.acquires.push({ instance, leaseKey, ttlMs, outcome });
+          return outcome;
+        },
+        releaseLease: async (leaseKey: string, holder: string): Promise<void> => {
+          const slot = `${instance}|${leaseKey}`;
+          this.releases.push({ instance, leaseKey });
+          if (this.leases.get(slot) === holder) {
+            this.leases.delete(slot);
+          }
+        },
+      };
+    }
+
+    asBinding(): Env["NONCE_STORE"] {
+      return this as unknown as Env["NONCE_STORE"];
+    }
+  }
 
   // A NONCE_STORE whose consume() rejects — models the DO being unavailable / a storage
   // error. handleActuate deliberately has no try/catch around consume, so this must surface
@@ -4550,6 +4598,169 @@ describe("POST /actuate route", () => {
     expect(calls.map((call) => call.method)).toEqual(["GET", "GET"]);
   });
 
+  // The reviewer's interleaving: jobs A and B (different nonces) both previewed record R holding
+  // "old-value". A's write is in flight when B arrives. Without the lease, B would pass its check
+  // and overwrite A's write. With it, B is refused while A runs and by its expect after A ends.
+  it("dns-record-upsert expect: a second guarded job for the same record cannot overwrite the first", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const recordName = "_dy-dirb-proof.jasonhulme.com";
+    const zoneRecords = [{ id: PREVIEWED_RECORD_ID, type: "TXT", name: recordName, content: "old-value" }];
+    const writes: string[] = [];
+    let finishFirstWrite: () => void = () => undefined;
+    const firstWriteFinished = new Promise<void>((resolve) => {
+      finishFirstWrite = resolve;
+    });
+    let firstWriteStarted: () => void = () => undefined;
+    const firstWriteInFlight = new Promise<void>((resolve) => {
+      firstWriteStarted = resolve;
+    });
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const parsed = new URL(urlOf(input));
+      const method = init?.method ?? "GET";
+      if (parsed.pathname === "/client/v4/zones" && method === "GET") {
+        return jsonResponse({ success: true, result: [{ id: "zone-1", name: "jasonhulme.com" }] });
+      }
+      if (parsed.pathname === "/client/v4/zones/zone-1/dns_records" && method === "GET") {
+        return jsonResponse({ success: true, result: zoneRecords.map((record) => ({ ...record })) });
+      }
+      if (parsed.pathname === `/client/v4/zones/zone-1/dns_records/${PREVIEWED_RECORD_ID}` && method === "PUT") {
+        const newContent = (JSON.parse(String(init?.body)) as { content: string }).content;
+        writes.push(newContent);
+        if (writes.length === 1) {
+          firstWriteStarted();
+          await firstWriteFinished;
+        }
+        zoneRecords[0].content = newContent;
+        return jsonResponse({ success: true, result: { id: PREVIEWED_RECORD_ID, name: recordName } });
+      }
+      throw new Error(`unexpected fetch ${method} ${parsed.toString()}`);
+    });
+
+    const leaseStore = new RecordingLeaseStore();
+    const expectOld = { recordId: PREVIEWED_RECORD_ID, content: "old-value" };
+    const jobA = dnsJob({
+      params: JSON.stringify({ ...DNS_PARAMS, content: "value-from-a", expect: expectOld }),
+      nonce: "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    });
+    const jobB = dnsJob({
+      params: JSON.stringify({ ...DNS_PARAMS, content: "value-from-b", expect: expectOld }),
+      nonce: "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+    });
+    const signatureA = await signAsApp(jobA, privateKey);
+    const signatureB = await signAsApp(jobB, privateKey);
+
+    const responseAPromise = worker.fetch(
+      actuateRequest({ job: jobA, signature: signatureA }),
+      envWith({ NONCE_STORE: leaseStore.asBinding() }),
+    );
+    await firstWriteInFlight;
+
+    // B arrives while A's write is in flight: refused, nothing written.
+    const responseBDuring = await worker.fetch(
+      actuateRequest({ job: jobB, signature: signatureB }),
+      envWith({ NONCE_STORE: leaseStore.asBinding() }),
+    );
+    const bodyBDuring = (await responseBDuring.json()) as { ok: boolean; detail: string };
+    expect(bodyBDuring.ok).toBe(false);
+    expect(bodyBDuring.detail).toMatch(/^record changed since preview/);
+    expect(writes).toEqual(["value-from-a"]);
+
+    finishFirstWrite();
+    const bodyA = (await (await responseAPromise).json()) as { ok: boolean; action: string };
+    expect(bodyA).toMatchObject({ ok: true, action: "updated" });
+    expect(leaseStore.leases.size).toBe(0);
+
+    // B retried after A ended (a fresh nonce): its expect sees A's content and refuses.
+    const jobBRetry = dnsJob({
+      params: JSON.stringify({ ...DNS_PARAMS, content: "value-from-b", expect: expectOld }),
+      nonce: "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    });
+    const responseBAfter = await worker.fetch(
+      actuateRequest({ job: jobBRetry, signature: await signAsApp(jobBRetry, privateKey) }),
+      envWith({ NONCE_STORE: leaseStore.asBinding() }),
+    );
+    const bodyBAfter = (await responseBAfter.json()) as { ok: boolean; detail: string };
+    expect(bodyBAfter.ok).toBe(false);
+    expect(bodyBAfter.detail).toMatch(/^record changed since preview/);
+    expect(writes).toEqual(["value-from-a"]);
+    expect(zoneRecords[0].content).toBe("value-from-a");
+
+    // Every lease was on the zone's own instance, keyed by type + name, never the nonce singleton.
+    for (const acquire of leaseStore.acquires) {
+      expect(acquire.instance).toBe("dns-record-lease:jasonhulme.com");
+      expect(acquire.leaseKey).toBe(`TXT ${recordName}`);
+      expect(acquire.ttlMs).toBe(DNS_GUARDED_LEASE_TTL_MS);
+    }
+    expect(leaseStore.acquires.map((acquire) => acquire.outcome)).toEqual(["acquired", "busy", "acquired"]);
+  });
+
+  it("dns-record-upsert expect: a guarded write with no answer keeps its lease until it expires", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const parsed = new URL(urlOf(input));
+      const method = init?.method ?? "GET";
+      if (parsed.pathname === "/client/v4/zones") {
+        return jsonResponse({ success: true, result: [{ id: "zone-1", name: "jasonhulme.com" }] });
+      }
+      if (parsed.pathname === "/client/v4/zones/zone-1/dns_records" && method === "GET") {
+        return jsonResponse({ success: true, result: [] });
+      }
+      throw new TypeError("network connection lost");
+    });
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const leaseStore = new RecordingLeaseStore();
+    const job = dnsJob({ params: JSON.stringify({ ...DNS_PARAMS, expect: { absent: true } }) });
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature: await signAsApp(job, privateKey) }),
+      envWith({ NONCE_STORE: leaseStore.asBinding() }),
+    );
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/could not reach Cloudflare to write/);
+    expect(leaseStore.releases).toEqual([]);
+    expect(leaseStore.leases.size).toBe(1);
+  });
+
+  it("dns-record-upsert expect: a refused guard releases the lease", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    mockDnsApi([{ id: "rec-appeared", type: "TXT", name: "_dy-dirb-proof.jasonhulme.com", content: "someone-else" }]);
+    const leaseStore = new RecordingLeaseStore();
+    const job = dnsJob({ params: JSON.stringify({ ...DNS_PARAMS, expect: { absent: true } }) });
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature: await signAsApp(job, privateKey) }),
+      envWith({ NONCE_STORE: leaseStore.asBinding() }),
+    );
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.detail).toMatch(/^record changed since preview/);
+    expect(leaseStore.acquires).toHaveLength(1);
+    expect(leaseStore.leases.size).toBe(0);
+  });
+
+  it("dns-record-upsert without expect takes no lease (unchanged behaviour)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockDnsApi([{ id: "rec-existing", type: "TXT", name: "_dy-dirb-proof.jasonhulme.com" }]);
+    const leaseStore = new RecordingLeaseStore();
+    const job = dnsJob();
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature: await signAsApp(job, privateKey) }),
+      envWith({ NONCE_STORE: leaseStore.asBinding() }),
+    );
+    const body = (await response.json()) as { ok: boolean; action: string };
+    expect(body).toMatchObject({ ok: true, action: "updated" });
+    expect(calls.map((call) => call.method)).toEqual(["GET", "GET", "PUT"]);
+    expect(leaseStore.acquires).toEqual([]);
+  });
+
+  it("dns-record-upsert expect: the lease outlasts the longest guarded run", () => {
+    // Three Cloudflare calls (zone, records, write), each bounded by its timeout.
+    const longestRunMs = 3 * DNS_GUARDED_REQUEST_TIMEOUT_MS;
+    expect(DNS_GUARDED_LEASE_TTL_MS).toBeGreaterThan(2 * longestRunMs);
+  });
+
   it("dns-record-upsert: a malformed expect in a signed job is 400 with no API call", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const job = dnsJob({ params: JSON.stringify({ ...DNS_PARAMS, expect: { absent: false } }) });
@@ -4570,7 +4781,12 @@ describe("POST /actuate route", () => {
 
   // A routed read-only mock: zone lookup (configurable: visible or not), then one record list.
   // Any write method is a test failure. Every call carries the DNS token.
-  function mockDnsGetApi(options: { zoneVisible: boolean; records?: unknown[]; totalPages?: number }) {
+  function mockDnsGetApi(options: {
+    zoneVisible: boolean;
+    records?: unknown[];
+    totalPages?: number;
+    resultInfo?: Record<string, unknown>;
+  }) {
     const calls: Array<{ method: string; url: string }> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = urlOf(input);
@@ -4590,7 +4806,7 @@ describe("POST /actuate route", () => {
         return jsonResponse({
           success: true,
           result: options.records ?? [],
-          result_info: { page: 1, total_pages: options.totalPages ?? 1 },
+          result_info: options.resultInfo ?? { page: 1, total_pages: options.totalPages ?? 1 },
         });
       }
       throw new Error(`unexpected Cloudflare call: ${method} ${url}`);
@@ -4670,6 +4886,52 @@ describe("POST /actuate route", () => {
   it("dns-record-get: fails closed on more than one page, never a partial list", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     mockDnsGetApi({ zoneVisible: true, records: [cloudflareRecord("rec-a1", "A", "203.0.113.10")], totalPages: 2 });
+    const job = dnsGetJob(DNS_GET_PARAMS);
+    const signature = await signAsApp(job, privateKey);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/partial list/);
+  });
+
+  it("dns-record-get: a full page is a partial list unless total_count confirms it", async () => {
+    const fullPage = Array.from({ length: 100 }, (_, index) =>
+      cloudflareRecord(`rec-${String(index).padStart(3, "0")}`, "A", `203.0.113.${index}`),
+    );
+    const cases: Array<{ resultInfo: Record<string, unknown>; ok: boolean; nonce: string }> = [
+      // The reviewer's case: no total_pages, but total_count shows one record beyond the page.
+      { resultInfo: { page: 1, per_page: 100, count: 100, total_count: 101 }, ok: false, nonce: "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1" },
+      // No counts at all: a full page cannot be told apart from the first page of a longer list.
+      { resultInfo: { page: 1, per_page: 100, count: 100 }, ok: false, nonce: "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2" },
+      // Exactly 100 records, and Cloudflare says so.
+      { resultInfo: { page: 1, per_page: 100, count: 100, total_count: 100, total_pages: 1 }, ok: true, nonce: "f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3" },
+    ];
+    for (const testCase of cases) {
+      vi.restoreAllMocks();
+      vi.setSystemTime(new Date(FREEZE_MS));
+      mockDnsGetApi({ zoneVisible: true, records: fullPage, resultInfo: testCase.resultInfo });
+      const job = dnsGetJob(DNS_GET_PARAMS, testCase.nonce);
+      const signature = await signAsApp(job, privateKey);
+
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+      const body = (await response.json()) as { ok: boolean; detail?: string; records?: unknown[] };
+      expect(body.ok).toBe(testCase.ok);
+      if (testCase.ok) {
+        expect(body.records).toHaveLength(100);
+      } else {
+        expect(body.detail).toMatch(/partial list/);
+      }
+    }
+  });
+
+  it("dns-record-get: total_count above the rows returned is a partial list, even on a short page", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    mockDnsGetApi({
+      zoneVisible: true,
+      records: [cloudflareRecord("rec-a1", "A", "203.0.113.10")],
+      resultInfo: { page: 1, per_page: 100, count: 1, total_count: 2 },
+    });
     const job = dnsGetJob(DNS_GET_PARAMS);
     const signature = await signAsApp(job, privateKey);
 
