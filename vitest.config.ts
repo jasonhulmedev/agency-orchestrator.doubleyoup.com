@@ -41,6 +41,7 @@ export default defineConfig({
             "test/hub43-r2-media.test.ts",
             "test/boot-metadata.test.ts",
             "test/custom-hostname-ops.test.ts",
+            "test/branded-media-ops.test.ts",
             "test/session-gate.test.ts",
             "test/session-gate-minter.test.ts",
             "test/edge-gate-deploy.test.ts",
