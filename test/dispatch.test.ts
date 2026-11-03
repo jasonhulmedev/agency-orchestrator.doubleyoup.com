@@ -145,6 +145,7 @@ import {
   cloudRunProbeInvokeTuning,
   DNS_GUARDED_LEASE_TTL_MS,
   DNS_GUARDED_REQUEST_TIMEOUT_MS,
+  dnsRecordLeaseInstanceName,
 } from "../src/actuate.js";
 import { GOOGLE_SCOPE_CLOUD_PLATFORM } from "../src/validators.js";
 
@@ -4686,9 +4687,9 @@ describe("POST /actuate route", () => {
     expect(writes).toEqual(["value-from-a"]);
     expect(zoneRecords[0].content).toBe("value-from-a");
 
-    // Every lease was on the zone's own instance, keyed by type + name, never the nonce singleton.
+    // Every lease was on the record's own instance (zone + type + name), never the nonce singleton.
     for (const acquire of leaseStore.acquires) {
-      expect(acquire.instance).toBe("dns-record-lease:jasonhulme.com");
+      expect(acquire.instance).toBe(dnsRecordLeaseInstanceName("jasonhulme.com", "TXT", recordName));
       expect(acquire.leaseKey).toBe(`TXT ${recordName}`);
       expect(acquire.ttlMs).toBe(DNS_GUARDED_LEASE_TTL_MS);
     }
@@ -4721,6 +4722,124 @@ describe("POST /actuate route", () => {
     expect(body.detail).toMatch(/could not reach Cloudflare to write/);
     expect(leaseStore.releases).toEqual([]);
     expect(leaseStore.leases.size).toBe(1);
+  });
+
+  // A zone with record R ("old-value") at the proof name, whose write answers with `writeAnswer`.
+  // Returns the contents written, in order.
+  function mockGuardedWrite(writeAnswer: () => Response): string[] {
+    const writes: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const parsed = new URL(urlOf(input));
+      const method = init?.method ?? "GET";
+      if (parsed.pathname === "/client/v4/zones") {
+        return jsonResponse({ success: true, result: [{ id: "zone-1", name: "jasonhulme.com" }] });
+      }
+      if (parsed.pathname === "/client/v4/zones/zone-1/dns_records" && method === "GET") {
+        return jsonResponse({
+          success: true,
+          result: [{ id: PREVIEWED_RECORD_ID, type: "TXT", name: "_dy-dirb-proof.jasonhulme.com", content: "old-value" }],
+        });
+      }
+      writes.push((JSON.parse(String(init?.body)) as { content: string }).content);
+      return writeAnswer();
+    });
+    return writes;
+  }
+
+  function guardedJob(content: string, nonce: string): DispatchJob {
+    return dnsJob({
+      nonce,
+      params: JSON.stringify({ ...DNS_PARAMS, content, expect: { recordId: PREVIEWED_RECORD_ID, content: "old-value" } }),
+    });
+  }
+
+  it.each([502, 503, 504, 520, 521, 522, 523, 524])(
+    "dns-record-upsert expect: a guarded write answered HTTP %i keeps its lease (the write may still land)",
+    async (gatewayStatus) => {
+      vi.setSystemTime(new Date(FREEZE_MS));
+      mockGuardedWrite(() => new Response("<html>gateway</html>", { status: gatewayStatus }));
+      vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const leaseStore = new RecordingLeaseStore();
+      const job = guardedJob("value-from-a", "a1111111111111111111111111111111");
+
+      const response = await worker.fetch(
+        actuateRequest({ job, signature: await signAsApp(job, privateKey) }),
+        envWith({ NONCE_STORE: leaseStore.asBinding() }),
+      );
+      const body = (await response.json()) as { ok: boolean; detail: string };
+      expect(body.ok).toBe(false);
+      expect(body.detail).toContain(`HTTP ${gatewayStatus}, which does not say whether the write was applied`);
+      expect(leaseStore.releases).toEqual([]);
+      expect(leaseStore.leases.size).toBe(1);
+    },
+  );
+
+  it("dns-record-upsert expect: a guarded write answered 2xx with an unreadable body keeps its lease", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    mockGuardedWrite(() => new Response("{not json", { status: 200 }));
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const leaseStore = new RecordingLeaseStore();
+    const job = guardedJob("value-from-a", "a1111111111111111111111111111111");
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature: await signAsApp(job, privateKey) }),
+      envWith({ NONCE_STORE: leaseStore.asBinding() }),
+    );
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toContain("HTTP 200, which does not say whether the write was applied");
+    expect(leaseStore.releases).toEqual([]);
+    expect(leaseStore.leases.size).toBe(1);
+  });
+
+  // The reviewer's gateway interleaving: A's write gets a 504 while Cloudflare still processes it.
+  // B previewed the same "old-value" and arrives next. B must be refused and write nothing, so A's
+  // late write cannot overwrite a change that B's user confirmed.
+  it("dns-record-upsert expect: after a gateway timeout a second guarded job is refused and writes nothing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const writes = mockGuardedWrite(() => new Response("", { status: 504 }));
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const leaseStore = new RecordingLeaseStore();
+    const env = envWith({ NONCE_STORE: leaseStore.asBinding() });
+
+    const jobA = guardedJob("value-from-a", "a1111111111111111111111111111111");
+    const responseA = await worker.fetch(actuateRequest({ job: jobA, signature: await signAsApp(jobA, privateKey) }), env);
+    expect(((await responseA.json()) as { ok: boolean }).ok).toBe(false);
+
+    const jobB = guardedJob("value-from-b", "b2222222222222222222222222222222");
+    const responseB = await worker.fetch(actuateRequest({ job: jobB, signature: await signAsApp(jobB, privateKey) }), env);
+    const bodyB = (await responseB.json()) as { ok: boolean; detail: string };
+    expect(bodyB.ok).toBe(false);
+    expect(bodyB.detail).toMatch(/^record changed since preview/);
+    expect(writes).toEqual(["value-from-a"]);
+    expect(leaseStore.acquires.map((acquire) => acquire.outcome)).toEqual(["acquired", "busy"]);
+  });
+
+  it.each([400, 500])("dns-record-upsert expect: a definite HTTP %i failure releases the lease", async (definiteStatus) => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    mockGuardedWrite(() =>
+      jsonResponse({ success: false, errors: [{ code: 9000, message: "refused" }] }, definiteStatus),
+    );
+    const leaseStore = new RecordingLeaseStore();
+    const job = guardedJob("value-from-a", "a1111111111111111111111111111111");
+
+    const response = await worker.fetch(
+      actuateRequest({ job, signature: await signAsApp(job, privateKey) }),
+      envWith({ NONCE_STORE: leaseStore.asBinding() }),
+    );
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toContain(`failed with HTTP ${definiteStatus}`);
+    expect(leaseStore.releases).toHaveLength(1);
+    expect(leaseStore.leases.size).toBe(0);
+  });
+
+  it("dns-record-upsert expect: each record has its own lease instance, so different records never share one", () => {
+    const proofRecord = dnsRecordLeaseInstanceName("jasonhulme.com", "TXT", "_dy-dirb-proof.jasonhulme.com");
+    const otherName = dnsRecordLeaseInstanceName("jasonhulme.com", "TXT", "site-b.jasonhulme.com");
+    const otherType = dnsRecordLeaseInstanceName("jasonhulme.com", "CNAME", "_dy-dirb-proof.jasonhulme.com");
+    expect(new Set([proofRecord, otherName, otherType]).size).toBe(3);
+    expect(proofRecord).not.toBe("dirb-nonce");
   });
 
   it("dns-record-upsert expect: a refused guard releases the lease", async () => {

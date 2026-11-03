@@ -133,6 +133,7 @@ import {
 } from "./edge-rate-limit.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
 import {
+  EDGE_SYNC_AMBIGUOUS_WRITE_STATUSES,
   EDGE_SYNC_RATE_LIMIT_RESERVE,
   EDGE_SYNC_RUN_LIMITS,
   EDGE_SYNC_UNKNOWN_MARKER,
@@ -1202,7 +1203,8 @@ export const DNS_GUARDED_LEASE_TTL_MS = 2 * 60 * 1000;
 
 /**
  * The guarded write's call options: a timeout signal per call, so the run always ends inside its lease.
- * `unknownWrite` is set when the write got no answer: Cloudflare may still apply it.
+ * `unknownWrite` is set when the answer to the write does not say whether it was applied (see
+ * dnsWriteIsUnknown): Cloudflare may have applied it, or may still apply it.
  */
 interface DnsGuardedRun {
   signal: () => AbortSignal;
@@ -1217,9 +1219,10 @@ interface DnsGuardedRun {
  * WITH `expect` (doubleyoup#277) the check and the write must be one step. The check reads the record
  * and the write is a plain PUT/POST, so two guarded jobs that previewed the same record could both
  * pass the check, and the second write would overwrite the first one, which its user never saw. So a
- * guarded run first takes a lease on its zone + type + name in the NonceStore Durable Object (one
- * instance per zone, never the "dirb-nonce" singleton, so no lock is shared across zones or with the
- * nonce traffic). A second guarded job for the same record that arrives while the lease is held fails
+ * guarded run first takes a lease on its zone + type + name in the NonceStore Durable Object. The
+ * instance is named by that full record identity (dnsRecordLeaseInstanceName), never the "dirb-nonce"
+ * singleton, so changes to different records never queue behind one another or behind the nonce
+ * traffic, and the lease cleanup touches only this record's row. A second guarded job for the same record that arrives while the lease is held fails
  * closed and writes nothing. One that arrives after the release reads the new record, and its `expect`
  * then refuses it. Without `expect` the run takes no lease and behaves exactly as before.
  */
@@ -1235,7 +1238,8 @@ export async function actuateDnsRecordUpsert(
     return upsertDnsRecord(params, token, undefined);
   }
 
-  const leaseStore = env.NONCE_STORE.get(env.NONCE_STORE.idFromName(`dns-record-lease:${params.zone}`));
+  const leaseInstanceName = dnsRecordLeaseInstanceName(params.zone, params.type, params.name);
+  const leaseStore = env.NONCE_STORE.get(env.NONCE_STORE.idFromName(leaseInstanceName));
   const leaseKey = `${params.type} ${params.name}`;
   const leaseHolder = crypto.randomUUID();
   const lease = await leaseStore.acquireLease(leaseKey, leaseHolder, DNS_GUARDED_LEASE_TTL_MS);
@@ -1256,7 +1260,7 @@ export async function actuateDnsRecordUpsert(
     result = await upsertDnsRecord(params, token, guardedRun);
   } finally {
     if (guardedRun.unknownWrite) {
-      // The write got no answer, and Cloudflare may still apply it. Keep the lease until it expires,
+      // The answer did not say whether the write was applied, and Cloudflare may still apply it. Keep the lease until it expires,
       // so a second guarded job cannot read the old record now and be overwritten by the late write.
       console.warn(`dns-record-upsert: the guarded write of ${leaseKey} ended UNKNOWN; its lease is kept until it expires.`);
     } else {
@@ -1270,6 +1274,35 @@ export async function actuateDnsRecordUpsert(
     }
   }
   return result;
+}
+
+/**
+ * The Durable Object instance that holds the lease of ONE record (zone + type + name). One instance per
+ * record keeps the lease traffic of different sites and cells apart: no shared per-zone process, and
+ * the expired-lease cleanup in acquireLease sees this record's row only. The parts are validated DNS
+ * names and a fixed type list, none of which can hold a space, so the joined name is unambiguous.
+ */
+export function dnsRecordLeaseInstanceName(zone: string, type: string, name: string): string {
+  return `dns-record-lease ${zone} ${type} ${name}`;
+}
+
+/**
+ * Whether the answer to a guarded write leaves it open whether Cloudflare applied it:
+ * - a gateway status of Cloudflare's edge (502, 503, 504, 520 to 524): the API behind it may still
+ *   apply the write;
+ * - a 2xx answer without a readable written record (the body failed to read or parse): the API
+ *   accepted the request, so the write most likely landed.
+ * A 4xx or a 500 is the API's own definite answer. A rejected fetch is handled by the caller.
+ */
+function dnsWriteIsUnknown(httpStatus: number, written: CloudflareDnsRecordSummary | undefined): boolean {
+  if (EDGE_SYNC_AMBIGUOUS_WRITE_STATUSES.includes(httpStatus)) {
+    return true;
+  }
+  const answeredSuccess = httpStatus >= 200 && httpStatus < 300;
+  if (answeredSuccess && !written?.id) {
+    return true;
+  }
+  return false;
 }
 
 /** The read, the guards and the write. `guardedRun` is set only for an `expect` upsert, which holds the lease. */
@@ -1331,6 +1364,7 @@ async function upsertDnsRecord(
     return dnsFailure(params.name, `could not reach Cloudflare to write the DNS record: ${errorMessage(err)}`);
   }
 
+  // A body that cannot be read (the timeout fired mid-body, a broken stream, not JSON) becomes null.
   const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
   if (response.status === 401 || response.status === 403) {
     return dnsFailure(
@@ -1339,6 +1373,14 @@ async function upsertDnsRecord(
     );
   }
   const written = body?.success ? (body.result as CloudflareDnsRecordSummary | undefined) : undefined;
+  if (guardedRun !== undefined && dnsWriteIsUnknown(response.status, written)) {
+    guardedRun.unknownWrite = true;
+    return dnsFailure(
+      params.name,
+      `DNS record ${action === "created" ? "create" : "update"} got HTTP ${response.status}, which does not say whether ` +
+        "the write was applied — Cloudflare may still apply it. Preview again before another change.",
+    );
+  }
   if (!written?.id) {
     return dnsFailure(
       params.name,
