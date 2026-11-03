@@ -30,6 +30,7 @@ import {
   isValidR2BucketName,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
+  validateDnsRecordGetParams,
   validateCachePurgeParams,
   validateCfTunnelCreateParams,
   validateCfTunnelConfigParams,
@@ -1126,6 +1127,76 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(validateDnsRecordDeleteParams({ zone: "Example.com", type: "CNAME", name: "cell-x.example.com" }).ok).toBe(false); // uppercase zone
   });
 
+  // ── doubleyoup#277: dns-record-upsert `expect` guard + dns-record-get params ──────────
+
+  it("dns-record-upsert: accepts both expect forms and returns only their known keys", () => {
+    const recordId = "0123456789abcdef0123456789abcdef";
+    expect(validateDnsRecordUpsertParams({ ...DNS_PARAMS, expect: { absent: true } })).toEqual({
+      ok: true,
+      params: { ...DNS_PARAMS, expect: { absent: true } },
+    });
+    expect(validateDnsRecordUpsertParams({ ...DNS_PARAMS, expect: { recordId, content: "old-value" } })).toEqual({
+      ok: true,
+      params: { ...DNS_PARAMS, expect: { recordId, content: "old-value" } },
+    });
+    // Without expect the validated params carry no expect key at all (unchanged shape).
+    const withoutExpect = validateDnsRecordUpsertParams(DNS_PARAMS);
+    expect(withoutExpect).toEqual({ ok: true, params: DNS_PARAMS });
+    expect(withoutExpect.ok && "expect" in withoutExpect.params).toBe(false);
+  });
+
+  it("dns-record-upsert: refuses a malformed expect instead of dropping the guard", () => {
+    const recordId = "0123456789abcdef0123456789abcdef";
+    const bad = (expectValue: unknown) => validateDnsRecordUpsertParams({ ...DNS_PARAMS, expect: expectValue });
+    expect(bad(null).ok).toBe(false);
+    expect(bad("absent").ok).toBe(false);
+    expect(bad([]).ok).toBe(false);
+    expect(bad({}).ok).toBe(false);
+    expect(bad({ absent: false }).ok).toBe(false);
+    expect(bad({ absent: "true" }).ok).toBe(false); // a string is not the boolean true
+    expect(bad({ absent: true, extra: "x" }).ok).toBe(false);
+    expect(bad({ absent: true, recordId, content: "x" }).ok).toBe(false); // the two forms mixed
+    expect(bad({ recordId }).ok).toBe(false); // content missing
+    expect(bad({ content: "x" }).ok).toBe(false); // recordId missing
+    expect(bad({ recordId: "rec-1", content: "x" }).ok).toBe(false); // not a Cloudflare id
+    expect(bad({ recordId: recordId.toUpperCase(), content: "x" }).ok).toBe(false);
+    expect(bad({ recordId, content: "" }).ok).toBe(false);
+    expect(bad({ recordId, content: " padded" }).ok).toBe(false);
+    expect(bad({ recordId, content: 42 }).ok).toBe(false);
+    expect(bad({ recordId, content: "x", extra: "y" }).ok).toBe(false);
+  });
+
+  it("dns-record-get: accepts zone + name with and without type, and returns only known keys", () => {
+    expect(validateDnsRecordGetParams({ zone: "example.com", name: "www.example.com", extra: "x" })).toEqual({
+      ok: true,
+      params: { zone: "example.com", name: "www.example.com" },
+    });
+    expect(validateDnsRecordGetParams({ zone: "example.com", name: "example.com", type: "A" })).toEqual({
+      ok: true,
+      params: { zone: "example.com", name: "example.com", type: "A" },
+    });
+    expect(validateDnsRecordGetParams({ zone: "example.com", name: "*.example.com", type: "CNAME" }).ok).toBe(true);
+    expect(validateDnsRecordGetParams({ zone: "example.com", name: "_dmarc.example.com", type: "TXT" }).ok).toBe(true);
+  });
+
+  it("dns-record-get: rejects bad input field by field", () => {
+    const good = { zone: "example.com", name: "www.example.com", type: "CNAME" };
+    const bad = (overrides: Record<string, unknown>) => validateDnsRecordGetParams({ ...good, ...overrides });
+    expect(validateDnsRecordGetParams(null).ok).toBe(false);
+    expect(validateDnsRecordGetParams([]).ok).toBe(false);
+    expect(validateDnsRecordGetParams("www.example.com").ok).toBe(false);
+    expect(bad({ zone: undefined }).ok).toBe(false);
+    expect(bad({ zone: "Example.com" }).ok).toBe(false);
+    expect(bad({ zone: "localhost" }).ok).toBe(false);
+    expect(bad({ name: undefined }).ok).toBe(false);
+    expect(bad({ name: "WWW.example.com" }).ok).toBe(false);
+    expect(bad({ name: "www.other.com" }).ok).toBe(false); // outside the zone
+    expect(bad({ name: "evilexample.com" }).ok).toBe(false); // suffix but not a subdomain
+    expect(bad({ type: "MX" }).ok).toBe(false);
+    expect(bad({ type: "cname" }).ok).toBe(false);
+    expect(bad({ type: null }).ok).toBe(false);
+  });
+
   it("the op registry has exactly the allowlisted ops, each with validateParams + actuate", () => {
     expect(Object.keys(DISPATCH_OP_REGISTRY).sort()).toEqual([
       "cache-purge",
@@ -1146,6 +1217,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "db-export",
       "db-import",
       "dns-record-delete",
+      "dns-record-get",
       "dns-record-upsert",
       "edge-gate-deploy",
       "gcp-address-create",
@@ -4202,7 +4274,10 @@ describe("POST /actuate route", () => {
   // A routed CF DNS API mock: zone lookup, record list (configurable matches), then the
   // create (POST) or update (PUT) call. Every call must carry the DNS token and never
   // the R2 token — the op's own credential, no cross-credential leakage.
-  function mockDnsApi(existing: Array<{ id: string; type: string; name: string }>) {
+  function mockDnsApi(
+    existing: Array<{ id: string; type: string; name: string; content?: string }>,
+    updatableRecordId = "rec-existing",
+  ) {
     const calls: Array<{ method: string; url: string; body?: unknown }> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = urlOf(input);
@@ -4225,8 +4300,8 @@ describe("POST /actuate route", () => {
       if (parsed.pathname === "/client/v4/zones/zone-1/dns_records" && method === "POST") {
         return jsonResponse({ success: true, result: { id: "rec-new", name: "_dy-dirb-proof.jasonhulme.com" } });
       }
-      if (parsed.pathname === "/client/v4/zones/zone-1/dns_records/rec-existing" && method === "PUT") {
-        return jsonResponse({ success: true, result: { id: "rec-existing", name: "_dy-dirb-proof.jasonhulme.com" } });
+      if (parsed.pathname === `/client/v4/zones/zone-1/dns_records/${updatableRecordId}` && method === "PUT") {
+        return jsonResponse({ success: true, result: { id: updatableRecordId, name: "_dy-dirb-proof.jasonhulme.com" } });
       }
       throw new Error(`unexpected fetch ${method} ${url}`);
     });
@@ -4360,6 +4435,304 @@ describe("POST /actuate route", () => {
     expect(response.status).toBe(400);
     const body = (await response.json()) as { reason: string };
     expect(body.reason).toMatch(/type must be one of/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── doubleyoup#277: dns-record-upsert with an `expect` guard ──────────────────────
+
+  const PREVIEWED_RECORD_ID = "0123456789abcdef0123456789abcdef";
+
+  it("dns-record-upsert expect absent: creates when no record exists", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockDnsApi([]);
+    const job = dnsJob({ params: JSON.stringify({ ...DNS_PARAMS, expect: { absent: true } }) });
+    const signature = await signAsApp(job, privateKey);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "dns-record-upsert",
+      action: "created",
+      recordId: "rec-new",
+      name: "_dy-dirb-proof.jasonhulme.com",
+    });
+    expect(calls.map((call) => call.method)).toEqual(["GET", "GET", "POST"]);
+    // The guard is never sent to Cloudflare.
+    expect(calls[2].body).not.toHaveProperty("expect");
+  });
+
+  it("dns-record-upsert expect absent: refuses a newly appeared record and writes nothing", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockDnsApi([
+      { id: "rec-appeared", type: "TXT", name: "_dy-dirb-proof.jasonhulme.com", content: "someone-else" },
+    ]);
+    const job = dnsJob({ params: JSON.stringify({ ...DNS_PARAMS, expect: { absent: true } }) });
+    const signature = await signAsApp(job, privateKey);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/^record changed since preview/);
+    expect(calls.map((call) => call.method)).toEqual(["GET", "GET"]);
+  });
+
+  it("dns-record-upsert expect record: updates when exactly that record holds that content", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockDnsApi(
+      [{ id: PREVIEWED_RECORD_ID, type: "TXT", name: "_dy-dirb-proof.jasonhulme.com", content: "old-value" }],
+      PREVIEWED_RECORD_ID,
+    );
+    const job = dnsJob({
+      params: JSON.stringify({ ...DNS_PARAMS, expect: { recordId: PREVIEWED_RECORD_ID, content: "old-value" } }),
+    });
+    const signature = await signAsApp(job, privateKey);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; action: string; recordId: string };
+    expect(body.ok).toBe(true);
+    expect(body.action).toBe("updated");
+    expect(body.recordId).toBe(PREVIEWED_RECORD_ID);
+    expect(calls.map((call) => call.method)).toEqual(["GET", "GET", "PUT"]);
+    expect(calls[2].url).toContain(`/dns_records/${PREVIEWED_RECORD_ID}`);
+  });
+
+  it("dns-record-upsert expect record: refuses changed content, a different record and a vanished record", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const guardedParams = JSON.stringify({
+      ...DNS_PARAMS,
+      expect: { recordId: PREVIEWED_RECORD_ID, content: "old-value" },
+    });
+    const cases: Array<{ existing: Array<{ id: string; type: string; name: string; content: string }>; nonce: string }> = [
+      {
+        existing: [{ id: PREVIEWED_RECORD_ID, type: "TXT", name: "_dy-dirb-proof.jasonhulme.com", content: "edited" }],
+        nonce: "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+      },
+      {
+        existing: [{ id: "fedcba9876543210fedcba9876543210", type: "TXT", name: "_dy-dirb-proof.jasonhulme.com", content: "old-value" }],
+        nonce: "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2",
+      },
+      { existing: [], nonce: "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3" },
+    ];
+    for (const testCase of cases) {
+      vi.restoreAllMocks();
+      const calls = mockDnsApi(testCase.existing);
+      const job = dnsJob({ params: guardedParams, nonce: testCase.nonce });
+      const signature = await signAsApp(job, privateKey);
+
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { ok: boolean; detail: string };
+      expect(body.ok).toBe(false);
+      expect(body.detail).toMatch(/^record changed since preview/);
+      // Fail closed: only the two reads, no POST or PUT.
+      expect(calls.map((call) => call.method)).toEqual(["GET", "GET"]);
+    }
+  });
+
+  it("dns-record-upsert expect: two matches stay ambiguous, before the guard is even checked", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockDnsApi([
+      { id: PREVIEWED_RECORD_ID, type: "TXT", name: "_dy-dirb-proof.jasonhulme.com" },
+      { id: "fedcba9876543210fedcba9876543210", type: "TXT", name: "_dy-dirb-proof.jasonhulme.com" },
+    ]);
+    const job = dnsJob({
+      params: JSON.stringify({ ...DNS_PARAMS, expect: { recordId: PREVIEWED_RECORD_ID, content: "old-value" } }),
+    });
+    const signature = await signAsApp(job, privateKey);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/ambiguous/);
+    expect(calls.map((call) => call.method)).toEqual(["GET", "GET"]);
+  });
+
+  it("dns-record-upsert: a malformed expect in a signed job is 400 with no API call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const job = dnsJob({ params: JSON.stringify({ ...DNS_PARAMS, expect: { absent: false } }) });
+    const signature = await signAsApp(job, privateKey);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(400);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── doubleyoup#277: dns-record-get through the registry ───────────────────────────
+
+  const DNS_GET_PARAMS = { zone: "jasonhulme.com", name: "www.jasonhulme.com" };
+  function dnsGetJob(params: unknown, nonce = "d9e7d9e7d9e7d9e7d9e7d9e7d9e7d9e7"): DispatchJob {
+    return sampleJob({ op: "dns-record-get", params: JSON.stringify(params), nonce });
+  }
+
+  // A routed read-only mock: zone lookup (configurable: visible or not), then one record list.
+  // Any write method is a test failure. Every call carries the DNS token.
+  function mockDnsGetApi(options: { zoneVisible: boolean; records?: unknown[]; totalPages?: number }) {
+    const calls: Array<{ method: string; url: string }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = urlOf(input);
+      const method = init?.method ?? "GET";
+      expect(method).toBe("GET");
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer cf-dns-token-abc");
+      calls.push({ method, url });
+
+      const parsed = new URL(url);
+      if (parsed.pathname === "/client/v4/zones") {
+        if (!options.zoneVisible) {
+          return jsonResponse({ success: true, result: [] });
+        }
+        return jsonResponse({ success: true, result: [{ id: "zone-1", name: "jasonhulme.com" }] });
+      }
+      if (parsed.pathname === "/client/v4/zones/zone-1/dns_records") {
+        return jsonResponse({
+          success: true,
+          result: options.records ?? [],
+          result_info: { page: 1, total_pages: options.totalPages ?? 1 },
+        });
+      }
+      throw new Error(`unexpected Cloudflare call: ${method} ${url}`);
+    });
+    return calls;
+  }
+
+  function cloudflareRecord(id: string, type: string, content: string, extra: Record<string, unknown> = {}) {
+    return { id, type, name: "www.jasonhulme.com", content, ttl: 1, proxied: true, zone_id: "zone-1", ...extra };
+  }
+
+  it("dns-record-get: zone not in the account is zoneFound false (ok, not an error), with no record lookup", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockDnsGetApi({ zoneVisible: false });
+    const job = dnsGetJob(DNS_GET_PARAMS);
+    const signature = await signAsApp(job, privateKey);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, op: "dns-record-get", zoneFound: false, records: [] });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("dns-record-get: zone found with no records", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    mockDnsGetApi({ zoneVisible: true, records: [] });
+    const job = dnsGetJob({ ...DNS_GET_PARAMS, type: "CNAME" });
+    const signature = await signAsApp(job, privateKey);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(await response.json()).toEqual({ ok: true, op: "dns-record-get", zoneFound: true, records: [] });
+  });
+
+  it("dns-record-get: one record, filtered by type, with only the diff fields", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockDnsGetApi({
+      zoneVisible: true,
+      records: [cloudflareRecord("rec-cname", "CNAME", "host.doubleyoup.com")],
+    });
+    const job = dnsGetJob({ ...DNS_GET_PARAMS, type: "CNAME" });
+    const signature = await signAsApp(job, privateKey);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(await response.json()).toEqual({
+      ok: true,
+      op: "dns-record-get",
+      zoneFound: true,
+      records: [{ id: "rec-cname", type: "CNAME", name: "www.jasonhulme.com", content: "host.doubleyoup.com", ttl: 1, proxied: true }],
+    });
+    const listUrl = new URL(calls[1].url);
+    expect(listUrl.searchParams.get("name")).toBe("www.jasonhulme.com");
+    expect(listUrl.searchParams.get("type")).toBe("CNAME");
+  });
+
+  it("dns-record-get: many records of any type when no type is given; drops rows for another name", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const calls = mockDnsGetApi({
+      zoneVisible: true,
+      records: [
+        cloudflareRecord("rec-a1", "A", "203.0.113.10"),
+        cloudflareRecord("rec-a2", "A", "203.0.113.11", { proxied: false, ttl: 300 }),
+        cloudflareRecord("rec-txt", "TXT", "v=spf1 -all", { proxied: false }),
+        cloudflareRecord("rec-other", "A", "198.51.100.1", { name: "other.jasonhulme.com" }),
+      ],
+    });
+    const job = dnsGetJob(DNS_GET_PARAMS);
+    const signature = await signAsApp(job, privateKey);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    const body = (await response.json()) as { ok: boolean; zoneFound: boolean; records: Array<{ id: string }> };
+    expect(body.ok).toBe(true);
+    expect(body.zoneFound).toBe(true);
+    expect(body.records.map((record) => record.id)).toEqual(["rec-a1", "rec-a2", "rec-txt"]);
+    expect(new URL(calls[1].url).searchParams.has("type")).toBe(false);
+  });
+
+  it("dns-record-get: fails closed on more than one page, never a partial list", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    mockDnsGetApi({ zoneVisible: true, records: [cloudflareRecord("rec-a1", "A", "203.0.113.10")], totalPages: 2 });
+    const job = dnsGetJob(DNS_GET_PARAMS);
+    const signature = await signAsApp(job, privateKey);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/partial list/);
+  });
+
+  it("dns-record-get: a rejected token is an error, not zoneFound false, and the token is never echoed", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => jsonResponse({ success: false, errors: [] }, 403));
+    const job = dnsGetJob(DNS_GET_PARAMS);
+    const signature = await signAsApp(job, privateKey);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    const text = await response.text();
+    expect(text).not.toContain("cf-dns-token-abc");
+    const body = JSON.parse(text) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/rejected CF_DNS_API_TOKEN/);
+  });
+
+  it("dns-record-get: bad params are 400 before any Cloudflare call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const badParamsList = [
+      { zone: "jasonhulme.com", name: "www.other.com" },
+      { zone: "jasonhulme.com", name: "www.jasonhulme.com", type: "MX" },
+      { zone: "JasonHulme.com", name: "www.jasonhulme.com" },
+    ];
+    let nonceCounter = 0;
+    for (const badParams of badParamsList) {
+      nonceCounter += 1;
+      const job = dnsGetJob(badParams, `bad0bad0bad0bad0bad0bad0bad0bad${nonceCounter}`);
+      const signature = await signAsApp(job, privateKey);
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+      expect(response.status).toBe(400);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("dns-record-get: a missing CF_DNS_API_TOKEN fails cleanly with no API call", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const job = dnsGetJob(DNS_GET_PARAMS);
+    const signature = await signAsApp(job, privateKey);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith({ CF_DNS_API_TOKEN: undefined }));
+    const body = (await response.json()) as { ok: boolean; detail: string };
+    expect(body.ok).toBe(false);
+    expect(body.detail).toMatch(/CF_DNS_API_TOKEN is not configured/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("dns-record-get: an unsigned job actuates NOTHING", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const response = await worker.fetch(
+      actuateRequest({ job: dnsGetJob(DNS_GET_PARAMS), signature: "not-a-signature" }),
+      envWith(),
+    );
+    expect(response.status).toBe(401);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 

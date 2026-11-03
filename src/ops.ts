@@ -85,6 +85,7 @@ import {
   type ParamsVerdict,
   type ProvisionR2Params,
   type DnsRecordUpsertParams,
+  type DnsRecordGetParams,
   type CachePurgeParams,
   type CacheRuleUpsertParams,
   type WafRuleUpsertParams,
@@ -127,6 +128,7 @@ import {
   type GcpProjectQuotaGetParams,
   validateProvisionR2Params,
   validateDnsRecordUpsertParams,
+  validateDnsRecordGetParams,
   validateCachePurgeParams,
   validateCacheRuleUpsertParams,
   validateWafRuleUpsertParams,
@@ -172,6 +174,7 @@ import {
   type ActuateResult,
   actuateProvisionR2,
   actuateDnsRecordUpsert,
+  actuateDnsRecordGet,
   actuateCachePurge,
   actuateCacheRuleUpsert,
   actuateWafRuleUpsert,
@@ -271,6 +274,11 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "dns-record-upsert": defineOp<DnsRecordUpsertParams>({
     validateParams: validateDnsRecordUpsertParams,
     actuate: (params, env) => actuateDnsRecordUpsert(params, env),
+  }),
+  // doubleyoup#277: read-only — the app's preview diff before an upsert and its check after it.
+  "dns-record-get": defineOp<DnsRecordGetParams>({
+    validateParams: validateDnsRecordGetParams,
+    actuate: (params, env) => actuateDnsRecordGet(params, env),
   }),
   "cache-purge": defineOp<CachePurgeParams>({
     validateParams: validateCachePurgeParams,

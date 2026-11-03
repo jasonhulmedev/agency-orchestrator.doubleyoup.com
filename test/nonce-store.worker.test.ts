@@ -32,10 +32,16 @@ vi.mock("../src/actuate.js", () => ({
     recordId: "rec-mock",
     name: params.name,
   })),
+  actuateDnsRecordGet: vi.fn(async () => ({
+    ok: true as const,
+    op: "dns-record-get" as const,
+    zoneFound: true,
+    records: [],
+  })),
 }));
 
 import worker from "../src/index.js";
-import { actuateProvisionR2, actuateDnsRecordUpsert } from "../src/actuate.js";
+import { actuateProvisionR2, actuateDnsRecordUpsert, actuateDnsRecordGet } from "../src/actuate.js";
 import type { Env } from "../src/env.js";
 import type { NonceStore } from "../src/nonce-store.js";
 import { nonceExpiresAtMs } from "../src/nonce-store.js";
@@ -172,10 +178,12 @@ describe("NonceStore leases (waf-edge-sync, one instance per zone) — real Dura
 describe("POST /actuate — single-use replay protection end-to-end (real DO)", () => {
   const r2Spy = vi.mocked(actuateProvisionR2);
   const dnsSpy = vi.mocked(actuateDnsRecordUpsert);
+  const dnsGetSpy = vi.mocked(actuateDnsRecordGet);
 
   beforeEach(() => {
     r2Spy.mockClear();
     dnsSpy.mockClear();
+    dnsGetSpy.mockClear();
   });
 
   it("provision-r2: actuates a valid job once (200), then rejects the identical replay (401) with no second actuation", async () => {
@@ -255,6 +263,36 @@ describe("POST /actuate — single-use replay protection end-to-end (real DO)", 
 
     expect(dnsSpy).toHaveBeenCalledTimes(1);
     expect(r2Spy).not.toHaveBeenCalled();
+  });
+
+  it("dns-record-get: a read op is single-use too — actuates once (200), then rejects the replay (401)", async () => {
+    const { publicKeyPem, privateKey } = await makeKeypair();
+    const getParams = { zone: "example.com", name: "www.example.com", type: "CNAME" };
+    const job: DispatchJob = {
+      op: "dns-record-get",
+      params: JSON.stringify(getParams),
+      accountId: "acct_replay_e2e",
+      timestamp: new Date().toISOString(),
+      nonce: `e2e-dnsget-${crypto.randomUUID().replace(/-/g, "")}`,
+    };
+    const signature = await signAsApp(job, privateKey);
+    const testEnv: Env = {
+      ...workerEnv,
+      DY_SIGNING_PUBLIC_KEY: publicKeyPem,
+      CF_DNS_API_TOKEN: "cf-dns-token-abc",
+    };
+
+    const [first, second] = await postTwice(job, signature, testEnv);
+
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ ok: true, op: "dns-record-get", zoneFound: true, records: [] });
+    expect(dnsGetSpy).toHaveBeenCalledTimes(1);
+    expect(dnsGetSpy).toHaveBeenCalledWith(getParams, expect.anything());
+
+    expect(second.status).toBe(401);
+    expect(await second.json()).toEqual({ ok: false, error: "unverified dispatch", reason: "replay" });
+    expect(dnsGetSpy).toHaveBeenCalledTimes(1);
+    expect(dnsSpy).not.toHaveBeenCalled();
   });
 });
 

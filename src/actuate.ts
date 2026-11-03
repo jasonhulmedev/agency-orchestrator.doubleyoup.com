@@ -24,6 +24,8 @@
 import type { Env } from "./env.js";
 import type {
   DnsRecordUpsertParams,
+  DnsRecordUpsertExpect,
+  DnsRecordGetParams,
   DnsRecordDeleteParams,
   CachePurgeParams,
   CacheRuleUpsertParams,
@@ -277,6 +279,25 @@ export type CfTunnelConfigResult =
 export type CfTunnelDeleteResult =
   | { ok: true; op: "cf-tunnel-delete"; tunnelId: string; status: "deleted" | "already-absent" }
   | { ok: false; op: "cf-tunnel-delete"; tunnelId: string; detail: string };
+
+/** One DNS record as dns-record-get reports it: only the fields the app's diff needs. */
+export interface DnsRecordView {
+  id: string;
+  type: string;
+  name: string;
+  content: string;
+  ttl: number;
+  proxied: boolean;
+}
+
+/**
+ * `zoneFound: false` is a SUCCESS: the token cannot see the zone, so the app can tell the user that
+ * the zone is not in this agency's Cloudflare account. Any other failure (token rejected, Cloudflare
+ * down) is `ok: false`.
+ */
+export type DnsRecordGetResult =
+  | { ok: true; op: "dns-record-get"; zoneFound: boolean; records: DnsRecordView[] }
+  | { ok: false; op: "dns-record-get"; name: string; detail: string };
 
 export type DnsRecordDeleteResult =
   | { ok: true; op: "dns-record-delete"; name: string; status: "deleted" | "already-absent" }
@@ -780,6 +801,7 @@ export type CloudRunProbeInvokeResult =
 export type ActuateResult =
   | ProvisionR2Result
   | DnsRecordUpsertResult
+  | DnsRecordGetResult
   | CachePurgeResult
   | CacheRuleUpsertResult
   | WafRuleUpsertResult
@@ -1002,6 +1024,10 @@ interface CloudflareDnsRecordSummary {
   id?: string;
   name?: string;
   type?: string;
+  /** Read by the dns-record-upsert `expect` guard and by dns-record-get. */
+  content?: string;
+  ttl?: number;
+  proxied?: boolean;
 }
 
 /**
@@ -1034,7 +1060,9 @@ export async function resolveZoneId(
   token: string,
   zoneName: string,
   signal?: AbortSignal,
-): Promise<{ id: string; planLegacyId: string | null; accountId: string | null } | { error: string }> {
+): Promise<
+  { id: string; planLegacyId: string | null; accountId: string | null } | { error: string; zoneNotVisible?: true }
+> {
   const query = new URLSearchParams({ name: zoneName, per_page: "2" });
   let response: Response;
   try {
@@ -1062,8 +1090,11 @@ export async function resolveZoneId(
   // looser server-side match can never pick a different zone.
   const zones = (body.result as CloudflareZoneSummary[]).filter((zone) => zone.name === zoneName && zone.id);
   if (zones.length === 0) {
+    // `zoneNotVisible` lets dns-record-get report "this zone is not in the agency account" as a
+    // result, not an error. Every other caller treats it as the plain error it always was.
     return {
       error: `zone "${zoneName}" is not visible to CF_DNS_API_TOKEN — check the zone name and the token's zone scope.`,
+      zoneNotVisible: true,
     };
   }
   if (zones.length > 1) {
@@ -1121,6 +1152,39 @@ async function findExistingRecords(
 }
 
 /**
+ * The `expect` guard of dns-record-upsert (doubleyoup#277): null when the zone still holds the state
+ * the user confirmed in the preview, else the failure detail. The caller has already refused 2+
+ * matches, so `records` holds zero or one record here.
+ */
+function dnsExpectMismatch(
+  expected: DnsRecordUpsertExpect,
+  records: CloudflareDnsRecordSummary[],
+  type: string,
+  name: string,
+): string | null {
+  const changedPrefix = "record changed since preview";
+
+  if ("absent" in expected) {
+    if (records.length === 0) {
+      return null;
+    }
+    return `${changedPrefix}: expected no ${type} record at "${name}", but record ${records[0].id} now exists.`;
+  }
+
+  if (records.length === 0) {
+    return `${changedPrefix}: expected ${type} record ${expected.recordId} at "${name}", but no ${type} record exists there now.`;
+  }
+  const currentRecord = records[0];
+  if (currentRecord.id !== expected.recordId) {
+    return `${changedPrefix}: expected ${type} record ${expected.recordId} at "${name}", but the record there now is ${currentRecord.id}.`;
+  }
+  if (currentRecord.content !== expected.content) {
+    return `${changedPrefix}: ${type} record ${expected.recordId} at "${name}" no longer holds the previewed content.`;
+  }
+  return null;
+}
+
+/**
  * Upsert the record with the agency's own CF_DNS_API_TOKEN. Returns a structured result;
  * never throws for a Cloudflare-side failure. NEVER falls back to a platform credential
  * (there is none).
@@ -1148,6 +1212,12 @@ export async function actuateDnsRecordUpsert(
       params.name,
       `${existing.records.length} existing ${params.type} records already match "${params.name}" — ambiguous, refusing to update one of them.`,
     );
+  }
+  if (params.expect !== undefined) {
+    const mismatch = dnsExpectMismatch(params.expect, existing.records, params.type, params.name);
+    if (mismatch !== null) {
+      return dnsFailure(params.name, mismatch);
+    }
   }
 
   // The signed params are all strings by convention; Cloudflare wants real JSON types here.
@@ -1192,6 +1262,100 @@ export async function actuateDnsRecordUpsert(
   }
 
   return { ok: true, op: "dns-record-upsert", action, recordId: written.id, name: params.name };
+}
+
+// ── dns-record-get ─────────────────────────────────────────────────────────────────
+// Read-only (doubleyoup#277): the records at ONE name, optionally of one type, with the agency's own
+// CF_DNS_API_TOKEN. The app shows them as a diff before a dns-record-upsert and re-reads them to
+// verify after it. A zone the token cannot see is `zoneFound: false`, not an error.
+
+// One page of records. A name with more records than this is far outside any real zone; the op
+// fails closed rather than return a partial list that would make the app's diff wrong.
+const DNS_RECORD_GET_PAGE_SIZE = 100;
+
+function dnsGetFailure(name: string, detail: string): DnsRecordGetResult {
+  return { ok: false, op: "dns-record-get", name, detail };
+}
+
+/** The record as dns-record-get reports it, or null when Cloudflare returned a row without the fields. */
+function toDnsRecordView(record: CloudflareDnsRecordSummary): DnsRecordView | null {
+  if (typeof record.id !== "string" || typeof record.type !== "string" || typeof record.name !== "string") {
+    return null;
+  }
+  if (typeof record.content !== "string" || typeof record.ttl !== "number" || typeof record.proxied !== "boolean") {
+    return null;
+  }
+  return {
+    id: record.id,
+    type: record.type,
+    name: record.name,
+    content: record.content,
+    ttl: record.ttl,
+    proxied: record.proxied,
+  };
+}
+
+export async function actuateDnsRecordGet(params: DnsRecordGetParams, env: Env): Promise<DnsRecordGetResult> {
+  const token = env.CF_DNS_API_TOKEN;
+  if (!token) {
+    return dnsGetFailure(params.name, "CF_DNS_API_TOKEN is not configured on this Worker.");
+  }
+
+  const zone = await resolveZoneId(token, params.zone);
+  if ("error" in zone) {
+    if (zone.zoneNotVisible === true) {
+      return { ok: true, op: "dns-record-get", zoneFound: false, records: [] };
+    }
+    return dnsGetFailure(params.name, zone.error);
+  }
+
+  const query = new URLSearchParams({ name: params.name, per_page: String(DNS_RECORD_GET_PAGE_SIZE) });
+  if (params.type !== undefined) {
+    query.set("type", params.type);
+  }
+  let response: Response;
+  try {
+    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zone.id)}/dns_records?${query.toString()}`, {
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+    });
+  } catch (err) {
+    return dnsGetFailure(params.name, `could not reach Cloudflare to list DNS records: ${errorMessage(err)}`);
+  }
+
+  const body = (await response.json().catch(() => null)) as
+    | (CloudflareEnvelope & { result_info?: { total_pages?: unknown } })
+    | null;
+  if (response.status === 401 || response.status === 403) {
+    return dnsGetFailure(params.name, "Cloudflare denied listing DNS records — CF_DNS_API_TOKEN needs Zone:DNS:Edit on this zone.");
+  }
+  if (!body?.success || !Array.isArray(body.result)) {
+    return dnsGetFailure(params.name, `DNS record lookup failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.`);
+  }
+  const totalPages = body.result_info?.total_pages;
+  if (typeof totalPages === "number" && totalPages > 1) {
+    return dnsGetFailure(
+      params.name,
+      `more than ${DNS_RECORD_GET_PAGE_SIZE} records match "${params.name}" — refusing to return a partial list.`,
+    );
+  }
+
+  const records: DnsRecordView[] = [];
+  for (const row of body.result as CloudflareDnsRecordSummary[]) {
+    // Re-check name (and type, when asked) on each row, as the upsert does: a looser server-side
+    // match must never put another name's record into the user's diff.
+    if (row.name !== params.name) {
+      continue;
+    }
+    if (params.type !== undefined && row.type !== params.type) {
+      continue;
+    }
+    const view = toDnsRecordView(row);
+    if (view === null) {
+      return dnsGetFailure(params.name, "Cloudflare returned a DNS record without id, type, name, content, ttl or proxied.");
+    }
+    records.push(view);
+  }
+  return { ok: true, op: "dns-record-get", zoneFound: true, records };
 }
 
 // planning/40 Phase B: delete the agent-host CNAME on teardown. Idempotent — a record already gone
