@@ -51,6 +51,13 @@ export const DISPATCH_OPS = [
   "custom-hostname-upsert",
   "custom-hostname-get",
   "custom-hostname-delete",
+  // hub#133 part 2 — branded media on an agency cell: the route of one media host to the agency media
+  // Worker (the script is MEDIA_WORKER_SCRIPT, never a job param) and its HOSTMAP entry (the namespace is
+  // pinned, never a job param). No generic KV write and no route-any-script op.
+  "worker-route-upsert",
+  "worker-route-delete",
+  "media-hostmap-upsert",
+  "media-hostmap-delete",
   "cf-tunnel-create",
   "cf-tunnel-config",
   "cf-tunnel-delete",

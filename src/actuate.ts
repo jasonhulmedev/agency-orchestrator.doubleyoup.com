@@ -143,6 +143,12 @@ import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessTo
 import { errorMessage, stripTrailingSlash } from "./util.js";
 import type { CfTunnelGetResult, GcpDiskSnapshotCreateResult, GcpInstanceRemoveServiceAccountResult } from "./actuate-hub58.js";
 import type { R2MediaBucketsResult, R2MediaStateResult, R2SiteKeyInstallResult, R2SiteKeyRevokeResult } from "./actuate-r2-media.js";
+import type {
+  MediaHostmapDeleteResult,
+  MediaHostmapUpsertResult,
+  MediaWorkerRouteDeleteResult,
+  MediaWorkerRouteUpsertResult,
+} from "./actuate-branded-media.js";
 import type { CfTunnelConnectionsGetResult, CfTunnelTokenGetResult, GcpInstanceMetadataDiffResult } from "./actuate-p47.js";
 import type { EdgeGateDeployResult } from "./actuate-edge-gate.js";
 
@@ -837,7 +843,11 @@ export type ActuateResult =
   | R2MediaBucketsResult
   | R2MediaStateResult
   | R2SiteKeyInstallResult
-  | R2SiteKeyRevokeResult;
+  | R2SiteKeyRevokeResult
+  | MediaWorkerRouteUpsertResult
+  | MediaWorkerRouteDeleteResult
+  | MediaHostmapUpsertResult
+  | MediaHostmapDeleteResult;
 
 export interface CloudflareEnvelope {
   success?: boolean;

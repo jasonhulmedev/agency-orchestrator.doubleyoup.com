@@ -109,7 +109,17 @@ export interface Env {
   // scopes are exercised for real on first use. Set only as a Worker secret, never in [vars].
   // hub#46: the custom-hostname ops (src/actuate-custom-hostname.ts) use this SAME token, which then also
   // needs "SSL and Certificates: Edit" on the zone named by CF_CUSTOM_HOSTNAME_ZONE below.
+  // hub#133: the branded-media ops (src/actuate-branded-media.ts) use this SAME token too, which then
+  // also needs "Workers Routes: Edit" on the agency zone and the account's "Workers KV Storage: Edit".
   CF_DNS_API_TOKEN?: string;
+
+  // hub#133: the script name of the agency's media Worker. worker-route-upsert points every media route
+  // at THIS script; a signed job never names one. Unset => "doubleyoup-media".
+  MEDIA_WORKER_SCRIPT?: string;
+
+  // hub#133: the id of the KV namespace the media Worker binds as HOSTMAP. media-hostmap-upsert / -delete
+  // write ONLY this namespace. Unset => the account's namespace titled "HOSTMAP" (looked up on each call).
+  MEDIA_HOSTMAP_KV_ID?: string;
 
   // hub#46: the agency zone that holds its customers' Cloudflare-for-SaaS custom hostnames — a zone NAME
   // such as "example.com" (the cell's Cell.cfZone). The custom-hostname-upsert / -get / -delete ops act
