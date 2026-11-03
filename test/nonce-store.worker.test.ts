@@ -169,6 +169,26 @@ describe("NonceStore leases (waf-edge-sync, one instance per zone) — real Dura
   });
 });
 
+describe("NonceStore media route ids (worker-route-*, one instance per zone) — real Durable Object", () => {
+  function routeIdStub(zoneId: string) {
+    const ns = workerEnv.NONCE_STORE;
+    return ns.get(ns.idFromName(`media-routes:${zoneId}`));
+  }
+
+  it("records, replaces and forgets the id of a pattern; zones do not share ids", async () => {
+    const stub = routeIdStub("zone-a");
+    expect(await stub.readMediaRouteId("a-media.example.com/*")).toBeNull();
+    await stub.writeMediaRouteId("a-media.example.com/*", "route-1");
+    expect(await stub.readMediaRouteId("a-media.example.com/*")).toBe("route-1");
+    await stub.writeMediaRouteId("a-media.example.com/*", "route-2");
+    expect(await stub.readMediaRouteId("a-media.example.com/*")).toBe("route-2");
+    expect(await stub.readMediaRouteId("b-media.example.com/*")).toBeNull();
+    expect(await routeIdStub("zone-b").readMediaRouteId("a-media.example.com/*")).toBeNull();
+    await stub.clearMediaRouteId("a-media.example.com/*");
+    expect(await stub.readMediaRouteId("a-media.example.com/*")).toBeNull();
+  });
+});
+
 describe("POST /actuate — single-use replay protection end-to-end (real DO)", () => {
   const r2Spy = vi.mocked(actuateProvisionR2);
   const dnsSpy = vi.mocked(actuateDnsRecordUpsert);

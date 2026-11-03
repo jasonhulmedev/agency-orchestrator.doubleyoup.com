@@ -66,6 +66,10 @@ export class NonceStore extends DurableObject {
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS leases (lease_key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires_at INTEGER NOT NULL)",
     );
+    // Media route ids (readMediaRouteId below). Same reasoning: idempotent and synchronous.
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS media_routes (pattern TEXT PRIMARY KEY, route_id TEXT NOT NULL)",
+    );
   }
 
   /**
@@ -139,5 +143,37 @@ export class NonceStore extends DurableObject {
    */
   releaseLease(leaseKey: string, holder: string): void {
     this.ctx.storage.sql.exec("DELETE FROM leases WHERE lease_key = ? AND holder = ?", leaseKey, holder);
+  }
+
+  // ── media route ids (hub#133 worker-route-*, one instance per agency zone) ─────────────
+  // A THIRD use of this class, on separate instances (actuate-branded-media.ts names one per zone id).
+  // Cloudflare reads a Workers route only by id; finding one by pattern means listing every route of the
+  // zone. So the Worker records the id of each media route it creates, and later calls read that one
+  // route by id. One small row per media host.
+
+  /** The id this Worker recorded for the media route `pattern`, or null when it recorded none. */
+  readMediaRouteId(pattern: string): string | null {
+    const rows = this.ctx.storage.sql
+      .exec<{ route_id: string }>("SELECT route_id FROM media_routes WHERE pattern = ? LIMIT 1", pattern)
+      .toArray();
+    const row = rows[0];
+    if (row === undefined) {
+      return null;
+    }
+    return row.route_id;
+  }
+
+  /** Record `routeId` as the media route of `pattern`, replacing an older id. */
+  writeMediaRouteId(pattern: string, routeId: string): void {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO media_routes (pattern, route_id) VALUES (?, ?) ON CONFLICT(pattern) DO UPDATE SET route_id = excluded.route_id",
+      pattern,
+      routeId,
+    );
+  }
+
+  /** Forget the media route of `pattern` (it is gone). */
+  clearMediaRouteId(pattern: string): void {
+    this.ctx.storage.sql.exec("DELETE FROM media_routes WHERE pattern = ?", pattern);
   }
 }

@@ -24,10 +24,10 @@
 // removes only the exact route `<hostname>/*` in that zone and only when it points at the media Worker,
 // so it needs no such check (and still works after the custom hostname is gone).
 //
-// THE ROUTE ID. Both route ops take an optional `routeId`, the id the upsert returned. With it, the
-// actuator reads that one route by id, so the steady path never lists the zone's routes (one list per
-// host would be quadratic work across a zone with many branded hosts). The id is re-checked against
-// Cloudflare, so it selects a route but grants nothing.
+// THE ROUTE ID. Both route ops take an optional `routeId`, the id the upsert returned. The actuator reads
+// that one route by id (else the id the Worker itself recorded at create), and never lists the zone's
+// routes (one list per host would be quadratic work across a zone with many branded hosts). The id is
+// re-checked against Cloudflare, so it selects a route but grants nothing.
 
 import type { ParamsVerdict } from "./dispatch-params.js";
 import { isCustomHostnameFqdn } from "./dispatch-params-custom-hostname.js";
@@ -56,7 +56,8 @@ export interface MediaWorkerRouteParams {
   hostname: string;
   /**
    * Optional: the route id an earlier worker-route-upsert returned (the platform stores it with the host).
-   * With it, the op reads and deletes that ONE route directly instead of listing every route in the zone.
+   * With it, the op reads and deletes that ONE route directly; the Worker's own record of the id is the
+   * fallback, and no path lists every route in the zone.
    * It is re-checked against Cloudflare (pattern and script), so a wrong id is refused, never trusted.
    */
   routeId?: string;
