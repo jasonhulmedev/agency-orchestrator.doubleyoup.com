@@ -12,6 +12,7 @@ import type { Env } from "./env.js";
 import { signS3Request } from "./sigv4.js";
 import { errorMessage, extractXmlTag, isWorkerScriptName, stripTrailingSlash } from "./util.js";
 import { probeCustomHostnameScope, type CustomHostnameScopeReport } from "./actuate-custom-hostname.js";
+import { resolveMediaAccountId } from "./media-account.js";
 import { cellRunServiceAccountFor, edgeGateScriptNameFor, isGcpRegionName } from "./dispatch-params.js";
 import {
   CLIENT_SECRET_MIN_LENGTH,
@@ -52,6 +53,26 @@ export interface ValidationResult {
    * ADVISORY — it never changes `ok`.
    */
   workersScope?: WorkersScopeReport;
+  /**
+   * cfDns only (hub#133): the three scopes the branded-media ops need on CF_DNS_API_TOKEN, and whether the
+   * HOSTMAP namespace is there. ADVISORY — it never changes `ok`.
+   */
+  brandedMedia?: BrandedMediaScopeReport;
+}
+
+/**
+ * hub#133: the branded-media scopes on CF_DNS_API_TOKEN, each as a READ probe (a read cannot prove Edit):
+ *   sslCertificates  Zone → SSL and Certificates (custom hostnames on CF_CUSTOM_HOSTNAME_ZONE)
+ *   workersRoutes    Zone → Workers Routes (routes on the zone the zone list returned first)
+ *   workersKv        Account → Workers KV Storage (the account's KV namespaces)
+ * hostmapNamespace: MEDIA_HOSTMAP_KV_ID is set ("pinned"), a namespace titled HOSTMAP was listed ("found"),
+ * none was listed ("missing"), or the list could not be read ("unknown").
+ */
+export interface BrandedMediaScopeReport {
+  sslCertificates: WorkersReadState;
+  workersRoutes: WorkersReadState;
+  workersKv: WorkersReadState;
+  hostmapNamespace: "pinned" | "found" | "missing" | "unknown";
 }
 
 /**
@@ -786,6 +807,69 @@ function workersReadText(probe: { state: WorkersReadState; status: string }, wha
   return `${what}: check inconclusive (${probe.status})`;
 }
 
+/**
+ * hub#133: the three scopes the branded-media ops (worker-route-*, media-hostmap-*, custom-hostname-*) need
+ * on CF_DNS_API_TOKEN. SSL and Workers Routes reuse the reads the custom-hostname and edge-gate probes
+ * already made; only the KV namespace list is a new call. ADVISORY: never changes `ok`.
+ */
+async function probeBrandedMediaScope(
+  token: string,
+  customHostnames: CustomHostnameScopeReport,
+  workersRoutes: WorkersReadState,
+  env: Env,
+): Promise<{ detail: string; report: BrandedMediaScopeReport }> {
+  // Without CF_CUSTOM_HOSTNAME_ZONE (or with an unreachable zone) the SSL scope could not be checked at all.
+  let sslCertificates: WorkersReadState = "unknown";
+  if (customHostnames.canReadCustomHostnames) {
+    sslCertificates = "read-ok";
+  } else if (customHostnames.readDenied) {
+    sslCertificates = "denied";
+  }
+
+  let kv: { state: WorkersReadState; status: string; body?: unknown };
+  // The SAME account the media-hostmap-* ops write to (MEDIA_ACCOUNT_ID, or the token's only account), so
+  // a green probe means "the account the ops will use", not "some account the token happens to list first".
+  const account = await resolveMediaAccountId(token, env, "Cloudflare denied the account list");
+  if (account.ok) {
+    kv = await probeWorkersRead(
+      token,
+      `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(account.id)}/storage/kv/namespaces?per_page=100`,
+    );
+  } else {
+    kv = { state: "unknown", status: account.error };
+  }
+
+  let hostmapNamespace: BrandedMediaScopeReport["hostmapNamespace"] = "unknown";
+  let hostmapText = "HOSTMAP namespace: not checked (the KV list was not read)";
+  if (env.MEDIA_HOSTMAP_KV_ID) {
+    hostmapNamespace = "pinned";
+    hostmapText = "HOSTMAP namespace: pinned by MEDIA_HOSTMAP_KV_ID";
+  } else if (kv.state === "read-ok") {
+    const listed = (kv.body as { result?: Array<{ title?: unknown }> } | null)?.result;
+    const found = Array.isArray(listed) && listed.some((namespace) => namespace.title === "HOSTMAP");
+    if (found) {
+      hostmapNamespace = "found";
+      hostmapText = "HOSTMAP namespace: found";
+    } else {
+      hostmapNamespace = "missing";
+      hostmapText =
+        "HOSTMAP namespace: NOT found in the first 100 — deploy the media Worker with its HOSTMAP binding, or set MEDIA_HOSTMAP_KV_ID";
+    }
+  }
+
+  const sslText = workersReadText(
+    { state: sslCertificates, status: "see the custom-hostname row" },
+    "Custom hostnames",
+    "Zone → SSL and Certificates: Edit",
+  );
+  const routesText = workersReadText({ state: workersRoutes, status: "see the edge-gate row" }, "Workers routes", "Zone → Workers Routes: Edit");
+  const kvText = workersReadText(kv, "Workers KV namespaces", "Account → Workers KV Storage: Edit");
+  return {
+    detail: `Branded media (advisory, does not affect this check): ${sslText}; ${routesText}; ${kvText}; ${hostmapText}. A read cannot prove Edit; it is exercised on the first branded-media op.`,
+    report: { sslCertificates, workersRoutes, workersKv: kv.state, hostmapNamespace },
+  };
+}
+
 export async function validateCfDns(env: Env): Promise<ValidationResult> {
   if (!env.CF_DNS_API_TOKEN) {
     return {
@@ -825,11 +909,14 @@ export async function validateCfDns(env: Env): Promise<ValidationResult> {
         const customHostnames = await probeCustomHostnameScope(env);
         // planning/49 Phase 3: the session edge gate's Workers scopes. Same non-fatal pattern.
         const workers = await probeWorkersScope(env.CF_DNS_API_TOKEN, { id: body.result[0]?.id, name: zoneName }, env);
+        // hub#133 branded media: the SSL, Workers Routes and Workers KV scopes, one row. Same non-fatal pattern.
+        const brandedMedia = await probeBrandedMediaScope(env.CF_DNS_API_TOKEN, customHostnames, workers.report.routes, env);
         return {
           ok: true,
-          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch. ${tunnelStatus} ${cacheRulesStatus} ${wafRulesStatus} ${customHostnames.detail} ${workers.detail}`,
+          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch. ${tunnelStatus} ${cacheRulesStatus} ${wafRulesStatus} ${customHostnames.detail} ${workers.detail} ${brandedMedia.detail}`,
           customHostnames,
           workersScope: workers.report,
+          brandedMedia: brandedMedia.report,
         };
       }
       return {

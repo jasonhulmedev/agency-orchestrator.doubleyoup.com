@@ -29,6 +29,8 @@ R2_PROVISION_API_TOKEN=""
 
 # Cloudflare DNS — API token with Zone:DNS:Edit + Zone:Read on the agency zone(s)
 # the platform may manage (Direction-B dns-record-upsert actuator).
+# Branded media (hub#133) also needs SSL and Certificates: Edit, Workers Routes: Edit
+# and Account Workers KV Storage: Edit on this same token.
 CF_DNS_API_TOKEN=""
 
 # Cell-agent access (Direction-B wp-cli actuator) — the base URL of the agency's OWN

@@ -240,7 +240,7 @@ export function configuredCustomHostnameZone(env: Env): { zone: string } | { err
   return { zone };
 }
 
-interface ResolvedCustomHostnameZone {
+export interface ResolvedCustomHostnameZone {
   token: string;
   zone: string;
   zoneId: string;
@@ -295,7 +295,7 @@ function customHostnamesPath(zoneId: string): string {
 }
 
 /** The custom hostname for EXACTLY `hostname` (null when the zone has none), or a reason the read failed. */
-async function findCustomHostname(
+export async function findCustomHostname(
   resolved: ResolvedCustomHostnameZone,
   hostname: string,
 ): Promise<{ found: CustomHostnameView | null } | { error: string }> {
@@ -569,6 +569,8 @@ export interface CustomHostnameScopeReport {
   zone: string | null;
   /** True when the token may READ the zone's custom hostnames (the edit scope is exercised on first use). */
   canReadCustomHostnames: boolean;
+  /** True only when Cloudflare refused that read (401/403): the token lacks "SSL and Certificates". */
+  readDenied: boolean;
   /** The zone's Cloudflare-for-SaaS fallback origin, or null when none is set or it could not be read. */
   fallbackOrigin: string | null;
   /** Cloudflare's status of that fallback origin (for example "active"), or null. */
@@ -622,6 +624,7 @@ export async function probeCustomHostnameScope(env: Env): Promise<CustomHostname
     return {
       zone,
       canReadCustomHostnames: false,
+      readDenied: false,
       fallbackOrigin: null,
       fallbackOriginStatus: null,
       detail: `Custom hostnames: not available — ${resolved.error}`,
@@ -637,6 +640,7 @@ export async function probeCustomHostnameScope(env: Env): Promise<CustomHostname
     return {
       zone: resolved.zone,
       canReadCustomHostnames: false,
+      readDenied: false,
       fallbackOrigin: null,
       fallbackOriginStatus: null,
       detail: `Custom hostnames: the probe could not be sent (${errorMessage(err)}).`,
@@ -647,6 +651,7 @@ export async function probeCustomHostnameScope(env: Env): Promise<CustomHostname
     return {
       zone: resolved.zone,
       canReadCustomHostnames: false,
+      readDenied: true,
       fallbackOrigin: null,
       fallbackOriginStatus: null,
       detail: `Custom hostnames: NOT available on ${resolved.zone} — ${CUSTOM_HOSTNAME_SCOPE_HINT}${cloudflareMessage(listBody)}.`,
@@ -657,6 +662,7 @@ export async function probeCustomHostnameScope(env: Env): Promise<CustomHostname
     return {
       zone: resolved.zone,
       canReadCustomHostnames: false,
+      readDenied: false,
       fallbackOrigin: null,
       fallbackOriginStatus: null,
       detail: `Custom hostnames: check inconclusive on ${resolved.zone} (HTTP ${listResponse.status}${cloudflareMessage(listBody)}) — is Cloudflare for SaaS enabled on the zone?`,
@@ -667,6 +673,7 @@ export async function probeCustomHostnameScope(env: Env): Promise<CustomHostname
   return {
     zone: resolved.zone,
     canReadCustomHostnames: true,
+    readDenied: false,
     fallbackOrigin: fallback.origin,
     fallbackOriginStatus: fallback.status,
     detail: `Custom hostnames: read access OK on ${resolved.zone} ("SSL and Certificates: Edit" is exercised on the first custom-hostname upsert); ${fallback.note}`,

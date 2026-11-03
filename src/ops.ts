@@ -69,6 +69,11 @@
 // only an ABSENT (or dead, `deleted`) hostname and otherwise reports the one there is, so a re-run after a
 // lost answer finds the hostname it created; `custom-hostname-get` is a read; `custom-hostname-delete`
 // treats an absent hostname as "already-absent".
+// The four hub#133 branded-media ops (actuate-branded-media.ts) are idempotent: `worker-route-upsert`
+// creates only an ABSENT route and reports one to the media Worker as "unchanged"; `media-hostmap-upsert`
+// is a KV PUT of the same value; both deletes treat an absent route or key as "already-absent". A stale
+// routeId falls through to one list of the agency zone's routes, so a replacement route is found, never
+// reported as "already-absent".
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -81,6 +86,21 @@ import {
   validateCustomHostnameUpsertParams,
 } from "./dispatch-params-custom-hostname.js";
 import { actuateCustomHostnameDelete, actuateCustomHostnameGet, actuateCustomHostnameUpsert } from "./actuate-custom-hostname.js";
+import {
+  type MediaHostmapDeleteParams,
+  type MediaHostmapUpsertParams,
+  type MediaWorkerRouteParams,
+  validateMediaHostmapDeleteParams,
+  validateMediaHostmapUpsertParams,
+  validateMediaWorkerRouteDeleteParams,
+  validateMediaWorkerRouteUpsertParams,
+} from "./dispatch-params-branded-media.js";
+import {
+  actuateMediaHostmapDelete,
+  actuateMediaHostmapUpsert,
+  actuateMediaWorkerRouteDelete,
+  actuateMediaWorkerRouteUpsert,
+} from "./actuate-branded-media.js";
 import {
   type ParamsVerdict,
   type ProvisionR2Params,
@@ -299,6 +319,22 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "custom-hostname-delete": defineOp<CustomHostnameDeleteParams>({
     validateParams: validateCustomHostnameDeleteParams,
     actuate: (params, env) => actuateCustomHostnameDelete(params, env),
+  }),
+  "worker-route-upsert": defineOp<MediaWorkerRouteParams>({
+    validateParams: validateMediaWorkerRouteUpsertParams,
+    actuate: (params, env) => actuateMediaWorkerRouteUpsert(params, env),
+  }),
+  "worker-route-delete": defineOp<MediaWorkerRouteParams>({
+    validateParams: validateMediaWorkerRouteDeleteParams,
+    actuate: (params, env) => actuateMediaWorkerRouteDelete(params, env),
+  }),
+  "media-hostmap-upsert": defineOp<MediaHostmapUpsertParams>({
+    validateParams: validateMediaHostmapUpsertParams,
+    actuate: (params, env) => actuateMediaHostmapUpsert(params, env),
+  }),
+  "media-hostmap-delete": defineOp<MediaHostmapDeleteParams>({
+    validateParams: validateMediaHostmapDeleteParams,
+    actuate: (params, env) => actuateMediaHostmapDelete(params, env),
   }),
   "cf-tunnel-create": defineOp<CfTunnelCreateParams>({
     validateParams: validateCfTunnelCreateParams,
