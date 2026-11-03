@@ -8823,7 +8823,7 @@ const WORKERS_ROUTE_UNAUTHORIZED_HINT =
   "Cloudflare denied the Workers route call — CF_DNS_API_TOKEN needs Zone → Workers Routes: Edit on this zone.";
 
 /** The routes in a zone whose pattern is EXACTLY `pattern`, or the reason the list failed. */
-async function findWorkerRoutesByPattern(
+export async function findWorkerRoutesByPattern(
   token: string,
   zoneId: string,
   pattern: string,

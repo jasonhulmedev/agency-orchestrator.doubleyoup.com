@@ -8,8 +8,9 @@
 //   - the route upsert refuses a hostname outside the zone (unless it is a custom hostname of that zone),
 //     creates an absent route, reports its own route as unchanged and refuses a foreign one;
 //   - the route delete removes only the media Worker's route and treats an absent one as already-absent;
-//   - no route path lists the zone's routes, and a stale routeId with a replacement route is unresolved,
-//     never already-absent;
+//   - a live routeId is one read by id with no list; without one (or with a stale one) the op lists the
+//     agency zone's routes once, so a replacement route is found, never reported already-absent;
+//   - the route delete never creates a route;
 //   - the HOSTMAP ops write only the pinned (or the HOSTMAP-titled) namespace, and a delete 404 is ok.
 
 import { describe, it, expect, vi, afterEach } from "vitest";
@@ -84,23 +85,11 @@ function mockCloudflare(handler: (call: RecordedCall) => Answer): RecordedCall[]
   return calls;
 }
 
-/**
- * An in-memory stand-in for the NonceStore Durable Object: every nonce is fresh, and the media route ids
- * live in `routeIds` (shared across instances, keyed by instance name and pattern).
- */
-function memoryNonceStore(routeIds: Map<string, string> = new Map()): Env["NONCE_STORE"] {
+/** An in-memory stand-in for the NonceStore Durable Object: every nonce is fresh. */
+function memoryNonceStore(): Env["NONCE_STORE"] {
   return {
     idFromName: (name: string) => name,
-    get: (instanceName: string) => ({
-      consume: async () => "fresh" as const,
-      readMediaRouteId: async (pattern: string) => routeIds.get(`${instanceName}|${pattern}`) ?? null,
-      writeMediaRouteId: async (pattern: string, routeId: string) => {
-        routeIds.set(`${instanceName}|${pattern}`, routeId);
-      },
-      clearMediaRouteId: async (pattern: string) => {
-        routeIds.delete(`${instanceName}|${pattern}`);
-      },
-    }),
+    get: () => ({ consume: async () => "fresh" as const }),
   } as unknown as Env["NONCE_STORE"];
 }
 
@@ -108,19 +97,14 @@ function env(overrides: Partial<Env> = {}): Env {
   return { CF_DNS_API_TOKEN: DNS_TOKEN, NONCE_STORE: memoryNonceStore(), ...overrides } as Env;
 }
 
-/** The key memoryNonceStore files the media route id of `hostname` (in the test zone) under. */
-function recordedRouteKey(hostname: string): string {
-  return `media-routes:${ZONE_ID}|${hostname}/*`;
-}
-
 const OK_EMPTY: Answer = { status: 200, body: { success: true, result: null } };
 const NOT_FOUND: Answer = { status: 404, body: { success: false, errors: [{ code: 10009, message: "key not found" }] } };
 
 /**
- * A Cloudflare zone holding `routes` (mutated in place) and `customHostnames`. Route POST adds a route
- * `rt-new` (or answers 10020 for a pattern that already has a route), a route GET by id answers that route,
- * route DELETE removes it. A GET of the zone's whole route list is a 500: no path may scan the zone.
- * Everything else not modelled is a 500 too, so a stray call fails the test loudly.
+ * A Cloudflare zone holding `routes` (mutated in place) and `customHostnames`. The route list answers the
+ * current routes, route POST adds a route `rt-new` (or answers 10020 for a pattern that already has a
+ * route), a route GET by id answers that route, route DELETE removes it. Everything else not modelled is a
+ * 500, so a stray call fails the test loudly.
  */
 function zoneWith(routes: Array<Record<string, unknown>>, customHostnames: Array<Record<string, unknown>> = []) {
   return (call: RecordedCall): Answer => {
@@ -130,41 +114,49 @@ function zoneWith(routes: Array<Record<string, unknown>>, customHostnames: Array
     if (call.url.startsWith(`${CF}/zones/${ZONE_ID}/custom_hostnames?`)) {
       return { status: 200, body: { success: true, result: customHostnames } };
     }
-    if (call.method === "POST" && call.url === ROUTES_URL) {
-      // Cloudflare refuses a second route with the same pattern (error 10020).
-      const requested = JSON.parse(call.body ?? "{}") as { pattern?: string; script?: string };
-      if (routes.some((route) => route.pattern === requested.pattern)) {
-        return { status: 409, body: { success: false, errors: [{ code: 10020, message: "A route with the same pattern already exists" }] } };
-      }
-      routes.push({ id: "rt-new", pattern: requested.pattern, script: requested.script });
-      return { status: 200, body: { success: true, result: { id: "rt-new" } } };
+    if (call.url === ROUTES_URL && call.method === "GET") {
+      return { status: 200, body: { success: true, result: routes } };
     }
-    if (call.method === "GET" && call.url.startsWith(`${ROUTES_URL}/`)) {
-      const routeId = call.url.slice(`${ROUTES_URL}/`.length);
-      const route = routes.find((candidate) => candidate.id === routeId);
-      if (route === undefined) {
-        return NOT_FOUND;
+    if (call.url === ROUTES_URL && call.method === "POST") {
+      const posted = JSON.parse(call.body ?? "{}") as { pattern?: string; script?: string };
+      const duplicate = routes.some((route) => route.pattern === posted.pattern);
+      if (duplicate) {
+        return { status: 400, body: { success: false, errors: [{ code: 10020, message: "A route with the same pattern already exists." }] } };
       }
-      return { status: 200, body: { success: true, result: { pattern: route.pattern, script: route.script } } };
+      routes.push({ id: "rt-new", pattern: posted.pattern, script: posted.script });
+      return { status: 200, body: { success: true, result: { id: "rt-new", pattern: posted.pattern, script: posted.script } } };
     }
-    if (call.method === "DELETE" && call.url.startsWith(`${ROUTES_URL}/`)) {
-      const routeId = call.url.slice(`${ROUTES_URL}/`.length);
-      const index = routes.findIndex((candidate) => candidate.id === routeId);
+    if (call.url.startsWith(`${ROUTES_URL}/`)) {
+      const routeId = decodeURIComponent(call.url.slice(ROUTES_URL.length + 1));
+      const index = routes.findIndex((route) => route.id === routeId);
       if (index === -1) {
         return NOT_FOUND;
       }
-      routes.splice(index, 1);
-      return { status: 200, body: { success: true, result: { id: routeId } } };
+      if (call.method === "GET") {
+        return { status: 200, body: { success: true, result: routes[index] } };
+      }
+      if (call.method === "DELETE") {
+        routes.splice(index, 1);
+        return { status: 200, body: { success: true, result: { id: routeId } } };
+      }
     }
     return { status: 500, body: { success: false } };
   };
 }
 
-/** No call lists every route of the zone. */
-function expectNoZoneRouteList(calls: RecordedCall[]): void {
-  expect(calls.some((call) => call.method === "GET" && call.url === ROUTES_URL)).toBe(false);
+/** The calls that listed the zone's whole route collection. */
+function zoneRouteListCalls(calls: RecordedCall[]): RecordedCall[] {
+  return calls.filter((call) => call.method === "GET" && call.url === ROUTES_URL);
 }
 
+/** The calls that read one route by id. */
+function routeReadByIdCalls(calls: RecordedCall[]): RecordedCall[] {
+  return calls.filter((call) => call.method === "GET" && call.url.startsWith(`${ROUTES_URL}/`));
+}
+
+function writeCalls(calls: RecordedCall[], method: "POST" | "DELETE"): RecordedCall[] {
+  return calls.filter((call) => call.method === method && call.url.startsWith(ROUTES_URL));
+}
 /** An account whose KV namespaces are `namespaces`; value writes go to `onValue`. */
 function accountWith(namespaces: Array<Record<string, unknown>>, onValue: (call: RecordedCall) => Answer = () => OK_EMPTY) {
   return (call: RecordedCall): Answer => {
@@ -270,10 +262,10 @@ describe("branded-media ops: params", () => {
 // ── worker-route-upsert / -delete ───────────────────────────────────────────────────
 
 describe("worker-route-upsert", () => {
-  it("creates an absent route for an in-zone host, pointing at the default media Worker, and records its id", async () => {
-    const routeIds = new Map<string, string>();
-    const calls = mockCloudflare(zoneWith([]));
-    const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env({ NONCE_STORE: memoryNonceStore(routeIds) }));
+  it("no routeId, no route: one list, then creates the route to the default media Worker", async () => {
+    const routes: Array<Record<string, unknown>> = [];
+    const calls = mockCloudflare(zoneWith(routes));
+    const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env());
     expect(result).toEqual({
       ok: true,
       op: "worker-route-upsert",
@@ -282,125 +274,137 @@ describe("worker-route-upsert", () => {
       routeId: "rt-new",
       status: "created",
     });
-    const posts = calls.filter((call) => call.method === "POST");
+    const posts = writeCalls(calls, "POST");
     expect(posts).toHaveLength(1);
-    expect(JSON.parse(posts[0]?.body ?? "{}")).toEqual({ pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" });
-    expect(routeIds.get(recordedRouteKey(IN_ZONE_HOST))).toBe("rt-new");
-    // An in-zone host needs no custom-hostname lookup, and a new route needs no zone-wide route list.
-    expect(calls.some((call) => call.url.includes("/custom_hostnames"))).toBe(false);
-    expectNoZoneRouteList(calls);
-    for (const call of calls) {
-      expect(call.authorization).toBe(`Bearer ${DNS_TOKEN}`);
-    }
+    expect(JSON.parse(posts[0].body ?? "{}")).toEqual({ pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" });
+    expect(posts[0].authorization).toBe(`Bearer ${DNS_TOKEN}`);
+    expect(zoneRouteListCalls(calls)).toHaveLength(1);
   });
 
-  it("uses MEDIA_WORKER_SCRIPT when it is set", async () => {
+  it("points the route at MEDIA_WORKER_SCRIPT when it is set", async () => {
     const calls = mockCloudflare(zoneWith([]));
-    const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env({ MEDIA_WORKER_SCRIPT: "agency-media" }));
-    expect(result).toMatchObject({ ok: true, script: "agency-media", status: "created" });
-    const post = calls.find((call) => call.method === "POST");
-    expect(JSON.parse(post?.body ?? "{}")).toEqual({ pattern: `${IN_ZONE_HOST}/*`, script: "agency-media" });
+    const result = await actuateMediaWorkerRouteUpsert(
+      { zone: AGENCY_ZONE, hostname: IN_ZONE_HOST },
+      env({ MEDIA_WORKER_SCRIPT: "agency-media" }),
+    );
+    expect(result).toMatchObject({ ok: true, status: "created", script: "agency-media" });
+    const posts = writeCalls(calls, "POST");
+    expect(JSON.parse(posts[0].body ?? "{}")).toMatchObject({ script: "agency-media" });
   });
 
-  it("refuses an unusable MEDIA_WORKER_SCRIPT before any call", async () => {
+  it("refuses an invalid MEDIA_WORKER_SCRIPT before any Cloudflare call", async () => {
     const calls = mockCloudflare(zoneWith([]));
-    const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env({ MEDIA_WORKER_SCRIPT: "Bad Script" }));
-    expect(result).toMatchObject({ ok: false, detail: expect.stringMatching(/MEDIA_WORKER_SCRIPT is not a Worker script name/) });
+    const result = await actuateMediaWorkerRouteUpsert(
+      { zone: AGENCY_ZONE, hostname: IN_ZONE_HOST },
+      env({ MEDIA_WORKER_SCRIPT: "Bad Script!" }),
+    );
+    expect(result).toMatchObject({ ok: false });
     expect(calls).toEqual([]);
   });
 
-  it("is idempotent with the stored routeId: one read by id, no list and no write", async () => {
+  it("a live routeId: one read by id, no list, no write (idempotent unchanged)", async () => {
     const calls = mockCloudflare(zoneWith([{ id: ROUTE_ID, pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" }]));
     const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID }, env());
-    expect(result).toMatchObject({ ok: true, routeId: ROUTE_ID, status: "unchanged" });
-    expect(calls.filter((call) => call.method !== "GET")).toEqual([]);
-    expectNoZoneRouteList(calls);
-    expect(calls.filter((call) => call.url === `${ROUTES_URL}/${ROUTE_ID}`)).toHaveLength(1);
+    expect(result).toMatchObject({ ok: true, status: "unchanged", routeId: ROUTE_ID });
+    expect(routeReadByIdCalls(calls)).toHaveLength(1);
+    expect(zoneRouteListCalls(calls)).toEqual([]);
+    expect(writeCalls(calls, "POST")).toEqual([]);
+    expect(writeCalls(calls, "DELETE")).toEqual([]);
   });
 
-  it("is idempotent without a routeId: the id recorded at create answers the re-run, no list and no write", async () => {
-    const workerEnv = env();
-    mockCloudflare(zoneWith([]));
-    await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, workerEnv);
-    vi.restoreAllMocks();
-    const calls = mockCloudflare(zoneWith([{ id: "rt-new", pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" }]));
-    const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, workerEnv);
-    expect(result).toMatchObject({ ok: true, routeId: "rt-new", status: "unchanged" });
-    expect(calls.filter((call) => call.method !== "GET")).toEqual([]);
-    expectNoZoneRouteList(calls);
-  });
-
-  it("a route under an id nobody knows: the refused create reports unresolved, no list and no takeover", async () => {
+  it("no routeId, route exists: one list, unchanged with its routeId (a re-run after a lost answer)", async () => {
     const calls = mockCloudflare(zoneWith([{ id: "rt-1", pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" }]));
     const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env());
-    expect(result).toMatchObject({ ok: false, unresolved: true, detail: expect.stringContaining("routeId") });
-    // The one POST was refused by Cloudflare (duplicate pattern), so nothing was written.
-    expect(calls.filter((call) => call.method !== "GET").map((call) => call.method)).toEqual(["POST"]);
-    expectNoZoneRouteList(calls);
+    expect(result).toMatchObject({ ok: true, status: "unchanged", routeId: "rt-1" });
+    expect(zoneRouteListCalls(calls)).toHaveLength(1);
+    expect(writeCalls(calls, "POST")).toEqual([]);
   });
 
-  it("recreates the route when the stored routeId no longer exists", async () => {
-    const calls = mockCloudflare(zoneWith([]));
+  it("ignores routes with another pattern in the list", async () => {
+    const routes: Array<Record<string, unknown>> = [
+      { id: "rt-wild", pattern: `*.${AGENCY_ZONE}/*`, script: "doubleyoup-media" },
+      { id: "rt-other", pattern: `other-media.${AGENCY_ZONE}/*`, script: "doubleyoup-media" },
+    ];
+    mockCloudflare(zoneWith(routes));
+    const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env());
+    expect(result).toMatchObject({ ok: true, status: "created", routeId: "rt-new" });
+  });
+
+  it("a stale routeId with a live replacement: 404 on the id, one list, unchanged with the replacement's id", async () => {
+    const routes: Array<Record<string, unknown>> = [{ id: "rt-b", pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" }];
+    const calls = mockCloudflare(zoneWith(routes));
     const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID }, env());
-    expect(result).toMatchObject({ ok: true, routeId: "rt-new", status: "created" });
-    expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
-    expectNoZoneRouteList(calls);
+    expect(result).toMatchObject({ ok: true, status: "unchanged", routeId: "rt-b" });
+    expect(routeReadByIdCalls(calls)).toHaveLength(1);
+    expect(zoneRouteListCalls(calls)).toHaveLength(1);
+    expect(writeCalls(calls, "POST")).toEqual([]);
   });
 
-  it("a stale job routeId falls back to the id this Worker recorded", async () => {
-    const routeIds = new Map([[recordedRouteKey(IN_ZONE_HOST), "rt-b"]]);
-    const calls = mockCloudflare(zoneWith([{ id: "rt-b", pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" }]));
-    const result = await actuateMediaWorkerRouteUpsert(
-      { zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID },
-      env({ NONCE_STORE: memoryNonceStore(routeIds) }),
-    );
-    expect(result).toMatchObject({ ok: true, routeId: "rt-b", status: "unchanged" });
-    expect(calls.filter((call) => call.method !== "GET")).toEqual([]);
-    expectNoZoneRouteList(calls);
-  });
-
-  it("refuses a routeId whose route has another pattern", async () => {
-    const calls = mockCloudflare(zoneWith([{ id: ROUTE_ID, pattern: `other.${AGENCY_ZONE}/*`, script: "doubleyoup-media" }]));
+  it("a stale routeId and no route: creates the route again", async () => {
+    const routes: Array<Record<string, unknown>> = [];
+    mockCloudflare(zoneWith(routes));
     const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID }, env());
-    expect(result).toMatchObject({ ok: false, detail: expect.stringMatching(/has the pattern "other\.agency\.example\/\*"/) });
-    expect(calls.filter((call) => call.method !== "GET")).toEqual([]);
+    expect(result).toMatchObject({ ok: true, status: "created", routeId: "rt-new" });
+    expect(routes).toHaveLength(1);
   });
 
-  it("refuses to take over another script's route found by routeId", async () => {
+  it("refuses a route to another script found by id, and changes nothing", async () => {
     const calls = mockCloudflare(zoneWith([{ id: ROUTE_ID, pattern: `${IN_ZONE_HOST}/*`, script: "agency-own-worker" }]));
     const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID }, env());
-    expect(result).toMatchObject({ ok: false, foreign: true, detail: expect.stringContaining("agency-own-worker") });
-    expect(calls.filter((call) => call.method !== "GET")).toEqual([]);
+    expect(result).toMatchObject({ ok: false, foreign: true });
+    expect(writeCalls(calls, "POST")).toEqual([]);
+    expect(writeCalls(calls, "DELETE")).toEqual([]);
   });
 
-  it("reports the create error when the create fails for another reason", async () => {
+  it("refuses a route to another script found by the list, and changes nothing", async () => {
+    const calls = mockCloudflare(zoneWith([{ id: "rt-1", pattern: `${IN_ZONE_HOST}/*`, script: "agency-own-worker" }]));
+    const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env());
+    expect(result).toMatchObject({ ok: false, foreign: true });
+    expect(writeCalls(calls, "POST")).toEqual([]);
+  });
+
+  it("refuses two routes with the exact pattern as ambiguous, writing nothing", async () => {
+    const calls = mockCloudflare(
+      zoneWith([
+        { id: "rt-1", pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" },
+        { id: "rt-2", pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" },
+      ]),
+    );
+    const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env());
+    expect(result).toMatchObject({ ok: false, detail: expect.stringContaining("rt-1, rt-2") });
+    expect(writeCalls(calls, "POST")).toEqual([]);
+  });
+
+  it("a failed create after an empty list is ok:false with Cloudflare's detail, and is not retried in the op", async () => {
     const calls = mockCloudflare((call) => {
-      if (call.method === "POST") {
-        return { status: 400, body: { success: false, errors: [{ code: 10019, message: "script not found" }] } };
+      if (call.method === "POST" && call.url === ROUTES_URL) {
+        return { status: 400, body: { success: false, errors: [{ code: 10020, message: "A route with the same pattern already exists." }] } };
       }
       return zoneWith([])(call);
     });
     const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env());
-    expect(result).toMatchObject({ ok: false, detail: expect.stringMatching(/create failed with HTTP 400.*script not found/) });
-    expect(result).not.toHaveProperty("unresolved");
-    expectNoZoneRouteList(calls);
+    expect(result).toMatchObject({ ok: false, detail: expect.stringContaining("same pattern") });
+    expect(writeCalls(calls, "POST")).toHaveLength(1);
   });
 
-  it("refuses a hostname outside the zone that is not a custom hostname of it", async () => {
-    const calls = mockCloudflare(zoneWith([], []));
-    const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: CUSTOMER_HOST }, env());
-    expect(result).toMatchObject({ ok: false, detail: expect.stringMatching(/is not in zone "agency\.example" and is not a custom hostname of it/) });
-    expect(calls.filter((call) => call.method !== "GET")).toEqual([]);
-    expectNoZoneRouteList(calls);
+  it("refuses a routeId that points at another host's route", async () => {
+    const calls = mockCloudflare(zoneWith([{ id: ROUTE_ID, pattern: `other.${AGENCY_ZONE}/*`, script: "doubleyoup-media" }]));
+    const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID }, env());
+    expect(result).toMatchObject({ ok: false, detail: expect.stringContaining("refusing") });
+    expect(writeCalls(calls, "POST")).toEqual([]);
   });
 
-  it("accepts a customer media host that is a custom hostname of the zone", async () => {
-    const calls = mockCloudflare(
-      zoneWith([], [{ id: "ch-1", hostname: CUSTOMER_HOST, status: "active", ssl: { status: "active" }, custom_origin_server: `origin.${AGENCY_ZONE}` }]),
-    );
+  it("refuses a hostname outside the zone that is not a custom hostname of it, before any route call", async () => {
+    const calls = mockCloudflare(zoneWith([]));
+    const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: "media.stranger.example" }, env());
+    expect(result).toMatchObject({ ok: false, detail: expect.stringContaining("not a custom hostname") });
+    expect(calls.filter((call) => call.url.startsWith(ROUTES_URL))).toEqual([]);
+  });
+
+  it("allows a customer media host that is already a custom hostname of the zone", async () => {
+    mockCloudflare(zoneWith([], [{ id: "ch-1", hostname: CUSTOMER_HOST, status: "active" }]));
     const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: CUSTOMER_HOST }, env());
-    expect(result).toMatchObject({ ok: true, pattern: `${CUSTOMER_HOST}/*`, status: "created" });
-    expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
+    expect(result).toMatchObject({ ok: true, status: "created", pattern: `${CUSTOMER_HOST}/*` });
   });
 
   it("refuses a zone the agency token can not see", async () => {
@@ -414,7 +418,8 @@ describe("worker-route-upsert", () => {
     expect(result).toMatchObject({ ok: false, detail: expect.stringMatching(/not visible to CF_DNS_API_TOKEN/) });
   });
 
-  it("names the missing Workers Routes scope on a 403", async () => {
+
+  it("reports a missing Workers Routes scope", async () => {
     mockCloudflare((call) => {
       if (call.url === ROUTES_URL) {
         return { status: 403, body: { success: false, errors: [{ code: 10000, message: "Authentication error" }] } };
@@ -425,80 +430,73 @@ describe("worker-route-upsert", () => {
     expect(result).toMatchObject({ ok: false, detail: expect.stringContaining("Workers Routes: Edit") });
   });
 
-  it("calls nothing without CF_DNS_API_TOKEN", async () => {
+  it("fails clearly without CF_DNS_API_TOKEN", async () => {
     const calls = mockCloudflare(zoneWith([]));
-    const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, {} as Env);
+    const result = await actuateMediaWorkerRouteUpsert({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env({ CF_DNS_API_TOKEN: undefined }));
     expect(result).toMatchObject({ ok: false, detail: expect.stringContaining("CF_DNS_API_TOKEN") });
     expect(calls).toEqual([]);
   });
 });
 
 describe("worker-route-delete", () => {
-  it("with the stored routeId: one read by id and one DELETE, no zone-wide list", async () => {
-    const calls = mockCloudflare(zoneWith([{ id: ROUTE_ID, pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" }]));
+  it("a live routeId: one read by id, one DELETE, no list", async () => {
+    const routes: Array<Record<string, unknown>> = [{ id: ROUTE_ID, pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" }];
+    const calls = mockCloudflare(zoneWith(routes));
     const result = await actuateMediaWorkerRouteDelete({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID }, env());
-    expect(result).toEqual({ ok: true, op: "worker-route-delete", pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media", status: "deleted" });
-    expectNoZoneRouteList(calls);
-    expect(calls.filter((call) => call.method === "POST")).toEqual([]);
-    expect(calls.filter((call) => call.method === "DELETE").map((call) => call.url)).toEqual([`${ROUTES_URL}/${ROUTE_ID}`]);
+    expect(result).toEqual({
+      ok: true,
+      op: "worker-route-delete",
+      pattern: `${IN_ZONE_HOST}/*`,
+      script: DEFAULT_MEDIA_WORKER_SCRIPT,
+      status: "deleted",
+    });
+    expect(routes).toEqual([]);
+    expect(routeReadByIdCalls(calls)).toHaveLength(1);
+    expect(writeCalls(calls, "DELETE")).toHaveLength(1);
+    expect(zoneRouteListCalls(calls)).toEqual([]);
+    expect(writeCalls(calls, "POST")).toEqual([]);
   });
 
-  it("without a routeId: deletes the route by the id this Worker recorded, and forgets it", async () => {
-    const routeIds = new Map([[recordedRouteKey(IN_ZONE_HOST), "rt-1"]]);
-    const calls = mockCloudflare(zoneWith([{ id: "rt-1", pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" }]));
-    const result = await actuateMediaWorkerRouteDelete({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env({ NONCE_STORE: memoryNonceStore(routeIds) }));
+  it("no routeId, route exists: one list, then deletes it", async () => {
+    const routes: Array<Record<string, unknown>> = [{ id: "rt-1", pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" }];
+    const calls = mockCloudflare(zoneWith(routes));
+    const result = await actuateMediaWorkerRouteDelete({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env());
     expect(result).toMatchObject({ ok: true, status: "deleted" });
-    expect(calls.filter((call) => call.method === "DELETE").map((call) => call.url)).toEqual([`${ROUTES_URL}/rt-1`]);
-    expect(routeIds.has(recordedRouteKey(IN_ZONE_HOST))).toBe(false);
-    expectNoZoneRouteList(calls);
+    expect(routes).toEqual([]);
+    expect(zoneRouteListCalls(calls)).toHaveLength(1);
+    expect(writeCalls(calls, "POST")).toEqual([]);
   });
 
-  it("no known id and no route: the probe create proves it absent and is removed at once", async () => {
-    const routes: Array<Record<string, unknown>> = [{ id: "rt-9", pattern: `other.${AGENCY_ZONE}/*`, script: "doubleyoup-media" }];
+  it("no routeId, no route: one list, already-absent, and the delete creates nothing", async () => {
+    const routes: Array<Record<string, unknown>> = [];
     const calls = mockCloudflare(zoneWith(routes));
     const result = await actuateMediaWorkerRouteDelete({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env());
     expect(result).toMatchObject({ ok: true, status: "already-absent" });
-    expect(calls.filter((call) => call.method !== "GET").map((call) => `${call.method} ${call.url}`)).toEqual([
-      `POST ${ROUTES_URL}`,
-      `DELETE ${ROUTES_URL}/rt-new`,
-    ]);
-    // The zone ends as it started: the other host's route is untouched and the probe is gone.
-    expect(routes).toEqual([{ id: "rt-9", pattern: `other.${AGENCY_ZONE}/*`, script: "doubleyoup-media" }]);
-    expectNoZoneRouteList(calls);
-  });
-
-  it("a stale routeId with a REPLACEMENT route for the same host: unresolved, never already-absent", async () => {
-    // The platform stored id A; someone replaced the route, so the live route for the host is B.
-    const routes: Array<Record<string, unknown>> = [{ id: "rt-b", pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" }];
-    const calls = mockCloudflare(zoneWith(routes));
-    const result = await actuateMediaWorkerRouteDelete({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID }, env());
-    expect(result).toMatchObject({ ok: false, unresolved: true, detail: expect.stringContaining("routeId") });
-    expect(result.ok).toBe(false);
-    expect(calls.filter((call) => call.method === "DELETE")).toEqual([]);
-    expect(routes).toHaveLength(1);
-    expectNoZoneRouteList(calls);
-  });
-
-  it("a stale routeId with no route at all: already-absent after the bounded probe", async () => {
-    const routes: Array<Record<string, unknown>> = [];
-    const calls = mockCloudflare(zoneWith(routes));
-    const result = await actuateMediaWorkerRouteDelete({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID }, env());
-    expect(result).toMatchObject({ ok: true, status: "already-absent" });
     expect(routes).toEqual([]);
-    expectNoZoneRouteList(calls);
+    expect(zoneRouteListCalls(calls)).toHaveLength(1);
+    expect(writeCalls(calls, "POST")).toEqual([]);
+    expect(writeCalls(calls, "DELETE")).toEqual([]);
   });
 
-  it("a stale job routeId falls back to the recorded id of the replacement route and deletes it", async () => {
-    const routeIds = new Map([[recordedRouteKey(IN_ZONE_HOST), "rt-b"]]);
+  it("a stale routeId with a live replacement: 404 on the id, one list, deletes the replacement (never already-absent)", async () => {
     const routes: Array<Record<string, unknown>> = [{ id: "rt-b", pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" }];
     const calls = mockCloudflare(zoneWith(routes));
-    const result = await actuateMediaWorkerRouteDelete(
-      { zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID },
-      env({ NONCE_STORE: memoryNonceStore(routeIds) }),
-    );
+    const result = await actuateMediaWorkerRouteDelete({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID }, env());
     expect(result).toMatchObject({ ok: true, status: "deleted" });
     expect(routes).toEqual([]);
-    expectNoZoneRouteList(calls);
+    expect(routeReadByIdCalls(calls)).toHaveLength(1);
+    expect(zoneRouteListCalls(calls)).toHaveLength(1);
+    const deletes = writeCalls(calls, "DELETE");
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0].url).toBe(`${ROUTES_URL}/rt-b`);
+    expect(writeCalls(calls, "POST")).toEqual([]);
+  });
+
+  it("a stale routeId and no route: already-absent", async () => {
+    const calls = mockCloudflare(zoneWith([]));
+    const result = await actuateMediaWorkerRouteDelete({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID }, env());
+    expect(result).toMatchObject({ ok: true, status: "already-absent" });
+    expect(writeCalls(calls, "POST")).toEqual([]);
   });
 
   it("a route that vanished before the DELETE (404) is already-absent", async () => {
@@ -512,40 +510,38 @@ describe("worker-route-delete", () => {
     expect(result).toMatchObject({ ok: true, status: "already-absent" });
   });
 
-  it("refuses to delete a route that points at another script", async () => {
+  it("refuses to delete a route to another script found by id", async () => {
     const calls = mockCloudflare(zoneWith([{ id: ROUTE_ID, pattern: `${IN_ZONE_HOST}/*`, script: "agency-own-worker" }]));
     const result = await actuateMediaWorkerRouteDelete({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID }, env());
     expect(result).toMatchObject({ ok: false, foreign: true });
-    expect(calls.filter((call) => call.method === "DELETE")).toEqual([]);
+    expect(writeCalls(calls, "DELETE")).toEqual([]);
   });
 
-  it("an unknown foreign route for the host: unresolved, nothing deleted", async () => {
+  it("refuses to delete a route to another script found by the list", async () => {
     const calls = mockCloudflare(zoneWith([{ id: "rt-1", pattern: `${IN_ZONE_HOST}/*`, script: "agency-own-worker" }]));
     const result = await actuateMediaWorkerRouteDelete({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env());
-    expect(result).toMatchObject({ ok: false, unresolved: true });
-    expect(calls.filter((call) => call.method === "DELETE")).toEqual([]);
-    expectNoZoneRouteList(calls);
+    expect(result).toMatchObject({ ok: false, foreign: true });
+    expect(writeCalls(calls, "DELETE")).toEqual([]);
   });
 
-  it("keeps the probe's id when the probe can not be removed, so a re-run removes it", async () => {
-    const routeIds = new Map<string, string>();
-    mockCloudflare((call) => {
-      if (call.method === "DELETE") {
-        return { status: 500, body: { success: false, errors: [{ code: 10013, message: "internal error" }] } };
-      }
-      return zoneWith([])(call);
-    });
-    const result = await actuateMediaWorkerRouteDelete({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env({ NONCE_STORE: memoryNonceStore(routeIds) }));
-    expect(result).toMatchObject({ ok: false, detail: expect.stringContaining("probe route rt-new") });
-    expect(routeIds.get(recordedRouteKey(IN_ZONE_HOST))).toBe("rt-new");
+  it("refuses two routes with the exact pattern as ambiguous, deleting nothing", async () => {
+    const calls = mockCloudflare(
+      zoneWith([
+        { id: "rt-1", pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" },
+        { id: "rt-2", pattern: `${IN_ZONE_HOST}/*`, script: "doubleyoup-media" },
+      ]),
+    );
+    const result = await actuateMediaWorkerRouteDelete({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST }, env());
+    expect(result).toMatchObject({ ok: false, detail: expect.stringContaining("more than one") });
+    expect(writeCalls(calls, "DELETE")).toEqual([]);
   });
 
   it("refuses a routeId that points at another host's route", async () => {
     const calls = mockCloudflare(zoneWith([{ id: ROUTE_ID, pattern: `other.${AGENCY_ZONE}/*`, script: "doubleyoup-media" }]));
     const result = await actuateMediaWorkerRouteDelete({ zone: AGENCY_ZONE, hostname: IN_ZONE_HOST, routeId: ROUTE_ID }, env());
     expect(result).toMatchObject({ ok: false });
-    expect(calls.filter((call) => call.method === "DELETE")).toEqual([]);
-    expect(calls.filter((call) => call.method === "POST")).toEqual([]);
+    expect(writeCalls(calls, "DELETE")).toEqual([]);
+    expect(writeCalls(calls, "POST")).toEqual([]);
   });
 });
 

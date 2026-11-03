@@ -2,15 +2,13 @@
 // entry that send one media host to the AGENCY's own media Worker. The custom hostname (for a customer
 // domain) is the hub#46 op set in actuate-custom-hostname.ts; it is not repeated here.
 //
-//   worker-route-upsert   read the route by its known id (the job's routeId, else the id this Worker
-//                         recorded); it points at MEDIA_WORKER_SCRIPT -> "unchanged"; another script ->
-//                         refused as foreign. No live known route -> POST `<hostname>/*` -> MEDIA_WORKER_SCRIPT;
-//                         created -> "created" + routeId. A POST refused as a duplicate pattern (a route
-//                         under an id nobody knows) -> ok:false, unresolved: true.
-//   worker-route-delete   read the route by its known id; DELETE it when it points at MEDIA_WORKER_SCRIPT;
+//   worker-route-upsert   find the route of `<hostname>/*` (see THE ROUTE LOOKUP); it points at
+//                         MEDIA_WORKER_SCRIPT -> "unchanged" + routeId; another script -> refused as foreign.
+//                         No route -> POST `<hostname>/*` -> MEDIA_WORKER_SCRIPT -> "created" + routeId. A
+//                         refused POST (a duplicate-pattern race included) -> ok:false; a re-run converges.
+//   worker-route-delete   find the route the same way; DELETE it when it points at MEDIA_WORKER_SCRIPT;
 //                         another script -> refused as foreign (the agency made it, not the platform). No
-//                         live known route -> a probe POST of the pattern: refused as a duplicate ->
-//                         ok:false, unresolved: true; created -> the probe is deleted -> "already-absent".
+//                         route -> "already-absent". The delete never creates anything.
 //   media-hostmap-upsert  PUT `<hostname>` -> `<value>` into the HOSTMAP namespace. A PUT overwrites, so a
 //                         re-run converges.
 //   media-hostmap-delete  DELETE that key; a 404 counts as "already-absent".
@@ -28,13 +26,14 @@
 // removes only the exact route `<hostname>/*` in that zone, and only when it points at the media Worker,
 // so it still works after the custom hostname is gone.
 //
-// NO ZONE-WIDE SCAN, ON ANY PATH. Cloudflare can not read a route by pattern, only list them all, and a
-// list per host costs O(routes in the zone) per op. So every lookup is by id: the routeId the platform
-// stored from the upsert, else the id this Worker recorded when it created the route (NonceStore Durable
-// Object, one instance per zone, one row per media host). When no known id names a live route, the op asks
-// Cloudflare with a POST of the pattern, which Cloudflare refuses for an existing pattern. A refusal means
-// a route exists under an unknown id (a hand-made route, or a replacement of a stale id): the op reports
-// `unresolved` and changes nothing. It never answers "already-absent" while such a route may exist.
+// THE ROUTE LOOKUP. Cloudflare reads a route by id or lists the zone's routes; it has no read by pattern.
+// Steady path: the platform stores the routeId the upsert returns and passes it back, so a call is one
+// read by id. Recovery path (no routeId, a stale one, or a lost upsert response): one list of THIS agency
+// zone's routes, filtered to the exact pattern. That list is bounded by Cloudflare's cap of 1,000 Workers
+// routes per zone, is scoped to one agency zone and its own token, and does not grow with the number of
+// agencies, cells or sites of the platform. The hub#93 workers-route-* ops (findWorkerRoutesByPattern,
+// reused here) and orchestrator ensureWorkerRoute use the same shape. A stale routeId therefore never
+// turns into a false "already-absent": a 404 on the id falls through to the list, which finds a replacement.
 //
 // THE ACCOUNT of the HOSTMAP namespace is MEDIA_ACCOUNT_ID, or the token's only account (media-account.ts).
 //
@@ -42,7 +41,14 @@
 // Account → Workers KV Storage: Edit (HOSTMAP) for these ops.
 
 import type { Env } from "./env.js";
-import { CF_API, cloudflareErrorMessage, cloudflareHeaders, resolveZoneId, type CloudflareEnvelope } from "./actuate.js";
+import {
+  CF_API,
+  cloudflareErrorMessage,
+  cloudflareHeaders,
+  findWorkerRoutesByPattern,
+  resolveZoneId,
+  type CloudflareEnvelope,
+} from "./actuate.js";
 import { findCustomHostname } from "./actuate-custom-hostname.js";
 import { isNameAtOrUnderZone } from "./dispatch-params-custom-hostname.js";
 import { resolveMediaAccountId } from "./media-account.js";
@@ -70,18 +76,16 @@ const KV_NAMESPACE_MAX_PAGES = 10;
 
 const MEDIA_ROUTE_UNAUTHORIZED_HINT =
   "Cloudflare denied the Workers route call — CF_DNS_API_TOKEN needs Zone → Workers Routes: Edit on this zone.";
-// Cloudflare's error code for "a route with the same pattern already exists".
-const MEDIA_ROUTE_DUPLICATE_PATTERN_CODE = 10020;
 const MEDIA_HOSTMAP_UNAUTHORIZED_HINT =
   "Cloudflare denied the Workers KV call — CF_DNS_API_TOKEN needs Account → Workers KV Storage: Edit.";
 
 export type MediaWorkerRouteUpsertResult =
   | { ok: true; op: "worker-route-upsert"; pattern: string; script: string; routeId: string; status: "created" | "unchanged" }
-  | { ok: false; op: "worker-route-upsert"; pattern: string; script: string; detail: string; foreign?: true; unresolved?: true };
+  | { ok: false; op: "worker-route-upsert"; pattern: string; script: string; detail: string; foreign?: true };
 
 export type MediaWorkerRouteDeleteResult =
   | { ok: true; op: "worker-route-delete"; pattern: string; script: string; status: "deleted" | "already-absent" }
-  | { ok: false; op: "worker-route-delete"; pattern: string; script: string; detail: string; foreign?: true; unresolved?: true };
+  | { ok: false; op: "worker-route-delete"; pattern: string; script: string; detail: string; foreign?: true };
 
 export type MediaHostmapUpsertResult =
   | { ok: true; op: "media-hostmap-upsert"; hostname: string; value: string; status: "written" }
@@ -150,71 +154,59 @@ async function readMediaRouteById(
   return { route: { ...route, id: routeId } };
 }
 
-/** The Durable Object instance that records the media route ids of one zone (NonceStore, see there). */
-function mediaRouteIdStore(env: Env, zoneId: string) {
-  return env.NONCE_STORE.get(env.NONCE_STORE.idFromName(`media-routes:${zoneId}`));
-}
-
-type KnownMediaRoute =
+type MediaRouteLookup =
   | { route: CloudflareMediaRoute & { id: string } }
   | { route: null }
   | { error: string };
 
 /**
- * The media route of `pattern`, read by id, never by listing the zone. It tries the job's routeId, then the
- * id this Worker recorded when it created the route — at most two reads. `{route: null}` means "no LIVE
- * route under a known id"; it does NOT mean the pattern has no route (a route made elsewhere, or a
- * replacement of a stale id, has an id nobody passed here). A known id whose route has ANOTHER pattern is
- * refused: the id is a hint, never an authority, so it can not point an op at some other host's route.
- * A recorded id whose route is gone is forgotten.
+ * The ONE media route of `pattern` in the zone, null when the zone has none, or the reason the lookup failed.
+ *
+ * Steady path: the job's routeId -> one read by id. A live route with this pattern is the answer. A live
+ * route with ANOTHER pattern is refused: the id is a hint, never an authority, so it can not point an op at
+ * some other host's route. A 404 (a stale id) falls through to the list, so a replacement route made under
+ * a new id is still found — a stale id never turns into a false "already-absent".
+ *
+ * Recovery path: one list of this agency zone's routes (findWorkerRoutesByPattern, the hub#93 lookup),
+ * filtered to the exact pattern. Bounded: see the header comment. Two routes with one pattern is ambiguous
+ * and refused (Cloudflare should not allow it).
  */
-async function readKnownMediaRoute(
+async function findTheMediaRoute(
   token: string,
-  env: Env,
   zoneId: string,
   pattern: string,
   jobRouteId: string | undefined,
-): Promise<KnownMediaRoute> {
-  const store = mediaRouteIdStore(env, zoneId);
-  const recordedRouteId = await store.readMediaRouteId(pattern);
-  const knownRouteIds: string[] = [];
+): Promise<MediaRouteLookup> {
   if (jobRouteId !== undefined) {
-    knownRouteIds.push(jobRouteId);
-  }
-  if (recordedRouteId !== null && recordedRouteId !== jobRouteId) {
-    knownRouteIds.push(recordedRouteId);
-  }
-
-  for (const routeId of knownRouteIds) {
-    const byId = await readMediaRouteById(token, zoneId, routeId);
+    const byId = await readMediaRouteById(token, zoneId, jobRouteId);
     if ("error" in byId) {
       return byId;
     }
-    if (byId.route === null) {
-      if (routeId === recordedRouteId) {
-        await store.clearMediaRouteId(pattern);
+    if (byId.route !== null) {
+      if (byId.route.pattern !== pattern) {
+        return { error: `Workers route ${jobRouteId} has the pattern "${byId.route.pattern ?? "(none)"}", not "${pattern}" — refusing to act on it.` };
       }
-      continue;
+      return { route: { ...byId.route, id: jobRouteId } };
     }
-    if (byId.route.pattern !== pattern) {
-      return { error: `Workers route ${routeId} has the pattern "${byId.route.pattern ?? "(none)"}", not "${pattern}" — refusing to act on it.` };
-    }
-    return { route: { ...byId.route, id: routeId } };
   }
-  return { route: null };
+
+  const listed = await findWorkerRoutesByPattern(token, zoneId, pattern);
+  if ("error" in listed) {
+    return listed;
+  }
+  if (listed.routes.length === 0) {
+    return { route: null };
+  }
+  if (listed.routes.length > 1) {
+    const routeIds = listed.routes.map((route) => route.id).join(", ");
+    return { error: `more than one Workers route has the pattern "${pattern}" (${routeIds}); refusing to guess which one is ours.` };
+  }
+  const onlyRoute = listed.routes[0];
+  return { route: { ...onlyRoute, id: onlyRoute.id as string } };
 }
 
-type MediaRouteCreateOutcome =
-  | { created: string }
-  | { duplicate: true }
-  | { error: string };
-
-/**
- * POST `pattern` -> `script`. Cloudflare refuses a second route with the same pattern (code 10020), so a
- * create can never make a duplicate, and that refusal is itself the bounded answer to "does a route with
- * this pattern exist?" (no list of the zone).
- */
-async function createMediaRoute(token: string, zoneId: string, pattern: string, script: string): Promise<MediaRouteCreateOutcome> {
+/** POST `pattern` -> `script`: the new route's id, or the reason the create failed. */
+async function createMediaRoute(token: string, zoneId: string, pattern: string, script: string): Promise<{ created: string } | { error: string }> {
   let response: Response;
   try {
     response = await fetch(`${CF_API}/zones/${encodeURIComponent(zoneId)}/workers/routes`, {
@@ -233,13 +225,8 @@ async function createMediaRoute(token: string, zoneId: string, pattern: string, 
   if (response.ok && body?.success && typeof created?.id === "string" && created.id.length > 0) {
     return { created: created.id };
   }
-  const isDuplicatePattern = (body?.errors ?? []).some(
-    (error) => error.code === MEDIA_ROUTE_DUPLICATE_PATTERN_CODE || /already exists/i.test(error.message ?? ""),
-  );
-  if (isDuplicatePattern) {
-    return { duplicate: true };
-  }
-  return { error: `Workers route create failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
+  // Any refusal (a duplicate-pattern race included) is reported as is. A re-run lists the zone and converges.
+  return { error: `Workers route create failed with HTTP ${response.status}${cloudflareErrorMessage(body)}. Re-run the upsert.` };
 }
 
 /** DELETE one route by id: deleted, already gone (404), or the reason it failed. */
@@ -265,14 +252,6 @@ async function deleteMediaRouteById(token: string, zoneId: string, routeId: stri
     return { error: `Workers route delete failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
   }
   return { deleted: true };
-}
-
-/** The detail of an `unresolved` result: a route for the pattern exists, and no known id names it. */
-function unresolvedRouteDetail(pattern: string): string {
-  return (
-    `a Workers route for "${pattern}" exists, but neither the job nor this Worker knows its id, and this op ` +
-    `does not list the zone's routes to find it. It was left unchanged. Re-run with its routeId.`
-  );
 }
 
 /**
@@ -323,13 +302,12 @@ export async function actuateMediaWorkerRouteUpsert(params: MediaWorkerRoutePara
     return failure(zoneRefusal);
   }
 
-  // A re-run: one read by the known id (the job's, else the one recorded at create).
-  const known = await readKnownMediaRoute(token, env, zone.id, pattern, params.routeId);
-  if ("error" in known) {
-    return failure(known.error);
+  const lookup = await findTheMediaRoute(token, zone.id, pattern, params.routeId);
+  if ("error" in lookup) {
+    return failure(lookup.error);
   }
-  if (known.route !== null) {
-    const route = known.route;
+  if (lookup.route !== null) {
+    const route = lookup.route;
     if (route.script !== script) {
       // The agency (or another tool) routed this host elsewhere on purpose. Never take that route over.
       const otherScript = route.script ?? "(no script)";
@@ -342,22 +320,13 @@ export async function actuateMediaWorkerRouteUpsert(params: MediaWorkerRoutePara
         foreign: true,
       };
     }
-    // Record it, so a later call without the routeId still reads this one route.
-    await mediaRouteIdStore(env, zone.id).writeMediaRouteId(pattern, route.id);
     return { ok: true, op: "worker-route-upsert", pattern, script, routeId: route.id, status: "unchanged" };
   }
 
-  // No live route under a known id: create it. On a new host this POST is the only Cloudflare write.
   const creation = await createMediaRoute(token, zone.id, pattern, script);
   if ("error" in creation) {
     return failure(creation.error);
   }
-  if ("duplicate" in creation) {
-    // A route for the pattern exists under an id nobody passed (made by hand, or a replacement of the
-    // stored one). Finding it would mean listing every route of the zone, so say so instead.
-    return { ok: false, op: "worker-route-upsert", pattern, script, detail: unresolvedRouteDetail(pattern), unresolved: true };
-  }
-  await mediaRouteIdStore(env, zone.id).writeMediaRouteId(pattern, creation.created);
   return { ok: true, op: "worker-route-upsert", pattern, script, routeId: creation.created, status: "created" };
 }
 
@@ -385,53 +354,34 @@ export async function actuateMediaWorkerRouteDelete(params: MediaWorkerRoutePara
   if ("error" in zone) {
     return failure(zone.error);
   }
-  const store = mediaRouteIdStore(env, zone.id);
 
-  const known = await readKnownMediaRoute(token, env, zone.id, pattern, params.routeId);
-  if ("error" in known) {
-    return failure(known.error);
+  // The delete never creates anything: "not found" comes from the zone's own route list, not from a probe.
+  const lookup = await findTheMediaRoute(token, zone.id, pattern, params.routeId);
+  if ("error" in lookup) {
+    return failure(lookup.error);
   }
-  if (known.route !== null) {
-    const route = known.route;
-    if (route.script !== script) {
-      const otherScript = route.script ?? "(no script)";
-      return {
-        ok: false,
-        op: "worker-route-delete",
-        pattern,
-        script,
-        detail: `the Workers route for "${pattern}" points at "${otherScript}", not "${script}", so this platform did not make it. It was left in place.`,
-        foreign: true,
-      };
-    }
-    const deletion = await deleteMediaRouteById(token, zone.id, route.id);
-    if ("error" in deletion) {
-      return failure(deletion.error);
-    }
-    await store.clearMediaRouteId(pattern);
-    // A route that vanished between the read and the delete (404) is the state the caller asked for.
-    if (deletion.deleted) {
-      return { ok: true, op: "worker-route-delete", pattern, script, status: "deleted" };
-    }
+  if (lookup.route === null) {
     return { ok: true, op: "worker-route-delete", pattern, script, status: "already-absent" };
   }
-
-  // No live route under a known id. That is NOT proof the pattern has no route: a stale id may have been
-  // replaced by another route. Ask Cloudflare with a create, which it refuses for an existing pattern —
-  // two calls at most, never a list of the zone. A create that succeeds proves the pattern was free; the
-  // probe route is removed at once (it points at the media Worker this op is unrouting anyway).
-  const probe = await createMediaRoute(token, zone.id, pattern, script);
-  if ("error" in probe) {
-    return failure(`could not check whether a Workers route for "${pattern}" exists: ${probe.error}`);
+  const route = lookup.route;
+  if (route.script !== script) {
+    const otherScript = route.script ?? "(no script)";
+    return {
+      ok: false,
+      op: "worker-route-delete",
+      pattern,
+      script,
+      detail: `the Workers route for "${pattern}" points at "${otherScript}", not "${script}", so this platform did not make it. It was left in place.`,
+      foreign: true,
+    };
   }
-  if ("duplicate" in probe) {
-    return { ok: false, op: "worker-route-delete", pattern, script, detail: unresolvedRouteDetail(pattern), unresolved: true };
+  const deletion = await deleteMediaRouteById(token, zone.id, route.id);
+  if ("error" in deletion) {
+    return failure(deletion.error);
   }
-  const probeRemoval = await deleteMediaRouteById(token, zone.id, probe.created);
-  if ("error" in probeRemoval) {
-    // Keep the probe's id, so a re-run of this delete reads and removes exactly that route.
-    await store.writeMediaRouteId(pattern, probe.created);
-    return failure(`the probe route ${probe.created} for "${pattern}" could not be removed: ${probeRemoval.error} Re-run the delete.`);
+  // A route that vanished between the read and the delete (404) is the state the caller asked for.
+  if (deletion.deleted) {
+    return { ok: true, op: "worker-route-delete", pattern, script, status: "deleted" };
   }
   return { ok: true, op: "worker-route-delete", pattern, script, status: "already-absent" };
 }

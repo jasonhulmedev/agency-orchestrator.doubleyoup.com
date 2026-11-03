@@ -71,8 +71,9 @@
 // treats an absent hostname as "already-absent".
 // The four hub#133 branded-media ops (actuate-branded-media.ts) are idempotent: `worker-route-upsert`
 // creates only an ABSENT route and reports one to the media Worker as "unchanged"; `media-hostmap-upsert`
-// is a KV PUT of the same value; both deletes treat an absent route or key as "already-absent". A route
-// that exists under an id nobody knows is `unresolved` (ok:false, nothing changed), never "already-absent".
+// is a KV PUT of the same value; both deletes treat an absent route or key as "already-absent". A stale
+// routeId falls through to one list of the agency zone's routes, so a replacement route is found, never
+// reported as "already-absent".
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
