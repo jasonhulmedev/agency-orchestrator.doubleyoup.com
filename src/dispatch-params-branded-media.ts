@@ -23,6 +23,11 @@
 // that already exists on that zone — the actuator checks that before it creates the route. The delete
 // removes only the exact route `<hostname>/*` in that zone and only when it points at the media Worker,
 // so it needs no such check (and still works after the custom hostname is gone).
+//
+// THE ROUTE ID. Both route ops take an optional `routeId`, the id the upsert returned. With it, the
+// actuator reads that one route by id, so the steady path never lists the zone's routes (one list per
+// host would be quadratic work across a zone with many branded hosts). The id is re-checked against
+// Cloudflare, so it selects a route but grants nothing.
 
 import type { ParamsVerdict } from "./dispatch-params.js";
 import { isCustomHostnameFqdn } from "./dispatch-params-custom-hostname.js";
@@ -49,7 +54,16 @@ export interface MediaWorkerRouteParams {
   zone: string;
   /** The media host, e.g. "acme-media.agency.example" or "media.customer.example". */
   hostname: string;
+  /**
+   * Optional: the route id an earlier worker-route-upsert returned (the platform stores it with the host).
+   * With it, the op reads and deletes that ONE route directly instead of listing every route in the zone.
+   * It is re-checked against Cloudflare (pattern and script), so a wrong id is refused, never trusted.
+   */
+  routeId?: string;
 }
+
+// A Workers route id is 32 lowercase hex characters.
+const MEDIA_ROUTE_ID_RE = /^[0-9a-f]{32}$/;
 
 /** media-hostmap-upsert: write `hostname -> value` into the pinned HOSTMAP namespace. */
 export interface MediaHostmapUpsertParams {
@@ -100,7 +114,7 @@ function validateMediaWorkerRouteParams(raw: unknown): ParamsVerdict<MediaWorker
   if (!isPlainParamsObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
   }
-  const unknownKey = unknownKeyReason(raw, ["zone", "hostname"]);
+  const unknownKey = unknownKeyReason(raw, ["zone", "hostname", "routeId"]);
   if (unknownKey !== null) {
     return { ok: false, reason: unknownKey };
   }
@@ -110,7 +124,13 @@ function validateMediaWorkerRouteParams(raw: unknown): ParamsVerdict<MediaWorker
   if (!isCustomHostnameFqdn(raw.hostname)) {
     return { ok: false, reason: `hostname ${MEDIA_HOSTNAME_RULE}` };
   }
-  return { ok: true, params: { zone: raw.zone, hostname: raw.hostname } };
+  if (raw.routeId === undefined) {
+    return { ok: true, params: { zone: raw.zone, hostname: raw.hostname } };
+  }
+  if (typeof raw.routeId !== "string" || !MEDIA_ROUTE_ID_RE.test(raw.routeId)) {
+    return { ok: false, reason: "routeId must be a Workers route id (32 lowercase hex characters)" };
+  }
+  return { ok: true, params: { zone: raw.zone, hostname: raw.hostname, routeId: raw.routeId } };
 }
 
 export function validateMediaWorkerRouteUpsertParams(raw: unknown): ParamsVerdict<MediaWorkerRouteParams> {

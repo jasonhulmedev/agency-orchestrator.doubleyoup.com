@@ -2,10 +2,13 @@
 // entry that send one media host to the AGENCY's own media Worker. The custom hostname (for a customer
 // domain) is the hub#46 op set in actuate-custom-hostname.ts; it is not repeated here.
 //
-//   worker-route-upsert   find the route `<hostname>/*` in the zone; none -> POST it to MEDIA_WORKER_SCRIPT;
-//                         one to that script -> "unchanged"; one to another script -> refused as foreign.
-//   worker-route-delete   DELETE that route when it points at MEDIA_WORKER_SCRIPT; absent -> "already-absent";
-//                         another script -> refused as foreign (the agency made it, not the platform).
+//   worker-route-upsert   with a routeId: read that route; it points at MEDIA_WORKER_SCRIPT -> "unchanged".
+//                         Else POST `<hostname>/*` -> MEDIA_WORKER_SCRIPT; created -> "created" + routeId.
+//                         A refused POST (the route exists) -> look it up: that script -> "unchanged";
+//                         another script -> refused as foreign.
+//   worker-route-delete   find the route (by routeId, else by pattern); DELETE it when it points at
+//                         MEDIA_WORKER_SCRIPT; absent -> "already-absent"; another script -> refused as foreign
+//                         (the agency made it, not the platform).
 //   media-hostmap-upsert  PUT `<hostname>` -> `<value>` into the HOSTMAP namespace. A PUT overwrites, so a
 //                         re-run converges.
 //   media-hostmap-delete  DELETE that key; a 404 counts as "already-absent".
@@ -23,13 +26,21 @@
 // removes only the exact route `<hostname>/*` in that zone, and only when it points at the media Worker,
 // so it still works after the custom hostname is gone.
 //
+// NO ZONE-WIDE SCAN ON THE STEADY PATH. Cloudflare can not read a route by pattern, only list them all.
+// A list per host would cost O(routes in the zone) per op. So the platform stores the routeId the upsert
+// returns and passes it back: a re-run or a delete is then one read by id. A new host is one POST. The
+// zone's route list is read only as recovery (a refused POST, or a call without a routeId).
+//
+// THE ACCOUNT of the HOSTMAP namespace is MEDIA_ACCOUNT_ID, or the token's only account (media-account.ts).
+//
 // Every call uses the agency's own CF_DNS_API_TOKEN, which needs Zone → Workers Routes: Edit (routes) and
 // Account → Workers KV Storage: Edit (HOSTMAP) for these ops.
 
 import type { Env } from "./env.js";
-import { CF_API, cloudflareErrorMessage, cloudflareHeaders, resolveAccountId, resolveZoneId, type CloudflareEnvelope } from "./actuate.js";
+import { CF_API, cloudflareErrorMessage, cloudflareHeaders, resolveZoneId, type CloudflareEnvelope } from "./actuate.js";
 import { findCustomHostname } from "./actuate-custom-hostname.js";
 import { isNameAtOrUnderZone } from "./dispatch-params-custom-hostname.js";
+import { resolveMediaAccountId } from "./media-account.js";
 import {
   mediaWorkerRoutePatternFor,
   type MediaHostmapDeleteParams,
@@ -100,7 +111,14 @@ function reportedScriptOf(env: Env): string {
   return "(invalid MEDIA_WORKER_SCRIPT)";
 }
 
-/** The routes in a zone whose pattern is EXACTLY `pattern`, or the reason the list failed. */
+/**
+ * The routes in a zone whose pattern is EXACTLY `pattern`, or the reason the list failed.
+ *
+ * RECOVERY ONLY. Cloudflare has no "route by pattern" read, so this reads every route of the zone. The
+ * steady path never calls it: the platform keeps the routeId the upsert returned and passes it back.
+ * It runs only when that id is missing — a create that Cloudflare rejected (most likely because the
+ * route already exists), or a delete for a host whose id the platform never got.
+ */
 async function findMediaRoutesByPattern(
   token: string,
   zoneId: string,
@@ -124,6 +142,72 @@ async function findMediaRoutesByPattern(
   // Exact pattern only: `*.<zone>/*` or `<host>/admin*` is a DIFFERENT route and is never touched.
   const routes = (body.result as CloudflareMediaRoute[]).filter((route) => route.id && route.pattern === pattern);
   return { routes };
+}
+
+/**
+ * ONE route, read by its id: the route, null when Cloudflare has no route with that id, or the reason
+ * the read failed. This is the bounded lookup of the steady path (one request, whatever the zone holds).
+ */
+async function readMediaRouteById(
+  token: string,
+  zoneId: string,
+  routeId: string,
+): Promise<{ route: CloudflareMediaRoute | null } | { error: string }> {
+  let response: Response;
+  try {
+    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zoneId)}/workers/routes/${encodeURIComponent(routeId)}`, {
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+    });
+  } catch (err) {
+    return { error: `could not reach Cloudflare to read the Workers route: ${errorMessage(err)}` };
+  }
+  if (response.status === 404) {
+    await response.text().catch(() => "");
+    return { route: null };
+  }
+  const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
+  if (response.status === 401 || response.status === 403) {
+    return { error: MEDIA_ROUTE_UNAUTHORIZED_HINT };
+  }
+  const route = body?.result as CloudflareMediaRoute | null | undefined;
+  if (!response.ok || !body?.success || !route || typeof route !== "object") {
+    return { error: `Workers route read failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.` };
+  }
+  return { route: { ...route, id: routeId } };
+}
+
+/**
+ * The route the job means, found the bounded way when it can be: by the job's routeId (one read), else by
+ * the recovery list. A routeId whose route has ANOTHER pattern is refused — the id is a hint from the
+ * platform, never an authority, so it can not point an op at some other host's route.
+ */
+async function findTheMediaRoute(
+  token: string,
+  zoneId: string,
+  pattern: string,
+  routeId: string | undefined,
+): Promise<{ route: CloudflareMediaRoute | null } | { error: string }> {
+  if (routeId !== undefined) {
+    const byId = await readMediaRouteById(token, zoneId, routeId);
+    if ("error" in byId) {
+      return byId;
+    }
+    if (byId.route === null) {
+      return { route: null };
+    }
+    if (byId.route.pattern !== pattern) {
+      return { error: `Workers route ${routeId} has the pattern "${byId.route.pattern ?? "(none)"}", not "${pattern}" — refusing to act on it.` };
+    }
+    return byId;
+  }
+  const listed = await findMediaRoutesByPattern(token, zoneId, pattern);
+  if ("error" in listed) {
+    return listed;
+  }
+  if (listed.routes.length > 1) {
+    return { error: `${listed.routes.length} Workers routes match "${pattern}" — ambiguous, refusing to change any of them.` };
+  }
+  return { route: listed.routes[0] ?? null };
 }
 
 /**
@@ -174,20 +258,12 @@ export async function actuateMediaWorkerRouteUpsert(params: MediaWorkerRoutePara
     return failure(zoneRefusal);
   }
 
-  const existing = await findMediaRoutesByPattern(token, zone.id, pattern);
-  if ("error" in existing) {
-    return failure(existing.error);
-  }
-  if (existing.routes.length > 1) {
-    return failure(`${existing.routes.length} Workers routes already match "${pattern}" — ambiguous, refusing to change any of them.`);
-  }
-  const existingRoute = existing.routes[0];
-  if (existingRoute) {
-    if (existingRoute.script === script) {
-      return { ok: true, op: "worker-route-upsert", pattern, script, routeId: existingRoute.id as string, status: "unchanged" };
+  const existingRoute = (route: CloudflareMediaRoute): MediaWorkerRouteUpsertResult => {
+    if (route.script === script) {
+      return { ok: true, op: "worker-route-upsert", pattern, script, routeId: route.id as string, status: "unchanged" };
     }
     // The agency (or another tool) routed this host elsewhere on purpose. Never take that route over.
-    const otherScript = existingRoute.script ?? "(no script)";
+    const otherScript = route.script ?? "(no script)";
     return {
       ok: false,
       op: "worker-route-upsert",
@@ -196,8 +272,22 @@ export async function actuateMediaWorkerRouteUpsert(params: MediaWorkerRoutePara
       detail: `a Workers route for "${pattern}" already points at "${otherScript}", not "${script}". It was left unchanged.`,
       foreign: true,
     };
+  };
+
+  // The steady re-run: the platform passes back the routeId it stored, so one read by id answers it.
+  if (params.routeId !== undefined) {
+    const known = await findTheMediaRoute(token, zone.id, pattern, params.routeId);
+    if ("error" in known) {
+      return failure(known.error);
+    }
+    if (known.route !== null) {
+      return existingRoute(known.route);
+    }
+    // The stored id is gone (deleted by hand?): create the route again below.
   }
 
+  // Create FIRST, without a list: on a new host this is the only call. Cloudflare refuses a second route
+  // with the same pattern, so a create can not make a duplicate; a refusal falls through to the recovery.
   let response: Response;
   try {
     response = await fetch(`${CF_API}/zones/${encodeURIComponent(zone.id)}/workers/routes`, {
@@ -213,10 +303,21 @@ export async function actuateMediaWorkerRouteUpsert(params: MediaWorkerRoutePara
     return failure(MEDIA_ROUTE_UNAUTHORIZED_HINT);
   }
   const created = body?.result as { id?: unknown } | null | undefined;
-  if (!response.ok || !body?.success || typeof created?.id !== "string" || created.id.length === 0) {
-    return failure(`Workers route create failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.`);
+  if (response.ok && body?.success && typeof created?.id === "string" && created.id.length > 0) {
+    return { ok: true, op: "worker-route-upsert", pattern, script, routeId: created.id, status: "created" };
   }
-  return { ok: true, op: "worker-route-upsert", pattern, script, routeId: created.id, status: "created" };
+  const createFailure = `Workers route create failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.`;
+
+  // RECOVERY: the create was refused, most likely because the route already exists (a re-run without the
+  // stored routeId). Only now read the zone's routes, to answer "unchanged" or "foreign" honestly.
+  const recovered = await findTheMediaRoute(token, zone.id, pattern, undefined);
+  if ("error" in recovered) {
+    return failure(`${createFailure} Then: ${recovered.error}`);
+  }
+  if (recovered.route === null) {
+    return failure(createFailure);
+  }
+  return existingRoute(recovered.route);
 }
 
 export async function actuateMediaWorkerRouteDelete(params: MediaWorkerRouteParams, env: Env): Promise<MediaWorkerRouteDeleteResult> {
@@ -243,17 +344,15 @@ export async function actuateMediaWorkerRouteDelete(params: MediaWorkerRoutePara
   if ("error" in zone) {
     return failure(zone.error);
   }
-  const existing = await findMediaRoutesByPattern(token, zone.id, pattern);
+  // With the stored routeId this is one read by id; without it, the recovery list of the zone's routes.
+  const existing = await findTheMediaRoute(token, zone.id, pattern, params.routeId);
   if ("error" in existing) {
     return failure(existing.error);
   }
-  if (existing.routes.length === 0) {
+  if (existing.route === null) {
     return { ok: true, op: "worker-route-delete", pattern, script, status: "already-absent" };
   }
-  if (existing.routes.length > 1) {
-    return failure(`${existing.routes.length} Workers routes match "${pattern}" — ambiguous, refusing to delete one.`);
-  }
-  const route = existing.routes[0];
+  const route = existing.route;
   if (route.script !== script) {
     const otherScript = route.script ?? "(no script)";
     return {
@@ -275,7 +374,7 @@ export async function actuateMediaWorkerRouteDelete(params: MediaWorkerRoutePara
   } catch (err) {
     return failure(`could not reach Cloudflare to delete the Workers route: ${errorMessage(err)}`);
   }
-  // A route that vanished between the list and the delete is the state the caller asked for.
+  // A route that vanished between the lookup and the delete is the state the caller asked for.
   if (response.status === 404) {
     await response.text().catch(() => "");
     return { ok: true, op: "worker-route-delete", pattern, script, status: "already-absent" };
@@ -294,9 +393,11 @@ export async function actuateMediaWorkerRouteDelete(params: MediaWorkerRoutePara
 
 /** The account and the HOSTMAP namespace id, or the reason they could not be found. */
 async function resolveHostmapNamespace(token: string, env: Env): Promise<{ accountId: string; namespaceId: string } | { error: string }> {
-  const account = await resolveAccountId(token, MEDIA_HOSTMAP_UNAUTHORIZED_HINT);
-  if ("error" in account) {
-    return account;
+  // MEDIA_ACCOUNT_ID, or the token's ONLY account. Never "the first account it lists": a token that sees
+  // two accounts would then write another account's HOSTMAP and report success.
+  const account = await resolveMediaAccountId(token, env, MEDIA_HOSTMAP_UNAUTHORIZED_HINT);
+  if (!account.ok) {
+    return { error: account.error };
   }
   const pinnedId = env.MEDIA_HOSTMAP_KV_ID;
   if (pinnedId !== undefined && pinnedId !== "") {

@@ -36,6 +36,13 @@ interface Route {
   match: (url: string) => boolean;
   respond: () => Response;
 }
+// The single-account token's account list: per_page=1 for the older probes, per_page=5 for the
+// branded-media probe (hub#133), which must see a SECOND account to refuse to guess between them.
+const ACCOUNT_LIST_URLS = [
+  "https://api.cloudflare.com/client/v4/accounts?per_page=1",
+  "https://api.cloudflare.com/client/v4/accounts?per_page=5",
+];
+
 function routedFetch(routes: Route[]) {
   return vi.fn(async (input: unknown) => {
     const url = String(input);
@@ -447,7 +454,7 @@ describe("validateCfDns", () => {
       // planning/40: after a green zone read, validateCfDns also probes the account-level Cloudflare
       // Tunnel scope (resolve account -> list one cfd_tunnel). Both are READ-ONLY GETs.
       {
-        match: (u) => u === "https://api.cloudflare.com/client/v4/accounts?per_page=1",
+        match: (u) => ACCOUNT_LIST_URLS.includes(u),
         respond: () => jsonResponse({ success: true, result: [{ id: "acc1" }] }),
       },
       {
@@ -635,7 +642,7 @@ describe("validateCfDns", () => {
       { match: (u) => u === "https://api.cloudflare.com/client/v4/zones?per_page=1", respond: () => jsonResponse({ success: true, result: [{ id: "z1", name: "jasonhulme.com" }] }) },
       { match: (u) => u === "https://api.cloudflare.com/client/v4/zones?name=jasonhulme.com&per_page=2", respond: () => jsonResponse({ success: true, result: [{ id: "z1", name: "jasonhulme.com" }] }) },
       { match: (u) => u.startsWith("https://api.cloudflare.com/client/v4/zones/z1/custom_hostnames"), respond: () => jsonResponse({ success: false, errors: [{ code: 10000 }] }, 403) },
-      { match: (u) => u === "https://api.cloudflare.com/client/v4/accounts?per_page=1", respond: () => jsonResponse({ success: true, result: [{ id: "acc1" }] }) },
+      { match: (u) => ACCOUNT_LIST_URLS.includes(u), respond: () => jsonResponse({ success: true, result: [{ id: "acc1" }] }) },
       { match: (u) => u.startsWith("https://api.cloudflare.com/client/v4/accounts/acc1/cfd_tunnel"), respond: () => jsonResponse({ success: true, result: [] }) },
       { match: (u) => u.includes("/rulesets/phases/"), respond: () => jsonResponse({ success: false, errors: [{ code: 10003 }] }, 404) },
       { match: (u) => u === "https://api.cloudflare.com/client/v4/accounts/acc1/workers/scripts", respond: () => jsonResponse({ success: true, result: [] }) },
@@ -660,7 +667,7 @@ describe("validateCfDns", () => {
     const routes = (namespaces: unknown[]) =>
       routedFetch([
         { match: (u) => u === "https://api.cloudflare.com/client/v4/zones?per_page=1", respond: () => jsonResponse({ success: true, result: [{ id: "z1", name: "jasonhulme.com" }] }) },
-        { match: (u) => u === "https://api.cloudflare.com/client/v4/accounts?per_page=1", respond: () => jsonResponse({ success: true, result: [{ id: "acc1" }] }) },
+        { match: (u) => ACCOUNT_LIST_URLS.includes(u), respond: () => jsonResponse({ success: true, result: [{ id: "acc1" }] }) },
         { match: (u) => u.startsWith("https://api.cloudflare.com/client/v4/accounts/acc1/cfd_tunnel"), respond: () => jsonResponse({ success: true, result: [] }) },
         { match: (u) => u.includes("/rulesets/phases/"), respond: () => jsonResponse({ success: false, errors: [{ code: 10003 }] }, 404) },
         { match: (u) => u.endsWith("/workers/scripts") || u.endsWith("/workers/routes"), respond: () => jsonResponse({ success: true, result: [] }) },
@@ -677,6 +684,41 @@ describe("validateCfDns", () => {
     const pinned = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token", MEDIA_HOSTMAP_KV_ID: "c".repeat(32) });
     expect(pinned.brandedMedia?.hostmapNamespace).toBe("pinned");
     expect(pinned.detail).toContain("HOSTMAP namespace: pinned by MEDIA_HOSTMAP_KV_ID");
+  });
+
+  it("hub#133: a token that sees two accounts gets no KV probe unless MEDIA_ACCOUNT_ID names the account", async () => {
+    const routes = () =>
+      routedFetch([
+        { match: (u) => u === "https://api.cloudflare.com/client/v4/zones?per_page=1", respond: () => jsonResponse({ success: true, result: [{ id: "z1", name: "jasonhulme.com" }] }) },
+        { match: (u) => u === "https://api.cloudflare.com/client/v4/accounts?per_page=1", respond: () => jsonResponse({ success: true, result: [{ id: "acc1" }] }) },
+        {
+          match: (u) => u === "https://api.cloudflare.com/client/v4/accounts?per_page=5",
+          respond: () => jsonResponse({ success: true, result: [{ id: "acc1" }, { id: "acc2" }] }),
+        },
+        { match: (u) => u.startsWith("https://api.cloudflare.com/client/v4/accounts/acc1/cfd_tunnel"), respond: () => jsonResponse({ success: true, result: [] }) },
+        { match: (u) => u.includes("/rulesets/phases/"), respond: () => jsonResponse({ success: false, errors: [{ code: 10003 }] }, 404) },
+        { match: (u) => u.endsWith("/workers/scripts") || u.endsWith("/workers/routes"), respond: () => jsonResponse({ success: true, result: [] }) },
+        { match: (u) => u.includes("/storage/kv/namespaces"), respond: () => jsonResponse({ success: true, result: [{ id: "c".repeat(32), title: "HOSTMAP" }] }) },
+      ]);
+
+    const ambiguousFetch = routes();
+    vi.stubGlobal("fetch", ambiguousFetch);
+    const ambiguous = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token" });
+    expect(ambiguous.ok).toBe(true);
+    expect(ambiguous.brandedMedia?.workersKv).toBe("unknown");
+    expect(ambiguous.brandedMedia?.hostmapNamespace).toBe("unknown");
+    expect(ambiguous.detail).toMatch(/Workers KV namespaces: check inconclusive \(.*MEDIA_ACCOUNT_ID/);
+    const ambiguousUrls = ambiguousFetch.mock.calls.map((call) => String(call[0]));
+    expect(ambiguousUrls.some((url) => url.includes("/storage/kv/namespaces"))).toBe(false);
+
+    const pinnedAccount = "d".repeat(32);
+    const pinnedFetch = routes();
+    vi.stubGlobal("fetch", pinnedFetch);
+    const pinned = await validateCfDns({ ...baseEnv, CF_DNS_API_TOKEN: "cf-dns-token", MEDIA_ACCOUNT_ID: pinnedAccount });
+    expect(pinned.brandedMedia?.workersKv).toBe("read-ok");
+    expect(pinned.brandedMedia?.hostmapNamespace).toBe("found");
+    const kvUrls = pinnedFetch.mock.calls.map((call) => String(call[0])).filter((url) => url.includes("/storage/kv/namespaces"));
+    expect(kvUrls).toEqual([`https://api.cloudflare.com/client/v4/accounts/${pinnedAccount}/storage/kv/namespaces?per_page=100`]);
   });
 
   it("planning/49 Phase 3: a Workers probe that cannot be made is inconclusive, never a failure", async () => {

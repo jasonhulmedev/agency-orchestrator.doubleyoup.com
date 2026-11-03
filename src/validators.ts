@@ -12,6 +12,7 @@ import type { Env } from "./env.js";
 import { signS3Request } from "./sigv4.js";
 import { errorMessage, extractXmlTag, isWorkerScriptName, stripTrailingSlash } from "./util.js";
 import { probeCustomHostnameScope, type CustomHostnameScopeReport } from "./actuate-custom-hostname.js";
+import { resolveMediaAccountId } from "./media-account.js";
 import { cellRunServiceAccountFor, edgeGateScriptNameFor, isGcpRegionName } from "./dispatch-params.js";
 import {
   CLIENT_SECRET_MIN_LENGTH,
@@ -825,16 +826,17 @@ async function probeBrandedMediaScope(
     sslCertificates = "denied";
   }
 
-  let kv: { state: WorkersReadState; status: string; body?: unknown } = {
-    state: "unknown",
-    status: "the token's account could not be resolved",
-  };
-  const account = await resolveFirstAccountId(token);
-  if (account !== undefined) {
+  let kv: { state: WorkersReadState; status: string; body?: unknown };
+  // The SAME account the media-hostmap-* ops write to (MEDIA_ACCOUNT_ID, or the token's only account), so
+  // a green probe means "the account the ops will use", not "some account the token happens to list first".
+  const account = await resolveMediaAccountId(token, env, "Cloudflare denied the account list");
+  if (account.ok) {
     kv = await probeWorkersRead(
       token,
-      `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(account)}/storage/kv/namespaces?per_page=100`,
+      `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(account.id)}/storage/kv/namespaces?per_page=100`,
     );
+  } else {
+    kv = { state: "unknown", status: account.error };
   }
 
   let hostmapNamespace: BrandedMediaScopeReport["hostmapNamespace"] = "unknown";
@@ -866,22 +868,6 @@ async function probeBrandedMediaScope(
     detail: `Branded media (advisory, does not affect this check): ${sslText}; ${routesText}; ${kvText}; ${hostmapText}. A read cannot prove Edit; it is exercised on the first branded-media op.`,
     report: { sslCertificates, workersRoutes, workersKv: kv.state, hostmapNamespace },
   };
-}
-
-/** The id of the first account the token can see, or undefined. Never throws. */
-async function resolveFirstAccountId(token: string): Promise<string | undefined> {
-  try {
-    const response = await fetch("https://api.cloudflare.com/client/v4/accounts?per_page=1", {
-      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
-    });
-    const body = (await response.json().catch(() => null)) as { success?: boolean; result?: Array<{ id?: string }> } | null;
-    if (body?.success && Array.isArray(body.result) && body.result.length > 0) {
-      return body.result[0]?.id;
-    }
-    return undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 export async function validateCfDns(env: Env): Promise<ValidationResult> {

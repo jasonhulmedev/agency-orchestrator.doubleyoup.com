@@ -121,6 +121,11 @@ export interface Env {
   // write ONLY this namespace. Unset => the account's namespace titled "HOSTMAP" (looked up on each call).
   MEDIA_HOSTMAP_KV_ID?: string;
 
+  // hub#133: the Cloudflare account id (32 hex) of the agency's media Worker and its HOSTMAP namespace.
+  // CF_DNS_API_TOKEN can see more than one account, so the HOSTMAP ops never guess: set => only this
+  // account; unset => the token's ONLY account, and a token that sees two or more accounts is refused.
+  MEDIA_ACCOUNT_ID?: string;
+
   // hub#46: the agency zone that holds its customers' Cloudflare-for-SaaS custom hostnames — a zone NAME
   // such as "example.com" (the cell's Cell.cfZone). The custom-hostname-upsert / -get / -delete ops act
   // on THIS zone only: a signed job names a hostname, never a zone. Unset => those ops return a clean
