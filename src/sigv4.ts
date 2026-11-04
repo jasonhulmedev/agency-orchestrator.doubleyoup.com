@@ -80,6 +80,16 @@ function canonicalQueryString(searchParams: URLSearchParams): string {
   return encodedPairs.map(([key, value]) => `${key}=${value}`).join("&");
 }
 
+/**
+ * A header value as SigV4 canonicalizes it ("Trimall"): no leading or trailing whitespace, and each run of
+ * whitespace inside collapsed to one space. The store computes its canonical request this way, so signing the raw
+ * value of, say, `text/plain;  charset=utf-8` would fail with SignatureDoesNotMatch. Callers that hand signed
+ * headers to a third party send this normalized value too, so the wire bytes equal the signed bytes.
+ */
+export function canonicalHeaderValue(value: string): string {
+  return value.trim().replace(/\s+/g, " ");
+}
+
 export interface SignedRequest {
   url: string;
   headers: Headers;
@@ -140,7 +150,7 @@ export async function signS3Request(options: {
   signedValues.set("x-amz-date", amzDate);
   const extraHeaders = options.extraHeaders ?? {};
   for (const [name, value] of Object.entries(extraHeaders)) {
-    signedValues.set(name.toLowerCase(), value.trim());
+    signedValues.set(name.toLowerCase(), canonicalHeaderValue(value));
   }
 
   const sortedNames = [...signedValues.keys()].sort();
@@ -183,7 +193,7 @@ export async function signS3Request(options: {
   outHeaders.set("x-amz-date", amzDate);
   outHeaders.set("authorization", authorization);
   for (const [name, value] of Object.entries(extraHeaders)) {
-    outHeaders.set(name.toLowerCase(), value.trim());
+    outHeaders.set(name.toLowerCase(), canonicalHeaderValue(value));
   }
 
   return { url: options.url, headers: outHeaders };
@@ -284,7 +294,7 @@ export async function presignS3Url(options: {
   headerValues.set("host", host);
   const extraSignedHeaders = options.signedHeaders ?? {};
   for (const [name, value] of Object.entries(extraSignedHeaders)) {
-    headerValues.set(name.toLowerCase(), value.trim());
+    headerValues.set(name.toLowerCase(), canonicalHeaderValue(value));
   }
   const sortedHeaderNames = [...headerValues.keys()].sort();
   const signedHeaderList = sortedHeaderNames.join(";");
