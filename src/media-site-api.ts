@@ -44,6 +44,7 @@ import {
   type MediaStoreIdentity,
 } from "./media-store.js";
 import { presignS3Put } from "./sigv4.js";
+import { readBodyCapped } from "./actuate.js";
 
 export const MEDIA_SITE_RATE_LIMIT_PER_MINUTE = 600;
 const MEDIA_SITE_RATE_WINDOW_MS = 60_000;
@@ -129,13 +130,15 @@ export function configuredMediaSiteSecret(env: Env): string | null {
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown> | null> {
-  const text = await request.text().catch(() => null);
-  if (text === null || text.length > MEDIA_REQUEST_MAX_BYTES) {
+  // Stream with a cap: the route is public, so a huge body must never be buffered whole.
+  const response = new Response(request.body);
+  const read = await readBodyCapped(response, MEDIA_REQUEST_MAX_BYTES);
+  if (!read.ok) {
     return null;
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(read.text);
   } catch {
     return null;
   }

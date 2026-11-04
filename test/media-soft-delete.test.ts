@@ -586,6 +586,14 @@ describe("hub#222 /media/* auth and limits", () => {
     expect(fake.s3Calls()).toEqual([]);
   });
 
+  it("refuses a body over 16 KiB without reading it whole", async () => {
+    const fake = new FakeCloud().install();
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const response = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.jpg", padding: "x".repeat(20_000) }, credential, env());
+    expect(response.status).toBe(400);
+    expect(fake.calls).toEqual([]);
+  });
+
   it("an unknown /media/ action is a 404", async () => {
     new FakeCloud().install();
     const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
