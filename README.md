@@ -4,25 +4,26 @@ The **agency-side glue** for the doubleyoup agency-cloud pivot — a Cloudflare
 Worker that each agency deploys into **their own** Cloudflare account (pulled
 from our GitHub, so we never need write access to their account).
 
-This is thin, always-on glue: it does **not** run heavy jobs. In the full
-design the long-running orchestration runs on a compute box in the agency's own
-Google Cloud; the Worker just dispatches and makes light API calls.
+This is thin, always-on glue. It does **not** run heavy jobs. The platform
+orchestrator runs the long jobs and sends this Worker one signed job per action.
+The Worker acts with the agency's own credentials.
 
-## Phase 1 scope (this repo, today)
+## Scope
 
-**Onboarding + credential self-validation only — NO infrastructure
-provisioning.** The Worker:
+The Worker does three things.
 
-1. Validates each service credential the agency connected (Google Cloud, S3,
-   Stripe, R2 provisioning, and the AI provider keys) with a **real
-   authenticated call** to each provider, returning a specific, actionable
-   error for anything that's wrong.
-2. Talks back to our control-plane app over **Direction-A OAuth2** (a
+1. It validates each service credential the agency connected (Google Cloud, S3,
+   Stripe, R2 provisioning, Cloudflare DNS and the AI provider keys) with a
+   **real authenticated call** to each provider, returning a specific,
+   actionable error for anything that's wrong.
+2. It talks back to our control-plane app over **Direction-A OAuth2** (a
    short-lived access token minted from the agency's client credentials) to
    prove the round-trip and signal onboarding complete.
-
-Provisioning, the inbound signed handshake (Direction B), the update pipeline,
-and everything else come in later phases.
+3. It runs signed Direction-B jobs (`POST /actuate`). With these jobs it builds
+   and tears down the agency's cell in the agency's own Google Cloud project. It
+   also manages DNS, tunnels, cache, WAF, custom hostnames, Workers routes, R2
+   media, the branded-media `HOSTMAP`, the edge session gate and Cloud Run
+   services in the agency's own accounts.
 
 ## How the credentials live
 
@@ -45,8 +46,12 @@ Worker never persists them anywhere else and we never hold them. See
 | `MEDIA_WORKER_SCRIPT` | var (optional) | hub#133: the script name of your media Worker. `worker-route-upsert` points every media route at this script; a signed job can never name a script. Default `doubleyoup-media` |
 | `MEDIA_ACCOUNT_ID` | var (optional) | hub#133: the Cloudflare account id (32 hex characters) of your media Worker and its `HOSTMAP` namespace. The `media-hostmap-*` ops and the `/validate` KV probe use only this account. Unset: they use the ONLY account `CF_DNS_API_TOKEN` sees; a token that sees two or more accounts is refused, never guessed. Set it when one token covers zones of several accounts |
 | `MEDIA_HOSTMAP_KV_ID` | var (optional) | hub#133: the id (32 hex characters) of the Workers KV namespace your media Worker binds as `HOSTMAP`. The `media-hostmap-*` ops write only to this namespace. Unset: the Worker uses the namespace titled `HOSTMAP` in the media account (`/validate` reports `hostmapNamespace: found` or `missing`) |
-| `DY_WORKER_NAME` | secret | this Worker's own script name, as the Cloudflare dashboard shows it (e.g. `sbmstudio`). It can differ from `name` in your fork's `wrangler.toml`. The `edge-gate-deploy` op binds your cell's session gate to this Worker's `SessionGateMinter` entrypoint by this name, and refuses while it is unset. Not secret, but set it as a secret so a redeploy keeps it. `/validate` reports whether it is set (`cfDns.workersScope.workerName`) |
+| `DY_WORKER_NAME` | secret | this Worker's own script name, as the Cloudflare dashboard shows it (e.g. `my-agency-orchestrator`). It can differ from `name` in your fork's `wrangler.toml`. The `edge-gate-deploy` op binds your cell's session gate to this Worker's `SessionGateMinter` entrypoint by this name, and refuses while it is unset. Not secret, but set it as a secret so a redeploy keeps it. `/validate` reports whether it is set (`cfDns.workersScope.workerName`) |
 | `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` | secrets | AI provider keys — set at least one (`OPENAI_API_KEY` also covers Codex) |
+| `DY_SIGNING_PUBLIC_KEY` | secret | your account's ed25519 public key (SPKI PEM) from onboarding. `/actuate` checks each job with it. Unset, `/actuate` refuses every job |
+| `CELL_AGENT_URL` / `CELL_AGENT_TOKEN` | secrets | your cell-agent base URL and bearer token. The `wp-cli`, `db-export` and `db-import` ops post to its `/exec` endpoint. The `provision-ssh-keys` op posts to its `/provision-ssh-keys` endpoint and needs the **gateway** cell-agent, not the web node. All four ops share this one pair, and it serves one cell only: on a cell where the web node and the gateway are separate machines, the pair reaches only one of them |
+| `CELL_FILE_AGENT_URL` / `CELL_FILE_AGENT_TOKEN` | secrets (optional) | a fallback file-node agent for `r2-site-key-install`. A current job names its own agent, and the job's pair wins, so most agencies do not set them. Set both or neither |
+| `R2_EXPECTED_ACCOUNT_ID` | var (optional) | the Cloudflare account id that `R2_PROVISION_API_TOKEN` must belong to. When set, the `r2-media-*` and `r2-site-key-*` ops refuse any other account |
 
 ## Where setup instructions live
 
@@ -139,6 +144,7 @@ npm run deploy
 | `POST /validate` | run every validator; returns `{ok, gcp, s3, stripe, ai, r2Provision, cfDns}`, each `{ok, detail}` |
 | `GET /whoami` | exercise Direction-A end-to-end; returns `{ok, accountId}` |
 | `POST /complete` | if all green, call our app's onboarding-complete route; returns `{ok, validation, callback}` |
+| `POST /actuate` | runs one signed Direction-B job (ed25519 signature and a single-use nonce). Only the platform calls it |
 
 > `POST /complete` re-validates and calls our app's `onboarding-complete` route
 > (now live). It stays resilient — if that callback is ever unreachable it still
@@ -170,7 +176,7 @@ There is no generic KV-write op and no op that routes to any other script.
 ```
 cp .dev.vars.example .dev.vars   # fill in real values (git-ignored)
 npm run dev                      # wrangler dev
-npm test                         # vitest — token-exchange caching + every validator (mocked fetch)
+npm test                         # vitest — validators, token exchange, signed dispatch and the op families (mocked fetch), plus the nonce store and session gate under workerd
 npm run typecheck                # tsc --noEmit
 ```
 
@@ -183,7 +189,10 @@ npm run typecheck                # tsc --noEmit
   hand-rolled against Web Crypto.
 - The Direction-B signed handshake (our app → this Worker) is **live**: `POST
   /actuate` verifies an ed25519 signature + a single-use nonce before running any
-  allowlisted op (provision-r2, dns-record-upsert, dns-record-get, cache-purge, cache-rule-upsert, waf-rule-upsert, waf-edge-sync, wp-cli,
-  db-export, db-import, gcp-instance-create, gcp-network-create,
-  gcp-firewall-create, gcp-address-create, gcp-router-nat-create). `/validate`
+  op in `DISPATCH_OP_REGISTRY` (`src/ops.ts`). The ops cover R2 media, DNS,
+  cache, WAF, custom hostnames, Cloudflare tunnels, Workers routes and the
+  branded-media `HOSTMAP`, the edge session gate, `wp-cli`, SSH keys and DB
+  export/import on the cell, and the cell's Google Cloud resources (instances,
+  networks, subnets, firewalls, addresses, routers and NAT, snapshots, quota and
+  Cloud Run). `/validate`
   and `/complete` stay agency-triggered.
