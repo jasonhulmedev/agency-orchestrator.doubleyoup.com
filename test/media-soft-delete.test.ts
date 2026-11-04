@@ -31,6 +31,7 @@ import {
   validateMediaTrashListParams,
 } from "../src/dispatch-params-media.js";
 import {
+  MEDIA_KEY_LEASE_TTL_MS,
   MEDIA_PRESIGN_TTL_SECONDS,
   MEDIA_SITE_RATE_LIMIT_PER_MINUTE,
   mediaSiteCredential,
@@ -51,7 +52,7 @@ import { presignS3Put } from "../src/sigv4.js";
 
 const mediaParamsSource: string = rawMediaParamsSource as string;
 // The app's copy of src/dispatch-params-media.ts pins the SAME value. Change both twins and both pins together.
-const MEDIA_PARAMS_SHA256 = "6b2ea23e9c7daaac2ed54ef641c64441b1cd543a33907ffa1732f72eff38692f";
+const MEDIA_PARAMS_SHA256 = "ee158d053e90657e5d10545ac84b73137c64402dff66d020edcc99ff18e12999";
 
 const ACCOUNT_ID = "043e3bdaf4a6849a2d745269084c0e5f";
 const R2_TOKEN = "r2-provision-token-must-not-be-echoed";
@@ -67,6 +68,18 @@ const JOB_AGENT_URL = "https://cell-region-file.example.org";
 const JOB_AGENT_TOKEN = "0123456789abcdef".repeat(4);
 const WORKER_URL = "https://agency-worker.example.workers.dev";
 const NOW = Date.parse("2026-11-04T10:20:30.000Z");
+
+/** A deterministic hex "MD5" of the bytes for the fake store (FNV-1a, twice, for 16 hex characters). */
+function fakeEtag(body: string): string {
+  let first = 0x811c9dc5;
+  let second = 0x01000193;
+  for (let index = 0; index < body.length; index += 1) {
+    const code = body.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193) >>> 0;
+    second = Math.imul(second ^ code, 0x811c9dc5) >>> 0;
+  }
+  return first.toString(16).padStart(8, "0") + second.toString(16).padStart(8, "0");
+}
 
 async function sha256Hex(text: string): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
@@ -104,12 +117,25 @@ class FakeCloud {
     body: { success: true, result: { accessKeyId: "tmp-akid", secretAccessKey: "tmp-secret", sessionToken: "tmp-session" } },
   };
   failNextDelete = false;
-  etagCounter = 0;
+  /**
+   * Runs before the fake answers each S3 request, so a test can let another writer act at that exact moment (an
+   * interleaving). It may await another Worker request.
+   */
+  beforeS3Answer: ((method: string, key: string, headers: Headers) => Promise<void>) | null = null;
 
   put(key: string, body: string, contentType = "image/jpeg"): void {
-    this.etagCounter += 1;
-    // Hex, like a real single-part ETag.
-    this.objects.set(key, { etag: `e7a${this.etagCounter}`, contentType, body });
+    // The ETag depends on the bytes only, like a real single-part ETag (an MD5): the same bytes uploaded again with
+    // another content type keep their ETag.
+    this.objects.set(key, { etag: fakeEtag(body), contentType, body });
+  }
+
+  /** What a site's presigned create-once PUT does: R2 refuses it (412) when the key exists. */
+  presignedUpload(key: string, body: string, contentType = "image/jpeg"): 200 | 412 {
+    if (this.objects.has(key)) {
+      return 412;
+    }
+    this.put(key, body, contentType);
+    return 200;
   }
 
   install(): this {
@@ -123,6 +149,10 @@ class FakeCloud {
     const headers = new Headers(init?.headers);
     const body = typeof init?.body === "string" ? init.body : null;
     this.calls.push({ method, url, headers, body });
+    if (this.beforeS3Answer !== null && url.startsWith(S3_ENDPOINT)) {
+      const key = decodeURIComponent(new URL(url).pathname.split("/").slice(2).join("/"));
+      await this.beforeS3Answer(method, key, headers);
+    }
     return this.answer(method, url, headers, body);
   }
 
@@ -227,6 +257,10 @@ class FakeCloud {
       if (ifMatch !== null && ifMatch !== `"${source.etag}"`) {
         return new Response("<Error><Code>PreconditionFailed</Code></Error>", { status: 412 });
       }
+      if (headers.get("cf-copy-destination-if-none-match") === "*" && existing !== undefined) {
+        // R2 checks the destination condition when it commits the copy.
+        return new Response("<Error><Code>PreconditionFailed</Code></Error>", { status: 412 });
+      }
       if (key.startsWith("trash/") && existing !== undefined) {
         // The bucket lock: a trash object can not be overwritten.
         return new Response("<Error><Code>ObjectLockedByBucketPolicy</Code></Error>", { status: 409 });
@@ -272,6 +306,20 @@ class FakeCloud {
 
 class FakeRateStore {
   counts = new Map<string, number>();
+  leases = new Map<string, { holder: string; expiresAt: number }>();
+  acquireLease(leaseKey: string, holder: string, ttlMs: number): "acquired" | "busy" {
+    const held = this.leases.get(leaseKey);
+    if (held !== undefined && held.expiresAt > Date.now()) {
+      return "busy";
+    }
+    this.leases.set(leaseKey, { holder, expiresAt: Date.now() + ttlMs });
+    return "acquired";
+  }
+  releaseLease(leaseKey: string, holder: string): void {
+    if (this.leases.get(leaseKey)?.holder === holder) {
+      this.leases.delete(leaseKey);
+    }
+  }
   countRequest(rateKey: string, _windowMs: number, limit: number): { allowed: true } | { allowed: false; retryAfterMs: number } {
     const count = this.counts.get(rateKey) ?? 0;
     if (count >= limit) {
@@ -626,6 +674,17 @@ describe("hub#222 /media/sign-put", () => {
   });
 });
 
+describe("hub#222 /media/sign-put header values", () => {
+  it("returns the content type as SigV4 signs it (inner whitespace collapsed), so the upload matches its signature", async () => {
+    new FakeCloud().install();
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const response = await siteRequest("sign-put", { bucket: BUCKET, key: "acme/a.txt", contentType: "text/plain;  charset=utf-8", contentLength: 5 }, credential, env());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { upload: { headers: Record<string, string> } };
+    expect(body.upload.headers["content-type"]).toBe("text/plain; charset=utf-8");
+  });
+});
+
 describe("hub#222 /media/delete", () => {
   it("copies to trash/<UTC day>/<key> keeping the content type, then deletes", async () => {
     const fake = new FakeCloud().install();
@@ -638,7 +697,9 @@ describe("hub#222 /media/delete", () => {
     expect(fake.writes()).toEqual(["PUT trash/2026-11-04/acme/a.png <- acme/a.png", "DELETE acme/a.png"]);
     const copy = fake.s3Calls().find((call) => call.method === "PUT");
     expect(copy?.headers.get("x-amz-metadata-directive")).toBe("COPY");
-    expect(copy?.headers.get("x-amz-copy-source-if-match")).toBe('"e7a1"');
+    expect(copy?.headers.get("x-amz-copy-source-if-match")).toBe(`"${fakeEtag("png-bytes")}"`);
+    expect(copy?.headers.get("cf-copy-destination-if-none-match")).toBe("*");
+    expect(copy?.headers.get("authorization")).toContain("cf-copy-destination-if-none-match");
     expect(copy?.headers.get("authorization")).toContain("x-amz-copy-source");
     expect(fake.objects.get("trash/2026-11-04/acme/a.png")?.contentType).toBe("image/png");
     expect(fake.objects.has("acme/a.png")).toBe(false);
@@ -662,6 +723,10 @@ describe("hub#222 /media/delete", () => {
     const first = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
     expect(first.status).toBe(502);
     expect(fake.objects.has("acme/a.png")).toBe(true);
+    // R2 may still apply the failed DELETE, so the key stays held until the lease expires.
+    const tooSoon = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
+    expect(tooSoon.status).toBe(409);
+    vi.setSystemTime(NOW + MEDIA_KEY_LEASE_TTL_MS + 1);
     const second = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
     expect(second.status).toBe(200);
     expect(fake.writes()).toEqual([
@@ -679,9 +744,70 @@ describe("hub#222 /media/delete", () => {
     await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
     fake.put("acme/a.png", "second", "image/png");
     const response = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
-    expect(await response.json()).toMatchObject({ ok: true, trashKey: "trash/2026-11-04.e7a2/acme/a.png" });
+    const body = (await response.json()) as { ok: boolean; trashKey: string };
+    expect(body.ok).toBe(true);
+    expect(body.trashKey).toMatch(/^trash\/2026-11-04\.[a-f0-9]{32}\/acme\/a\.png$/);
     expect(fake.objects.get("trash/2026-11-04/acme/a.png")?.body).toBe("first");
-    expect(fake.objects.get("trash/2026-11-04.e7a2/acme/a.png")?.body).toBe("second");
+    expect(fake.objects.get(body.trashKey)?.body).toBe("second");
+  });
+
+  it("the same bytes with another content type are a new revision: both get a trash copy", async () => {
+    const fake = new FakeCloud().install();
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const workerEnv = env();
+    fake.put("acme/a.jpg", "same-bytes", "application/octet-stream");
+    await siteRequest("delete", { bucket: BUCKET, key: "acme/a.jpg" }, credential, workerEnv);
+    fake.put("acme/a.jpg", "same-bytes", "image/jpeg");
+    expect(fake.objects.get("acme/a.jpg")?.etag).toBe(fake.objects.get("trash/2026-11-04/acme/a.jpg")?.etag);
+
+    const response = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.jpg" }, credential, workerEnv);
+    const body = (await response.json()) as { ok: boolean; status: string; trashKey: string };
+    expect(body).toMatchObject({ ok: true, status: "trashed" });
+    expect(body.trashKey).not.toBe("trash/2026-11-04/acme/a.jpg");
+    expect(fake.objects.get("trash/2026-11-04/acme/a.jpg")?.contentType).toBe("application/octet-stream");
+    expect(fake.objects.get(body.trashKey)?.contentType).toBe("image/jpeg");
+    expect(fake.objects.has("acme/a.jpg")).toBe(false);
+  });
+
+  it("a second request for the same key waits its turn: a replace during a delete changes nothing (409)", async () => {
+    const fake = new FakeCloud().install();
+    fake.put("acme/a.png", "v1", "image/png");
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const workerEnv = env();
+    let competing: Response | null = null;
+    let uploadStatus: number | null = null;
+    fake.beforeS3Answer = async (method, key) => {
+      if (method !== "DELETE" || key !== "acme/a.png" || competing !== null) {
+        return;
+      }
+      // Request A has copied v1 to trash and is about to delete. Request B tries to replace the same key, and a
+      // presigned upload of v2 races in.
+      competing = await siteRequest("replace", { bucket: BUCKET, key: "acme/a.png", contentType: "image/png", contentLength: 2 }, credential, workerEnv);
+      uploadStatus = fake.presignedUpload("acme/a.png", "v2", "image/png");
+    };
+    const response = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
+    expect(response.status).toBe(200);
+    expect((competing as Response | null)?.status).toBe(409);
+    // v1 still existed when the upload raced in, so create-once refused it: no version was lost unseen.
+    expect(uploadStatus).toBe(412);
+    expect(fake.objects.get("trash/2026-11-04/acme/a.png")?.body).toBe("v1");
+    expect(fake.writes()).toEqual(["PUT trash/2026-11-04/acme/a.png <- acme/a.png", "DELETE acme/a.png"]);
+  });
+
+  it("a request that took too long after its trash copy does not delete (its lease may have expired)", async () => {
+    const fake = new FakeCloud().install();
+    fake.put("acme/a.png", "v1", "image/png");
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    fake.beforeS3Answer = async (method, key) => {
+      if (method === "PUT" && key.startsWith("trash/")) {
+        vi.setSystemTime(NOW + MEDIA_KEY_LEASE_TTL_MS - 1000);
+      }
+    };
+    const response = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, env());
+    expect(response.status).toBe(503);
+    expect(fake.objects.get("acme/a.png")?.body).toBe("v1");
+    expect(fake.objects.get("trash/2026-11-04/acme/a.png")?.body).toBe("v1");
+    expect(fake.writes()).toEqual(["PUT trash/2026-11-04/acme/a.png <- acme/a.png"]);
   });
 
   it("an object that changes between the HEAD and the copy is not deleted (409)", async () => {
@@ -739,6 +865,23 @@ describe("hub#222 /media/rename", () => {
       "DELETE acme/old.jpg",
     ]);
     expect(fake.objects.get("acme/new.jpg")?.contentType).toBe("image/jpeg");
+  });
+
+  it("never overwrites a target that a presigned upload creates after the target HEAD (409, R2 refuses the copy)", async () => {
+    const fake = new FakeCloud().install();
+    fake.put("acme/old.jpg", "a");
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    fake.beforeS3Answer = async (method, key, headers) => {
+      if (method === "PUT" && key === "acme/new.jpg" && headers.get("x-amz-copy-source") !== null) {
+        expect(fake.presignedUpload("acme/new.jpg", "uploaded", "image/png")).toBe(200);
+      }
+    };
+    const response = await siteRequest("rename", { bucket: BUCKET, from: "acme/old.jpg", to: "acme/new.jpg" }, credential, env());
+    expect(response.status).toBe(409);
+    expect(fake.objects.get("acme/new.jpg")?.body).toBe("uploaded");
+    expect(fake.objects.get("acme/new.jpg")?.contentType).toBe("image/png");
+    expect(fake.objects.get("acme/old.jpg")?.body).toBe("a");
+    expect(fake.writes()).toEqual(["PUT acme/new.jpg <- acme/old.jpg"]);
   });
 
   it("never overwrites a target with other bytes (409)", async () => {
@@ -930,7 +1073,7 @@ describe("hub#222 media-trash-list", () => {
     const result = await readMediaTrashList({ bucket: BUCKET, prefix: "2026-11-04/" }, env());
     if (!result.ok) throw new Error(result.detail);
     expect(result.entries.map((entry) => entry.key)).toEqual(["trash/2026-11-04/acme/b.jpg"]);
-    expect(result.entries[0]?.etag).toBe("e7a2");
+    expect(result.entries[0]?.etag).toBe(fakeEtag("x"));
   });
 });
 
@@ -955,6 +1098,27 @@ describe("hub#222 media-restore", () => {
     expect(await actuateMediaRestore(params, env())).toMatchObject({ ok: false, code: 409 });
     expect(fake.objects.get("acme/a.png")?.body).toBe("newer");
     expect(await actuateMediaRestore({ ...params, trashKey: "trash/2026-11-04/acme/none.png" }, env())).toMatchObject({ ok: false, code: 404 });
+  });
+
+  it("never overwrites a live object that a presigned upload creates after the target HEAD (409)", async () => {
+    const fake = new FakeCloud().install();
+    fake.put("trash/2026-11-04/acme/a.png", "old", "image/png");
+    fake.beforeS3Answer = async (method, key, headers) => {
+      if (method === "PUT" && key === "acme/a.png" && headers.get("x-amz-copy-source") !== null) {
+        expect(fake.presignedUpload("acme/a.png", "fresh-upload", "image/png")).toBe(200);
+      }
+    };
+    const result = await actuateMediaRestore({ bucket: BUCKET, trashKey: "trash/2026-11-04/acme/a.png", targetKey: "acme/a.png" }, env());
+    expect(result).toMatchObject({ ok: false, code: 409 });
+    expect(fake.objects.get("acme/a.png")?.body).toBe("fresh-upload");
+  });
+
+  it("a target with the same bytes but other metadata is another revision (409), not already-restored", async () => {
+    const fake = new FakeCloud().install();
+    fake.put("trash/2026-11-04/acme/a.png", "bytes", "image/png");
+    fake.put("acme/a.png", "bytes", "application/octet-stream");
+    const result = await actuateMediaRestore({ bucket: BUCKET, trashKey: "trash/2026-11-04/acme/a.png", targetKey: "acme/a.png" }, env());
+    expect(result).toMatchObject({ ok: false, code: 409 });
   });
 });
 

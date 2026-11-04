@@ -11,9 +11,15 @@
 // THE TRASH MOVE (moveToTrash). Copy the live object to `trash/<UTC yyyy-mm-dd>/<key>` with
 // x-amz-metadata-directive: COPY (the content type, cache control and custom metadata travel with it), then the
 // caller deletes the original. A bucket lock keeps `trash/` objects for 30 days, so a trash key can NOT be
-// overwritten: when that key is already taken by OTHER bytes (the same key deleted twice in one day), the copy goes
-// to `trash/<yyyy-mm-dd>.<etag>/<key>` instead. When the trash key already holds the SAME bytes (same ETag), the
-// copy is skipped: that is a retry of a move that already copied.
+// overwritten: when that key is already taken by ANOTHER revision (the same key deleted twice in one day), the copy
+// goes to `trash/<yyyy-mm-dd>.<revision>/<key>` instead, where <revision> is a hash of the ETag and the metadata.
+// When the trash key already holds the SAME revision, the copy is skipped: that is a retry of a move that already
+// copied. A revision is the ETag AND the metadata (sameMediaRevision): the ETag covers the bytes only, so the same
+// bytes uploaded again with a corrected content type are a new revision that needs its own trash copy.
+//
+// CREATE-ONCE COPIES. Every copy signs R2's `cf-copy-destination-if-none-match: *` (an R2 extension of CopyObject,
+// developers.cloudflare.com/r2/api/s3/extensions). R2 checks it when it commits the target, so a copy never
+// replaces an object, also one that a presigned PUT created a moment after our HEAD. A refused copy is a 412.
 //
 // NEVER LOGGED. No function here logs or returns the token, the derived secret or a presigned URL in an error.
 
@@ -131,6 +137,7 @@ async function sendSigned(
   method: "GET" | "HEAD" | "PUT" | "DELETE",
   url: string,
   extraHeaders?: Record<string, string>,
+  timeoutMs?: number,
 ): Promise<Response | { error: string }> {
   const signed = await signS3Request({
     method,
@@ -142,7 +149,11 @@ async function sendSigned(
     pathIsEncoded: true,
   });
   try {
-    return await fetch(signed.url, { method, headers: signed.headers });
+    const init: RequestInit = { method, headers: signed.headers };
+    if (timeoutMs !== undefined) {
+      init.signal = AbortSignal.timeout(timeoutMs);
+    }
+    return await fetch(signed.url, init);
   } catch (err) {
     return { error: `could not reach R2: ${errorMessage(err)}` };
   }
@@ -163,6 +174,52 @@ export interface MediaObjectHead {
   etag: string;
   contentType: string | null;
   size: number | null;
+  /**
+   * The metadata that CopyObject carries along (system headers and x-amz-meta-*), as one stable string. Two
+   * objects with the same ETag but other metadata are different revisions (sameMediaRevision).
+   */
+  metadataFingerprint: string;
+}
+
+// The system metadata that x-amz-metadata-directive: COPY keeps (R2's CopyObject list), plus every x-amz-meta-*.
+const FINGERPRINT_SYSTEM_HEADERS = [
+  "cache-control",
+  "content-disposition",
+  "content-encoding",
+  "content-language",
+  "content-type",
+  "expires",
+];
+const CUSTOM_METADATA_HEADER_PREFIX = "x-amz-meta-";
+
+function metadataFingerprintOf(headers: Headers): string {
+  const names: string[] = [...FINGERPRINT_SYSTEM_HEADERS];
+  const customNames: string[] = [];
+  for (const [name] of headers) {
+    if (name.startsWith(CUSTOM_METADATA_HEADER_PREFIX)) {
+      customNames.push(name);
+    }
+  }
+  customNames.sort();
+  names.push(...customNames);
+  const parts: string[] = [];
+  for (const name of names) {
+    const value = headers.get(name);
+    if (value === null) {
+      continue;
+    }
+    // JSON quoting keeps a value that holds "=" or a newline from running into the next part.
+    parts.push(`${name}=${JSON.stringify(value)}`);
+  }
+  return parts.join("\n");
+}
+
+/** True when both HEADs show the same bytes AND the same metadata. */
+export function sameMediaRevision(first: MediaObjectHead, second: MediaObjectHead): boolean {
+  if (first.etag !== second.etag) {
+    return false;
+  }
+  return first.metadataFingerprint === second.metadataFingerprint;
 }
 
 /** HEAD one object: its ETag and content type, null when it does not exist. */
@@ -187,11 +244,17 @@ export async function headMediaObject(
   if (sizeText !== null && /^\d+$/.test(sizeText)) {
     size = Number(sizeText);
   }
-  return { etag, contentType: response.headers.get("content-type"), size };
+  return {
+    etag,
+    contentType: response.headers.get("content-type"),
+    size,
+    metadataFingerprint: metadataFingerprintOf(response.headers),
+  };
 }
 
 /**
- * CopyObject inside one bucket, keeping the source's metadata (x-amz-metadata-directive: COPY). With
+ * CopyObject inside one bucket, keeping the source's metadata (x-amz-metadata-directive: COPY). The copy is
+ * create-once: it never replaces an existing target (cf-copy-destination-if-none-match: *, a 412 otherwise). With
  * `sourceEtag`, the copy happens only while the source still has that ETag (x-amz-copy-source-if-match), so a
  * copy never takes newer bytes than the caller checked.
  */
@@ -205,6 +268,7 @@ export async function copyMediaObject(
   const headers: Record<string, string> = {
     "x-amz-copy-source": `/${awsUriEncodeComponent(bucket)}/${encodeS3KeyPath(sourceKey)}`,
     "x-amz-metadata-directive": "COPY",
+    "cf-copy-destination-if-none-match": "*",
   };
   if (sourceEtag !== undefined && sourceEtag !== "") {
     headers["x-amz-copy-source-if-match"] = `"${sourceEtag}"`;
@@ -225,13 +289,18 @@ export async function copyMediaObject(
   return { ok: true };
 }
 
-/** DeleteObject. A missing object is success (S3 answers 204 either way). */
+/**
+ * DeleteObject. A missing object is success (S3 answers 204 either way). R2's DeleteObject takes no condition, so
+ * the caller must make sure that nothing else changes the key meanwhile (media-site-api.ts holds a key lease).
+ * `timeoutMs` bounds the request; status 0 means the outcome is unknown (R2 may still apply the delete).
+ */
 export async function deleteMediaObject(
   identity: MediaStoreIdentity,
   bucket: string,
   key: string,
+  timeoutMs?: number,
 ): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
-  const response = await sendSigned(identity, "DELETE", mediaObjectUrl(identity, bucket, key));
+  const response = await sendSigned(identity, "DELETE", mediaObjectUrl(identity, bucket, key), undefined, timeoutMs);
   if ("error" in response) {
     return { ok: false, status: 0, error: response.error };
   }
@@ -246,16 +315,14 @@ export function utcDay(nowMs: number): string {
   return new Date(nowMs).toISOString().slice(0, 10);
 }
 
-// An ETag as a folder-name part: hex and "-" only (a multipart ETag is `<hex>-<parts>`), at most 64 characters.
-const ETAG_FOLDER_RE = /^[a-f0-9-]{1,64}$/;
-
-async function etagFolderPart(etag: string): Promise<string> {
-  const lowered = etag.toLowerCase();
-  if (ETAG_FOLDER_RE.test(lowered)) {
-    return lowered;
-  }
-  // An ETag of another shape still names the bytes: hash it to a safe, fixed-length part.
-  return (await sha256Hex(etag)).slice(0, 32);
+/**
+ * The revision as a folder-name part: 32 hex characters of the SHA-256 of the ETag and the metadata fingerprint.
+ * Two revisions with the same bytes but other metadata get different folders, so neither blocks the other's trash
+ * copy.
+ */
+async function revisionFolderPart(source: MediaObjectHead): Promise<string> {
+  const digest = await sha256Hex(`${source.etag}\n${source.metadataFingerprint}`);
+  return digest.slice(0, 32);
 }
 
 export type TrashMoveResult =
@@ -264,7 +331,7 @@ export type TrashMoveResult =
 
 /**
  * Copy `key` (whose HEAD the caller already read) into trash. The caller deletes the original afterwards. Safe to
- * re-run: a trash key that already holds the same ETag is reused, not copied again.
+ * re-run: a trash key that already holds the same revision (ETag and metadata) is reused, not copied again.
  */
 export async function moveToTrash(
   identity: MediaStoreIdentity,
@@ -274,17 +341,18 @@ export async function moveToTrash(
   nowMs: number,
 ): Promise<TrashMoveResult> {
   const day = utcDay(nowMs);
-  const candidates = [`${MEDIA_TRASH_PREFIX}${day}/${key}`, `${MEDIA_TRASH_PREFIX}${day}.${await etagFolderPart(source.etag)}/${key}`];
+  const revisionFolder = await revisionFolderPart(source);
+  const candidates = [`${MEDIA_TRASH_PREFIX}${day}/${key}`, `${MEDIA_TRASH_PREFIX}${day}.${revisionFolder}/${key}`];
   for (const trashKey of candidates) {
     const existing = await headMediaObject(identity, bucket, trashKey);
     if (existing !== null && "error" in existing) {
       return { ok: false, status: 502, error: existing.error };
     }
-    if (existing !== null && existing.etag === source.etag) {
+    if (existing !== null && sameMediaRevision(existing, source)) {
       return { ok: true, trashKey, copied: false };
     }
     if (existing !== null) {
-      // Other bytes already sit at this trash key, and the bucket lock forbids overwriting them: try the next key.
+      // Another revision already sits at this trash key, and the bucket lock forbids overwriting it: try the next key.
       continue;
     }
     const copied = await copyMediaObject(identity, bucket, key, trashKey, source.etag);
@@ -296,7 +364,7 @@ export async function moveToTrash(
   return {
     ok: false,
     status: 409,
-    error: `both trash keys for ${key} already hold other bytes: refusing to delete the original without a trash copy.`,
+    error: `both trash keys for ${key} already hold other revisions: refusing to delete the original without a trash copy.`,
   };
 }
 

@@ -35,8 +35,8 @@ export const MEDIA_TRASH_PREFIX = "trash/";
 const MEDIA_BUCKET_NAME_PREFIX = "doubleyoup-media-";
 
 /**
- * The longest live key, in UTF-8 bytes. R2 allows 1024; a trash key adds `trash/<date>.<etag>/` (at most 6 + 10 +
- * 1 + 64 + 1 = 82 bytes), so a live key keeps room for that.
+ * The longest live key, in UTF-8 bytes. R2 allows 1024; a trash key adds `trash/<date>.<revision>/` (6 + 10 + 1 +
+ * 32 + 1 = 50 bytes), so a live key keeps room for that.
  */
 export const MEDIA_KEY_MAX_BYTES = 900;
 const MEDIA_TRASH_KEY_MAX_BYTES = 1024;
@@ -172,7 +172,7 @@ export function mediaTrashKeyViolation(key: unknown, field: string): string | nu
 
 /**
  * The live key a trash key restores to by default: `trash/<day folder>/<key>` -> `<key>`. The day folder is
- * `yyyy-mm-dd` or `yyyy-mm-dd.<etag>` (media-store.ts::moveToTrash); either way it is one segment.
+ * `yyyy-mm-dd` or `yyyy-mm-dd.<revision>` (media-store.ts::moveToTrash); either way it is one segment.
  */
 export function mediaDefaultRestoreTarget(trashKey: string): string {
   const segments = trashKey.split("/");

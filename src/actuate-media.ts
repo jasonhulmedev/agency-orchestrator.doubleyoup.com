@@ -13,8 +13,9 @@
 //                                  key whose NAME proves r2-site-key-install minted it for this bucket. 404 =
 //                                  already-absent, so it converges.
 //   media-trash-list               READ one page (at most 1000) of `trash/` keys. Paged with an opaque cursor.
-//   media-restore                  COPY one trash object back to a live key, create-once: 409 when the target exists
-//                                  with other bytes; "already-restored" when it holds the same bytes (a retry).
+//   media-restore                  COPY one trash object back to a live key, create-once in R2
+//                                  (cf-copy-destination-if-none-match): 409 when the target exists with another
+//                                  revision; "already-restored" when it holds the same revision (a retry).
 //   media-bulk-credential          MINT an R2 temporary access credential (POST /r2/temp-access-credentials) for ONE
 //                                  bucket and ONE site prefix, object-read-write, at most 12 hours. Its parent is
 //                                  R2_PROVISION_API_TOKEN. It is the ONE op whose answer carries a credential: it is
@@ -42,6 +43,7 @@ import { configuredMediaSiteSecret, mediaSiteCredential } from "./media-site-api
 import {
   copyMediaObject,
   headMediaObject,
+  sameMediaRevision,
   listMediaObjects,
   mediaStoreIdentity,
   type MediaStoreIdentity,
@@ -447,7 +449,7 @@ export type MediaRestoreResult =
       ok: false;
       op: "media-restore";
       bucket: string;
-      /** 404: no such trash object. 409: the target holds other bytes. 412: the trash object changed during the copy. */
+      /** 404: no such trash object. 409: the target holds another revision. 412: the trash object changed during the copy. */
       code?: 404 | 409 | 412;
       detail: string;
     };
@@ -475,35 +477,51 @@ export async function actuateMediaRestore(params: MediaRestoreParams, env: Env):
   if (target !== null && "error" in target) {
     return failure(target.error);
   }
-  if (target !== null && target.etag === source.etag) {
+  if (target !== null && sameMediaRevision(target, source)) {
+    return alreadyRestored(params);
+  }
+  if (target !== null) {
+    return failure(`${params.targetKey} already exists with another revision: a restore never overwrites. Restore to another targetKey.`, 409);
+  }
+  // Create-once in R2 itself: copyMediaObject signs cf-copy-destination-if-none-match: *, so a live object that a
+  // site uploaded after the HEAD above is never replaced. The copy keeps the trash object's metadata
+  // (x-amz-metadata-directive: COPY), and the trash object stays in trash.
+  const copied = await copyMediaObject(identity, params.bucket, params.trashKey, params.targetKey, source.etag);
+  if (copied.ok) {
     return {
       ok: true,
       op: "media-restore",
       bucket: params.bucket,
       trashKey: params.trashKey,
       targetKey: params.targetKey,
-      status: "already-restored",
+      status: "restored",
     };
   }
-  if (target !== null) {
-    return failure(`${params.targetKey} already exists with other bytes: a restore never overwrites. Restore to another targetKey.`, 409);
-  }
-  // Create-once by the HEAD above: R2's CopyObject has no If-None-Match on the target. The copy keeps the trash
-  // object's metadata (x-amz-metadata-directive: COPY), and the trash object stays in trash.
-  const copied = await copyMediaObject(identity, params.bucket, params.trashKey, params.targetKey, source.etag);
-  if (!copied.ok) {
-    if (copied.status === 412) {
-      return failure(`${params.trashKey} changed during the restore: nothing was restored.`, 412);
-    }
+  if (copied.status !== 412) {
     return failure(copied.error);
   }
+  // 412: the target appeared after the HEAD, or the trash object changed. Read the target again to tell which.
+  const recheck = await headMediaObject(identity, params.bucket, params.targetKey);
+  if (recheck !== null && "error" in recheck) {
+    return failure(recheck.error);
+  }
+  if (recheck !== null && sameMediaRevision(recheck, source)) {
+    return alreadyRestored(params);
+  }
+  if (recheck !== null) {
+    return failure(`${params.targetKey} was created during the restore: nothing was overwritten. Restore to another targetKey.`, 409);
+  }
+  return failure(`${params.trashKey} changed during the restore: nothing was restored.`, 412);
+}
+
+function alreadyRestored(params: MediaRestoreParams): MediaRestoreResult {
   return {
     ok: true,
     op: "media-restore",
     bucket: params.bucket,
     trashKey: params.trashKey,
     targetKey: params.targetKey,
-    status: "restored",
+    status: "already-restored",
   };
 }
 

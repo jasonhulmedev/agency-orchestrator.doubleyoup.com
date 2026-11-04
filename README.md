@@ -200,14 +200,23 @@ never hold a `.` or `..` segment. Rate limit: 600 requests a minute per bucket
 | `/media/sign-put` | `{bucket, key, contentType, contentLength}` | Returns `upload: {method, url, headers, expiresAt}`: a presigned PUT, valid 10 minutes, that signs `if-none-match: *`, the content type and the length. Send exactly those headers. R2 answers 412 when the key exists, so a site can create but never overwrite |
 | `/media/replace` | `{bucket, key, contentType, contentLength}` | Moves the current object to trash, deletes it, then returns a create-once `upload` for the key. No current object: `previous: "already-absent"` |
 | `/media/delete` | `{bucket, key}` | Moves the object to trash, then deletes it. Missing: `status: "already-absent"` (ok) |
-| `/media/rename` | `{bucket, from, to}` | Copies `from` to `to` (409 when `to` holds other bytes), moves `from` to trash, deletes `from`. Missing `from`: `already-absent` (ok) |
+| `/media/rename` | `{bucket, from, to}` | Copies `from` to `to` (409 when `to` holds another revision, also one uploaded during the rename), moves `from` to trash, deletes `from`. Missing `from`: `already-absent` (ok) |
 
 Each route is safe to retry. A trash copy keeps the metadata
 (`x-amz-metadata-directive: COPY`) and is taken only while the source still has
 the ETag the Worker read (`x-amz-copy-source-if-match`); an object that changes
-in between is not deleted (409). When the same key goes to trash twice in one
-day with other bytes, the second copy goes to `trash/<day>.<etag>/<key>`,
+in between is not deleted (409). Every Worker copy is create-once in R2
+(`cf-copy-destination-if-none-match: *`), so a copy never replaces an object.
+A revision is the ETag and the metadata: when the same key goes to trash twice
+in one day as another revision (other bytes, or the same bytes with another
+content type), the second copy goes to `trash/<day>.<revision hash>/<key>`,
 because the lock forbids overwriting the first.
+
+R2's DeleteObject takes no condition. So delete, replace and rename take a
+60-second lease on the key being deleted (Durable Object instance
+`media-lease:<bucket>`): a second request for the same key answers 409 and the
+site retries. The final DELETE starts only while the lease has room for it, and
+a DELETE that fails or times out keeps the key held until the lease expires.
 
 **Signed ops.**
 

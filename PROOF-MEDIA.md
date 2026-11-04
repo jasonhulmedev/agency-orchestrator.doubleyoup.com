@@ -1,6 +1,6 @@
 # Media soft delete (hub#222) — live proof steps
 
-`npm run proof:media` proves, against ONE scratch R2 bucket, the three R2
+`npm run proof:media` proves, against ONE scratch R2 bucket, the R2
 behaviours the Worker's media soft delete depends on. It runs the Worker's own
 code (`src/media-store.ts`, `src/actuate-media.ts`, `src/sigv4.ts`) in Node with
 the agency's `R2_PROVISION_API_TOKEN`. It does not need a deployed Worker.
@@ -9,6 +9,7 @@ the agency's `R2_PROVISION_API_TOKEN`. It does not need a deployed Worker.
 | --- | --- |
 | a1, a2 | A presigned PUT that signs `if-none-match: *` creates a new key (200), and the same PUT onto that existing key answers **412** |
 | b | The trash move (CopyObject with `x-amz-metadata-directive: COPY`) keeps the content type |
+| b2 | A Worker copy onto an existing key is refused (**412**): R2 honours `cf-copy-destination-if-none-match: *` (an R2 beta extension). Rename, restore and the trash move rely on it to never replace an object |
 | c1, c2 | `media-bucket-protect` writes the `trash/` lifecycle rule and bucket lock; a second run writes nothing |
 | c3, c4 | A DELETE of the `trash/` object is refused (**409** expected) and the object is still there |
 | d | With `--check-bucket <name>`: each named bucket exists in the token's account |
@@ -68,6 +69,7 @@ account <account id>, bucket doubleyoup-media-proof222
 [PASS] a1 presigned create-once PUT of a new key: HTTP 200 (want 200)
 [PASS] a2 the same PUT onto the existing key: HTTP 412 (want 412)
 [PASS] b  copy into trash/ keeps the content type: source "text/plain; charset=utf-8", trash "text/plain; charset=utf-8" (trash/<day>/proof222/proof-222/<run>.txt)
+[PASS] b2 create-once CopyObject onto an existing key: HTTP 412 (want 412)
 [PASS] c1 media-bucket-protect: lifecycle created, lock created
 [PASS] c2 media-bucket-protect again writes nothing: lifecycle unchanged, lock unchanged
 [PASS] c3 DELETE of the trash/ object: HTTP 409 ... (want 409)

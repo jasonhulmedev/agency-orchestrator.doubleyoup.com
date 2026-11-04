@@ -6,7 +6,8 @@
 // It runs the Worker's own code (src/media-store.ts, src/actuate-media.ts, src/sigv4.ts) in Node, with the agency's
 // R2_PROVISION_API_TOKEN from the environment, and proves:
 //   (a) a presigned PUT that signs `if-none-match: *` creates a key once, and answers 412 for an existing key;
-//   (b) the trash move (CopyObject with x-amz-metadata-directive: COPY) keeps the content type;
+//   (b) the trash move (CopyObject with x-amz-metadata-directive: COPY) keeps the content type, and a Worker copy
+//       onto an existing key is refused (412, cf-copy-destination-if-none-match: *, an R2 beta feature);
 //   (c) after media-bucket-protect, a DELETE of the trash/ object is refused (409 expected);
 //   (d) with --check-bucket: each named bucket exists in the token's account (are a cell's media buckets in the
 //       same Cloudflare account as the agency Worker whose token this is?).
@@ -35,7 +36,7 @@ export async function resolve(specifier, context, next) {
 }`),
 );
 
-const { mediaStoreIdentity, headMediaObject, moveToTrash, mediaObjectUrl } = await import("../src/media-store.ts");
+const { mediaStoreIdentity, headMediaObject, moveToTrash, mediaObjectUrl, copyMediaObject } = await import("../src/media-store.ts");
 const { actuateMediaBucketProtect } = await import("../src/actuate-media.ts");
 const { validateMediaBucketProtectParams, mediaBucketSitePrefix } = await import("../src/dispatch-params-media.ts");
 const { presignS3Put, signS3Request } = await import("../src/sigv4.ts");
@@ -188,6 +189,17 @@ async function main() {
     trashType === source.contentType,
     `source "${source.contentType}", trash "${trashType}" (${moved.trashKey})`,
   );
+
+  // b2: every Worker copy is create-once. Copy the trash object back onto the live key, which still exists: R2
+  // must refuse it with 412 and leave the live key alone.
+  const copyOver = await copyMediaObject(identity, bucket, moved.trashKey, key);
+  const liveAfter = await headMediaObject(identity, bucket, key);
+  const liveUnchanged = liveAfter !== null && !("error" in liveAfter) && liveAfter.etag === source.etag;
+  let copyOverDetail = "copied over the live key (want 412)";
+  if (!copyOver.ok) {
+    copyOverDetail = `HTTP ${copyOver.status} (want 412)`;
+  }
+  record("b2 create-once CopyObject onto an existing key", !copyOver.ok && copyOver.status === 412 && liveUnchanged, copyOverDetail);
 
   // (c) the bucket lock refuses a delete in trash/
   const protect = await actuateMediaBucketProtect({ bucket }, env);
