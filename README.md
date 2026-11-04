@@ -52,6 +52,7 @@ Worker never persists them anywhere else and we never hold them. See
 | `CELL_AGENT_URL` / `CELL_AGENT_TOKEN` | secrets | your cell-agent base URL and bearer token. The `wp-cli`, `db-export` and `db-import` ops post to its `/exec` endpoint. The `provision-ssh-keys` op posts to its `/provision-ssh-keys` endpoint and needs the **gateway** cell-agent, not the web node. All four ops share this one pair, and it serves one cell only: on a cell where the web node and the gateway are separate machines, the pair reaches only one of them |
 | `CELL_FILE_AGENT_URL` / `CELL_FILE_AGENT_TOKEN` | secrets (optional) | a fallback file-node agent for `r2-site-key-install`. A current job names its own agent, and the job's pair wins, so most agencies do not set them. Set both or neither |
 | `R2_EXPECTED_ACCOUNT_ID` | var (optional) | the Cloudflare account id that `R2_PROVISION_API_TOKEN` must belong to. When set, the `r2-media-*` and `r2-site-key-*` ops refuse any other account |
+| `MEDIA_SITE_SECRET` | secret | hub#222: at least 32 characters (for example `openssl rand -hex 32`). The root of every site's media credential for `POST /media/*`, see [Media soft delete](#media-soft-delete). Changing it invalidates every site's credential until `media-site-credential-install` runs again |
 
 ## Where setup instructions live
 
