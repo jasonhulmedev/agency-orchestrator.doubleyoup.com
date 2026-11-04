@@ -175,6 +175,33 @@ describe("NonceStore leases (waf-edge-sync, one instance per zone) — real Dura
   });
 });
 
+describe("NonceStore.countRequest (hub#222 per-site media rate limit) — real Durable Object", () => {
+  function rateStub(bucket: string) {
+    const ns = workerEnv.NONCE_STORE;
+    return ns.get(ns.idFromName(`media-rate:${bucket}`));
+  }
+
+  it("allows `limit` requests in a window, refuses the next with a retry time, and starts over in a new window", async () => {
+    const stub = rateStub("doubleyoup-media-rate-a");
+    for (let index = 0; index < 3; index += 1) {
+      expect(await stub.countRequest("doubleyoup-media-rate-a", 60_000, 3)).toEqual({ allowed: true });
+    }
+    const refused = await stub.countRequest("doubleyoup-media-rate-a", 60_000, 3);
+    expect(refused.allowed).toBe(false);
+    if (!refused.allowed) {
+      expect(refused.retryAfterMs).toBeGreaterThan(0);
+      expect(refused.retryAfterMs).toBeLessThanOrEqual(60_000);
+    }
+    // Another bucket has its own instance and its own counter.
+    expect(await rateStub("doubleyoup-media-rate-b").countRequest("doubleyoup-media-rate-b", 60_000, 3)).toEqual({ allowed: true });
+    // Move the window back, as if a minute had passed.
+    await runInDurableObject(stub, (_instance: NonceStore, state) => {
+      state.storage.sql.exec("UPDATE rate_windows SET window_start = window_start - 60000 WHERE rate_key = ?", "doubleyoup-media-rate-a");
+    });
+    expect(await stub.countRequest("doubleyoup-media-rate-a", 60_000, 3)).toEqual({ allowed: true });
+  });
+});
+
 describe("POST /actuate — single-use replay protection end-to-end (real DO)", () => {
   const r2Spy = vi.mocked(actuateProvisionR2);
   const dnsSpy = vi.mocked(actuateDnsRecordUpsert);
