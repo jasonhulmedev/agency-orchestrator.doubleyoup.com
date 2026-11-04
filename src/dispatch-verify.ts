@@ -132,6 +132,15 @@ export const DISPATCH_OPS = [
   "r2-media-state",
   "r2-site-key-install",
   "r2-site-key-revoke",
+  // hub#222 — media soft delete (actuate-media.ts): protect a media bucket's trash/, switch a site to Worker-mode
+  // media (its credential goes Worker -> file node only), revoke its old R2 key, list and restore trash, and a
+  // short-lived prefix-scoped R2 credential for a bulk offload engine.
+  "media-bucket-protect",
+  "media-site-credential-install",
+  "media-site-key-revoke",
+  "media-trash-list",
+  "media-restore",
+  "media-bulk-credential",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 

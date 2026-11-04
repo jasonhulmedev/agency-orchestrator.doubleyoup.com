@@ -53,6 +53,9 @@ export type ConsumeOutcome = "fresh" | "replay";
 
 export type LeaseOutcome = "acquired" | "busy";
 
+/** hub#222: the answer of countRequest. `retryAfterMs` is set only when the request is over the limit. */
+export type RateOutcome = { allowed: true } | { allowed: false; retryAfterMs: number };
+
 export class NonceStore extends DurableObject {
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -65,6 +68,10 @@ export class NonceStore extends DurableObject {
     // Short leases (acquireLease below). Same reasoning: idempotent and synchronous.
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS leases (lease_key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires_at INTEGER NOT NULL)",
+    );
+    // hub#222: fixed-window request counters (countRequest below). Same reasoning: idempotent and synchronous.
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS rate_windows (rate_key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, count INTEGER NOT NULL)",
     );
   }
 
@@ -139,5 +146,38 @@ export class NonceStore extends DurableObject {
    */
   releaseLease(leaseKey: string, holder: string): void {
     this.ctx.storage.sql.exec("DELETE FROM leases WHERE lease_key = ? AND holder = ?", leaseKey, holder);
+  }
+
+  // ── per-site request counters (hub#222, the site-facing media API) ─────────────────────────────
+  // A THIRD use of this class, again on separate instances: the caller names one instance per media bucket
+  // (`media-rate:<bucket>`), so one busy site never slows another and there is no shared counter. Same atomicity
+  // as consume(): no `await`, so read -> decide -> write is one uninterruptible turn.
+
+  /**
+   * Count one request against `rateKey` in a fixed window of `windowMs`. Allowed while the window holds fewer
+   * than `limit` requests; a refused request is not counted.
+   */
+  countRequest(rateKey: string, windowMs: number, limit: number): RateOutcome {
+    const sql = this.ctx.storage.sql;
+    const now = Date.now();
+    const windowStart = now - (now % windowMs);
+    const rows = sql
+      .exec<{ window_start: number; count: number }>("SELECT window_start, count FROM rate_windows WHERE rate_key = ? LIMIT 1", rateKey)
+      .toArray();
+    const current = rows[0];
+    if (current === undefined || current.window_start !== windowStart) {
+      sql.exec(
+        "INSERT INTO rate_windows (rate_key, window_start, count) VALUES (?, ?, 1) " +
+          "ON CONFLICT(rate_key) DO UPDATE SET window_start = excluded.window_start, count = 1",
+        rateKey,
+        windowStart,
+      );
+      return { allowed: true };
+    }
+    if (current.count >= limit) {
+      return { allowed: false, retryAfterMs: windowStart + windowMs - now };
+    }
+    sql.exec("UPDATE rate_windows SET count = count + 1 WHERE rate_key = ?", rateKey);
+    return { allowed: true };
   }
 }
