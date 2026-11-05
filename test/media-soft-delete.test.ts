@@ -353,13 +353,19 @@ class FakeRateStore {
     if (this.acquireLease(objectKey, holder, leaseTtlMs) === "busy") {
       return { outcome: "busy" as const };
     }
-    const pending = this.pendingDeletes.get(objectKey);
-    let expiredPendingDelete: { holder: string; revision: string; startedAtMs: number } | null = null;
-    if (pending !== undefined && pending.startedAtMs <= Date.now() - quarantineMs) {
-      expiredPendingDelete = pending;
-      this.pendingDeletes.delete(objectKey);
+    // Like production, the sweep is bucket-wide: it drops the aged records of every key, and returns them by key.
+    const quarantineCutoff = Date.now() - quarantineMs;
+    const expiredPendingDeletes: { objectKey: string; holder: string; revision: string; startedAtMs: number }[] = [];
+    for (const [pendingKey, pending] of this.pendingDeletes) {
+      if (pending.startedAtMs <= quarantineCutoff) {
+        expiredPendingDeletes.push({ objectKey: pendingKey, ...pending });
+      }
     }
-    return { outcome: "acquired" as const, pendingDelete: this.pendingDeletes.get(objectKey) ?? null, expiredPendingDelete };
+    for (const expired of expiredPendingDeletes) {
+      this.pendingDeletes.delete(expired.objectKey);
+    }
+    expiredPendingDeletes.sort((left, right) => left.objectKey.localeCompare(right.objectKey));
+    return { outcome: "acquired" as const, pendingDelete: this.pendingDeletes.get(objectKey) ?? null, expiredPendingDeletes };
   }
   beginMediaDelete(objectKey: string, holder: string, revision: string, minLeaseRemainingMs: number): "recorded" | "lease-lost" {
     const lease = this.leases.get(objectKey);
@@ -801,6 +807,38 @@ describe("hub#222 /media/delete", () => {
       "DELETE acme/a.png",
       "DELETE acme/a.png",
     ]);
+  });
+
+  it("a request on another key that sweeps an aged pending-delete record logs that record's key", async () => {
+    const fake = new FakeCloud().install();
+    fake.put("acme/a.png", "a-bytes", "image/png");
+    fake.put("acme/b.png", "b-bytes", "image/png");
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const workerEnv = env();
+    // The DELETE of a.png fails with a 5xx, so its outcome is unknown and its record outlives the lease.
+    fake.failNextDelete = true;
+    const failed = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
+    expect(failed.status).toBe(502);
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const reopenWarnings = () =>
+      warnSpy.mock.calls.map((call) => String(call[0])).filter((message) => message.includes("MEDIA_UNKNOWN_DELETE_QUARANTINE_MS"));
+    vi.setSystemTime(NOW + MEDIA_UNKNOWN_DELETE_QUARANTINE_MS + 1);
+
+    // A delete of b.png takes the lease on b.png; its bucket-wide sweep drops a.png's record and must log it.
+    const otherKey = await siteRequest("delete", { bucket: BUCKET, key: "acme/b.png" }, credential, workerEnv);
+    expect(otherKey.status).toBe(200);
+    const warnings = reopenWarnings();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(`${BUCKET}/acme/a.png`);
+    expect(warnings[0]).not.toContain("acme/b.png");
+    await expectNoSecrets(warnings[0]);
+
+    // a.png's record is gone, so its next delete proceeds without 409 and logs nothing more.
+    const reopened = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
+    expect(reopened.status).toBe(200);
+    expect(reopenWarnings()).toHaveLength(1);
+    expect(fake.objects.has("acme/a.png")).toBe(false);
   });
 
   it("a DELETE that lands after the client gave up and after the lease expired can not remove a newer upload", async () => {

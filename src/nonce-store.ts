@@ -59,13 +59,16 @@ export type LeaseOutcome = "acquired" | "busy";
  */
 export type MediaPendingDelete = { holder: string; revision: string; startedAtMs: number };
 
+/** hub#222: a pending-delete record that the age sweep of acquireMediaKey dropped, with the key it belonged to. */
+export type MediaExpiredPendingDelete = MediaPendingDelete & { objectKey: string };
+
 /**
- * hub#222: the answer of acquireMediaKey. `expiredPendingDelete` is the record of THIS key that the age sweep dropped
- * in this call (null when none was dropped), so the caller can log the reopen of the key.
+ * hub#222: the answer of acquireMediaKey. `expiredPendingDeletes` returns every record that the sweep dropped in this
+ * call, for any key of the bucket (empty when none was dropped), so the caller can log each reopen.
  */
 export type MediaKeyLeaseOutcome =
   | { outcome: "busy" }
-  | { outcome: "acquired"; pendingDelete: MediaPendingDelete | null; expiredPendingDelete: MediaPendingDelete | null };
+  | { outcome: "acquired"; pendingDelete: MediaPendingDelete | null; expiredPendingDeletes: MediaExpiredPendingDelete[] };
 
 /** hub#222: the answer of beginMediaDelete. */
 export type MediaDeleteStart = "recorded" | "lease-lost";
@@ -213,7 +216,9 @@ export class NonceStore extends DurableObject {
 
   /**
    * Take the lease on `objectKey` (as acquireLease) and return the pending-delete record of that key, if any.
-   * Records older than `quarantineMs` are dropped first: such a DELETE is treated as one that R2 will never apply.
+   * Records older than `quarantineMs` are dropped first, for every key of the bucket: such a DELETE is treated as one
+   * that R2 will never apply. The answer returns every record that the sweep dropped, for any key of the bucket, so
+   * the caller can log each reopen.
    */
   acquireMediaKey(objectKey: string, holder: string, leaseTtlMs: number, quarantineMs: number): MediaKeyLeaseOutcome {
     const leaseOutcome = this.acquireLease(objectKey, holder, leaseTtlMs);
@@ -222,18 +227,22 @@ export class NonceStore extends DurableObject {
     }
     const sql = this.ctx.storage.sql;
     const quarantineCutoff = Date.now() - quarantineMs;
-    // Read this key's aged record before the sweep drops it: the caller logs the reopen of the key.
+    // Read every aged record before the sweep drops it, for any key of the bucket: the sweep is bucket-wide, and the
+    // caller must log each reopen, not only the one of the key it asked for.
     const expiredRows = sql
-      .exec<{ holder: string; revision: string; started_at: number }>(
-        "SELECT holder, revision, started_at FROM media_pending_deletes WHERE object_key = ? AND started_at <= ? LIMIT 1",
-        objectKey,
+      .exec<{ object_key: string; holder: string; revision: string; started_at: number }>(
+        "SELECT object_key, holder, revision, started_at FROM media_pending_deletes WHERE started_at <= ? ORDER BY object_key",
         quarantineCutoff,
       )
       .toArray();
-    const expiredRow = expiredRows[0];
-    let expiredPendingDelete: MediaPendingDelete | null = null;
-    if (expiredRow !== undefined) {
-      expiredPendingDelete = { holder: expiredRow.holder, revision: expiredRow.revision, startedAtMs: expiredRow.started_at };
+    const expiredPendingDeletes: MediaExpiredPendingDelete[] = [];
+    for (const expiredRow of expiredRows) {
+      expiredPendingDeletes.push({
+        objectKey: expiredRow.object_key,
+        holder: expiredRow.holder,
+        revision: expiredRow.revision,
+        startedAtMs: expiredRow.started_at,
+      });
     }
     sql.exec("DELETE FROM media_pending_deletes WHERE started_at <= ?", quarantineCutoff);
     const rows = sql
@@ -244,12 +253,12 @@ export class NonceStore extends DurableObject {
       .toArray();
     const row = rows[0];
     if (row === undefined) {
-      return { outcome: "acquired", pendingDelete: null, expiredPendingDelete };
+      return { outcome: "acquired", pendingDelete: null, expiredPendingDeletes };
     }
     return {
       outcome: "acquired",
       pendingDelete: { holder: row.holder, revision: row.revision, startedAtMs: row.started_at },
-      expiredPendingDelete,
+      expiredPendingDeletes,
     };
   }
 

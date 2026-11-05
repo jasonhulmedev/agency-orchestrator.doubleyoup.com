@@ -289,12 +289,13 @@ async function withKeyLease<T>(env: Env, bucket: string, key: string, work: (lea
   if (acquired.outcome === "busy") {
     return { acquired: false, response: refuse(409, `another media request is changing ${key}: nothing was changed, retry.`) };
   }
-  if (acquired.expiredPendingDelete !== null) {
-    // The accepted remaining risk (hub#222, Decision (genius) 2026-11-05) must at least be visible in the Worker log.
-    // Name the bucket and the key only: never the credential, the secret or a URL.
-    const ageMinutes = Math.floor((Date.now() - acquired.expiredPendingDelete.startedAtMs) / 60_000);
+  // The accepted remaining risk (hub#222, Decision (genius) 2026-11-05) must at least be visible in the Worker log.
+  // The sweep is bucket-wide, so this request may have dropped the records of other keys too: log each one.
+  // Name the bucket and the key only: never the credential, the secret or a URL.
+  for (const expired of acquired.expiredPendingDeletes) {
+    const ageMinutes = Math.floor((Date.now() - expired.startedAtMs) / 60_000);
     console.warn(
-      `media: a DELETE of ${bucket}/${key} with an unknown outcome is ${ageMinutes} min old, older than ` +
+      `media: a DELETE of ${bucket}/${expired.objectKey} with an unknown outcome is ${ageMinutes} min old, older than ` +
         `MEDIA_UNKNOWN_DELETE_QUARANTINE_MS; the key is reopened. If R2 applies that DELETE now, a newer object at ` +
         `this key has no trash copy.`,
     );
@@ -327,9 +328,10 @@ async function withKeyLease<T>(env: Env, bucket: string, key: string, work: (lea
  *   - key still holds the revision the earlier DELETE targeted: that DELETE may still land. Refuse (409) and keep
  *     the key as it is, so nothing new can be created on it (create-once uploads and copies get 412 on an existing
  *     key). The earlier revision is already in trash, so nothing is lost while the key waits.
- * A record older than MEDIA_UNKNOWN_DELETE_QUARANTINE_MS is dropped when the lease is taken: by then the DELETE is
+ * A record older than MEDIA_UNKNOWN_DELETE_QUARANTINE_MS is dropped when a lease is taken: by then the DELETE is
  * treated as one that R2 will never apply (an R2 5xx that did not apply, say), so the key does not stay stuck.
- * withKeyLease logs that drop with the bucket and the key. A DELETE that R2 applies later than that is an accepted
+ * The sweep drops aged records of every key in the bucket; each drop is logged (bucket and key) by the request that
+ * caused it, in withKeyLease. A DELETE that R2 applies later than that is an accepted
  * remaining risk (hub#222, doubleyoup#360): it is smaller than the per-site R2 key that this API replaces.
  */
 async function pendingDeleteViolation(lease: KeyLease, head: MediaObjectHead | null): Promise<string | null> {

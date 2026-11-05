@@ -184,7 +184,7 @@ describe("NonceStore media key leases with a pending-delete record (hub#222) —
   it("a recorded DELETE outlives its lease until a holder clears it; only the lease holder can record", async () => {
     const stub = mediaLeaseStub("doubleyoup-media-lease-a");
     const key = "lease-a/a.png";
-    expect(await stub.acquireMediaKey(key, "req-1", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null, expiredPendingDelete: null });
+    expect(await stub.acquireMediaKey(key, "req-1", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null, expiredPendingDeletes: [] });
     expect(await stub.acquireMediaKey(key, "req-2", 60_000, 3_600_000)).toEqual({ outcome: "busy" });
     expect(await stub.beginMediaDelete(key, "req-2", "rev-1", 15_000)).toBe("lease-lost");
     expect(await stub.beginMediaDelete(key, "req-1", "rev-1", 15_000)).toBe("recorded");
@@ -197,7 +197,7 @@ describe("NonceStore media key leases with a pending-delete record (hub#222) —
     }
     // req-3 proved the DELETE landed and clears req-1's record.
     await stub.finishMediaKey(key, "req-3", "req-1");
-    expect(await stub.acquireMediaKey(key, "req-4", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null, expiredPendingDelete: null });
+    expect(await stub.acquireMediaKey(key, "req-4", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null, expiredPendingDeletes: [] });
     await stub.finishMediaKey(key, "req-4", null);
   });
 
@@ -216,15 +216,46 @@ describe("NonceStore media key leases with a pending-delete record (hub#222) —
     expect(await stub.acquireMediaKey(key, "req-2", 60_000, 3_600_000)).toEqual({
       outcome: "acquired",
       pendingDelete: null,
-      expiredPendingDelete: { holder: "req-1", revision: "rev-1", startedAtMs: agedStartedAtMs },
+      expiredPendingDeletes: [{ objectKey: key, holder: "req-1", revision: "rev-1", startedAtMs: agedStartedAtMs }],
     });
     await stub.finishMediaKey(key, "req-2", null);
     expect(await stub.acquireMediaKey(key, "req-3", 60_000, 3_600_000)).toEqual({
       outcome: "acquired",
       pendingDelete: null,
-      expiredPendingDelete: null,
+      expiredPendingDeletes: [],
     });
     await stub.finishMediaKey(key, "req-3", null);
+  });
+
+  it("an acquire of one key sweeps and returns the aged records of every other key of the bucket", async () => {
+    const stub = mediaLeaseStub("doubleyoup-media-lease-c");
+    const recordUnknownDelete = async (key: string, holder: string, revision: string) => {
+      expect((await stub.acquireMediaKey(key, holder, 60_000, 3_600_000)).outcome).toBe("acquired");
+      expect(await stub.beginMediaDelete(key, holder, revision, 15_000)).toBe("recorded");
+      await stub.finishMediaKey(key, holder, null);
+    };
+    await recordUnknownDelete("lease-b/c.png", "req-c", "rev-c");
+    await recordUnknownDelete("lease-b/a.png", "req-a", "rev-a");
+    const agedStartedAtMs = Date.now() - 3_600_001;
+    await runInDurableObject(stub, (_instance: NonceStore, state) => {
+      state.storage.sql.exec("UPDATE media_pending_deletes SET started_at = ?", agedStartedAtMs);
+    });
+    // b.png has no record of its own, but its acquire runs the bucket-wide sweep, so it must return both drops.
+    expect(await stub.acquireMediaKey("lease-b/b.png", "req-b", 60_000, 3_600_000)).toEqual({
+      outcome: "acquired",
+      pendingDelete: null,
+      expiredPendingDeletes: [
+        { objectKey: "lease-b/a.png", holder: "req-a", revision: "rev-a", startedAtMs: agedStartedAtMs },
+        { objectKey: "lease-b/c.png", holder: "req-c", revision: "rev-c", startedAtMs: agedStartedAtMs },
+      ],
+    });
+    await stub.finishMediaKey("lease-b/b.png", "req-b", null);
+    expect(await stub.acquireMediaKey("lease-b/a.png", "req-a2", 60_000, 3_600_000)).toEqual({
+      outcome: "acquired",
+      pendingDelete: null,
+      expiredPendingDeletes: [],
+    });
+    await stub.finishMediaKey("lease-b/a.png", "req-a2", null);
   });
 });
 
