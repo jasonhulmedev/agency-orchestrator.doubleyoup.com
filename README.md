@@ -222,7 +222,10 @@ the key still holds the revision that DELETE targeted, delete, replace and
 rename of that key answer 409 (and nothing can re-create the key, because every
 write is create-once). Once the key is absent or holds another revision, the
 old DELETE has landed and the key is free. A record older than one hour is
-dropped. A trash copy counts only when R2 answers with a complete
+dropped, and the Worker logs a warning with the bucket and the key. A DELETE
+that R2 applies later than one hour is an accepted remaining risk: it is
+smaller than the per-site R2 key with Object Read & Write that this replaces.
+A trash copy counts only when R2 answers with a complete
 `CopyObjectResult`; an unreadable, empty or cut-off answer fails the request
 and nothing is deleted.
 

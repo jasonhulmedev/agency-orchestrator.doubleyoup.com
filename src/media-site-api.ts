@@ -289,6 +289,16 @@ async function withKeyLease<T>(env: Env, bucket: string, key: string, work: (lea
   if (acquired.outcome === "busy") {
     return { acquired: false, response: refuse(409, `another media request is changing ${key}: nothing was changed, retry.`) };
   }
+  if (acquired.expiredPendingDelete !== null) {
+    // The accepted remaining risk (hub#222, Decision (genius) 2026-11-05) must at least be visible in the Worker log.
+    // Name the bucket and the key only: never the credential, the secret or a URL.
+    const ageMinutes = Math.floor((Date.now() - acquired.expiredPendingDelete.startedAtMs) / 60_000);
+    console.warn(
+      `media: a DELETE of ${bucket}/${key} with an unknown outcome is ${ageMinutes} min old, older than ` +
+        `MEDIA_UNKNOWN_DELETE_QUARANTINE_MS; the key is reopened. If R2 applies that DELETE now, a newer object at ` +
+        `this key has no trash copy.`,
+    );
+  }
   const lease: KeyLease = { key, holder, store, pendingDelete: acquired.pendingDelete, clearPendingOf: null };
   try {
     const value = await work(lease);
@@ -319,6 +329,8 @@ async function withKeyLease<T>(env: Env, bucket: string, key: string, work: (lea
  *     key). The earlier revision is already in trash, so nothing is lost while the key waits.
  * A record older than MEDIA_UNKNOWN_DELETE_QUARANTINE_MS is dropped when the lease is taken: by then the DELETE is
  * treated as one that R2 will never apply (an R2 5xx that did not apply, say), so the key does not stay stuck.
+ * withKeyLease logs that drop with the bucket and the key. A DELETE that R2 applies later than that is an accepted
+ * remaining risk (hub#222, doubleyoup#360): it is smaller than the per-site R2 key that this API replaces.
  */
 async function pendingDeleteViolation(lease: KeyLease, head: MediaObjectHead | null): Promise<string | null> {
   const pending = lease.pendingDelete;

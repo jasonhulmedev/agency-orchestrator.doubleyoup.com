@@ -59,8 +59,13 @@ export type LeaseOutcome = "acquired" | "busy";
  */
 export type MediaPendingDelete = { holder: string; revision: string; startedAtMs: number };
 
-/** hub#222: the answer of acquireMediaKey. */
-export type MediaKeyLeaseOutcome = { outcome: "busy" } | { outcome: "acquired"; pendingDelete: MediaPendingDelete | null };
+/**
+ * hub#222: the answer of acquireMediaKey. `expiredPendingDelete` is the record of THIS key that the age sweep dropped
+ * in this call (null when none was dropped), so the caller can log the reopen of the key.
+ */
+export type MediaKeyLeaseOutcome =
+  | { outcome: "busy" }
+  | { outcome: "acquired"; pendingDelete: MediaPendingDelete | null; expiredPendingDelete: MediaPendingDelete | null };
 
 /** hub#222: the answer of beginMediaDelete. */
 export type MediaDeleteStart = "recorded" | "lease-lost";
@@ -216,7 +221,21 @@ export class NonceStore extends DurableObject {
       return { outcome: "busy" };
     }
     const sql = this.ctx.storage.sql;
-    sql.exec("DELETE FROM media_pending_deletes WHERE started_at <= ?", Date.now() - quarantineMs);
+    const quarantineCutoff = Date.now() - quarantineMs;
+    // Read this key's aged record before the sweep drops it: the caller logs the reopen of the key.
+    const expiredRows = sql
+      .exec<{ holder: string; revision: string; started_at: number }>(
+        "SELECT holder, revision, started_at FROM media_pending_deletes WHERE object_key = ? AND started_at <= ? LIMIT 1",
+        objectKey,
+        quarantineCutoff,
+      )
+      .toArray();
+    const expiredRow = expiredRows[0];
+    let expiredPendingDelete: MediaPendingDelete | null = null;
+    if (expiredRow !== undefined) {
+      expiredPendingDelete = { holder: expiredRow.holder, revision: expiredRow.revision, startedAtMs: expiredRow.started_at };
+    }
+    sql.exec("DELETE FROM media_pending_deletes WHERE started_at <= ?", quarantineCutoff);
     const rows = sql
       .exec<{ holder: string; revision: string; started_at: number }>(
         "SELECT holder, revision, started_at FROM media_pending_deletes WHERE object_key = ? LIMIT 1",
@@ -225,9 +244,13 @@ export class NonceStore extends DurableObject {
       .toArray();
     const row = rows[0];
     if (row === undefined) {
-      return { outcome: "acquired", pendingDelete: null };
+      return { outcome: "acquired", pendingDelete: null, expiredPendingDelete };
     }
-    return { outcome: "acquired", pendingDelete: { holder: row.holder, revision: row.revision, startedAtMs: row.started_at } };
+    return {
+      outcome: "acquired",
+      pendingDelete: { holder: row.holder, revision: row.revision, startedAtMs: row.started_at },
+      expiredPendingDelete,
+    };
   }
 
   /**

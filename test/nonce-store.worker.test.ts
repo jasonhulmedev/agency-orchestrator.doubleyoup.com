@@ -184,7 +184,7 @@ describe("NonceStore media key leases with a pending-delete record (hub#222) —
   it("a recorded DELETE outlives its lease until a holder clears it; only the lease holder can record", async () => {
     const stub = mediaLeaseStub("doubleyoup-media-lease-a");
     const key = "lease-a/a.png";
-    expect(await stub.acquireMediaKey(key, "req-1", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null });
+    expect(await stub.acquireMediaKey(key, "req-1", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null, expiredPendingDelete: null });
     expect(await stub.acquireMediaKey(key, "req-2", 60_000, 3_600_000)).toEqual({ outcome: "busy" });
     expect(await stub.beginMediaDelete(key, "req-2", "rev-1", 15_000)).toBe("lease-lost");
     expect(await stub.beginMediaDelete(key, "req-1", "rev-1", 15_000)).toBe("recorded");
@@ -197,7 +197,7 @@ describe("NonceStore media key leases with a pending-delete record (hub#222) —
     }
     // req-3 proved the DELETE landed and clears req-1's record.
     await stub.finishMediaKey(key, "req-3", "req-1");
-    expect(await stub.acquireMediaKey(key, "req-4", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null });
+    expect(await stub.acquireMediaKey(key, "req-4", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null, expiredPendingDelete: null });
     await stub.finishMediaKey(key, "req-4", null);
   });
 
@@ -208,11 +208,23 @@ describe("NonceStore media key leases with a pending-delete record (hub#222) —
     expect(await stub.beginMediaDelete(key, "req-1", "rev-1", 61_000)).toBe("lease-lost");
     expect(await stub.beginMediaDelete(key, "req-1", "rev-1", 15_000)).toBe("recorded");
     await stub.finishMediaKey(key, "req-1", null);
+    const agedStartedAtMs = Date.now() - 3_600_001;
     await runInDurableObject(stub, (_instance: NonceStore, state) => {
-      state.storage.sql.exec("UPDATE media_pending_deletes SET started_at = ? WHERE object_key = ?", Date.now() - 3_600_001, key);
+      state.storage.sql.exec("UPDATE media_pending_deletes SET started_at = ? WHERE object_key = ?", agedStartedAtMs, key);
     });
-    expect(await stub.acquireMediaKey(key, "req-2", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null });
+    // The acquire that drops the aged record returns it, so the Worker can log the reopen of the key.
+    expect(await stub.acquireMediaKey(key, "req-2", 60_000, 3_600_000)).toEqual({
+      outcome: "acquired",
+      pendingDelete: null,
+      expiredPendingDelete: { holder: "req-1", revision: "rev-1", startedAtMs: agedStartedAtMs },
+    });
     await stub.finishMediaKey(key, "req-2", null);
+    expect(await stub.acquireMediaKey(key, "req-3", 60_000, 3_600_000)).toEqual({
+      outcome: "acquired",
+      pendingDelete: null,
+      expiredPendingDelete: null,
+    });
+    await stub.finishMediaKey(key, "req-3", null);
   });
 });
 

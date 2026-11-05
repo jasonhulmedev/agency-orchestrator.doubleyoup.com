@@ -354,10 +354,12 @@ class FakeRateStore {
       return { outcome: "busy" as const };
     }
     const pending = this.pendingDeletes.get(objectKey);
+    let expiredPendingDelete: { holder: string; revision: string; startedAtMs: number } | null = null;
     if (pending !== undefined && pending.startedAtMs <= Date.now() - quarantineMs) {
+      expiredPendingDelete = pending;
       this.pendingDeletes.delete(objectKey);
     }
-    return { outcome: "acquired" as const, pendingDelete: this.pendingDeletes.get(objectKey) ?? null };
+    return { outcome: "acquired" as const, pendingDelete: this.pendingDeletes.get(objectKey) ?? null, expiredPendingDelete };
   }
   beginMediaDelete(objectKey: string, holder: string, revision: string, minLeaseRemainingMs: number): "recorded" | "lease-lost" {
     const lease = this.leases.get(objectKey);
@@ -778,11 +780,22 @@ describe("hub#222 /media/delete", () => {
     expect(fake.objects.has("acme/a.png")).toBe(true);
     // R2 may still apply the failed DELETE (a 5xx), so the key stays as it is while it holds the same revision.
     vi.setSystemTime(NOW + MEDIA_KEY_LEASE_TTL_MS + 1);
+    // The drop of an aged pending-delete record is the accepted remaining risk, so it must reach the Worker log.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const reopenWarnings = () =>
+      warnSpy.mock.calls.map((call) => String(call[0])).filter((message) => message.includes("MEDIA_UNKNOWN_DELETE_QUARANTINE_MS"));
     const tooSoon = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
     expect(tooSoon.status).toBe(409);
+    expect(reopenWarnings()).toEqual([]);
     vi.setSystemTime(NOW + MEDIA_UNKNOWN_DELETE_QUARANTINE_MS + 1);
     const second = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
     expect(second.status).toBe(200);
+    const warnings = reopenWarnings();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(`${BUCKET}/acme/a.png`);
+    expect(warnings[0]).toContain("60 min old");
+    await expectNoSecrets(warnings[0]);
+    expect(MEDIA_UNKNOWN_DELETE_QUARANTINE_MS).toBeGreaterThanOrEqual(60 * 60_000);
     expect(fake.writes()).toEqual([
       "PUT trash/2026-11-04/acme/a.png <- acme/a.png",
       "DELETE acme/a.png",
