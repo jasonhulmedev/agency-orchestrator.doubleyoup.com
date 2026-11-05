@@ -34,6 +34,7 @@ import {
   MEDIA_KEY_LEASE_TTL_MS,
   MEDIA_PRESIGN_TTL_SECONDS,
   MEDIA_SITE_RATE_LIMIT_PER_MINUTE,
+  MEDIA_UNKNOWN_DELETE_QUARANTINE_MS,
   mediaSiteCredential,
   verifyMediaSiteCredential,
 } from "../src/media-site-api.js";
@@ -118,6 +119,21 @@ class FakeCloud {
   };
   failNextDelete = false;
   /**
+   * The next DELETE "times out": the Worker gets a network error, but R2 has the request and applies it later, when
+   * the test calls landLostDeletes(). Models a DELETE that lands after the client gave up.
+   */
+  loseNextDelete = false;
+  lostDeletes: string[] = [];
+  /** When set, the next CopyObject is applied, but the Worker gets this answer instead of the real one. */
+  nextCopyAnswer: (() => Response) | null = null;
+
+  landLostDeletes(): void {
+    for (const key of this.lostDeletes) {
+      this.objects.delete(key);
+    }
+    this.lostDeletes = [];
+  }
+  /**
    * Runs before the fake answers each S3 request, so a test can let another writer act at that exact moment (an
    * interleaving). It may await another Worker request.
    */
@@ -152,6 +168,11 @@ class FakeCloud {
     if (this.beforeS3Answer !== null && url.startsWith(S3_ENDPOINT)) {
       const key = decodeURIComponent(new URL(url).pathname.split("/").slice(2).join("/"));
       await this.beforeS3Answer(method, key, headers);
+    }
+    if (this.loseNextDelete && method === "DELETE" && url.startsWith(S3_ENDPOINT)) {
+      this.loseNextDelete = false;
+      this.lostDeletes.push(decodeURIComponent(new URL(url).pathname.split("/").slice(2).join("/")));
+      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
     }
     return this.answer(method, url, headers, body);
   }
@@ -270,6 +291,11 @@ class FakeCloud {
         contentType = "application/octet-stream";
       }
       this.objects.set(key, { etag: source.etag, contentType, body: source.body });
+      if (this.nextCopyAnswer !== null) {
+        const answer = this.nextCopyAnswer;
+        this.nextCopyAnswer = null;
+        return answer();
+      }
       return new Response("<CopyObjectResult><ETag>x</ETag></CopyObjectResult>", { status: 200 });
     }
     if (method === "DELETE") {
@@ -319,6 +345,33 @@ class FakeRateStore {
     if (this.leases.get(leaseKey)?.holder === holder) {
       this.leases.delete(leaseKey);
     }
+  }
+  // The same rules as NonceStore.acquireMediaKey / beginMediaDelete / finishMediaKey (test/nonce-store.worker.test.ts
+  // runs those against the real Durable Object).
+  pendingDeletes = new Map<string, { holder: string; revision: string; startedAtMs: number }>();
+  acquireMediaKey(objectKey: string, holder: string, leaseTtlMs: number, quarantineMs: number) {
+    if (this.acquireLease(objectKey, holder, leaseTtlMs) === "busy") {
+      return { outcome: "busy" as const };
+    }
+    const pending = this.pendingDeletes.get(objectKey);
+    if (pending !== undefined && pending.startedAtMs <= Date.now() - quarantineMs) {
+      this.pendingDeletes.delete(objectKey);
+    }
+    return { outcome: "acquired" as const, pendingDelete: this.pendingDeletes.get(objectKey) ?? null };
+  }
+  beginMediaDelete(objectKey: string, holder: string, revision: string, minLeaseRemainingMs: number): "recorded" | "lease-lost" {
+    const lease = this.leases.get(objectKey);
+    if (lease === undefined || lease.holder !== holder || lease.expiresAt - Date.now() < minLeaseRemainingMs) {
+      return "lease-lost";
+    }
+    this.pendingDeletes.set(objectKey, { holder, revision, startedAtMs: Date.now() });
+    return "recorded";
+  }
+  finishMediaKey(objectKey: string, holder: string, clearPendingOf: string | null): void {
+    if (clearPendingOf !== null && this.pendingDeletes.get(objectKey)?.holder === clearPendingOf) {
+      this.pendingDeletes.delete(objectKey);
+    }
+    this.releaseLease(objectKey, holder);
   }
   countRequest(rateKey: string, _windowMs: number, limit: number): { allowed: true } | { allowed: false; retryAfterMs: number } {
     const count = this.counts.get(rateKey) ?? 0;
@@ -723,10 +776,11 @@ describe("hub#222 /media/delete", () => {
     const first = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
     expect(first.status).toBe(502);
     expect(fake.objects.has("acme/a.png")).toBe(true);
-    // R2 may still apply the failed DELETE, so the key stays held until the lease expires.
+    // R2 may still apply the failed DELETE (a 5xx), so the key stays as it is while it holds the same revision.
+    vi.setSystemTime(NOW + MEDIA_KEY_LEASE_TTL_MS + 1);
     const tooSoon = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
     expect(tooSoon.status).toBe(409);
-    vi.setSystemTime(NOW + MEDIA_KEY_LEASE_TTL_MS + 1);
+    vi.setSystemTime(NOW + MEDIA_UNKNOWN_DELETE_QUARANTINE_MS + 1);
     const second = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
     expect(second.status).toBe(200);
     expect(fake.writes()).toEqual([
@@ -734,6 +788,71 @@ describe("hub#222 /media/delete", () => {
       "DELETE acme/a.png",
       "DELETE acme/a.png",
     ]);
+  });
+
+  it("a DELETE that lands after the client gave up and after the lease expired can not remove a newer upload", async () => {
+    const fake = new FakeCloud().install();
+    fake.put("acme/a.png", "v1", "image/png");
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const workerEnv = env();
+
+    // Request A copies v1 to trash, sends the DELETE and times out. R2 has not applied it yet.
+    fake.loseNextDelete = true;
+    const first = await siteRequest("replace", { bucket: BUCKET, key: "acme/a.png", contentType: "image/png", contentLength: 2 }, credential, workerEnv);
+    expect(first.status).toBe(502);
+    expect(fake.objects.get("trash/2026-11-04/acme/a.png")?.body).toBe("v1");
+
+    // The lease expired long ago. Request B retries the replace: v1 is still live and A's DELETE may still land, so B
+    // must neither delete v1 nor hand out an upload URL. A delete and a rename are refused the same way.
+    vi.setSystemTime(NOW + MEDIA_KEY_LEASE_TTL_MS * 5);
+    const retry = await siteRequest("replace", { bucket: BUCKET, key: "acme/a.png", contentType: "image/png", contentLength: 2 }, credential, workerEnv);
+    expect(retry.status).toBe(409);
+    expect(await retry.json()).not.toHaveProperty("upload");
+    const deleteRetry = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
+    expect(deleteRetry.status).toBe(409);
+    const renameRetry = await siteRequest("rename", { bucket: BUCKET, from: "acme/a.png", to: "acme/b.png" }, credential, workerEnv);
+    expect(renameRetry.status).toBe(409);
+    expect(fake.objects.has("acme/b.png")).toBe(false);
+    // Nothing can create a new revision on the key while v1 is there: a stray create-once upload gets 412.
+    expect(fake.presignedUpload("acme/a.png", "v2", "image/png")).toBe(412);
+    expect(fake.writes()).toEqual(["PUT trash/2026-11-04/acme/a.png <- acme/a.png", "DELETE acme/a.png"]);
+
+    // A's DELETE lands now. It removes v1, which is in trash. Nothing newer existed for it to hit.
+    fake.landLostDeletes();
+    expect(fake.objects.has("acme/a.png")).toBe(false);
+
+    // The key is absent, which proves A's DELETE is done: the next replace goes ahead and the upload lands.
+    const after = await siteRequest("replace", { bucket: BUCKET, key: "acme/a.png", contentType: "image/png", contentLength: 2 }, credential, workerEnv);
+    expect(after.status).toBe(200);
+    expect(await after.json()).toMatchObject({ ok: true, previous: "already-absent" });
+    expect(fake.presignedUpload("acme/a.png", "v2", "image/png")).toBe(200);
+    // A later delete of v2 is not blocked by A's old record, and v2 reaches trash before it goes.
+    const deleteV2 = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
+    expect(deleteV2.status).toBe(200);
+    const deleteV2Body = (await deleteV2.json()) as { trashKey: string };
+    expect(fake.objects.get(deleteV2Body.trashKey)?.body).toBe("v2");
+    expect(fake.objects.has("acme/a.png")).toBe(false);
+  });
+
+  it("a DELETE refused with a 4xx did not happen: the key is free again at once", async () => {
+    const fake = new FakeCloud().install();
+    fake.put("acme/a.png", "v1", "image/png");
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const workerEnv = env();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "DELETE") {
+        fake.calls.push({ method: "DELETE", url: String(input), headers: new Headers(init?.headers), body: null });
+        return new Response("<Error><Code>AccessDenied</Code></Error>", { status: 403 });
+      }
+      return fake.handle(input, init);
+    });
+    const first = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
+    expect(first.status).toBe(502);
+    vi.restoreAllMocks();
+    fake.install();
+    const second = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
+    expect(second.status).toBe(200);
+    expect(fake.objects.has("acme/a.png")).toBe(false);
   });
 
   it("the same key deleted twice in one day goes to a second trash folder, never over the locked first copy", async () => {
@@ -1074,6 +1193,99 @@ describe("hub#222 media-trash-list", () => {
     if (!result.ok) throw new Error(result.detail);
     expect(result.entries.map((entry) => entry.key)).toEqual(["trash/2026-11-04/acme/b.jpg"]);
     expect(result.entries[0]?.etag).toBe(fakeEtag("x"));
+  });
+});
+
+describe("hub#222 an unconfirmed CopyObject is never a backup", () => {
+  // R2 sends the 200 of a CopyObject before the copy ends; only a complete CopyObjectResult proves it. Each answer
+  // below must stop delete, replace and rename before their DELETE, and must fail rename and restore.
+  function unreadableStream(): Response {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("<?xml version=\"1.0\"?><CopyObjectRes"));
+        controller.error(new TypeError("network connection lost"));
+      },
+    });
+    return new Response(body, { status: 200 });
+  }
+  const badAnswers: Array<[string, () => Response]> = [
+    ["a body stream that fails", unreadableStream],
+    ["an empty 200", () => new Response("", { status: 200 })],
+    ["a cut-off 200", () => new Response("<?xml version=\"1.0\"?><CopyObjectResult><ETag>\"ab", { status: 200 })],
+    ["a 200 without a CopyObjectResult", () => new Response("<Other/>", { status: 200 })],
+  ];
+
+  for (const [name, answer] of badAnswers) {
+    it(`delete with ${name}: the original stays`, async () => {
+      const fake = new FakeCloud().install();
+      fake.put("acme/a.png", "v1", "image/png");
+      fake.nextCopyAnswer = answer;
+      const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+      const response = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, env());
+      expect(response.status).toBe(502);
+      expect(fake.objects.get("acme/a.png")?.body).toBe("v1");
+      expect(fake.writes().filter((line) => line.startsWith("DELETE"))).toEqual([]);
+    });
+
+    it(`replace with ${name}: the original stays and no upload URL is handed out`, async () => {
+      const fake = new FakeCloud().install();
+      fake.put("acme/a.png", "v1", "image/png");
+      fake.nextCopyAnswer = answer;
+      const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+      const response = await siteRequest("replace", { bucket: BUCKET, key: "acme/a.png", contentType: "image/png", contentLength: 2 }, credential, env());
+      expect(response.status).toBe(502);
+      expect(await response.json()).not.toHaveProperty("upload");
+      expect(fake.objects.get("acme/a.png")?.body).toBe("v1");
+      expect(fake.writes().filter((line) => line.startsWith("DELETE"))).toEqual([]);
+    });
+
+    it(`rename with ${name} on the copy to the target: the source stays`, async () => {
+      const fake = new FakeCloud().install();
+      fake.put("acme/old.png", "v1", "image/png");
+      fake.nextCopyAnswer = answer;
+      const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+      const response = await siteRequest("rename", { bucket: BUCKET, from: "acme/old.png", to: "acme/new.png" }, credential, env());
+      expect(response.status).toBe(502);
+      expect(fake.objects.get("acme/old.png")?.body).toBe("v1");
+      expect(fake.writes().filter((line) => line.startsWith("DELETE"))).toEqual([]);
+    });
+
+    it(`rename with ${name} on the trash copy: the source stays`, async () => {
+      const fake = new FakeCloud().install();
+      fake.put("acme/old.png", "v1", "image/png");
+      fake.beforeS3Answer = async (method, key) => {
+        if (method === "PUT" && key.startsWith("trash/")) {
+          fake.nextCopyAnswer = answer;
+        }
+      };
+      const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+      const response = await siteRequest("rename", { bucket: BUCKET, from: "acme/old.png", to: "acme/new.png" }, credential, env());
+      expect(response.status).toBe(502);
+      expect(fake.objects.get("acme/old.png")?.body).toBe("v1");
+      expect(fake.writes().filter((line) => line.startsWith("DELETE"))).toEqual([]);
+    });
+
+    it(`media-restore with ${name}: not reported as restored`, async () => {
+      const fake = new FakeCloud().install();
+      fake.put("trash/2026-11-04/acme/a.png", "bytes", "image/png");
+      fake.nextCopyAnswer = answer;
+      const result = await actuateMediaRestore({ bucket: BUCKET, trashKey: "trash/2026-11-04/acme/a.png", targetKey: "acme/a.png" }, env());
+      expect(result.ok).toBe(false);
+    });
+  }
+
+  it("a retry after an unconfirmed trash copy reuses that copy and then deletes", async () => {
+    const fake = new FakeCloud().install();
+    fake.put("acme/a.png", "v1", "image/png");
+    fake.nextCopyAnswer = () => new Response("", { status: 200 });
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const workerEnv = env();
+    const first = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
+    expect(first.status).toBe(502);
+    const second = await siteRequest("delete", { bucket: BUCKET, key: "acme/a.png" }, credential, workerEnv);
+    expect(second.status).toBe(200);
+    expect(await second.json()).toMatchObject({ ok: true, status: "trashed", trashKey: "trash/2026-11-04/acme/a.png" });
+    expect(fake.writes()).toEqual(["PUT trash/2026-11-04/acme/a.png <- acme/a.png", "DELETE acme/a.png"]);
   });
 });
 

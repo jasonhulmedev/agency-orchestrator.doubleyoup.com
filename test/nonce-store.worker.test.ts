@@ -175,6 +175,47 @@ describe("NonceStore leases (waf-edge-sync, one instance per zone) — real Dura
   });
 });
 
+describe("NonceStore media key leases with a pending-delete record (hub#222) — real Durable Object", () => {
+  function mediaLeaseStub(bucket: string) {
+    const ns = workerEnv.NONCE_STORE;
+    return ns.get(ns.idFromName(`media-lease:${bucket}`));
+  }
+
+  it("a recorded DELETE outlives its lease until a holder clears it; only the lease holder can record", async () => {
+    const stub = mediaLeaseStub("doubleyoup-media-lease-a");
+    const key = "lease-a/a.png";
+    expect(await stub.acquireMediaKey(key, "req-1", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null });
+    expect(await stub.acquireMediaKey(key, "req-2", 60_000, 3_600_000)).toEqual({ outcome: "busy" });
+    expect(await stub.beginMediaDelete(key, "req-2", "rev-1", 15_000)).toBe("lease-lost");
+    expect(await stub.beginMediaDelete(key, "req-1", "rev-1", 15_000)).toBe("recorded");
+    // The DELETE's outcome is unknown: req-1 ends without clearing its record.
+    await stub.finishMediaKey(key, "req-1", null);
+    const next = await stub.acquireMediaKey(key, "req-3", 60_000, 3_600_000);
+    expect(next.outcome).toBe("acquired");
+    if (next.outcome === "acquired") {
+      expect(next.pendingDelete).toMatchObject({ holder: "req-1", revision: "rev-1" });
+    }
+    // req-3 proved the DELETE landed and clears req-1's record.
+    await stub.finishMediaKey(key, "req-3", "req-1");
+    expect(await stub.acquireMediaKey(key, "req-4", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null });
+    await stub.finishMediaKey(key, "req-4", null);
+  });
+
+  it("refuses to record when too little lease is left, and drops a record older than the quarantine", async () => {
+    const stub = mediaLeaseStub("doubleyoup-media-lease-b");
+    const key = "lease-b/a.png";
+    expect((await stub.acquireMediaKey(key, "req-1", 60_000, 3_600_000)).outcome).toBe("acquired");
+    expect(await stub.beginMediaDelete(key, "req-1", "rev-1", 61_000)).toBe("lease-lost");
+    expect(await stub.beginMediaDelete(key, "req-1", "rev-1", 15_000)).toBe("recorded");
+    await stub.finishMediaKey(key, "req-1", null);
+    await runInDurableObject(stub, (_instance: NonceStore, state) => {
+      state.storage.sql.exec("UPDATE media_pending_deletes SET started_at = ? WHERE object_key = ?", Date.now() - 3_600_001, key);
+    });
+    expect(await stub.acquireMediaKey(key, "req-2", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null });
+    await stub.finishMediaKey(key, "req-2", null);
+  });
+});
+
 describe("NonceStore.countRequest (hub#222 per-site media rate limit) — real Durable Object", () => {
   function rateStub(bucket: string) {
     const ns = workerEnv.NONCE_STORE;

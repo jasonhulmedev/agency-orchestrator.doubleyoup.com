@@ -53,6 +53,18 @@ export type ConsumeOutcome = "fresh" | "replay";
 
 export type LeaseOutcome = "acquired" | "busy";
 
+/**
+ * hub#222: a DELETE of a media object whose outcome is not known yet. `holder` is the request that sent it, and
+ * `revision` is the revision (mediaRevisionId) that the request copied to trash before it sent the DELETE.
+ */
+export type MediaPendingDelete = { holder: string; revision: string; startedAtMs: number };
+
+/** hub#222: the answer of acquireMediaKey. */
+export type MediaKeyLeaseOutcome = { outcome: "busy" } | { outcome: "acquired"; pendingDelete: MediaPendingDelete | null };
+
+/** hub#222: the answer of beginMediaDelete. */
+export type MediaDeleteStart = "recorded" | "lease-lost";
+
 /** hub#222: the answer of countRequest. `retryAfterMs` is set only when the request is over the limit. */
 export type RateOutcome = { allowed: true } | { allowed: false; retryAfterMs: number };
 
@@ -72,6 +84,11 @@ export class NonceStore extends DurableObject {
     // hub#222: fixed-window request counters (countRequest below). Same reasoning: idempotent and synchronous.
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS rate_windows (rate_key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, count INTEGER NOT NULL)",
+    );
+    // hub#222: media DELETEs whose outcome is not known yet (beginMediaDelete below). Same reasoning.
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS media_pending_deletes " +
+        "(object_key TEXT PRIMARY KEY, holder TEXT NOT NULL, revision TEXT NOT NULL, started_at INTEGER NOT NULL)",
     );
   }
 
@@ -179,5 +196,74 @@ export class NonceStore extends DurableObject {
     }
     sql.exec("UPDATE rate_windows SET count = count + 1 WHERE rate_key = ?", rateKey);
     return { allowed: true };
+  }
+
+  // ── media key leases with a pending-delete record (hub#222, the site-facing media API) ─────────────
+  // On the per-bucket instance `media-lease:<bucket>`. R2's DeleteObject takes no condition, and a DELETE that timed
+  // out may still land at R2 later. So before a request sends the DELETE of a media object, it records that DELETE
+  // here (beginMediaDelete), in the same turn as the check that it still holds the key's lease. The record stays
+  // until the request learns the outcome (finishMediaKey), or until a later request proves that the DELETE landed.
+  // A later request for the key reads the record when it takes the lease (acquireMediaKey). Same atomicity as
+  // consume(): none of these methods awaits.
+
+  /**
+   * Take the lease on `objectKey` (as acquireLease) and return the pending-delete record of that key, if any.
+   * Records older than `quarantineMs` are dropped first: such a DELETE is treated as one that R2 will never apply.
+   */
+  acquireMediaKey(objectKey: string, holder: string, leaseTtlMs: number, quarantineMs: number): MediaKeyLeaseOutcome {
+    const leaseOutcome = this.acquireLease(objectKey, holder, leaseTtlMs);
+    if (leaseOutcome === "busy") {
+      return { outcome: "busy" };
+    }
+    const sql = this.ctx.storage.sql;
+    sql.exec("DELETE FROM media_pending_deletes WHERE started_at <= ?", Date.now() - quarantineMs);
+    const rows = sql
+      .exec<{ holder: string; revision: string; started_at: number }>(
+        "SELECT holder, revision, started_at FROM media_pending_deletes WHERE object_key = ? LIMIT 1",
+        objectKey,
+      )
+      .toArray();
+    const row = rows[0];
+    if (row === undefined) {
+      return { outcome: "acquired", pendingDelete: null };
+    }
+    return { outcome: "acquired", pendingDelete: { holder: row.holder, revision: row.revision, startedAtMs: row.started_at } };
+  }
+
+  /**
+   * Record that `holder` is about to DELETE `objectKey`, which holds `revision`. "lease-lost" (and nothing recorded)
+   * when `holder` no longer holds the key's lease with at least `minLeaseRemainingMs` left: the DELETE must not go.
+   * The record replaces an older record of the key, which the caller has already resolved.
+   */
+  beginMediaDelete(objectKey: string, holder: string, revision: string, minLeaseRemainingMs: number): MediaDeleteStart {
+    const sql = this.ctx.storage.sql;
+    const now = Date.now();
+    const leases = sql
+      .exec<{ expires_at: number }>("SELECT expires_at FROM leases WHERE lease_key = ? AND holder = ? LIMIT 1", objectKey, holder)
+      .toArray();
+    const lease = leases[0];
+    if (lease === undefined || lease.expires_at - now < minLeaseRemainingMs) {
+      return "lease-lost";
+    }
+    sql.exec(
+      "INSERT INTO media_pending_deletes (object_key, holder, revision, started_at) VALUES (?, ?, ?, ?) " +
+        "ON CONFLICT(object_key) DO UPDATE SET holder = excluded.holder, revision = excluded.revision, started_at = excluded.started_at",
+      objectKey,
+      holder,
+      revision,
+      now,
+    );
+    return "recorded";
+  }
+
+  /**
+   * End a request on `objectKey`: drop the pending-delete record of `clearPendingOf` (when not null and when the
+   * record is still that holder's), then give the lease back (as releaseLease).
+   */
+  finishMediaKey(objectKey: string, holder: string, clearPendingOf: string | null): void {
+    if (clearPendingOf !== null) {
+      this.ctx.storage.sql.exec("DELETE FROM media_pending_deletes WHERE object_key = ? AND holder = ?", objectKey, clearPendingOf);
+    }
+    this.releaseLease(objectKey, holder);
   }
 }

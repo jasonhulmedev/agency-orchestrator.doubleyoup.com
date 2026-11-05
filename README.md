@@ -216,7 +216,15 @@ R2's DeleteObject takes no condition. So delete, replace and rename take a
 60-second lease on the key being deleted (Durable Object instance
 `media-lease:<bucket>`): a second request for the same key answers 409 and the
 site retries. The final DELETE starts only while the lease has room for it, and
-a DELETE that fails or times out keeps the key held until the lease expires.
+the same Durable Object turn records it as pending. A DELETE that times out or
+gets a 5xx may still land at R2 later, so its record outlives the lease: while
+the key still holds the revision that DELETE targeted, delete, replace and
+rename of that key answer 409 (and nothing can re-create the key, because every
+write is create-once). Once the key is absent or holds another revision, the
+old DELETE has landed and the key is free. A record older than one hour is
+dropped. A trash copy counts only when R2 answers with a complete
+`CopyObjectResult`; an unreadable, empty or cut-off answer fails the request
+and nothing is deleted.
 
 **Signed ops.**
 

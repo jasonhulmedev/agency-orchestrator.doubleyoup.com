@@ -34,7 +34,11 @@
 // (cf-copy-destination-if-none-match). So each route that deletes takes a short lease on its key first, in the
 // bucket's own Durable Object instance (`media-lease:<bucket>`, the NonceStore lease table). A second request for the
 // same key gets 409 and retries; requests for other keys or other sites never wait. The DELETE starts only while the
-// lease still has room for it (deleteFenceViolation), so a stalled request can not delete after its lease expired.
+// lease still has room for it, and the same Durable Object turn records the DELETE as pending (beginMediaDelete).
+// A DELETE whose outcome is unknown (a timeout, a 5xx) may land at R2 long after its lease expired, so its record
+// stays: while the key still holds the revision that DELETE targeted, no request may delete or replace the key
+// (409), and nothing else can re-create it (create-once). So a late DELETE can only remove the revision that is
+// already in trash, never a newer upload (pendingDeleteViolation).
 //
 // NEVER LOGGED. The credential, the secret and the presigned URL are never logged and never put in an error.
 
@@ -48,6 +52,7 @@ import {
   copyMediaObject,
   deleteMediaObject,
   headMediaObject,
+  mediaRevisionId,
   mediaStoreIdentity,
   moveToTrash,
   sameMediaRevision,
@@ -56,6 +61,7 @@ import {
 } from "./media-store.js";
 import { canonicalHeaderValue, presignS3Put } from "./sigv4.js";
 import { readBodyCapped } from "./actuate.js";
+import type { MediaPendingDelete, NonceStore } from "./nonce-store.js";
 
 export const MEDIA_SITE_RATE_LIMIT_PER_MINUTE = 600;
 const MEDIA_SITE_RATE_WINDOW_MS = 60_000;
@@ -67,6 +73,13 @@ export const MEDIA_DELETE_TIMEOUT_MS = 10_000;
 // Room left for clock steps and the Durable Object round trip: the DELETE must be answered this long before the
 // lease expires.
 const MEDIA_LEASE_SAFETY_MARGIN_MS = 5_000;
+/**
+ * How long a DELETE with an unknown outcome (a timeout or a 5xx) keeps its key from being deleted or replaced again
+ * while the key still holds the revision it targeted (pendingDeleteViolation). R2 documents no upper bound for a
+ * request that the Worker stopped waiting for, so this is a generous bound: after it, the DELETE is treated as one
+ * that R2 will never apply. Its trash copy exists, so the wait loses nothing.
+ */
+export const MEDIA_UNKNOWN_DELETE_QUARANTINE_MS = 60 * 60_000;
 
 /** How long a presigned PUT stays valid: 10 minutes (hub#222 allows at most 15). */
 export const MEDIA_PRESIGN_TTL_SECONDS = 600;
@@ -248,54 +261,91 @@ async function handleSignPut(identity: MediaStoreIdentity, bucket: string, body:
 
 interface KeyLease {
   key: string;
-  /** Date.now() when the lease was granted (taken just BEFORE the request, so it never overstates the time left). */
-  acquiredAtMs: number;
-  /** Set when the DELETE failed, so its outcome is unknown: the lease is then kept until it expires (withKeyLease). */
-  keepUntilExpiry: boolean;
+  /** This request's lease holder id in the bucket's lease instance. */
+  holder: string;
+  /** The bucket's lease instance (`media-lease:<bucket>`). */
+  store: DurableObjectStub<NonceStore>;
+  /** An earlier DELETE of this key whose outcome is not known yet (another request's), or null. */
+  pendingDelete: MediaPendingDelete | null;
+  /**
+   * The holder whose pending-delete record this request may drop when it ends: the earlier request's, once this
+   * request has proved that its DELETE landed, or this request's own, once its DELETE was answered. Null = keep.
+   */
+  clearPendingOf: string | null;
 }
 
 type KeyLeaseOutcome<T> = { acquired: true; value: T } | { acquired: false; response: Response };
 
 /**
  * Run `work` while holding the lease on `key` in the bucket's own Durable Object instance. A key that another
- * request holds answers 409 (retry). The lease is released afterwards, except when the work could not tell
- * whether its DELETE was applied: R2 may still apply that DELETE, so the key stays held until the lease expires.
+ * request holds answers 409 (retry). The lease is released afterwards. A DELETE whose outcome is unknown is NOT
+ * fenced by the lease (the lease expires, and the DELETE may land later): its pending-delete record is, see
+ * pendingDeleteViolation.
  */
 async function withKeyLease<T>(env: Env, bucket: string, key: string, work: (lease: KeyLease) => Promise<T>): Promise<KeyLeaseOutcome<T>> {
-  const leaseStore = env.NONCE_STORE.get(env.NONCE_STORE.idFromName(`media-lease:${bucket}`));
+  const store = env.NONCE_STORE.get(env.NONCE_STORE.idFromName(`media-lease:${bucket}`));
   const holder = crypto.randomUUID();
-  const acquiredAtMs = Date.now();
-  const outcome = await leaseStore.acquireLease(key, holder, MEDIA_KEY_LEASE_TTL_MS);
-  if (outcome === "busy") {
+  const acquired = await store.acquireMediaKey(key, holder, MEDIA_KEY_LEASE_TTL_MS, MEDIA_UNKNOWN_DELETE_QUARANTINE_MS);
+  if (acquired.outcome === "busy") {
     return { acquired: false, response: refuse(409, `another media request is changing ${key}: nothing was changed, retry.`) };
   }
-  const lease: KeyLease = { key, acquiredAtMs, keepUntilExpiry: false };
+  const lease: KeyLease = { key, holder, store, pendingDelete: acquired.pendingDelete, clearPendingOf: null };
   try {
     const value = await work(lease);
     return { acquired: true, value };
   } finally {
-    if (!lease.keepUntilExpiry) {
-      // A failed release must not hide the result: the lease then expires on its own after its TTL. This catch
-      // exists for that reason only.
-      try {
-        await leaseStore.releaseLease(key, holder);
-      } catch {
-        // Nothing to do: the lease expires after MEDIA_KEY_LEASE_TTL_MS.
-      }
+    // A failed release must not hide the result: the lease then expires on its own after its TTL, and a record that
+    // was not dropped is resolved by the next request (pendingDeleteViolation). This catch exists for that reason only.
+    try {
+      await store.finishMediaKey(key, holder, lease.clearPendingOf);
+    } catch {
+      // Nothing to do: the lease expires after MEDIA_KEY_LEASE_TTL_MS.
     }
   }
 }
 
-/** Why the final DELETE must not start now, or null when the lease still has room for it. */
-function deleteFenceViolation(lease: KeyLease): string | null {
-  const latestStartMs = lease.acquiredAtMs + MEDIA_KEY_LEASE_TTL_MS - MEDIA_DELETE_TIMEOUT_MS - MEDIA_LEASE_SAFETY_MARGIN_MS;
-  if (Date.now() <= latestStartMs) {
+/**
+ * Why this request must not touch `lease.key` yet, or null. `head` is the key's current HEAD (null = absent).
+ *
+ * An earlier request sent a DELETE of this key and never learned its outcome (a timeout or a 5xx). R2 may still
+ * apply that DELETE, at any later moment. If the key were deleted and created again meanwhile, that late DELETE
+ * would remove the new object, which has no trash copy. So:
+ *   - key absent: a DELETE has landed. Only the earlier request can have sent one, because every later request
+ *     stops here while the record is unresolved, and nothing can remove an object except a DELETE (uploads and
+ *     Worker copies are create-once). So the earlier DELETE is done: drop its record and go on.
+ *   - key holds ANOTHER revision: it was created after the key was absent, so the same reasoning holds.
+ *   - key still holds the revision the earlier DELETE targeted: that DELETE may still land. Refuse (409) and keep
+ *     the key as it is, so nothing new can be created on it (create-once uploads and copies get 412 on an existing
+ *     key). The earlier revision is already in trash, so nothing is lost while the key waits.
+ * A record older than MEDIA_UNKNOWN_DELETE_QUARANTINE_MS is dropped when the lease is taken: by then the DELETE is
+ * treated as one that R2 will never apply (an R2 5xx that did not apply, say), so the key does not stay stuck.
+ */
+async function pendingDeleteViolation(lease: KeyLease, head: MediaObjectHead | null): Promise<string | null> {
+  const pending = lease.pendingDelete;
+  if (pending === null) {
     return null;
   }
-  return `${lease.key} took too long to move to trash: the original was not deleted, retry.`;
+  if (head !== null) {
+    const currentRevision = await mediaRevisionId(head);
+    if (currentRevision === pending.revision) {
+      return `an earlier delete of ${lease.key} has an unknown outcome and may still land: nothing was changed, retry later.`;
+    }
+  }
+  // Resolved: the earlier DELETE has landed. Drop its record when this request ends.
+  lease.clearPendingOf = pending.holder;
+  lease.pendingDelete = null;
+  return null;
 }
 
-/** Move `key` to trash and delete it, under `lease` on that key. A missing key is "already-absent". */
+/**
+ * Move `key` to trash and delete it, under `lease` on that key. A missing key is "already-absent".
+ *
+ * The DELETE is unconditional (R2 has no If-Match on DeleteObject). It removes exactly the revision that went to
+ * trash because the lease keeps every other Worker request off this key, and while the object exists nothing else
+ * can write it (create-once). Before the DELETE is sent, the lease instance records it (beginMediaDelete), in the
+ * same Durable Object turn as the check that this request still holds the lease with room for the DELETE. The
+ * record outlives the lease when the outcome is unknown, so a late DELETE can never meet a re-created key.
+ */
 async function trashAndDelete(
   identity: MediaStoreIdentity,
   bucket: string,
@@ -306,6 +356,10 @@ async function trashAndDelete(
   const head = await headMediaObject(identity, bucket, key);
   if (head !== null && "error" in head) {
     return { ok: false, httpStatus: 502, error: head.error };
+  }
+  const pendingViolation = await pendingDeleteViolation(lease, head);
+  if (pendingViolation !== null) {
+    return { ok: false, httpStatus: 409, error: pendingViolation };
   }
   if (head === null) {
     return { ok: true, status: "already-absent", trashKey: null };
@@ -318,19 +372,24 @@ async function trashAndDelete(
     }
     return { ok: false, httpStatus: upstreamStatus(moved.status), error: moved.error };
   }
-  // The DELETE is unconditional (R2 has no If-Match on DeleteObject). It removes exactly the revision that went to
-  // trash only because the lease kept every other writer off this key since the HEAD: check that it still does.
-  const fenceViolation = deleteFenceViolation(lease);
-  if (fenceViolation !== null) {
-    return { ok: false, httpStatus: 503, error: fenceViolation };
+
+  const revision = await mediaRevisionId(head);
+  const started = await lease.store.beginMediaDelete(key, lease.holder, revision, MEDIA_DELETE_TIMEOUT_MS + MEDIA_LEASE_SAFETY_MARGIN_MS);
+  if (started === "lease-lost") {
+    return { ok: false, httpStatus: 503, error: `${key} took too long to move to trash: the original was not deleted, retry.` };
   }
+  // From here the record is this request's own. It replaced any earlier record, which pendingDeleteViolation resolved.
+  lease.clearPendingOf = null;
   const deleted = await deleteMediaObject(identity, bucket, key, MEDIA_DELETE_TIMEOUT_MS);
   if (!deleted.ok) {
-    // A timeout or a 5xx does not prove that R2 left the object alone: it may still apply this DELETE. Keep the key
-    // held until the lease expires, so no new upload can land on it before that late DELETE.
-    lease.keepUntilExpiry = true;
+    if (deleted.status >= 400 && deleted.status < 500) {
+      // A 4xx is a definite refusal: R2 did not apply this DELETE, so there is nothing that could land later.
+      lease.clearPendingOf = lease.holder;
+    }
+    // A timeout or a 5xx does not prove that R2 left the object alone: the record stays (pendingDeleteViolation).
     return { ok: false, httpStatus: 502, error: `${deleted.error} (the trash copy ${moved.trashKey} exists)` };
   }
+  lease.clearPendingOf = lease.holder;
   return { ok: true, status: "trashed", trashKey: moved.trashKey };
 }
 
@@ -400,6 +459,11 @@ async function renameUnderLease(identity: MediaStoreIdentity, bucket: string, le
   const source = await headMediaObject(identity, bucket, from);
   if (source !== null && "error" in source) {
     return refuse(502, source.error);
+  }
+  // Check an earlier DELETE of `from` with an unknown outcome BEFORE writing `to`, so a refused rename writes nothing.
+  const pendingViolation = await pendingDeleteViolation(lease, source);
+  if (pendingViolation !== null) {
+    return refuse(409, pendingViolation);
   }
   if (source === null) {
     // Nothing to rename: a retry of a rename that already finished, or a key that never existed.

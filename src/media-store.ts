@@ -280,13 +280,34 @@ export async function copyMediaObject(
   if (response.status !== 200) {
     return { ok: false, status: response.status, error: await s3ErrorDetail(`copying ${sourceKey} to ${targetKey}`, response) };
   }
-  // S3 can answer a CopyObject with 200 and an <Error> body; treat that as a failure.
-  const body = await response.text().catch(() => "");
+  // S3 sends the 200 status of a CopyObject before the copy ends, and reports a late failure in the body. So only a
+  // complete <CopyObjectResult> proves the copy. An unreadable, empty or cut-off body is NOT a success: the callers
+  // delete the original after a "successful" trash copy, so they must fail closed here. Status 0 = outcome unknown.
+  let body: string;
+  try {
+    body = await response.text();
+  } catch (err) {
+    return { ok: false, status: 0, error: `copying ${sourceKey} to ${targetKey}: the answer could not be read (${errorMessage(err)}), outcome unknown` };
+  }
   if (body.includes("<Error>")) {
     const code = extractXmlTag(body, "Code") ?? "unknown error";
     return { ok: false, status: 500, error: `copying ${sourceKey} to ${targetKey} failed (${code})` };
   }
+  if (!isCompleteCopyResult(body)) {
+    return { ok: false, status: 0, error: `copying ${sourceKey} to ${targetKey}: the answer holds no complete CopyObjectResult, outcome unknown` };
+  }
   return { ok: true };
+}
+
+/** True when `body` is a whole CopyObjectResult with an ETag: its start, its ETag and its closing tag. */
+function isCompleteCopyResult(body: string): boolean {
+  if (!body.includes("<CopyObjectResult")) {
+    return false;
+  }
+  if (!body.includes("</CopyObjectResult>")) {
+    return false;
+  }
+  return /<ETag>[^<]+<\/ETag>/.test(body);
 }
 
 /**
@@ -316,11 +337,11 @@ export function utcDay(nowMs: number): string {
 }
 
 /**
- * The revision as a folder-name part: 32 hex characters of the SHA-256 of the ETag and the metadata fingerprint.
+ * The revision as an id (a trash folder-name part, and the revision a pending DELETE removes): 32 hex characters of the SHA-256 of the ETag and the metadata fingerprint.
  * Two revisions with the same bytes but other metadata get different folders, so neither blocks the other's trash
  * copy.
  */
-async function revisionFolderPart(source: MediaObjectHead): Promise<string> {
+export async function mediaRevisionId(source: MediaObjectHead): Promise<string> {
   const digest = await sha256Hex(`${source.etag}\n${source.metadataFingerprint}`);
   return digest.slice(0, 32);
 }
@@ -341,7 +362,7 @@ export async function moveToTrash(
   nowMs: number,
 ): Promise<TrashMoveResult> {
   const day = utcDay(nowMs);
-  const revisionFolder = await revisionFolderPart(source);
+  const revisionFolder = await mediaRevisionId(source);
   const candidates = [`${MEDIA_TRASH_PREFIX}${day}/${key}`, `${MEDIA_TRASH_PREFIX}${day}.${revisionFolder}/${key}`];
   for (const trashKey of candidates) {
     const existing = await headMediaObject(identity, bucket, trashKey);
