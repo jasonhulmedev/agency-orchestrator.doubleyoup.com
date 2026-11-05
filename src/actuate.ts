@@ -24,6 +24,8 @@
 import type { Env } from "./env.js";
 import type {
   DnsRecordUpsertParams,
+  DnsRecordUpsertExpect,
+  DnsRecordGetParams,
   DnsRecordDeleteParams,
   CachePurgeParams,
   CacheRuleUpsertParams,
@@ -131,6 +133,7 @@ import {
 } from "./edge-rate-limit.js";
 import { presignS3Put, presignS3Get } from "./sigv4.js";
 import {
+  EDGE_SYNC_AMBIGUOUS_WRITE_STATUSES,
   EDGE_SYNC_RATE_LIMIT_RESERVE,
   EDGE_SYNC_RUN_LIMITS,
   EDGE_SYNC_UNKNOWN_MARKER,
@@ -143,8 +146,22 @@ import { type ServiceAccountKey, GOOGLE_SCOPE_CLOUD_PLATFORM, mintGoogleAccessTo
 import { errorMessage, stripTrailingSlash } from "./util.js";
 import type { CfTunnelGetResult, GcpDiskSnapshotCreateResult, GcpInstanceRemoveServiceAccountResult } from "./actuate-hub58.js";
 import type { R2MediaBucketsResult, R2MediaStateResult, R2SiteKeyInstallResult, R2SiteKeyRevokeResult } from "./actuate-r2-media.js";
+import type {
+  MediaHostmapDeleteResult,
+  MediaHostmapUpsertResult,
+  MediaWorkerRouteDeleteResult,
+  MediaWorkerRouteUpsertResult,
+} from "./actuate-branded-media.js";
 import type { CfTunnelConnectionsGetResult, CfTunnelTokenGetResult, GcpInstanceMetadataDiffResult } from "./actuate-p47.js";
 import type { EdgeGateDeployResult } from "./actuate-edge-gate.js";
+import type {
+  MediaBucketProtectResult,
+  MediaBulkCredentialResult,
+  MediaRestoreResult,
+  MediaSiteCredentialInstallResult,
+  MediaSiteKeyRevokeResult,
+  MediaTrashListResult,
+} from "./actuate-media.js";
 
 export const CF_API = "https://api.cloudflare.com/client/v4";
 
@@ -277,6 +294,25 @@ export type CfTunnelConfigResult =
 export type CfTunnelDeleteResult =
   | { ok: true; op: "cf-tunnel-delete"; tunnelId: string; status: "deleted" | "already-absent" }
   | { ok: false; op: "cf-tunnel-delete"; tunnelId: string; detail: string };
+
+/** One DNS record as dns-record-get reports it: only the fields the app's diff needs. */
+export interface DnsRecordView {
+  id: string;
+  type: string;
+  name: string;
+  content: string;
+  ttl: number;
+  proxied: boolean;
+}
+
+/**
+ * `zoneFound: false` is a SUCCESS: the token cannot see the zone, so the app can tell the user that
+ * the zone is not in this agency's Cloudflare account. Any other failure (token rejected, Cloudflare
+ * down) is `ok: false`.
+ */
+export type DnsRecordGetResult =
+  | { ok: true; op: "dns-record-get"; zoneFound: boolean; records: DnsRecordView[] }
+  | { ok: false; op: "dns-record-get"; name: string; detail: string };
 
 export type DnsRecordDeleteResult =
   | { ok: true; op: "dns-record-delete"; name: string; status: "deleted" | "already-absent" }
@@ -780,6 +816,7 @@ export type CloudRunProbeInvokeResult =
 export type ActuateResult =
   | ProvisionR2Result
   | DnsRecordUpsertResult
+  | DnsRecordGetResult
   | CachePurgeResult
   | CacheRuleUpsertResult
   | WafRuleUpsertResult
@@ -837,7 +874,18 @@ export type ActuateResult =
   | R2MediaBucketsResult
   | R2MediaStateResult
   | R2SiteKeyInstallResult
-  | R2SiteKeyRevokeResult;
+  | R2SiteKeyRevokeResult
+  | MediaWorkerRouteUpsertResult
+  | MediaWorkerRouteDeleteResult
+  | MediaHostmapUpsertResult
+  | MediaHostmapDeleteResult
+  // hub#222 (actuate-media.ts): media soft delete.
+  | MediaBucketProtectResult
+  | MediaSiteCredentialInstallResult
+  | MediaSiteKeyRevokeResult
+  | MediaTrashListResult
+  | MediaRestoreResult
+  | MediaBulkCredentialResult;
 
 export interface CloudflareEnvelope {
   success?: boolean;
@@ -1002,6 +1050,10 @@ interface CloudflareDnsRecordSummary {
   id?: string;
   name?: string;
   type?: string;
+  /** Read by the dns-record-upsert `expect` guard and by dns-record-get. */
+  content?: string;
+  ttl?: number;
+  proxied?: boolean;
 }
 
 /**
@@ -1034,7 +1086,9 @@ export async function resolveZoneId(
   token: string,
   zoneName: string,
   signal?: AbortSignal,
-): Promise<{ id: string; planLegacyId: string | null; accountId: string | null } | { error: string }> {
+): Promise<
+  { id: string; planLegacyId: string | null; accountId: string | null } | { error: string; zoneNotVisible?: true }
+> {
   const query = new URLSearchParams({ name: zoneName, per_page: "2" });
   let response: Response;
   try {
@@ -1062,8 +1116,11 @@ export async function resolveZoneId(
   // looser server-side match can never pick a different zone.
   const zones = (body.result as CloudflareZoneSummary[]).filter((zone) => zone.name === zoneName && zone.id);
   if (zones.length === 0) {
+    // `zoneNotVisible` lets dns-record-get report "this zone is not in the agency account" as a
+    // result, not an error. Every other caller treats it as the plain error it always was.
     return {
       error: `zone "${zoneName}" is not visible to CF_DNS_API_TOKEN — check the zone name and the token's zone scope.`,
+      zoneNotVisible: true,
     };
   }
   if (zones.length > 1) {
@@ -1095,13 +1152,15 @@ async function findExistingRecords(
   zoneId: string,
   type: string,
   name: string,
+  signal?: AbortSignal,
 ): Promise<{ records: CloudflareDnsRecordSummary[] } | { error: string }> {
   const query = new URLSearchParams({ type, name, per_page: "5" });
   let response: Response;
   try {
-    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zoneId)}/dns_records?${query.toString()}`, {
-      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
-    });
+    response = await fetch(
+      `${CF_API}/zones/${encodeURIComponent(zoneId)}/dns_records?${query.toString()}`,
+      withOptionalSignal({ headers: { authorization: `Bearer ${token}`, accept: "application/json" } }, signal),
+    );
   } catch (err) {
     return { error: `could not reach Cloudflare to list DNS records: ${errorMessage(err)}` };
   }
@@ -1121,9 +1180,76 @@ async function findExistingRecords(
 }
 
 /**
+ * The `expect` guard of dns-record-upsert (doubleyoup#277): null when the zone still holds the state
+ * the user confirmed in the preview, else the failure detail. The caller has already refused 2+
+ * matches, so `records` holds zero or one record here.
+ */
+function dnsExpectMismatch(
+  expected: DnsRecordUpsertExpect,
+  records: CloudflareDnsRecordSummary[],
+  type: string,
+  name: string,
+): string | null {
+  const changedPrefix = "record changed since preview";
+
+  if ("absent" in expected) {
+    if (records.length === 0) {
+      return null;
+    }
+    return `${changedPrefix}: expected no ${type} record at "${name}", but record ${records[0].id} now exists.`;
+  }
+
+  if (records.length === 0) {
+    return `${changedPrefix}: expected ${type} record ${expected.recordId} at "${name}", but no ${type} record exists there now.`;
+  }
+  const currentRecord = records[0];
+  if (currentRecord.id !== expected.recordId) {
+    return `${changedPrefix}: expected ${type} record ${expected.recordId} at "${name}", but the record there now is ${currentRecord.id}.`;
+  }
+  if (currentRecord.content !== expected.content) {
+    return `${changedPrefix}: ${type} record ${expected.recordId} at "${name}" no longer holds the previewed content.`;
+  }
+  return null;
+}
+
+/**
+ * How long ONE Cloudflare call of a guarded (`expect`) dns-record-upsert may take. A guarded run makes
+ * at most three calls (zone, records, write), so it ends within 30 s plus the two lease calls.
+ */
+export const DNS_GUARDED_REQUEST_TIMEOUT_MS = 10 * 1000;
+
+/**
+ * The longest a guarded dns-record-upsert holds the lease of its type + name. It MUST outlast a run
+ * (at most 3 x DNS_GUARDED_REQUEST_TIMEOUT_MS): a lease that expired mid-run would let a second
+ * guarded job read the old record and overwrite this run's write. A run that dies without releasing
+ * it frees the record after this TTL. A test pins TTL > 2 x the longest run.
+ */
+export const DNS_GUARDED_LEASE_TTL_MS = 2 * 60 * 1000;
+
+/**
+ * The guarded write's call options: a timeout signal per call, so the run always ends inside its lease.
+ * `unknownWrite` is set when the answer to the write does not say whether it was applied (see
+ * dnsWriteIsUnknown): Cloudflare may have applied it, or may still apply it.
+ */
+interface DnsGuardedRun {
+  signal: () => AbortSignal;
+  unknownWrite: boolean;
+}
+
+/**
  * Upsert the record with the agency's own CF_DNS_API_TOKEN. Returns a structured result;
  * never throws for a Cloudflare-side failure. NEVER falls back to a platform credential
  * (there is none).
+ *
+ * WITH `expect` (doubleyoup#277) the check and the write must be one step. The check reads the record
+ * and the write is a plain PUT/POST, so two guarded jobs that previewed the same record could both
+ * pass the check, and the second write would overwrite the first one, which its user never saw. So a
+ * guarded run first takes a lease on its zone + type + name in the NonceStore Durable Object. The
+ * instance is named by that full record identity (dnsRecordLeaseInstanceName), never the "dirb-nonce"
+ * singleton, so changes to different records never queue behind one another or behind the nonce
+ * traffic, and the lease cleanup touches only this record's row. A second guarded job for the same record that arrives while the lease is held fails
+ * closed and writes nothing. One that arrives after the release reads the new record, and its `expect`
+ * then refuses it. Without `expect` the run takes no lease and behaves exactly as before.
  */
 export async function actuateDnsRecordUpsert(
   params: DnsRecordUpsertParams,
@@ -1133,13 +1259,89 @@ export async function actuateDnsRecordUpsert(
   if (!token) {
     return dnsFailure(params.name, "CF_DNS_API_TOKEN is not configured on this Worker.");
   }
+  if (params.expect === undefined) {
+    return upsertDnsRecord(params, token, undefined);
+  }
 
-  const zone = await resolveZoneId(token, params.zone);
+  const leaseInstanceName = dnsRecordLeaseInstanceName(params.zone, params.type, params.name);
+  const leaseStore = env.NONCE_STORE.get(env.NONCE_STORE.idFromName(leaseInstanceName));
+  const leaseKey = `${params.type} ${params.name}`;
+  const leaseHolder = crypto.randomUUID();
+  const lease = await leaseStore.acquireLease(leaseKey, leaseHolder, DNS_GUARDED_LEASE_TTL_MS);
+  if (lease === "busy") {
+    return dnsFailure(
+      params.name,
+      `record changed since preview: another confirmed change to the ${params.type} record at "${params.name}" ` +
+        "is being applied now — nothing was written. Preview again when it ends.",
+    );
+  }
+
+  const guardedRun: DnsGuardedRun = {
+    signal: () => AbortSignal.timeout(DNS_GUARDED_REQUEST_TIMEOUT_MS),
+    unknownWrite: false,
+  };
+  let result: DnsRecordUpsertResult;
+  try {
+    result = await upsertDnsRecord(params, token, guardedRun);
+  } finally {
+    if (guardedRun.unknownWrite) {
+      // The answer did not say whether the write was applied, and Cloudflare may still apply it. Keep the lease until it expires,
+      // so a second guarded job cannot read the old record now and be overwritten by the late write.
+      console.warn(`dns-record-upsert: the guarded write of ${leaseKey} ended UNKNOWN; its lease is kept until it expires.`);
+    } else {
+      // A failed release must not lose the run's result (the write has happened): log it, and let
+      // the lease expire on its own. This catch exists for that reason only.
+      try {
+        await leaseStore.releaseLease(leaseKey, leaseHolder);
+      } catch (err) {
+        console.error(`dns-record-upsert: could not release the lease of ${leaseKey}; it expires on its own. ${errorMessage(err)}`);
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * The Durable Object instance that holds the lease of ONE record (zone + type + name). One instance per
+ * record keeps the lease traffic of different sites and cells apart: no shared per-zone process, and
+ * the expired-lease cleanup in acquireLease sees this record's row only. The parts are validated DNS
+ * names and a fixed type list, none of which can hold a space, so the joined name is unambiguous.
+ */
+export function dnsRecordLeaseInstanceName(zone: string, type: string, name: string): string {
+  return `dns-record-lease ${zone} ${type} ${name}`;
+}
+
+/**
+ * Whether the answer to a guarded write leaves it open whether Cloudflare applied it:
+ * - a gateway status of Cloudflare's edge (502, 503, 504, 520 to 524): the API behind it may still
+ *   apply the write;
+ * - a 2xx answer without a readable written record (the body failed to read or parse): the API
+ *   accepted the request, so the write most likely landed.
+ * A 4xx or a 500 is the API's own definite answer. A rejected fetch is handled by the caller.
+ */
+function dnsWriteIsUnknown(httpStatus: number, written: CloudflareDnsRecordSummary | undefined): boolean {
+  if (EDGE_SYNC_AMBIGUOUS_WRITE_STATUSES.includes(httpStatus)) {
+    return true;
+  }
+  const answeredSuccess = httpStatus >= 200 && httpStatus < 300;
+  if (answeredSuccess && !written?.id) {
+    return true;
+  }
+  return false;
+}
+
+/** The read, the guards and the write. `guardedRun` is set only for an `expect` upsert, which holds the lease. */
+async function upsertDnsRecord(
+  params: DnsRecordUpsertParams,
+  token: string,
+  guardedRun: DnsGuardedRun | undefined,
+): Promise<DnsRecordUpsertResult> {
+  const zone = await resolveZoneId(token, params.zone, guardedRun?.signal());
   if ("error" in zone) {
     return dnsFailure(params.name, zone.error);
   }
 
-  const existing = await findExistingRecords(token, zone.id, params.type, params.name);
+  const existing = await findExistingRecords(token, zone.id, params.type, params.name, guardedRun?.signal());
   if ("error" in existing) {
     return dnsFailure(params.name, existing.error);
   }
@@ -1148,6 +1350,12 @@ export async function actuateDnsRecordUpsert(
       params.name,
       `${existing.records.length} existing ${params.type} records already match "${params.name}" — ambiguous, refusing to update one of them.`,
     );
+  }
+  if (params.expect !== undefined) {
+    const mismatch = dnsExpectMismatch(params.expect, existing.records, params.type, params.name);
+    if (mismatch !== null) {
+      return dnsFailure(params.name, mismatch);
+    }
   }
 
   // The signed params are all strings by convention; Cloudflare wants real JSON types here.
@@ -1167,15 +1375,21 @@ export async function actuateDnsRecordUpsert(
 
   let response: Response;
   try {
-    response = await fetch(url, {
-      method: existingRecord ? "PUT" : "POST",
-      headers: cloudflareHeaders(token),
-      body: recordBody,
-    });
+    response = await fetch(
+      url,
+      withOptionalSignal(
+        { method: existingRecord ? "PUT" : "POST", headers: cloudflareHeaders(token), body: recordBody },
+        guardedRun?.signal(),
+      ),
+    );
   } catch (err) {
+    if (guardedRun !== undefined) {
+      guardedRun.unknownWrite = true;
+    }
     return dnsFailure(params.name, `could not reach Cloudflare to write the DNS record: ${errorMessage(err)}`);
   }
 
+  // A body that cannot be read (the timeout fired mid-body, a broken stream, not JSON) becomes null.
   const body = (await response.json().catch(() => null)) as CloudflareEnvelope | null;
   if (response.status === 401 || response.status === 403) {
     return dnsFailure(
@@ -1184,6 +1398,14 @@ export async function actuateDnsRecordUpsert(
     );
   }
   const written = body?.success ? (body.result as CloudflareDnsRecordSummary | undefined) : undefined;
+  if (guardedRun !== undefined && dnsWriteIsUnknown(response.status, written)) {
+    guardedRun.unknownWrite = true;
+    return dnsFailure(
+      params.name,
+      `DNS record ${action === "created" ? "create" : "update"} got HTTP ${response.status}, which does not say whether ` +
+        "the write was applied — Cloudflare may still apply it. Preview again before another change.",
+    );
+  }
   if (!written?.id) {
     return dnsFailure(
       params.name,
@@ -1192,6 +1414,125 @@ export async function actuateDnsRecordUpsert(
   }
 
   return { ok: true, op: "dns-record-upsert", action, recordId: written.id, name: params.name };
+}
+
+// ── dns-record-get ─────────────────────────────────────────────────────────────────
+// Read-only (doubleyoup#277): the records at ONE name, optionally of one type, with the agency's own
+// CF_DNS_API_TOKEN. The app shows them as a diff before a dns-record-upsert and re-reads them to
+// verify after it. A zone the token cannot see is `zoneFound: false`, not an error.
+
+// One page of records. A name with more records than this is far outside any real zone; the op
+// fails closed rather than return a partial list that would make the app's diff wrong.
+const DNS_RECORD_GET_PAGE_SIZE = 100;
+
+function dnsGetFailure(name: string, detail: string): DnsRecordGetResult {
+  return { ok: false, op: "dns-record-get", name, detail };
+}
+
+/** The record as dns-record-get reports it, or null when Cloudflare returned a row without the fields. */
+function toDnsRecordView(record: CloudflareDnsRecordSummary): DnsRecordView | null {
+  if (typeof record.id !== "string" || typeof record.type !== "string" || typeof record.name !== "string") {
+    return null;
+  }
+  if (typeof record.content !== "string" || typeof record.ttl !== "number" || typeof record.proxied !== "boolean") {
+    return null;
+  }
+  return {
+    id: record.id,
+    type: record.type,
+    name: record.name,
+    content: record.content,
+    ttl: record.ttl,
+    proxied: record.proxied,
+  };
+}
+
+/**
+ * True only when the one page holds every matching record. A preview built from a partial list would
+ * show the user a wrong diff, so any doubt is "not complete":
+ *   - `total_pages` above 1, or `total_count` above the rows returned, means more records exist;
+ *   - a full page (PAGE_SIZE rows) is complete only when `total_count` confirms it, because without
+ *     the counts a full page cannot be told apart from the first page of a longer list.
+ */
+function dnsRecordPageIsComplete(
+  rowCount: number,
+  resultInfo: { total_pages?: unknown; total_count?: unknown } | undefined,
+): boolean {
+  const totalPages = resultInfo?.total_pages;
+  if (typeof totalPages === "number" && totalPages > 1) {
+    return false;
+  }
+  const totalCount = resultInfo?.total_count;
+  if (typeof totalCount === "number" && totalCount > rowCount) {
+    return false;
+  }
+  if (rowCount < DNS_RECORD_GET_PAGE_SIZE) {
+    return true;
+  }
+  return typeof totalCount === "number" && totalCount === rowCount;
+}
+
+export async function actuateDnsRecordGet(params: DnsRecordGetParams, env: Env): Promise<DnsRecordGetResult> {
+  const token = env.CF_DNS_API_TOKEN;
+  if (!token) {
+    return dnsGetFailure(params.name, "CF_DNS_API_TOKEN is not configured on this Worker.");
+  }
+
+  const zone = await resolveZoneId(token, params.zone);
+  if ("error" in zone) {
+    if (zone.zoneNotVisible === true) {
+      return { ok: true, op: "dns-record-get", zoneFound: false, records: [] };
+    }
+    return dnsGetFailure(params.name, zone.error);
+  }
+
+  const query = new URLSearchParams({ name: params.name, per_page: String(DNS_RECORD_GET_PAGE_SIZE) });
+  if (params.type !== undefined) {
+    query.set("type", params.type);
+  }
+  let response: Response;
+  try {
+    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zone.id)}/dns_records?${query.toString()}`, {
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+    });
+  } catch (err) {
+    return dnsGetFailure(params.name, `could not reach Cloudflare to list DNS records: ${errorMessage(err)}`);
+  }
+
+  const body = (await response.json().catch(() => null)) as
+    | (CloudflareEnvelope & { result_info?: { total_pages?: unknown; total_count?: unknown } })
+    | null;
+  if (response.status === 401 || response.status === 403) {
+    return dnsGetFailure(params.name, "Cloudflare denied listing DNS records — CF_DNS_API_TOKEN needs Zone:DNS:Edit on this zone.");
+  }
+  if (!body?.success || !Array.isArray(body.result)) {
+    return dnsGetFailure(params.name, `DNS record lookup failed with HTTP ${response.status}${cloudflareErrorMessage(body)}.`);
+  }
+  if (!dnsRecordPageIsComplete(body.result.length, body.result_info)) {
+    return dnsGetFailure(
+      params.name,
+      `more than ${DNS_RECORD_GET_PAGE_SIZE} records match "${params.name}" (or Cloudflare did not confirm the list is ` +
+        "complete) — refusing to return a partial list.",
+    );
+  }
+
+  const records: DnsRecordView[] = [];
+  for (const row of body.result as CloudflareDnsRecordSummary[]) {
+    // Re-check name (and type, when asked) on each row, as the upsert does: a looser server-side
+    // match must never put another name's record into the user's diff.
+    if (row.name !== params.name) {
+      continue;
+    }
+    if (params.type !== undefined && row.type !== params.type) {
+      continue;
+    }
+    const view = toDnsRecordView(row);
+    if (view === null) {
+      return dnsGetFailure(params.name, "Cloudflare returned a DNS record without id, type, name, content, ttl or proxied.");
+    }
+    records.push(view);
+  }
+  return { ok: true, op: "dns-record-get", zoneFound: true, records };
 }
 
 // planning/40 Phase B: delete the agent-host CNAME on teardown. Idempotent — a record already gone
@@ -8813,7 +9154,7 @@ const WORKERS_ROUTE_UNAUTHORIZED_HINT =
   "Cloudflare denied the Workers route call — CF_DNS_API_TOKEN needs Zone → Workers Routes: Edit on this zone.";
 
 /** The routes in a zone whose pattern is EXACTLY `pattern`, or the reason the list failed. */
-async function findWorkerRoutesByPattern(
+export async function findWorkerRoutesByPattern(
   token: string,
   zoneId: string,
   pattern: string,

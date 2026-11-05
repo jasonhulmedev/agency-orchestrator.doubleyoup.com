@@ -74,7 +74,22 @@ export interface DnsRecordUpsertParams {
   content: string;
   proxied: "true" | "false";
   ttl: string;
+  /**
+   * Optional guard (doubleyoup#277): the state the user saw in the preview. The actuator refuses
+   * the write when the zone no longer holds exactly this state. Absent => no guard (the old behaviour).
+   */
+  expect?: DnsRecordUpsertExpect;
 }
+
+/**
+ * What the record set for type + name must hold right before the write:
+ *   - `{ absent: true }`: no record of this type + name exists (the preview showed a create);
+ *   - `{ recordId, content }`: exactly this one record exists, with this content (the preview showed
+ *     an update of it).
+ * `absent` is a real JSON boolean, not the "true"/"false" string convention, because the only legal
+ * value is `true`: there is no formatting the two runtimes could disagree on.
+ */
+export type DnsRecordUpsertExpect = { absent: true } | { recordId: string; content: string };
 
 // One DNS label: 1-63 chars of [a-z0-9_-], not starting or ending with "-". Underscore is
 // allowed because service/verification names need it (_dmarc, _acme-challenge, ...).
@@ -93,12 +108,62 @@ const DNS_TTL_AUTO = 1;
 const DNS_TTL_MIN = 30;
 const DNS_TTL_MAX = 86_400;
 const DNS_CONTENT_MAX_LENGTH = 4096;
+// A Cloudflare DNS record id: Cloudflare's 32-char lowercase-hex identifier. It goes into a URL
+// path only through encodeURIComponent, but the strict grammar keeps junk out of the signed job.
+const DNS_RECORD_ID_RE = /^[a-f0-9]{32}$/;
+
+/** True when `content` is a usable DNS record content string (the upsert's content rule). */
+function isValidDnsRecordContent(content: unknown): content is string {
+  if (typeof content !== "string") {
+    return false;
+  }
+  if (content.length === 0 || content.length > DNS_CONTENT_MAX_LENGTH) {
+    return false;
+  }
+  return content.trim() === content;
+}
+
+/**
+ * Validate the optional `expect` guard of dns-record-upsert. Strict on purpose: an unknown key, a
+ * mix of the two forms or `absent: false` is refused rather than ignored, because a guard that a
+ * typo silently drops would let the write overwrite a record the user never confirmed.
+ */
+function validateDnsRecordUpsertExpect(raw: unknown): ParamsVerdict<DnsRecordUpsertExpect> {
+  const shapeReason = 'expect must be { "absent": true } or { "recordId": "<32-hex id>", "content": "<content>" }';
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: shapeReason };
+  }
+  const keys = Object.keys(raw).sort();
+
+  const isAbsentForm = keys.length === 1 && keys[0] === "absent";
+  if (isAbsentForm) {
+    if (raw.absent !== true) {
+      return { ok: false, reason: "expect.absent must be the boolean true" };
+    }
+    return { ok: true, params: { absent: true } };
+  }
+
+  const isRecordForm = keys.length === 2 && keys[0] === "content" && keys[1] === "recordId";
+  if (!isRecordForm) {
+    return { ok: false, reason: shapeReason };
+  }
+  if (typeof raw.recordId !== "string" || !DNS_RECORD_ID_RE.test(raw.recordId)) {
+    return { ok: false, reason: "expect.recordId must be a Cloudflare DNS record id (32 lowercase hex chars)" };
+  }
+  if (!isValidDnsRecordContent(raw.content)) {
+    return {
+      ok: false,
+      reason: `expect.content must be a non-empty string (max ${DNS_CONTENT_MAX_LENGTH} chars, no leading/trailing whitespace)`,
+    };
+  }
+  return { ok: true, params: { recordId: raw.recordId, content: raw.content } };
+}
 
 export function validateDnsRecordUpsertParams(raw: unknown): ParamsVerdict<DnsRecordUpsertParams> {
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
   }
-  const { zone, type, name, content, proxied, ttl } = raw;
+  const { zone, type, name, content, proxied, ttl, expect } = raw;
 
   if (typeof zone !== "string" || zone.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(zone)) {
     return { ok: false, reason: "zone must be a lowercase DNS zone name (e.g. example.com)" };
@@ -116,12 +181,7 @@ export function validateDnsRecordUpsertParams(raw: unknown): ParamsVerdict<DnsRe
   if (!nameIsInZone) {
     return { ok: false, reason: "name must be within zone (equal to it or a subdomain of it)" };
   }
-  if (
-    typeof content !== "string" ||
-    content.length === 0 ||
-    content.length > DNS_CONTENT_MAX_LENGTH ||
-    content.trim() !== content
-  ) {
+  if (!isValidDnsRecordContent(content)) {
     return {
       ok: false,
       reason: `content must be a non-empty string (max ${DNS_CONTENT_MAX_LENGTH} chars, no leading/trailing whitespace)`,
@@ -146,10 +206,57 @@ export function validateDnsRecordUpsertParams(raw: unknown): ParamsVerdict<DnsRe
 
   // Return a FRESH object holding only the known keys — never the caller's object — so an
   // extra key in the parsed params can never ride along into the actuator.
-  return {
-    ok: true,
-    params: { zone, type: type as DnsRecordType, name, content, proxied, ttl },
-  };
+  const params: DnsRecordUpsertParams = { zone, type: type as DnsRecordType, name, content, proxied, ttl };
+
+  // No `expect` key => no guard, exactly the params (and behaviour) of the op before the guard existed.
+  if (expect === undefined) {
+    return { ok: true, params };
+  }
+  const expectVerdict = validateDnsRecordUpsertExpect(expect);
+  if (!expectVerdict.ok) {
+    return expectVerdict;
+  }
+  params.expect = expectVerdict.params;
+  return { ok: true, params };
+}
+
+// ── dns-record-get ───────────────────────────────────────────────────────────────────
+// Read the records at ONE name in an agency zone (doubleyoup#277): the app shows the user a diff
+// before a dns-record-upsert and verifies the result after it. Read-only. The same grammars as
+// dns-record-upsert; `type` is optional (absent => every record at the name, of any type).
+
+export interface DnsRecordGetParams {
+  /** The zone NAME (e.g. "example.com") — resolved to a zone id by the actuator. */
+  zone: string;
+  /** Fully-qualified record name, within `zone`. */
+  name: string;
+  type?: DnsRecordType;
+}
+
+export function validateDnsRecordGetParams(raw: unknown): ParamsVerdict<DnsRecordGetParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  const { zone, name, type } = raw;
+  if (typeof zone !== "string" || zone.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a lowercase DNS zone name (e.g. example.com)" };
+  }
+  if (typeof name !== "string" || name.length > DNS_NAME_MAX_LENGTH || !DNS_RECORD_NAME_RE.test(name)) {
+    return { ok: false, reason: "name must be a lowercase fully-qualified DNS record name" };
+  }
+  const nameWithoutWildcard = name.startsWith("*.") ? name.slice(2) : name;
+  const nameIsInZone = nameWithoutWildcard === zone || nameWithoutWildcard.endsWith(`.${zone}`);
+  if (!nameIsInZone) {
+    return { ok: false, reason: "name must be within zone (equal to it or a subdomain of it)" };
+  }
+
+  if (type === undefined) {
+    return { ok: true, params: { zone, name } };
+  }
+  if (typeof type !== "string" || !(DNS_RECORD_TYPES as readonly string[]).includes(type)) {
+    return { ok: false, reason: `type must be one of ${DNS_RECORD_TYPES.join(", ")}` };
+  }
+  return { ok: true, params: { zone, name, type: type as DnsRecordType } };
 }
 
 // ── cache-purge ──────────────────────────────────────────────────────────────────────
@@ -4265,7 +4372,9 @@ export function splitCloudRunSessionServiceName(
  *   term    sites/<slug>, platform/<slug>
  *   staging sites/<slug>/staging, platform/<slug>-staging
  *   sterm   sites/<slug>/staging, platform/<slug>-staging
- *   pma     platform/<slug>          (planning/49 Phase 4: the image reads the DB credentials here)
+ *   pma     platform/<slug>          (planning/49 Phase 4: the image reads the DB credentials here),
+ *           and platform/<slug>-staging when it also lists the staging DB (hub#223 D3, see
+ *           pmaSessionStagingServerReason)
  *   spma    platform/<slug>-staging
  * EXACT paths, not a prefix test: a prefix test on `sites/<slug>` would also admit `sites/<slug>-x`,
  * which is ANOTHER site's tree. A staging service gets no path to the LIVE `platform/<slug>`, which
@@ -4285,7 +4394,7 @@ export function siteSessionNfsPathsFor(prefix: CloudRunSessionServicePrefix, slu
     return [`${sitesPath}/staging`, stagingPlatformPath];
   }
   if (prefix === "pma") {
-    return [platformPath];
+    return [platformPath, stagingPlatformPath];
   }
   if (prefix === "spma") {
     return [stagingPlatformPath];
@@ -4300,19 +4409,121 @@ export function siteSessionNfsPathsFor(prefix: CloudRunSessionServicePrefix, slu
  * or shell runs the tenant's own code, so a read-only mount means a flaw there can read the dir but
  * never rewrite it.
  *   term    none (unchanged: the terminal's mounts stay as they are)
- *   pma     platform/<slug>
+ *   pma     platform/<slug> and platform/<slug>-staging
  *   staging, sterm, spma   platform/<slug>-staging (staging and sterm still write sites/<slug>/staging)
  */
 export function siteSessionReadOnlyNfsPathsFor(prefix: CloudRunSessionServicePrefix, slug: string): string[] {
   const platformPath = `${SITE_STORAGE_ROOT}/platform/${slug}`;
   const stagingPlatformPath = `${SITE_STORAGE_ROOT}/platform/${slug}-staging`;
   if (prefix === "pma") {
-    return [platformPath];
+    return [platformPath, stagingPlatformPath];
   }
   if (prefix === "staging" || prefix === "sterm" || prefix === "spma") {
     return [stagingPlatformPath];
   }
   return [];
+}
+
+/**
+ * The reason a staging- session's NFS volumes are not its one allowed shape, or null when they are
+ * (hub#223, D3). The loop in validateCloudRunServiceUpsertParams already refuses any path that is not
+ * one of the two staging paths of this slug. This adds the count and the pairing:
+ *   - EXACTLY two volumes. A staging WordPress with no docroot or no config cannot serve, and a third
+ *     volume could only repeat an allowed path at a second mount point.
+ *   - each staging path exactly ONCE: the staging tree (sites/<slug>/staging) and the staging config
+ *     dir (platform/<slug>-staging).
+ *   - both from the SAME server. The twin cannot know the cell's file node; app binds each server to it
+ *     before it signs. Two different servers would mean one of them is not that file node.
+ */
+function stagingSessionNfsVolumesReason(slug: string, nfsVolumes: CloudRunNfsVolume[] | undefined): string | null {
+  const requiredPaths = siteSessionNfsPathsFor("staging", slug);
+  const shapeRule =
+    `a staging- session for "${slug}" must mount exactly two NFS volumes, ${requiredPaths.join(" and ")}, ` +
+    "each once and both from the cell's file node";
+  if (nfsVolumes === undefined || nfsVolumes.length !== requiredPaths.length) {
+    return shapeRule;
+  }
+  for (const requiredPath of requiredPaths) {
+    const volumesWithPath = nfsVolumes.filter((volume) => volume.path === requiredPath);
+    if (volumesWithPath.length !== 1) {
+      return shapeRule;
+    }
+  }
+  const firstServer = nfsVolumes[0].server;
+  for (const volume of nfsVolumes) {
+    if (volume.server !== firstServer) {
+      return `${shapeRule} — not from two different servers`;
+    }
+  }
+  return null;
+}
+
+/**
+ * The env names of the shared pma's SECOND server entry: the site's staging DB (hub#223, D3). The first
+ * entry is the live DB and keeps the single-server env unchanged (DY_WPCONFIG_REAL and the rest), so a pma
+ * without these names behaves exactly as before.
+ *   DY_STAGING_WPCONFIG_REAL  exactly /platform/<slug>-staging/wp-config-real.php. The image reads the
+ *                             dedicated staging user from it, as the site user, from the read-only
+ *                             platform/<slug>-staging mount (decision D2: no DB password in the env).
+ *   DY_STAGING_DB_NAME        exactly siteStagingDatabaseNameFor(slug). The image limits the entry to this
+ *                             schema and refuses a staging config that names another one.
+ */
+export const PMA_STAGING_SERVER_ENV_NAMES = ["DY_STAGING_WPCONFIG_REAL", "DY_STAGING_DB_NAME"] as const;
+
+/**
+ * The staging schema of a site on its cell's data node: the live DB name plus "_staging". The live DB
+ * name is the slug with each "-" mapped to "_" (MariaDB identifiers and the cell-agent take
+ * [A-Za-z0-9_] only; the orchestrator's cellDbIdentifiers, infra cell-agent clone-staging-db.sh). The
+ * longest slug (46) gives 54 characters, under MariaDB's 64.
+ */
+export function siteStagingDatabaseNameFor(slug: string): string {
+  const liveDatabaseName = slug.replace(/-/g, "_");
+  return `${liveDatabaseName}_staging`;
+}
+
+/**
+ * The reason a pma- session's staging server entry is wrong, or null when it is right or absent
+ * (hub#223, D3: one shared pma lists prod and staging). The rule:
+ *   - both PMA_STAGING_SERVER_ENV_NAMES, or neither. Half an entry is refused.
+ *   - DY_STAGING_DB_NAME is this site's staging schema. A staging entry on any other schema (the live
+ *     one, another site's) is refused.
+ *   - DY_STAGING_WPCONFIG_REAL is this site's staging config, nothing else.
+ *   - the read-only platform/<slug>-staging volume is mounted when, and only when, the entry is present.
+ *     A pma that does not list staging gets no path to the staging config.
+ * No value is put in a reason: the env of a session service is never echoed (planning/49 §5.2).
+ */
+function pmaSessionStagingServerReason(
+  slug: string,
+  env: CloudRunEnvVar[] | undefined,
+  nfsVolumes: CloudRunNfsVolume[] | undefined,
+): string | null {
+  const envEntries = env ?? [];
+  const wpConfigEntry = envEntries.find((entry) => entry.name === "DY_STAGING_WPCONFIG_REAL");
+  const databaseNameEntry = envEntries.find((entry) => entry.name === "DY_STAGING_DB_NAME");
+  const stagingPlatformPath = `${SITE_STORAGE_ROOT}/platform/${slug}-staging`;
+  const mountsStagingPlatform = (nfsVolumes ?? []).some((volume) => volume.path === stagingPlatformPath);
+
+  if (wpConfigEntry === undefined && databaseNameEntry === undefined) {
+    if (mountsStagingPlatform) {
+      return `a pma- session may mount ${stagingPlatformPath} only when it lists the staging DB (${PMA_STAGING_SERVER_ENV_NAMES.join(" and ")})`;
+    }
+    return null;
+  }
+  if (wpConfigEntry === undefined || databaseNameEntry === undefined) {
+    return `a pma- session's staging server entry needs both ${PMA_STAGING_SERVER_ENV_NAMES.join(" and ")}, or neither`;
+  }
+  const stagingDatabaseName = siteStagingDatabaseNameFor(slug);
+  if (databaseNameEntry.value !== stagingDatabaseName) {
+    return `a pma- session's staging server entry must use the schema ${stagingDatabaseName} (DY_STAGING_DB_NAME), not another schema`;
+  }
+  const stagingWpConfigPath = `/platform/${slug}-staging/wp-config-real.php`;
+  if (wpConfigEntry.value !== stagingWpConfigPath) {
+    return `a pma- session's staging server entry must read ${stagingWpConfigPath} (DY_STAGING_WPCONFIG_REAL), not another file`;
+  }
+  if (!mountsStagingPlatform) {
+    return `a pma- session that lists the staging DB must mount ${stagingPlatformPath} read-only`;
+  }
+  return null;
 }
 
 /** True when `value` is an absolute POSIX path that contains no "." or ".." segment. */
@@ -4565,7 +4776,9 @@ function cleanCloudRunProbe(value: unknown): { ok: true; probe: CloudRunProbeSpe
 //          service's OWN slug (siteSessionNfsPathsFor). A `platform/` config dir of a pma or staging
 //          purpose must be read-only (siteSessionReadOnlyNfsPathsFor). `maxInstances` must be
 //          exactly 1: one writer per NFS mount, and the per-site /24 is sized for one instance per
-//          service (hub#93 G1).
+//          service (hub#93 G1). hub#223 D3: a staging- session mounts exactly its two staging volumes
+//          from one server (stagingSessionNfsVolumesReason), and a pma- session may list the site's
+//          staging DB as a second server entry, on `<slug>_staging` only (pmaSessionStagingServerReason).
 //       2. app ONLY, before it signs (agency-dispatch-site-binding.ts): slug -> Site -> Cell must match
 //          the job's project, region and account, the slot must be Site.runSlot, its subnet must be
 //          confirmed created, `network` must be the cell's effective network and `subnet` its effective
@@ -4806,6 +5019,18 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
           ok: false,
           reason: `a ${sessionName.prefix}- session must mount "${volume.path}" read-only (readOnly: true)`,
         };
+      }
+    }
+    if (sessionName.prefix === "staging") {
+      const stagingVolumesReason = stagingSessionNfsVolumesReason(sessionName.slug, cleanedNfsVolumes.nfsVolumes);
+      if (stagingVolumesReason !== null) {
+        return { ok: false, reason: stagingVolumesReason };
+      }
+    }
+    if (sessionName.prefix === "pma") {
+      const stagingServerReason = pmaSessionStagingServerReason(sessionName.slug, cleanedEnv.env, cleanedNfsVolumes.nfsVolumes);
+      if (stagingServerReason !== null) {
+        return { ok: false, reason: stagingServerReason };
       }
     }
   }

@@ -16,8 +16,8 @@
 //
 // Worker-native (Web Crypto only), like the rest of the Worker's tests.
 
-import { describe, it, expect } from "vitest";
-import { presignS3Put, presignS3Get, presignS3Url } from "../src/sigv4.js";
+import { describe, it, expect, vi } from "vitest";
+import { presignS3Put, presignS3Get, presignS3Url, signS3Request } from "../src/sigv4.js";
 
 // ── Pin 1: the AWS-published example ──────────────────────────────────────────────────
 const AWS_EXAMPLE = {
@@ -233,5 +233,61 @@ describe("presignS3Get — the db-import GET pin (same object as the PUT, method
       presigned.url.startsWith("https://agency-backups.s3.us-east-1.amazonaws.com/db-exports/geelongns-2026-09-07t01-02-03z.sql?"),
     ).toBe(true);
     expect(presigned.canonicalRequest.split("\n")[0]).toBe("GET");
+  });
+});
+
+// ── hub#222: signed header values are SigV4-canonicalized ("Trimall") ─────────────────────────────────
+// Expected signatures from botocore 1.40.72 (S3SigV4Auth and S3SigV4QueryAuth, region "auto", clock pinned to
+// 2026-11-04T10:20:30Z), an independent SigV4 implementation that collapses runs of whitespace in header values.
+// Before this fix the signer only trimmed the ends, so a content type such as `text/plain;  charset=utf-8` got a
+// signature that the store rejects.
+describe("SigV4 signed header values collapse inner whitespace (hub#222)", () => {
+  const credentials = {
+    region: "auto",
+    accessKeyId: "AKIDEXAMPLE",
+    secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+  };
+  const pinnedNowMs = Date.parse("2026-11-04T10:20:30.000Z");
+
+  it("presignS3Put: a content type with a double space signs like botocore", async () => {
+    const presigned = await presignS3Put({
+      ...credentials,
+      endpoint: "https://acct.r2.cloudflarestorage.com",
+      bucket: "doubleyoup-media-acme",
+      key: "acme/a.txt",
+      expiresSeconds: 600,
+      nowMs: pinnedNowMs,
+      signedHeaders: { "content-type": "text/plain;  charset=utf-8", "if-none-match": "*", "content-length": "5" },
+    });
+    expect(presigned.canonicalRequest).toContain("\ncontent-type:text/plain; charset=utf-8\n");
+    expect(new URL(presigned.url).searchParams.get("X-Amz-Signature")).toBe(
+      "2a6dbe120972dfbf120d1c51e70030c58078534e9e35e79bb99ba2db8cfbaa35",
+    );
+  });
+
+  it("signS3Request: a header-signed CopyObject with a double-spaced value signs like botocore and sends the normalized value", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(pinnedNowMs);
+    try {
+      const signed = await signS3Request({
+        ...credentials,
+        method: "PUT",
+        url: "https://acct.r2.cloudflarestorage.com/doubleyoup-media-acme/acme/a.txt",
+        pathIsEncoded: true,
+        extraHeaders: {
+          "x-amz-copy-source": "/doubleyoup-media-acme/acme/src.txt",
+          "x-amz-metadata-directive": "COPY",
+          "content-type": "text/plain;  charset=utf-8",
+        },
+      });
+      expect(signed.headers.get("authorization")).toBe(
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261104/auto/s3/aws4_request, " +
+          "SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-copy-source;x-amz-date;x-amz-metadata-directive, " +
+          "Signature=42450f274e5f3aa3906a1b782b26999399b40ac20237aac5ac8be9c605ade00b",
+      );
+      expect(signed.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

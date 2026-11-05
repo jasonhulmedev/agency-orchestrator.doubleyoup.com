@@ -52,7 +52,7 @@ async function hmacSha256(keyBytes: Uint8Array, message: string): Promise<Uint8A
 // set (A-Za-z0-9-_.~). encodeURIComponent already leaves the unreserved set plus
 // "!'()*" unescaped and emits upper-hex %XX, so we only additionally escape
 // "!'()*" to land exactly on the AWS rule.
-function awsUriEncodeComponent(component: string): string {
+export function awsUriEncodeComponent(component: string): string {
   return encodeURIComponent(component).replace(
     /[!'()*]/g,
     (char) => "%" + char.charCodeAt(0).toString(16).toUpperCase(),
@@ -80,6 +80,16 @@ function canonicalQueryString(searchParams: URLSearchParams): string {
   return encodedPairs.map(([key, value]) => `${key}=${value}`).join("&");
 }
 
+/**
+ * A header value as SigV4 canonicalizes it ("Trimall"): no leading or trailing whitespace, and each run of
+ * whitespace inside collapsed to one space. The store computes its canonical request this way, so signing the raw
+ * value of, say, `text/plain;  charset=utf-8` would fail with SignatureDoesNotMatch. Callers that hand signed
+ * headers to a third party send this normalized value too, so the wire bytes equal the signed bytes.
+ */
+export function canonicalHeaderValue(value: string): string {
+  return value.trim().replace(/\s+/g, " ");
+}
+
 export interface SignedRequest {
   url: string;
   headers: Headers;
@@ -96,6 +106,17 @@ export async function signS3Request(options: {
   accessKeyId: string;
   secretAccessKey: string;
   body?: string;
+  /**
+   * Extra headers to SIGN and send (hub#222: x-amz-copy-source, x-amz-metadata-directive and the
+   * copy conditions of a CopyObject). Names are lower-cased. Omitted = the minimal set, as before.
+   */
+  extraHeaders?: Record<string, string>;
+  /**
+   * hub#222: true when the URL path is ALREADY AWS-URI-encoded (each key segment encoded once, as
+   * encodeS3KeyPath does). The path is then signed verbatim, like presignS3Url does. Without it the
+   * path is encoded here, which double-encodes a key that holds a space or a non-ASCII character.
+   */
+  pathIsEncoded?: boolean;
 }): Promise<SignedRequest> {
   const parsed = new URL(options.url);
   const host = parsed.host; // includes a non-default port if present
@@ -127,6 +148,10 @@ export async function signS3Request(options: {
   signedValues.set("host", host);
   signedValues.set("x-amz-content-sha256", payloadHash);
   signedValues.set("x-amz-date", amzDate);
+  const extraHeaders = options.extraHeaders ?? {};
+  for (const [name, value] of Object.entries(extraHeaders)) {
+    signedValues.set(name.toLowerCase(), canonicalHeaderValue(value));
+  }
 
   const sortedNames = [...signedValues.keys()].sort();
   const canonicalHeaders = sortedNames
@@ -134,9 +159,14 @@ export async function signS3Request(options: {
     .join("");
   const signedHeaderList = sortedNames.join(";");
 
+  let signedPath = canonicalUri(parsed.pathname);
+  if (options.pathIsEncoded === true) {
+    signedPath = parsed.pathname;
+  }
+
   const canonicalRequest =
     `${options.method}\n` +
-    `${canonicalUri(parsed.pathname)}\n` +
+    `${signedPath}\n` +
     `${canonicalQueryString(parsed.searchParams)}\n` +
     `${canonicalHeaders}\n` +
     `${signedHeaderList}\n` +
@@ -162,6 +192,9 @@ export async function signS3Request(options: {
   outHeaders.set("x-amz-content-sha256", payloadHash);
   outHeaders.set("x-amz-date", amzDate);
   outHeaders.set("authorization", authorization);
+  for (const [name, value] of Object.entries(extraHeaders)) {
+    outHeaders.set(name.toLowerCase(), canonicalHeaderValue(value));
+  }
 
   return { url: options.url, headers: outHeaders };
 }
@@ -236,6 +269,12 @@ export async function presignS3Url(options: {
   secretAccessKey: string;
   expiresSeconds: number;
   nowMs?: number;
+  /**
+   * hub#222: headers the uploader MUST send with these exact values (for example `if-none-match: *`
+   * for a create-once PUT, and the content type and length). They join `host` in the signed headers,
+   * so a request without them, or with other values, fails the signature check. Omitted = `host` only.
+   */
+  signedHeaders?: Record<string, string>;
 }): Promise<PresignedUrl> {
   const parsed = new URL(options.url);
   const host = parsed.host; // includes a non-default port if present
@@ -251,16 +290,27 @@ export async function presignS3Url(options: {
   query.set("X-Amz-Credential", `${options.accessKeyId}/${scope}`);
   query.set("X-Amz-Date", amzDate);
   query.set("X-Amz-Expires", String(options.expiresSeconds));
-  query.set("X-Amz-SignedHeaders", "host");
+  const headerValues = new Map<string, string>();
+  headerValues.set("host", host);
+  const extraSignedHeaders = options.signedHeaders ?? {};
+  for (const [name, value] of Object.entries(extraSignedHeaders)) {
+    headerValues.set(name.toLowerCase(), canonicalHeaderValue(value));
+  }
+  const sortedHeaderNames = [...headerValues.keys()].sort();
+  const signedHeaderList = sortedHeaderNames.join(";");
+  let canonicalHeaders = "";
+  for (const name of sortedHeaderNames) {
+    canonicalHeaders += `${name}:${headerValues.get(name)}\n`;
+  }
+  query.set("X-Amz-SignedHeaders", signedHeaderList);
   const canonicalQuery = canonicalQueryString(query);
 
   const canonicalRequest =
     `${options.method}\n` +
     `${parsed.pathname}\n` +
     `${canonicalQuery}\n` +
-    `host:${host}\n` +
-    `\n` +
-    `host\n` +
+    `${canonicalHeaders}\n` +
+    `${signedHeaderList}\n` +
     `UNSIGNED-PAYLOAD`;
 
   const stringToSign =
@@ -284,6 +334,13 @@ export interface PresignS3ObjectOptions {
   key: string;
   expiresSeconds: number;
   nowMs?: number;
+  /** Headers the uploader must send with these exact values (see presignS3Url). */
+  signedHeaders?: Record<string, string>;
+}
+
+/** AWS-URI-encode an object key once per `/`-separated segment (hub#222: CopyObject sources and request paths). */
+export function encodeS3KeyPath(key: string): string {
+  return key.split("/").map(awsUriEncodeComponent).join("/");
 }
 
 /**
@@ -295,7 +352,7 @@ export interface PresignS3ObjectOptions {
  * presigners so an upload and a download address the same object identically.
  */
 function s3ObjectUrl(options: PresignS3ObjectOptions): string {
-  const encodedKey = options.key.split("/").map(awsUriEncodeComponent).join("/");
+  const encodedKey = encodeS3KeyPath(options.key);
   if (options.endpoint) {
     const endpoint = new URL(options.endpoint);
     // Keep any path prefix the endpoint carries (normally none — R2 endpoints are bare hosts),
@@ -316,6 +373,7 @@ function presignS3Object(method: "GET" | "PUT", options: PresignS3ObjectOptions)
     secretAccessKey: options.secretAccessKey,
     expiresSeconds: options.expiresSeconds,
     nowMs: options.nowMs,
+    signedHeaders: options.signedHeaders,
   });
 }
 

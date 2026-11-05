@@ -11,7 +11,8 @@
     "tail": "wrangler tail",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "embed-session-gate": "node scripts/embed-session-gate.mjs"
+    "embed-session-gate": "node scripts/embed-session-gate.mjs",
+    "proof:media": "node scripts/proof-media.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",

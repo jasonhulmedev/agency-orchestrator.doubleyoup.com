@@ -40,6 +40,8 @@ import type { Env } from "./env.js";
 export const DISPATCH_OPS = [
   "provision-r2",
   "dns-record-upsert",
+  // doubleyoup#277: read the records at one name (the app's preview diff and post-change check).
+  "dns-record-get",
   "cache-purge",
   "cache-rule-upsert",
   "waf-rule-upsert",
@@ -51,6 +53,13 @@ export const DISPATCH_OPS = [
   "custom-hostname-upsert",
   "custom-hostname-get",
   "custom-hostname-delete",
+  // hub#133 part 2 — branded media on an agency cell: the route of one media host to the agency media
+  // Worker (the script is MEDIA_WORKER_SCRIPT, never a job param) and its HOSTMAP entry (the namespace is
+  // pinned, never a job param). No generic KV write and no route-any-script op.
+  "worker-route-upsert",
+  "worker-route-delete",
+  "media-hostmap-upsert",
+  "media-hostmap-delete",
   "cf-tunnel-create",
   "cf-tunnel-config",
   "cf-tunnel-delete",
@@ -123,6 +132,15 @@ export const DISPATCH_OPS = [
   "r2-media-state",
   "r2-site-key-install",
   "r2-site-key-revoke",
+  // hub#222 — media soft delete (actuate-media.ts): protect a media bucket's trash/, switch a site to Worker-mode
+  // media (its credential goes Worker -> file node only), revoke its old R2 key, list and restore trash, and a
+  // short-lived prefix-scoped R2 credential for a bulk offload engine.
+  "media-bucket-protect",
+  "media-site-credential-install",
+  "media-site-key-revoke",
+  "media-trash-list",
+  "media-restore",
+  "media-bulk-credential",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 

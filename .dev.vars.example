@@ -27,8 +27,16 @@ STRIPE_SECRET_KEY=""
 # Account API Tokens: Edit. NOT a My Profile -> API Tokens (user) token.
 R2_PROVISION_API_TOKEN=""
 
+# Media soft delete (hub#222) — the root of every site's media credential
+# (HMAC-SHA256(MEDIA_SITE_SECRET, <bucket>)), checked by POST /media/*. At least
+# 32 characters, e.g. `openssl rand -hex 32`. Changing it invalidates every
+# site's credential until media-site-credential-install runs again.
+MEDIA_SITE_SECRET=""
+
 # Cloudflare DNS — API token with Zone:DNS:Edit + Zone:Read on the agency zone(s)
 # the platform may manage (Direction-B dns-record-upsert actuator).
+# Branded media (hub#133) also needs SSL and Certificates: Edit, Workers Routes: Edit
+# and Account Workers KV Storage: Edit on this same token.
 CF_DNS_API_TOKEN=""
 
 # Cell-agent access (Direction-B wp-cli actuator) — the base URL of the agency's OWN
