@@ -63,6 +63,19 @@
 // one named key (an absent key is "already-absent"), so both converge. `r2-site-key-install` is NOT
 // idempotent: every run mints a NEW key, so it runs exactly once under F1 and a lost answer is settled
 // by r2-media-state, never by a resend.
+// The six hub#222 media soft-delete ops (actuate-media.ts, params in dispatch-params-media.ts):
+//   `media-bucket-protect` is idempotent: it reads the bucket's lifecycle and lock rules, keeps every rule with
+//     another id, and writes only when its own two rules (`doubleyoup-trash-expire`: delete trash/ after 31 days;
+//     `doubleyoup-trash-lock`: lock trash/ for 30 days) are missing or drifted. A re-run writes nothing.
+//   `media-site-credential-install` is idempotent: the site credential is HMAC-SHA256(MEDIA_SITE_SECRET, bucket),
+//     derived, not minted, so a re-run posts the same wp-config constants to the file node again.
+//   `media-site-key-revoke` converges like r2-site-key-revoke (it calls it): a 404 is "already-absent".
+//   `media-trash-list` is a read (one page; the cursor pages on).
+//   `media-restore` is idempotent: a target that already holds the trash object's bytes is "already-restored";
+//     a target with OTHER bytes is refused (code 409), never overwritten.
+//   `media-bulk-credential` is NOT idempotent (each run mints a new R2 temporary credential), but repeating it
+//     only mints another short-lived credential of the same scope; the old one expires on its own. It is the one
+//     op whose answer carries a credential, by design: a bulk offload engine needs it.
 // planning/47 decision G (actuate-p47.ts): `cf-tunnel-token-get` is a read, so it is idempotent, and so
 // are the review's two reads, `gcp-instance-metadata-diff` (it writes nothing) and `cf-tunnel-connections-get`.
 // The three hub#46 custom-hostname ops (actuate-custom-hostname.ts) are idempotent too: the upsert creates
@@ -259,6 +272,28 @@ import {
 } from "./dispatch-params.js";
 import { actuateCfTunnelGet, actuateGcpDiskSnapshotCreate, actuateGcpInstanceRemoveServiceAccount } from "./actuate-hub58.js";
 import { actuateR2SiteKeyInstall, actuateR2SiteKeyRevoke, readR2MediaBuckets, readR2MediaState } from "./actuate-r2-media.js";
+import {
+  actuateMediaBucketProtect,
+  actuateMediaBulkCredential,
+  actuateMediaRestore,
+  actuateMediaSiteCredentialInstall,
+  actuateMediaSiteKeyRevoke,
+  readMediaTrashList,
+} from "./actuate-media.js";
+import {
+  validateMediaBucketProtectParams,
+  validateMediaBulkCredentialParams,
+  validateMediaRestoreParams,
+  validateMediaSiteCredentialInstallParams,
+  validateMediaSiteKeyRevokeParams,
+  validateMediaTrashListParams,
+  type MediaBucketProtectParams,
+  type MediaBulkCredentialParams,
+  type MediaRestoreParams,
+  type MediaSiteCredentialInstallParams,
+  type MediaSiteKeyRevokeParams,
+  type MediaTrashListParams,
+} from "./dispatch-params-media.js";
 import { actuateCfTunnelConnectionsGet, actuateCfTunnelTokenGet, actuateGcpInstanceMetadataDiff } from "./actuate-p47.js";
 import { actuateEdgeGateDeploy } from "./actuate-edge-gate.js";
 
@@ -527,6 +562,30 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "cf-tunnel-connections-get": defineOp<CfTunnelConnectionsGetParams>({
     validateParams: validateCfTunnelConnectionsGetParams,
     actuate: (params, env) => actuateCfTunnelConnectionsGet(params, env),
+  }),
+  "media-bucket-protect": defineOp<MediaBucketProtectParams>({
+    validateParams: validateMediaBucketProtectParams,
+    actuate: (params, env) => actuateMediaBucketProtect(params, env),
+  }),
+  "media-site-credential-install": defineOp<MediaSiteCredentialInstallParams>({
+    validateParams: validateMediaSiteCredentialInstallParams,
+    actuate: (params, env) => actuateMediaSiteCredentialInstall(params, env),
+  }),
+  "media-site-key-revoke": defineOp<MediaSiteKeyRevokeParams>({
+    validateParams: validateMediaSiteKeyRevokeParams,
+    actuate: (params, env) => actuateMediaSiteKeyRevoke(params, env),
+  }),
+  "media-trash-list": defineOp<MediaTrashListParams>({
+    validateParams: validateMediaTrashListParams,
+    actuate: (params, env) => readMediaTrashList(params, env),
+  }),
+  "media-restore": defineOp<MediaRestoreParams>({
+    validateParams: validateMediaRestoreParams,
+    actuate: (params, env) => actuateMediaRestore(params, env),
+  }),
+  "media-bulk-credential": defineOp<MediaBulkCredentialParams>({
+    validateParams: validateMediaBulkCredentialParams,
+    actuate: (params, env) => actuateMediaBulkCredential(params, env),
   }),
 };
 

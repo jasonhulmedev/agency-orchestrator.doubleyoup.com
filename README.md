@@ -52,6 +52,7 @@ Worker never persists them anywhere else and we never hold them. See
 | `CELL_AGENT_URL` / `CELL_AGENT_TOKEN` | secrets | your cell-agent base URL and bearer token. The `wp-cli`, `db-export` and `db-import` ops post to its `/exec` endpoint. The `provision-ssh-keys` op posts to its `/provision-ssh-keys` endpoint and needs the **gateway** cell-agent, not the web node. All four ops share this one pair, and it serves one cell only: on a cell where the web node and the gateway are separate machines, the pair reaches only one of them |
 | `CELL_FILE_AGENT_URL` / `CELL_FILE_AGENT_TOKEN` | secrets (optional) | a fallback file-node agent for `r2-site-key-install`. A current job names its own agent, and the job's pair wins, so most agencies do not set them. Set both or neither |
 | `R2_EXPECTED_ACCOUNT_ID` | var (optional) | the Cloudflare account id that `R2_PROVISION_API_TOKEN` must belong to. When set, the `r2-media-*` and `r2-site-key-*` ops refuse any other account |
+| `MEDIA_SITE_SECRET` | secret | hub#222: at least 32 characters (for example `openssl rand -hex 32`). The root of every site's media credential for `POST /media/*`, see [Media soft delete](#media-soft-delete). Changing it invalidates every site's credential until `media-site-credential-install` runs again |
 
 ## Where setup instructions live
 
@@ -145,6 +146,7 @@ npm run deploy
 | `GET /whoami` | exercise Direction-A end-to-end; returns `{ok, accountId}` |
 | `POST /complete` | if all green, call our app's onboarding-complete route; returns `{ok, validation, callback}` |
 | `POST /actuate` | runs one signed Direction-B job (ed25519 signature and a single-use nonce). Only the platform calls it |
+| `POST /media/sign-put`, `/media/replace`, `/media/delete`, `/media/rename` | hub#222: the site-facing media API. Only a site's mu-plugin calls it, with its own credential (see [Media soft delete](#media-soft-delete)) |
 
 > `POST /complete` re-validates and calls our app's `onboarding-complete` route
 > (now live). It stays resilient — if that callback is ever unreachable it still
@@ -170,6 +172,78 @@ wildcard) and refuses an unknown param key.
 | `media-hostmap-delete` | `{hostname}` | Deletes the `HOSTMAP` entry. A 404 is `already-absent` (ok) |
 
 There is no generic KV-write op and no op that routes to any other script.
+
+## Media soft delete
+
+hub#222: this Worker is the only writer of a site's R2 media bucket
+(`doubleyoup-media-<prefix>`). The site holds no R2 key. Its mu-plugin calls
+`POST /media/*` with a per-site credential, and every delete, rename and
+overwrite first copies the old object to `trash/<UTC yyyy-mm-dd>/<key>`. A
+bucket lock keeps `trash/` for 30 days; a lifecycle rule deletes it after 31.
+
+Setup: add the secret `MEDIA_SITE_SECRET` (at least 32 characters, for example
+`openssl rand -hex 32`). The routes and ops sign R2 requests with
+`R2_PROVISION_API_TOKEN` (Cloudflare's S3 form of the token: its id and the
+SHA-256 of its value), so that token must be set too. Changing
+`MEDIA_SITE_SECRET` invalidates every site's credential until
+`media-site-credential-install` runs again for each site.
+
+**Site-facing routes.** `Authorization: Bearer <credential>`, where the
+credential is `hex(HMAC-SHA256(MEDIA_SITE_SECRET, <bucket>))` (64 lowercase hex
+characters, compared in constant time). Every body names the site's `bucket`.
+A key must be under `<prefix>/`, never under `trash/` or `<prefix>/trash/`, and
+never hold a `.` or `..` segment. Rate limit: 600 requests a minute per bucket
+(answer 429 with `Retry-After`), counted after the credential check.
+
+| Route | Body | What it does |
+| --- | --- | --- |
+| `/media/sign-put` | `{bucket, key, contentType, contentLength}` | Returns `upload: {method, url, headers, expiresAt}`: a presigned PUT, valid 10 minutes, that signs `if-none-match: *`, the content type and the length. Send exactly those headers. R2 answers 412 when the key exists, so a site can create but never overwrite |
+| `/media/replace` | `{bucket, key, contentType, contentLength}` | Moves the current object to trash, deletes it, then returns a create-once `upload` for the key. No current object: `previous: "already-absent"` |
+| `/media/delete` | `{bucket, key}` | Moves the object to trash, then deletes it. Missing: `status: "already-absent"` (ok) |
+| `/media/rename` | `{bucket, from, to}` | Copies `from` to `to` (409 when `to` holds another revision, also one uploaded during the rename), moves `from` to trash, deletes `from`. Missing `from`: `already-absent` (ok) |
+
+Each route is safe to retry. A trash copy keeps the metadata
+(`x-amz-metadata-directive: COPY`) and is taken only while the source still has
+the ETag the Worker read (`x-amz-copy-source-if-match`); an object that changes
+in between is not deleted (409). Every Worker copy is create-once in R2
+(`cf-copy-destination-if-none-match: *`), so a copy never replaces an object.
+A revision is the ETag and the metadata: when the same key goes to trash twice
+in one day as another revision (other bytes, or the same bytes with another
+content type), the second copy goes to `trash/<day>.<revision hash>/<key>`,
+because the lock forbids overwriting the first.
+
+R2's DeleteObject takes no condition. So delete, replace and rename take a
+60-second lease on the key being deleted (Durable Object instance
+`media-lease:<bucket>`): a second request for the same key answers 409 and the
+site retries. The final DELETE starts only while the lease has room for it, and
+the same Durable Object turn records it as pending. A DELETE that times out or
+gets a 5xx may still land at R2 later, so its record outlives the lease: while
+the key still holds the revision that DELETE targeted, delete, replace and
+rename of that key answer 409 (and nothing can re-create the key, because every
+write is create-once). Once the key is absent or holds another revision, the
+old DELETE has landed and the key is free. A record older than one hour is
+dropped, and the Worker logs a warning with the bucket and the key. Any media
+request on the bucket may drop an aged record of another key; each drop is
+logged by the request that caused it. A DELETE
+that R2 applies later than one hour is an accepted remaining risk: it is
+smaller than the per-site R2 key with Object Read & Write that this replaces.
+A trash copy counts only when R2 answers with a complete
+`CopyObjectResult`; an unreadable, empty or cut-off answer fails the request
+and nothing is deleted.
+
+**Signed ops.**
+
+| Op | Params | What it does |
+| --- | --- | --- |
+| `media-bucket-protect` | `{bucket}` | Lifecycle rule `doubleyoup-trash-expire` (delete `trash/` after 31 days) and bucket lock `doubleyoup-trash-lock` (`trash/`, 30 days). Keeps every other rule. A re-run writes nothing (`unchanged`) |
+| `media-site-credential-install` | `{slug, bucket, workerUrl, fileAgentUrl?, fileAgentToken?}` | Derives the site credential and posts it with `workerUrl` to the file-node cell-agent `/update-r2-config` (Worker mode), which writes `DOUBLEYOUP_MEDIA_WORKER_URL` and `DOUBLEYOUP_MEDIA_SITE_TOKEN` and removes `DOUBLEYOUP_R2_KEY` and `DOUBLEYOUP_R2_SECRET`. The answer never carries the credential. Idempotent |
+| `media-site-key-revoke` | `{slug, bucket, tokenId}` | Deletes the site's old R2 key, only when its name shows `r2-site-key-install` minted it for this bucket. Missing: `already-absent` |
+| `media-trash-list` | `{bucket, prefix?, cursor?}` | One page (up to 1000) of `trash/<prefix>` objects: `entries` and `cursor` (null on the last page) |
+| `media-restore` | `{bucket, trashKey, targetKey?}` | Copies a trash object back (default target: the key without `trash/<day>/`). A target with other bytes is refused (`code: 409`); with the same bytes it is `already-restored` |
+| `media-bulk-credential` | `{bucket, prefix, ttlSeconds}` | An R2 temporary credential (object-read-write) for one bucket and one prefix under `<prefix>/`, 60 to 43200 seconds, for a bulk offload engine. The one op whose answer carries a credential |
+
+`npm run proof:media` proves the R2 behaviour this relies on against a scratch
+bucket: see [PROOF-MEDIA.md](PROOF-MEDIA.md).
 
 ## Local dev
 

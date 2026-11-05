@@ -175,6 +175,117 @@ describe("NonceStore leases (waf-edge-sync, one instance per zone) — real Dura
   });
 });
 
+describe("NonceStore media key leases with a pending-delete record (hub#222) — real Durable Object", () => {
+  function mediaLeaseStub(bucket: string) {
+    const ns = workerEnv.NONCE_STORE;
+    return ns.get(ns.idFromName(`media-lease:${bucket}`));
+  }
+
+  it("a recorded DELETE outlives its lease until a holder clears it; only the lease holder can record", async () => {
+    const stub = mediaLeaseStub("doubleyoup-media-lease-a");
+    const key = "lease-a/a.png";
+    expect(await stub.acquireMediaKey(key, "req-1", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null, expiredPendingDeletes: [] });
+    expect(await stub.acquireMediaKey(key, "req-2", 60_000, 3_600_000)).toEqual({ outcome: "busy" });
+    expect(await stub.beginMediaDelete(key, "req-2", "rev-1", 15_000)).toBe("lease-lost");
+    expect(await stub.beginMediaDelete(key, "req-1", "rev-1", 15_000)).toBe("recorded");
+    // The DELETE's outcome is unknown: req-1 ends without clearing its record.
+    await stub.finishMediaKey(key, "req-1", null);
+    const next = await stub.acquireMediaKey(key, "req-3", 60_000, 3_600_000);
+    expect(next.outcome).toBe("acquired");
+    if (next.outcome === "acquired") {
+      expect(next.pendingDelete).toMatchObject({ holder: "req-1", revision: "rev-1" });
+    }
+    // req-3 proved the DELETE landed and clears req-1's record.
+    await stub.finishMediaKey(key, "req-3", "req-1");
+    expect(await stub.acquireMediaKey(key, "req-4", 60_000, 3_600_000)).toEqual({ outcome: "acquired", pendingDelete: null, expiredPendingDeletes: [] });
+    await stub.finishMediaKey(key, "req-4", null);
+  });
+
+  it("refuses to record when too little lease is left, and drops a record older than the quarantine", async () => {
+    const stub = mediaLeaseStub("doubleyoup-media-lease-b");
+    const key = "lease-b/a.png";
+    expect((await stub.acquireMediaKey(key, "req-1", 60_000, 3_600_000)).outcome).toBe("acquired");
+    expect(await stub.beginMediaDelete(key, "req-1", "rev-1", 61_000)).toBe("lease-lost");
+    expect(await stub.beginMediaDelete(key, "req-1", "rev-1", 15_000)).toBe("recorded");
+    await stub.finishMediaKey(key, "req-1", null);
+    const agedStartedAtMs = Date.now() - 3_600_001;
+    await runInDurableObject(stub, (_instance: NonceStore, state) => {
+      state.storage.sql.exec("UPDATE media_pending_deletes SET started_at = ? WHERE object_key = ?", agedStartedAtMs, key);
+    });
+    // The acquire that drops the aged record returns it, so the Worker can log the reopen of the key.
+    expect(await stub.acquireMediaKey(key, "req-2", 60_000, 3_600_000)).toEqual({
+      outcome: "acquired",
+      pendingDelete: null,
+      expiredPendingDeletes: [{ objectKey: key, holder: "req-1", revision: "rev-1", startedAtMs: agedStartedAtMs }],
+    });
+    await stub.finishMediaKey(key, "req-2", null);
+    expect(await stub.acquireMediaKey(key, "req-3", 60_000, 3_600_000)).toEqual({
+      outcome: "acquired",
+      pendingDelete: null,
+      expiredPendingDeletes: [],
+    });
+    await stub.finishMediaKey(key, "req-3", null);
+  });
+
+  it("an acquire of one key sweeps and returns the aged records of every other key of the bucket", async () => {
+    const stub = mediaLeaseStub("doubleyoup-media-lease-c");
+    const recordUnknownDelete = async (key: string, holder: string, revision: string) => {
+      expect((await stub.acquireMediaKey(key, holder, 60_000, 3_600_000)).outcome).toBe("acquired");
+      expect(await stub.beginMediaDelete(key, holder, revision, 15_000)).toBe("recorded");
+      await stub.finishMediaKey(key, holder, null);
+    };
+    await recordUnknownDelete("lease-b/c.png", "req-c", "rev-c");
+    await recordUnknownDelete("lease-b/a.png", "req-a", "rev-a");
+    const agedStartedAtMs = Date.now() - 3_600_001;
+    await runInDurableObject(stub, (_instance: NonceStore, state) => {
+      state.storage.sql.exec("UPDATE media_pending_deletes SET started_at = ?", agedStartedAtMs);
+    });
+    // b.png has no record of its own, but its acquire runs the bucket-wide sweep, so it must return both drops.
+    expect(await stub.acquireMediaKey("lease-b/b.png", "req-b", 60_000, 3_600_000)).toEqual({
+      outcome: "acquired",
+      pendingDelete: null,
+      expiredPendingDeletes: [
+        { objectKey: "lease-b/a.png", holder: "req-a", revision: "rev-a", startedAtMs: agedStartedAtMs },
+        { objectKey: "lease-b/c.png", holder: "req-c", revision: "rev-c", startedAtMs: agedStartedAtMs },
+      ],
+    });
+    await stub.finishMediaKey("lease-b/b.png", "req-b", null);
+    expect(await stub.acquireMediaKey("lease-b/a.png", "req-a2", 60_000, 3_600_000)).toEqual({
+      outcome: "acquired",
+      pendingDelete: null,
+      expiredPendingDeletes: [],
+    });
+    await stub.finishMediaKey("lease-b/a.png", "req-a2", null);
+  });
+});
+
+describe("NonceStore.countRequest (hub#222 per-site media rate limit) — real Durable Object", () => {
+  function rateStub(bucket: string) {
+    const ns = workerEnv.NONCE_STORE;
+    return ns.get(ns.idFromName(`media-rate:${bucket}`));
+  }
+
+  it("allows `limit` requests in a window, refuses the next with a retry time, and starts over in a new window", async () => {
+    const stub = rateStub("doubleyoup-media-rate-a");
+    for (let index = 0; index < 3; index += 1) {
+      expect(await stub.countRequest("doubleyoup-media-rate-a", 60_000, 3)).toEqual({ allowed: true });
+    }
+    const refused = await stub.countRequest("doubleyoup-media-rate-a", 60_000, 3);
+    expect(refused.allowed).toBe(false);
+    if (!refused.allowed) {
+      expect(refused.retryAfterMs).toBeGreaterThan(0);
+      expect(refused.retryAfterMs).toBeLessThanOrEqual(60_000);
+    }
+    // Another bucket has its own instance and its own counter.
+    expect(await rateStub("doubleyoup-media-rate-b").countRequest("doubleyoup-media-rate-b", 60_000, 3)).toEqual({ allowed: true });
+    // Move the window back, as if a minute had passed.
+    await runInDurableObject(stub, (_instance: NonceStore, state) => {
+      state.storage.sql.exec("UPDATE rate_windows SET window_start = window_start - 60000 WHERE rate_key = ?", "doubleyoup-media-rate-a");
+    });
+    expect(await stub.countRequest("doubleyoup-media-rate-a", 60_000, 3)).toEqual({ allowed: true });
+  });
+});
+
 describe("POST /actuate — single-use replay protection end-to-end (real DO)", () => {
   const r2Spy = vi.mocked(actuateProvisionR2);
   const dnsSpy = vi.mocked(actuateDnsRecordUpsert);

@@ -31,6 +31,9 @@
 #       wrangler secret put CELL_FILE_AGENT_URL        # OPTIONAL fallback (hub#43): the FILE-node cell-agent (set-r2-target). Not needed: the signed r2-site-key-install job names the site's file-node agent, and the job's pair wins
 #       wrangler secret put CELL_FILE_AGENT_TOKEN      # OPTIONAL fallback: its bearer token (set both or neither)
 #       R2_EXPECTED_ACCOUNT_ID (a var, hub#43 L7): the account id R2_PROVISION_API_TOKEN must belong to; the media ops refuse any other
+#       MEDIA_SITE_SECRET (a secret, hub#222): at least 32 characters (openssl rand -hex 32). The root of every site's media credential
+#         (POST /media/*); changing it invalidates every site's credential until media-site-credential-install runs again. The /media/*
+#         routes and the media-* ops sign R2 requests with R2_PROVISION_API_TOKEN (its S3 form), so that token must be set too.
 #       wrangler secret put CF_DNS_API_TOKEN           # Zone:DNS:Edit + Zone:Read (Direction-B dns-record-upsert) + Zone:Cache Purge (cache-purge) + Zone:Cache Rules:Edit (cache-rule-upsert) + Zone WAF:Edit (waf-rule-upsert) + Zone:SSL and Certificates:Edit (hub#46 custom-hostname-*) + Zone:Workers Routes:Edit (hub#133 worker-route-*) + Account:Workers KV Storage:Edit (hub#133 media-hostmap-*)
 #       wrangler secret put CF_CUSTOM_HOSTNAME_ZONE    # hub#46: the agency zone NAME that holds its customers' custom hostnames, e.g. example.com (a secret so a redeploy keeps it)
 #       wrangler secret put ANTHROPIC_API_KEY

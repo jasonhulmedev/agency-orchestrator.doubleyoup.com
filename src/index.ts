@@ -32,12 +32,19 @@
 //                     static external IP), gcp-router-nat-create (a Cloud Router + NAT
 //                     for private-VM egress) — each in the agency's own GCP project
 //                     with its own service-account key. Verified before any side effect.
+//   POST /media/sign-put, /media/replace, /media/delete, /media/rename
+//                   — hub#222: the SITE-FACING media API (src/media-site-api.ts). The site's
+//                     mu-plugin calls it with its per-site credential (HMAC of MEDIA_SITE_SECRET
+//                     and its bucket), not with a Direction-B signature. Delete, rename and
+//                     overwrite move the old object to trash/ first; new objects are created
+//                     once through a presigned PUT.
 //
 // NOTE on inbound auth: /validate and /complete are Phase-1 endpoints the agency
 // triggers themselves, so they are intentionally open. /actuate is the Direction-B
 // (platform → Worker) surface: it is NOT open — every request must carry a valid
 // ed25519 signature over the canonical job, verified with the agency's own public key
-// (DY_SIGNING_PUBLIC_KEY). An unverified request actuates NOTHING.
+// (DY_SIGNING_PUBLIC_KEY). An unverified request actuates NOTHING. /media/* is not open
+// either: each request carries the site's own credential, which opens that site's bucket only.
 
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Env } from "./env.js";
@@ -48,6 +55,7 @@ import { errorMessage } from "./util.js";
 import { verifyDispatch, signingPublicKey } from "./dispatch-verify.js";
 import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "./ops.js";
 import { nonceExpiresAtMs } from "./nonce-store.js";
+import { handleMediaSiteRequest, isMediaSiteAction } from "./media-site-api.js";
 import { mintSessionGateIdToken, type SessionGateMintResult } from "./session-gate/minter.js";
 
 // Re-exported so wrangler can bind the Durable Object class declared in wrangler.toml. The
@@ -271,6 +279,8 @@ async function handleActuate(request: Request, env: Env): Promise<Response> {
   return json(result, 200);
 }
 
+const MEDIA_ROUTE_PREFIX = "/media/";
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -295,6 +305,12 @@ export default {
     }
     if (method === "POST" && path === "/actuate") {
       return handleActuate(request, env);
+    }
+    if (method === "POST" && path.startsWith(MEDIA_ROUTE_PREFIX)) {
+      const action = path.slice(MEDIA_ROUTE_PREFIX.length);
+      if (isMediaSiteAction(action)) {
+        return handleMediaSiteRequest(request, env, action);
+      }
     }
 
     return json({ ok: false, error: "not found" }, 404);

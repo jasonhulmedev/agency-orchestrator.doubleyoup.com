@@ -154,6 +154,14 @@ import type {
 } from "./actuate-branded-media.js";
 import type { CfTunnelConnectionsGetResult, CfTunnelTokenGetResult, GcpInstanceMetadataDiffResult } from "./actuate-p47.js";
 import type { EdgeGateDeployResult } from "./actuate-edge-gate.js";
+import type {
+  MediaBucketProtectResult,
+  MediaBulkCredentialResult,
+  MediaRestoreResult,
+  MediaSiteCredentialInstallResult,
+  MediaSiteKeyRevokeResult,
+  MediaTrashListResult,
+} from "./actuate-media.js";
 
 export const CF_API = "https://api.cloudflare.com/client/v4";
 
@@ -870,7 +878,14 @@ export type ActuateResult =
   | MediaWorkerRouteUpsertResult
   | MediaWorkerRouteDeleteResult
   | MediaHostmapUpsertResult
-  | MediaHostmapDeleteResult;
+  | MediaHostmapDeleteResult
+  // hub#222 (actuate-media.ts): media soft delete.
+  | MediaBucketProtectResult
+  | MediaSiteCredentialInstallResult
+  | MediaSiteKeyRevokeResult
+  | MediaTrashListResult
+  | MediaRestoreResult
+  | MediaBulkCredentialResult;
 
 export interface CloudflareEnvelope {
   success?: boolean;
