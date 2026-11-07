@@ -1,0 +1,49 @@
+# Policy-as-code CI: run the repo's own semgrep rules on every PR and every push to main.
+#
+# Both steps BLOCK. The rule fixtures and the full scan are green on the dev tree, so there
+# is nothing to report-only. Do not add continue-on-error: a rule that cannot fail a PR is
+# not a policy.
+#
+# `.semgrepignore` skips `.policy-as-code/`: the rule fixtures contain violations on purpose.
+# `semgrep test` is what runs them; the scan must only look at real code.
+#
+# The job id stays `policy` and has no `name:` override. The harness waits for a check run
+# named `policy` before the security review and the merge.
+#
+# There is no `npm ci`: the two npm scripts only call the semgrep CLI, which is a Python
+# package. Node and npm are already on the ubuntu-latest runner.
+name: Policy as code
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: policy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python (semgrep ships as a Python package)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install semgrep
+        run: python -m pip install --disable-pip-version-check semgrep
+
+      - name: Semgrep rule unit tests
+        run: npm run semgrep:test
+
+      - name: Semgrep scan with the repo's own rules
+        run: npm run semgrep:policy

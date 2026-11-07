@@ -11,6 +11,8 @@
     "tail": "wrangler tail",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "semgrep:test": "semgrep test .policy-as-code/.semgrep",
+    "semgrep:policy": "semgrep scan --config .policy-as-code/.semgrep --error --metrics=off",
     "embed-session-gate": "node scripts/embed-session-gate.mjs",
     "proof:media": "node scripts/proof-media.mjs"
   },
