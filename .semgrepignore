@@ -1,0 +1,21 @@
+# Paths semgrep must not scan.
+#
+# A .semgrepignore file REPLACES semgrep's built-in default list, so the common
+# entries are repeated here on purpose.
+
+# Dependencies and build output
+node_modules/
+dist/
+build/
+.wrangler/
+
+# Policy-as-code sources, including semgrep's deliberately-broken test fixtures.
+# `semgrep test` runs the fixtures; `semgrep scan` must not report them as violations.
+.policy-as-code/
+
+# Lockfile
+package-lock.json
+
+# Semgrep's own defaults worth keeping
+.git/
+.venv/
