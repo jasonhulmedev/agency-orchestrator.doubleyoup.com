@@ -21,6 +21,11 @@
 # The same commands run locally: `npm run semgrep:test`, `npm run semgrep:policy`,
 # `npm run conftest:test` and `npm run conftest`.
 #
+# `.semgrepignore` skips `.policy-as-code/`: the semgrep rule fixtures contain violations on
+# purpose. `semgrep test` is what runs them; the scan must only look at real code. The conftest
+# policies need no such exclusion — their fixtures live in `_test.rego` files, which `conftest
+# test` evaluates as tests and never as input documents.
+#
 # There is no `npm ci`: the four npm scripts only call the semgrep and conftest CLIs. Node and
 # npm are already on the ubuntu-latest runner, and @doubleyoup/contracts is a private git
 # dependency this job has no reason to fetch.
