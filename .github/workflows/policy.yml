@@ -1,17 +1,29 @@
-# Policy-as-code CI: run the repo's own semgrep rules on every PR and every push to main.
+# Policy-as-code CI: run this repo's semgrep rules and conftest policies on every PR and every
+# push to main.
 #
-# Both steps BLOCK. The rule fixtures and the full scan are green on the dev tree, so there
-# is nothing to report-only. Do not add continue-on-error: a rule that cannot fail a PR is
-# not a policy.
+# Every policy step BLOCKS:
+#   * semgrep rule unit tests          — the rules match what their fixtures say they match
+#   * semgrep scan with the repo's own rules (.policy-as-code/.semgrep), `--error`
+#   * conftest Rego unit tests         — the config policies likewise
+#   * conftest policies vs real files  — 0 denials (a `warn` is advisory)
+# Do not add `continue-on-error`: a rule that cannot fail a PR is only a suggestion. A real
+# exception takes a `nosemgrep: <rule id>` comment with the reason on the matched line.
 #
-# `.semgrepignore` skips `.policy-as-code/`: the rule fixtures contain violations on purpose.
-# `semgrep test` is what runs them; the scan must only look at real code.
+# The job id is `policy` and it has no `name:` override on purpose. The harness waits for the
+# check run named `policy` before the security review and the merge.
 #
-# The job id stays `policy` and has no `name:` override. The harness waits for a check run
-# named `policy` before the security review and the merge.
+# Supply chain (rule dy-workflow-unpinned-supply-chain, from the security review of infra#160):
+# every action is pinned to a full commit SHA with the tag in a comment, semgrep is installed at
+# an exact version, and conftest is downloaded at a pinned version and checksum-verified. A
+# moving version is an unreviewed change to what "passing" means. `--metrics=off` keeps the scan
+# from reporting to semgrep.
 #
-# There is no `npm ci`: the two npm scripts only call the semgrep CLI, which is a Python
-# package. Node and npm are already on the ubuntu-latest runner.
+# The same commands run locally: `npm run semgrep:test`, `npm run semgrep:policy`,
+# `npm run conftest:test` and `npm run conftest`.
+#
+# There is no `npm ci`: the four npm scripts only call the semgrep and conftest CLIs. Node and
+# npm are already on the ubuntu-latest runner, and @doubleyoup/contracts is a private git
+# dependency this job has no reason to fetch.
 name: Policy as code
 
 on:
@@ -30,20 +42,42 @@ concurrency:
 jobs:
   policy:
     runs-on: ubuntu-latest
+    env:
+      CONFTEST_VERSION: "0.69.0"
+      # From the release's own checksums.txt for conftest_0.69.0_Linux_x86_64.tar.gz.
+      CONFTEST_SHA256: "96fc2fbf11f0afde51256647127e6f00a64ce839a4d9a0a1aef2426c0e6f4b3f"
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python (semgrep ships as a Python package)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
       - name: Install semgrep
-        run: python -m pip install --disable-pip-version-check semgrep
+        run: python -m pip install --disable-pip-version-check semgrep==1.183.0
 
-      - name: Semgrep rule unit tests
+      - name: Install conftest (pinned + checksum-verified)
+        run: |
+          set -euo pipefail
+          url="https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+          curl -sSfL -o conftest.tar.gz "$url"
+          echo "${CONFTEST_SHA256}  conftest.tar.gz" | sha256sum --check --status \
+            || { echo "::error::conftest tarball checksum mismatch — refusing to run an unverified binary."; exit 1; }
+          tar -xzf conftest.tar.gz conftest
+          install -m 0755 conftest /usr/local/bin/conftest
+          rm -f conftest conftest.tar.gz
+          conftest --version
+
+      - name: Semgrep rule tests
         run: npm run semgrep:test
 
-      - name: Semgrep scan with the repo's own rules
+      - name: Semgrep scan
         run: npm run semgrep:policy
+
+      - name: Conftest policy unit tests
+        run: npm run conftest:test
+
+      - name: Conftest policies against the workflows
+        run: npm run conftest
