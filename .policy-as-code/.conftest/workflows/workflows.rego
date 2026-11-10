@@ -52,48 +52,72 @@ trigger_names contains name if {
 # A run script that interpolates attacker-influenced context is a shell-injection sink: the
 # value is pasted into the script before the shell sees it. Passing it through `env:` and
 # referencing "$VAR" is the safe form, which is what deploy.yml already does for the repository
-# name. `github.sha` is deliberately not in this set — it is a 40-character hex id, not text a
-# contributor can author.
+# name.
 #
-# Bracket notation (`github['event']['pull_request']['title']`) reads the same value as dot
-# notation, and a function wrapper (`toJSON(github.event)`, `format('{0}', github.event.body)`)
-# passes it on just as directly. All of these are the same sink, so the pattern allows anything
-# between `${{` and the reference and accepts either notation. Requiring the literal prefix
-# `github.event` right after `${{` would be a bypass that any PR could write by hand.
+# This is an ALLOWLIST, not a blocklist. Earlier versions looked for the spellings of
+# `github.event` and `github.head_ref` (dot, bracket, wrapped in a function, upper case, ...),
+# and each fix left the next spelling open: `toJSON(github)` dumps the whole context including
+# the pull request title, `github.*.pull_request.title` filters it out of the context, and
+# `github[format('{0}', 'event')]` builds the property name at run time. So the rule works the
+# other way round: inside a `${{ }}` expression of a `run:` script, every reference to the
+# `github` context must be `github.<property>` where <property> is on the list below. Anything
+# else (a bare `github`, `github.*`, `github[...]`, or an unlisted property) is denied. Passing
+# the value through `env:` stays allowed because only `run:` scripts are inspected.
 #
-# The `(?i)` flag on the assembled pattern matters for the same reason: GitHub resolves expression
-# context and property names case-insensitively, so `${{ GITHUB.EVENT.pull_request.title }}` reads
-# exactly the attacker-authored title that the lowercase spelling does. A case-sensitive pattern
-# would be a bypass that any PR could write by holding down the shift key.
+# The list holds only properties whose value a contributor cannot author. `ref`, `ref_name` and
+# `head_ref` are not on it: a branch name can carry shell syntax. `github.sha` is a 40-character
+# hex id. `actor` is a login name (letters, digits, hyphens). `event_name` is one of GitHub's
+# fixed trigger names, unlike `github.event`, which holds the payload.
+safe_github_properties := {
+	"sha",
+	"repository",
+	"repository_owner",
+	"run_id",
+	"run_number",
+	"run_attempt",
+	"actor",
+	"event_name",
+	"workflow",
+	"job",
+	"server_url",
+}
 
-# A reference to an injectable context, in dot or in bracket notation. Case is folded by the flag
-# on the assembled pattern below.
-injectable_context_reference := `github\s*(\.\s*|\[\s*['"]\s*)(event|head_ref)`
+# A single-quoted expression string. `''` is the only escape GitHub knows for a quote inside the
+# string; a backslash is an ordinary character. The string may span lines, as GitHub allows.
+quoted_expression_string := `'(?:''|[^'])*'`
 
-# A single-quoted expression string, consumed whole. `''` is the escape for one quote inside the
-# string and `\[^\n]` allows the backslash form; either way the run of characters between the two
-# outer quotes is opaque.
-#
-# The string cannot cross a newline. A `run:` block is usually multi-line, and prose on one line
-# often carries an apostrophe (`don't`, `it's`). Without the `\n` exclusion, two such apostrophes on
-# different lines would pair up into one quoted string, and any `}}` between them would stop
-# terminating an expression — which then reports a real injection as absent. Restricting the string
-# to one line keeps those apostrophes separate, and matches how a shell heredoc reads them anyway.
-quoted_expression_string := `'(?:''|[^'\\\n]|\\[^\n])*'`
+# One `${{ ... }}` expression. Outside a quoted string the body cannot contain a quote or a
+# doubled `}}`, so a `}}` inside a quoted string (`format('}}{0}', ...)`) does not end the
+# expression, which matches how GitHub reads it. A lone `}` is allowed (`format('{0}', ...)`
+# keeps its brace inside the string anyway). An expression with an unbalanced quote does not
+# match; GitHub rejects such a workflow when it parses it, so it never runs.
+expression_pattern := sprintf(`(?s)\$\{\{(?:[^}']|\}[^}']|%s)*\}\}`, [quoted_expression_string])
 
-# The body of a `${{ ... }}` expression, up to the `}}` that closes it. A single `}` is allowed
-# because a wrapper such as `format('{0}', ...)` puts one between `${{` and the reference; only the
-# doubled `}}` ends the expression.
-#
-# A quoted string is consumed by the third branch before the other two can see its characters, so a
-# `}}` inside quotes does not end the expression — which is what GitHub does too. Without that
-# branch, `${{ format('}}{0}', github.event.pull_request.title) }}` stops the body at the quoted
-# `}}` and the reference past it goes unreported, while GitHub still substitutes the attacker's
-# title into the shell. A `}}` outside a quoted string still cannot be crossed, so a mention of
-# `github.event` in the text after a closed expression is not a finding.
-expression_body := sprintf(`(?:[^}]|\}[^}]|%s)*`, [quoted_expression_string])
+# A reference to the `github` context, as one of three shapes: `github.<property>`, `github[`, or
+# a `github` with anything else after it (a bare `github`, as in `toJSON(github)`). Only the first
+# shape can be safe, and only for a listed property; `github.*` has `*` as its "property", which no
+# list entry matches. Case is folded because GitHub resolves context and property names
+# case-insensitively. The word must not be the tail of a longer path (`steps.github.outputs`), so
+# the match takes one leading character that is not part of a name; Go regexp has no lookbehind.
+github_reference_pattern := `(?i)(?:^|[^a-z0-9_.-])github(?:\s*\.\s*[a-z0-9_*-]+|\s*\[|[^a-z0-9_]|$)`
 
-injectable_context_pattern := sprintf(`(?i)\$\{\{%s%s`, [expression_body, injectable_context_reference])
+github_property_pattern := `(?i)^[^a-z0-9_.-]?github\s*\.\s*([a-z0-9_-]+)$`
+
+is_safe_github_reference(reference) if {
+	matches := regex.find_all_string_submatch_n(github_property_pattern, reference, 1)
+	property := lower(matches[0][1])
+	property in safe_github_properties
+}
+
+script_reads_unsafe_github_context(script) if {
+	some expression in regex.find_n(expression_pattern, script, -1)
+
+	# Text inside a quoted string is data, not a reference. Blank it so `'github.com'` is not a
+	# finding, while `github['event']` still leaves a bare `github` behind.
+	code_only := regex.replace(expression, quoted_expression_string, "''")
+	some reference in regex.find_n(github_reference_pattern, code_only, -1)
+	not is_safe_github_reference(reference)
+}
 
 deny contains msg if {
 	"pull_request_target" in trigger_names
@@ -110,8 +134,8 @@ deny contains msg if {
 deny contains msg if {
 	some job_name, job in input.jobs
 	some step in job.steps
-	regex.match(injectable_context_pattern, step.run)
-	msg := sprintf("Workflow job %q has a `run:` script that interpolates a github.event or github.head_ref value directly, in dot or bracket notation. That is a shell-injection sink: pass it through `env:` and reference it as a shell variable instead.", [job_name])
+	script_reads_unsafe_github_context(step.run)
+	msg := sprintf("Workflow job %q has a `run:` script whose ${{ }} expression reads the github context beyond a short allowlist of safe properties (sha, repository, run_id, actor, ...). github.event, github.head_ref, github.ref_name, toJSON(github) and github[...] can carry text a contributor wrote, so this is a shell-injection sink: pass the value through `env:` and reference it as a shell variable instead.", [job_name])
 }
 
 # GCP auth here is keyless Workload Identity Federation (deploy.yml, docs/DEPLOY-ON-MERGE.md).

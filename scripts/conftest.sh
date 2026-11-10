@@ -72,7 +72,27 @@ else
   # that is not pinned to a commit SHA — and a workflow nobody remembered to list here is
   # exactly the one that would carry it. Globbed so a new workflow is covered the day it is
   # added.
-  run_policy_dir "$POLICY_ROOT/workflows" .github/workflows/*.yml "$@"
+  #
+  # GitHub runs both `.yml` and `.yaml` files in this folder, so both are collected. A glob that
+  # matches nothing stays a literal pattern in POSIX sh, and conftest would fail on that missing
+  # path, so a pattern is only kept when it names a real file.
+  workflow_files=""
+  for workflow_file in .github/workflows/*.yml .github/workflows/*.yaml; do
+    if [ ! -f "$workflow_file" ]; then
+      continue
+    fi
+    workflow_files="$workflow_files $workflow_file"
+  done
+
+  if [ -z "$workflow_files" ]; then
+    echo "No workflow files found in .github/workflows." >&2
+    exit 1
+  fi
+
+  # The file names come from a glob of the repo's own workflow folder; word splitting here is
+  # intended and a name with a space is not a valid workflow name in this repo.
+  # shellcheck disable=SC2086
+  run_policy_dir "$POLICY_ROOT/workflows" $workflow_files "$@"
 fi
 
 exit "$WORST_STATUS"

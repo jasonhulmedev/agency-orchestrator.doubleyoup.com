@@ -247,16 +247,6 @@ test_denies_github_event_after_a_quoted_double_brace_with_a_doubled_quote if {
 	contains(msg, "shell-injection sink")
 }
 
-test_denies_github_event_after_a_quoted_double_brace_with_a_backslash_escape if {
-	injected := {"jobs": {"deploy": {
-		"permissions": {"contents": "read"},
-		"steps": [{"run": "echo \"${{ format('a\\'}}b{0}', github.event.issue.body) }}\""}],
-	}}}
-	msgs := deny with input as injected
-	some msg in msgs
-	contains(msg, "shell-injection sink")
-}
-
 test_denies_uppercase_github_event_after_a_quoted_double_brace if {
 	injected := {"jobs": {"deploy": {
 		"permissions": {"contents": "read"},
@@ -299,7 +289,9 @@ test_allows_a_github_event_mention_in_the_shell_text_after_a_closed_expression i
 # A multi-line `run:` script often carries prose apostrophes (`don't`, `it's`). If a quoted string
 # could cross a newline, the apostrophe on the earlier line would pair with the one on the later
 # line, the `}}` between them would stop terminating an expression, and the real injection past it
-# would go unreported. The newline exclusion in the pattern keeps the two separate.
+# would go unreported. The expression pattern only starts at `${{`, so the apostrophe in shell text
+# is never read, and the unbalanced one inside the first expression leaves that expression
+# unmatched (GitHub rejects such a workflow) without hiding the second.
 test_denies_github_event_after_an_apostrophe_on_an_earlier_line_of_the_script if {
 	injected := {"jobs": {"deploy": {
 		"permissions": {"contents": "read"},
@@ -360,4 +352,83 @@ test_canary_fires_when_there_are_no_jobs if {
 	msgs := deny with input as {"name": "Deploy on merge"}
 	some msg in msgs
 	contains(msg, "policy is inert")
+}
+
+# The `github` context root. The policy allowlists safe properties rather than listing the unsafe
+# spellings, so each way of reaching the attacker's text is denied without being named.
+test_denies_tojson_of_the_whole_github_context if {
+	injected := {"jobs": {"debug": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo '${{ toJSON(github) }}'"}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
+test_denies_the_object_filter_over_the_github_context if {
+	injected := {"jobs": {"debug": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo \"${{ join(github.*.pull_request.title, '') }}\""}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
+test_denies_a_computed_index_into_the_github_context if {
+	injected := {"jobs": {"debug": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo \"${{ github[format('{0}', 'event')].pull_request.title }}\""}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
+test_denies_a_branch_name_property_of_the_github_context if {
+	injected := {"jobs": {"build": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "git checkout ${{ github.ref_name }}"}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
+test_denies_the_github_context_in_a_second_expression_of_the_same_script if {
+	injected := {"jobs": {"build": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo ${{ github.sha }} ${{ toJSON(github) }}"}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
+test_allows_safe_github_properties_in_a_run_script if {
+	safe := {"jobs": {"build": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo ${{ github.sha }} ${{ github.repository }} ${{ github.run_id }} ${{ github.event_name }} ${{ GITHUB.ACTOR }}"}],
+	}}}
+	count(deny) == 0 with input as safe
+}
+
+test_allows_a_github_word_inside_a_quoted_string_or_another_context if {
+	safe := {"jobs": {"build": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo ${{ format('{0} github.com', steps.github.outputs.name) }}"}],
+	}}}
+	count(deny) == 0 with input as safe
+}
+
+test_allows_the_github_context_passed_through_env_with_tojson if {
+	safe := {"jobs": {"debug": {
+		"permissions": {"contents": "read"},
+		"steps": [{
+			"env": {"CONTEXT": "${{ toJSON(github) }}"},
+			"run": "echo \"$CONTEXT\"",
+		}],
+	}}}
+	count(deny) == 0 with input as safe
 }
