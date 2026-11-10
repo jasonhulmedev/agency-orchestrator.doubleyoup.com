@@ -3,10 +3,9 @@
 # model shape, which this repo does not have yet. The message is still the right advice: a
 # workflow job that needs to reach a cloud declares the minimum scopes it needs and no more.
 #
-# The trigger block does NOT arrive under the key "on". The YAML parser resolves the bare word
-# `on` to the boolean true, so it lands under the key "true" — confirmed with
-# `conftest parse .github/workflows/policy.yml`. Read triggers through the helper below rather
-# than reaching for input.on, which is always undefined.
+# The trigger block arrives under one of two keys, depending on how the workflow author quoted it.
+# Read triggers through the helpers below, which cover both keys and all three value shapes, rather
+# than reaching for input.on or input["true"] directly.
 #
 # WHY IT MATTERS. A workflow's token scopes and the values it pastes into a shell are the
 # security story of the workflow. Every agency forks this repo, so a workflow here is the same
@@ -17,16 +16,37 @@ package main
 
 import rego.v1
 
-triggers := object.get(input, "true", {})
+# The YAML parser resolves the bare word `on` to the boolean true, so an unquoted `on:` lands under
+# the key "true", while a quoted `"on":` keeps the string key "on". Both spellings are valid
+# workflow YAML — confirmed with `conftest parse` on both forms, and on the other YAML boolean
+# spellings (`On:`, `ON:`, `yes:`), which also resolve to "true". A policy that read only one key
+# would be a bypass rather than a gate.
+trigger_keys := {"true", "on"}
 
-# `on:` accepts a map (on: {push: {...}}) or a sequence (on: [push]); cover both.
+trigger_block(key) := object.get(input, key, {})
+
+# `on:` accepts a map (on: {push: {...}}), a sequence (on: [push]) or a bare scalar
+# (on: pull_request_target); cover all three.
 trigger_names contains name if {
-	some name, _ in triggers
+	some key in trigger_keys
+	block := trigger_block(key)
+	is_object(block)
+	some name, _ in block
 }
 
 trigger_names contains name if {
-	some name in triggers
+	some key in trigger_keys
+	block := trigger_block(key)
+	is_array(block)
+	some name in block
 	is_string(name)
+}
+
+trigger_names contains name if {
+	some key in trigger_keys
+	block := trigger_block(key)
+	is_string(block)
+	name := block
 }
 
 # A run script that interpolates attacker-influenced context is a shell-injection sink: the
@@ -34,7 +54,22 @@ trigger_names contains name if {
 # referencing "$VAR" is the safe form, which is what deploy.yml already does for the repository
 # name. `github.sha` is deliberately not in this set — it is a 40-character hex id, not text a
 # contributor can author.
-injectable_context_pattern := `\$\{\{\s*github\.(event|head_ref)`
+#
+# Bracket notation (`github['event']['pull_request']['title']`) reads the same value as dot
+# notation, and a function wrapper (`toJSON(github.event)`, `format('{0}', github.event.body)`)
+# passes it on just as directly. All of these are the same sink, so the pattern allows anything
+# between `${{` and the reference and accepts either notation. Requiring the literal prefix
+# `github.event` right after `${{` would be a bypass that any PR could write by hand.
+
+# A reference to an injectable context, in dot or in bracket notation.
+injectable_context_reference := `github\s*(\.\s*|\[\s*['"]\s*)(event|head_ref)`
+
+# The body of a `${{ ... }}` expression, up to the `}}` that closes it. A single `}` is allowed
+# because a wrapper such as `format('{0}', ...)` puts one between `${{` and the reference; only the
+# doubled `}}` ends the expression.
+expression_body := `(?:[^}]|\}[^}])*`
+
+injectable_context_pattern := sprintf(`\$\{\{%s%s`, [expression_body, injectable_context_reference])
 
 deny contains msg if {
 	"pull_request_target" in trigger_names
@@ -52,7 +87,7 @@ deny contains msg if {
 	some job_name, job in input.jobs
 	some step in job.steps
 	regex.match(injectable_context_pattern, step.run)
-	msg := sprintf("Workflow job %q has a `run:` script that interpolates a github.event value directly. That is a shell-injection sink: pass it through `env:` and reference it as a shell variable instead.", [job_name])
+	msg := sprintf("Workflow job %q has a `run:` script that interpolates a github.event or github.head_ref value directly, in dot or bracket notation. That is a shell-injection sink: pass it through `env:` and reference it as a shell variable instead.", [job_name])
 }
 
 # GCP auth here is keyless Workload Identity Federation (deploy.yml, docs/DEPLOY-ON-MERGE.md).
