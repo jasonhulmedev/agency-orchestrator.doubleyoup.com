@@ -60,16 +60,40 @@ trigger_names contains name if {
 # passes it on just as directly. All of these are the same sink, so the pattern allows anything
 # between `${{` and the reference and accepts either notation. Requiring the literal prefix
 # `github.event` right after `${{` would be a bypass that any PR could write by hand.
+#
+# The `(?i)` flag on the assembled pattern matters for the same reason: GitHub resolves expression
+# context and property names case-insensitively, so `${{ GITHUB.EVENT.pull_request.title }}` reads
+# exactly the attacker-authored title that the lowercase spelling does. A case-sensitive pattern
+# would be a bypass that any PR could write by holding down the shift key.
 
-# A reference to an injectable context, in dot or in bracket notation.
+# A reference to an injectable context, in dot or in bracket notation. Case is folded by the flag
+# on the assembled pattern below.
 injectable_context_reference := `github\s*(\.\s*|\[\s*['"]\s*)(event|head_ref)`
+
+# A single-quoted expression string, consumed whole. `''` is the escape for one quote inside the
+# string and `\[^\n]` allows the backslash form; either way the run of characters between the two
+# outer quotes is opaque.
+#
+# The string cannot cross a newline. A `run:` block is usually multi-line, and prose on one line
+# often carries an apostrophe (`don't`, `it's`). Without the `\n` exclusion, two such apostrophes on
+# different lines would pair up into one quoted string, and any `}}` between them would stop
+# terminating an expression — which then reports a real injection as absent. Restricting the string
+# to one line keeps those apostrophes separate, and matches how a shell heredoc reads them anyway.
+quoted_expression_string := `'(?:''|[^'\\\n]|\\[^\n])*'`
 
 # The body of a `${{ ... }}` expression, up to the `}}` that closes it. A single `}` is allowed
 # because a wrapper such as `format('{0}', ...)` puts one between `${{` and the reference; only the
 # doubled `}}` ends the expression.
-expression_body := `(?:[^}]|\}[^}])*`
+#
+# A quoted string is consumed by the third branch before the other two can see its characters, so a
+# `}}` inside quotes does not end the expression — which is what GitHub does too. Without that
+# branch, `${{ format('}}{0}', github.event.pull_request.title) }}` stops the body at the quoted
+# `}}` and the reference past it goes unreported, while GitHub still substitutes the attacker's
+# title into the shell. A `}}` outside a quoted string still cannot be crossed, so a mention of
+# `github.event` in the text after a closed expression is not a finding.
+expression_body := sprintf(`(?:[^}]|\}[^}]|%s)*`, [quoted_expression_string])
 
-injectable_context_pattern := sprintf(`\$\{\{%s%s`, [expression_body, injectable_context_reference])
+injectable_context_pattern := sprintf(`(?i)\$\{\{%s%s`, [expression_body, injectable_context_reference])
 
 deny contains msg if {
 	"pull_request_target" in trigger_names

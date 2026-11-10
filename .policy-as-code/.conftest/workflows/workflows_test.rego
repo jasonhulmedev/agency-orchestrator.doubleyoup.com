@@ -171,12 +171,143 @@ test_denies_github_event_inside_a_format_wrapper if {
 	contains(msg, "shell-injection sink")
 }
 
+# GitHub resolves context and property names case-insensitively, so an uppercase spelling reaches
+# the same attacker-authored value as the lowercase one.
+test_denies_uppercase_github_event_interpolated_into_a_run_script if {
+	injected := {"jobs": {"build": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo \"${{ GITHUB.EVENT.pull_request.title }}\""}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
+test_denies_mixed_case_github_event_interpolated_into_a_run_script if {
+	injected := {"jobs": {"build": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo \"${{ GitHub.Event.pull_request.title }}\""}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
+test_denies_uppercase_github_event_in_bracket_notation if {
+	injected := {"jobs": {"build": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo \"${{ GITHUB['EVENT']['pull_request']['title'] }}\""}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
+test_denies_uppercase_github_head_ref_interpolated_into_a_run_script if {
+	injected := {"jobs": {"build": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "git checkout ${{ GITHUB.HEAD_REF }}"}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
+test_denies_uppercase_github_event_inside_a_function_wrapper if {
+	injected := {"jobs": {"build": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo \"${{ toJSON(GITHUB.EVENT.pull_request.title) }}\""}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
+# A `}}` inside a quoted expression string does not end the expression, so the reference past it is
+# still substituted by GitHub and has to be a finding here too.
+test_denies_github_event_after_a_quoted_double_brace_in_the_format_pattern if {
+	injected := {"jobs": {"deploy": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo \"${{ format('}}{0}', github.event.pull_request.title) }}\""}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
+# The doubled quote is the expression language's own escape for one literal quote, so it does not
+# close the string either.
+test_denies_github_event_after_a_quoted_double_brace_with_a_doubled_quote if {
+	injected := {"jobs": {"deploy": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo \"${{ format('it''s }}{0}', github.event.issue.body) }}\""}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
+test_denies_github_event_after_a_quoted_double_brace_with_a_backslash_escape if {
+	injected := {"jobs": {"deploy": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo \"${{ format('a\\'}}b{0}', github.event.issue.body) }}\""}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
+test_denies_uppercase_github_event_after_a_quoted_double_brace if {
+	injected := {"jobs": {"deploy": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo \"${{ format('}}{0}', GITHUB.EVENT.pull_request.title) }}\""}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
+}
+
 test_allows_a_run_script_that_mentions_github_event_only_in_a_variable_name if {
 	safe := {"jobs": {"build": {
 		"permissions": {"contents": "read"},
 		"steps": [{"run": "echo \"${{ steps.build.outputs.github_event_summary }}\""}],
 	}}}
 	count(deny) == 0 with input as safe
+}
+
+# The case-insensitive match folds the context name only, not the whole script, so an uppercase
+# output name that merely contains the words is still safe.
+test_allows_an_uppercase_output_name_that_mentions_github_event if {
+	safe := {"jobs": {"build": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo \"${{ steps.build.outputs.GITHUB_EVENT_SUMMARY }}\""}],
+	}}}
+	count(deny) == 0 with input as safe
+}
+
+# The quoted-string branch has to stop at the `}}` that really closes the expression, otherwise a
+# mention of github.event in the shell text after a closed expression would be reported as an
+# interpolation of it.
+test_allows_a_github_event_mention_in_the_shell_text_after_a_closed_expression if {
+	safe := {"jobs": {"build": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo \"${{ github.sha }}\" # don't interpolate github.event.title here"}],
+	}}}
+	count(deny) == 0 with input as safe
+}
+
+# A multi-line `run:` script often carries prose apostrophes (`don't`, `it's`). If a quoted string
+# could cross a newline, the apostrophe on the earlier line would pair with the one on the later
+# line, the `}}` between them would stop terminating an expression, and the real injection past it
+# would go unreported. The newline exclusion in the pattern keeps the two separate.
+test_denies_github_event_after_an_apostrophe_on_an_earlier_line_of_the_script if {
+	injected := {"jobs": {"deploy": {
+		"permissions": {"contents": "read"},
+		"steps": [{"run": "echo \"${{ steps.a.outputs.don't }}\"\necho \"${{ github.event.pull_request.title }}\""}],
+	}}}
+	msgs := deny with input as injected
+	some msg in msgs
+	contains(msg, "shell-injection sink")
 }
 
 test_allows_github_event_passed_through_env if {
