@@ -103,13 +103,16 @@ describe("session gate under workerd", () => {
     expect(forwarded.headers.get("cookie")).toBeNull();
   });
 
-  it("answers a staging- or pma- GET with a verified ?token= with the token-strip page: its CSP hash, its cookie, no fetch", async () => {
+  it("answers a staging-, dev<N>- or pma- GET with a verified ?token= with the token-strip page: its CSP hash, its cookie, no fetch", async () => {
     const minter = { mintIdToken: vi.fn(async () => ({ ok: false, reason: "unavailable" })) };
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
       throw new Error("no origin fetch is allowed in this test");
     });
     for (const [prefix, purpose] of [
       ["staging", "staging"],
+      ["dev1", "staging"],
+      ["dev2", "staging"],
+      ["dev3", "staging"],
       ["pma", "pma"],
     ]) {
       const host = `${prefix}-docs-892769.doubleyoup.com`;
@@ -159,8 +162,8 @@ describe("SessionGateMinter over workerd RPC", () => {
     expect(await minterBinding.mintIdToken(`https://term-x${RUN_URL_SUFFIX}`)).toEqual({ ok: false, reason: "unavailable" });
   });
 
-  it("refuses a call with NO caller proof for pma-, spma- and staging- (the transition rule), and lets term- and sterm- through it", async () => {
-    for (const prefix of ["pma", "spma", "staging"]) {
+  it("refuses a call with NO caller proof for pma-, spma-, staging- and dev<N>- (the transition rule), and lets term- and sterm- through it", async () => {
+    for (const prefix of ["pma", "spma", "staging", "dev1", "dev2", "dev3"]) {
       expect(await minterBinding.mintIdToken(`https://${prefix}-x${RUN_URL_SUFFIX}`), prefix).toEqual({ ok: false, reason: "caller-refused" });
     }
     // term- and sterm- pass the caller check without a proof; this Worker then has no key to mint with.

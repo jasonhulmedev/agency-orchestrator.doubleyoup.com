@@ -299,7 +299,7 @@ describe("edge-gate-deploy helpers", () => {
   });
 
   it("sessionGateVersionOf reads the marker of the FIRST line only", () => {
-    expect(sessionGateVersionOf(SESSION_GATE_SOURCE)).toBe(2);
+    expect(sessionGateVersionOf(SESSION_GATE_SOURCE)).toBe(3);
     expect(sessionGateVersionOf("// dy-session-gate v12\nexport default {}")).toBe(12);
     expect(sessionGateVersionOf("// dy-session-gate v3")).toBe(3);
     expect(sessionGateVersionOf("// dy-session-gate v3\r\nx")).toBe(3);
@@ -323,7 +323,7 @@ describe("actuateEdgeGateDeploy", () => {
       op: "edge-gate-deploy",
       script: GATE_SCRIPT,
       status: "created",
-      gateVersion: 2,
+      gateVersion: 3,
       keyVersion: 1,
       keyFingerprint: fingerprint,
       runUrlSuffix: `-${PROJECT_NUMBER}.${REGION}.run.app`,
@@ -424,7 +424,7 @@ describe("actuateEdgeGateDeploy", () => {
   });
 
   it("refuses a DOWNGRADE: a deployed gate with a higher marker version is never overwritten", async () => {
-    for (const version of [3, 99]) {
+    for (const version of [4, 99]) {
       const { calls } = fakeCloudflare({
         scripts: { [WORKER_NAME]: minterWorkerScript(), [GATE_SCRIPT]: await convergedGateScript({ source: `// dy-session-gate v${version}\nexport default {}` }) },
       });
@@ -434,7 +434,7 @@ describe("actuateEdgeGateDeploy", () => {
         op: "edge-gate-deploy",
         script: GATE_SCRIPT,
         detail:
-          `the deployed "${GATE_SCRIPT}" is session gate v${version}, newer than this Worker's v2: this fork is older than the deployed gate, ` +
+          `the deployed "${GATE_SCRIPT}" is session gate v${version}, newer than this Worker's v3: this fork is older than the deployed gate, ` +
           "so it does not overwrite it. Sync the fork, then deploy again.",
       });
       expect(calls.filter((call) => call.method !== "GET")).toHaveLength(0);
@@ -586,12 +586,12 @@ describe("actuateEdgeGateDeploy", () => {
     expectNoSecretIn(result);
   });
 
-  it("updates a deployed v1 gate to v2: the v2 source, the eight bindings, and gateVersion 2", async () => {
+  it("updates a deployed v1 gate to v3: the v3 source, the eight bindings, and gateVersion 3", async () => {
     // A v1 gate as Phase 3 left it: another source (v1), six bindings, no caller key.
     const v1Gate: FakeScript = { format: "module", source: "// dy-session-gate v1\nexport default {}", bindings: await reportedV1GateBindings(SECRET_V1) };
     const { calls } = fakeCloudflare({ scripts: { [WORKER_NAME]: minterWorkerScript(), [GATE_SCRIPT]: v1Gate } });
     const result = await actuateEdgeGateDeploy(PARAMS, envWith());
-    expect(result).toMatchObject({ ok: true, status: "updated", gateVersion: 2, keyVersion: 1, keyFingerprint: await sessionKeyFingerprint(SECRET_V1) });
+    expect(result).toMatchObject({ ok: true, status: "updated", gateVersion: 3, keyVersion: 1, keyFingerprint: await sessionKeyFingerprint(SECRET_V1) });
     expectNoSecretIn(result);
     const puts = calls.filter((call) => call.method === "PUT");
     expect(puts).toHaveLength(1);
@@ -609,10 +609,23 @@ describe("actuateEdgeGateDeploy", () => {
     ]);
   });
 
+  it("updates a deployed v2 gate to v3 with the dev-branch prefixes", async () => {
+    const existingGate = await convergedGateScript();
+    existingGate.source = "// dy-session-gate v2\nexport default {}";
+    const { calls } = fakeCloudflare({ scripts: { [WORKER_NAME]: minterWorkerScript(), [GATE_SCRIPT]: existingGate } });
+
+    const result = await actuateEdgeGateDeploy(PARAMS, envWith());
+
+    expect(result).toMatchObject({ ok: true, status: "updated", gateVersion: 3 });
+    const puts = calls.filter((call) => call.method === "PUT");
+    expect(puts).toHaveLength(1);
+    expect((puts[0] as RecordedCall).moduleSource).toBe(SESSION_GATE_SOURCE);
+  });
+
   it("is unchanged only when the caller key fingerprint matches too; another fingerprint or no caller key is updated", async () => {
     const converged = await convergedGateScript();
     const unchanged = fakeCloudflare({ scripts: { [WORKER_NAME]: minterWorkerScript(), [GATE_SCRIPT]: converged } });
-    expect(await actuateEdgeGateDeploy(PARAMS, envWith())).toMatchObject({ ok: true, status: "unchanged", gateVersion: 2 });
+    expect(await actuateEdgeGateDeploy(PARAMS, envWith())).toMatchObject({ ok: true, status: "unchanged", gateVersion: 3 });
     expect(unchanged.calls.filter((call) => call.method !== "GET")).toHaveLength(0);
     vi.unstubAllGlobals();
 
@@ -627,7 +640,7 @@ describe("actuateEdgeGateDeploy", () => {
     for (const testCase of cases) {
       const { calls } = fakeCloudflare({ scripts: { [WORKER_NAME]: minterWorkerScript(), [GATE_SCRIPT]: testCase.existing } });
       const result = await actuateEdgeGateDeploy(PARAMS, testCase.env);
-      expect(result, testCase.name).toMatchObject({ ok: true, status: "updated", gateVersion: 2 });
+      expect(result, testCase.name).toMatchObject({ ok: true, status: "updated", gateVersion: 3 });
       const puts = calls.filter((call) => call.method === "PUT");
       expect(puts, testCase.name).toHaveLength(1);
       const sentBindings = (puts[0] as RecordedCall).metadata?.bindings as Array<Record<string, unknown>>;
