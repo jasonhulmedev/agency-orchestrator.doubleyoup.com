@@ -68,6 +68,7 @@ import {
   SESSION_IMAGE_NAMES,
   siteSessionNfsPathsFor,
   siteSessionReadOnlyNfsPathsFor,
+  splitCloudRunSessionServiceName,
   siteStagingDatabaseNameFor,
   PMA_STAGING_SERVER_ENV_NAMES,
   validateGcpSubnetsListParams,
@@ -524,7 +525,7 @@ function sessionImageFor(serviceName: string) {
   if (prefix === "pma" || prefix === "spma") {
     imageName = "dy-run-pma";
   }
-  if (prefix === "staging") {
+  if (prefix === "staging" || prefix === "dev1" || prefix === "dev2" || prefix === "dev3") {
     imageName = "dy-run-wp";
   }
   return `${SESSION_IMAGE_REPO_FOR_TESTS}/${imageName}@sha256:` + "a".repeat(64);
@@ -556,7 +557,7 @@ const CLOUD_RUN_PROBE_REF_PARAMS = { project: "dy-agency-proof", region: "austra
 // this marker up to, not including, the next section rule after it). Changing the block means changing
 // BOTH twins and BOTH pins in one go.
 const TWIN_BLOCK_START_MARKER = "// ── planning/49: the agency-side ephemeral-compute ops";
-const TWIN_BLOCK_SHA256 = "d6960be2a45c57fd16037dad1bc6f83ae618c52bdb8aace81b72f40ad87e2d3f";
+const TWIN_BLOCK_SHA256 = "2b7c31387eef23483dc94aa79e79f497b8bac16e1fa0a2a7bae17055117771a8";
 
 function planning49Job(op: DispatchJob["op"], params: unknown, nonce: string): DispatchJob {
   return sampleJob({ op, params: JSON.stringify(params), nonce });
@@ -3315,7 +3316,16 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
   });
 
   it("cloudrun-service-upsert (hub#93 M4 lift): a session on the SHARED probe subnet, or with no slot, is still refused", () => {
-    for (const serviceName of ["term-docs-892769", "pma-docs-892769", "staging-docs-892769", "sterm-docs-892769", "spma-docs-892769"]) {
+    for (const serviceName of [
+      "term-docs-892769",
+      "pma-docs-892769",
+      "staging-docs-892769",
+      "sterm-docs-892769",
+      "spma-docs-892769",
+      "dev1-docs-892769",
+      "dev2-docs-892769",
+      "dev3-docs-892769",
+    ]) {
       // The pre-M4 shape: no slot, the probe subnet. Never signable for a session.
       expectRefused(validateCloudRunServiceUpsertParams({ ...CLOUD_RUN_SESSION_PARAMS, image: sessionImageFor(serviceName), serviceName }), /^a session service must carry its site's Run slot/);
       expectRefused(
@@ -3774,6 +3784,108 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     }
   });
 
+  it("cloudrun-service-upsert SESSION (hub#473): a dev<N>- upsert is exactly the pinned dy-run-wp and its OWN slot's two volumes", () => {
+    const devPrefixes = ["dev1", "dev2", "dev3"] as const;
+    for (const prefix of devPrefixes) {
+      const serviceName = `${prefix}-docs-892769`;
+      const sitesSlot = `/srv/dy-storage/sites/docs-892769/${prefix}`;
+      const platformSlot = `/srv/dy-storage/platform/docs-892769-${prefix}`;
+      const slotVolumes = [
+        { name: "sites", server: "10.20.0.4", path: sitesSlot, mountPath: `/sites/docs-892769/${prefix}` },
+        { name: "platslot", server: "10.20.0.4", path: platformSlot, mountPath: `/platform/docs-892769-${prefix}`, readOnly: true },
+      ];
+      const devUpsert = (overrides: Record<string, unknown>) =>
+        validateCloudRunServiceUpsertParams({
+          ...SITE_SESSION_PARAMS,
+          serviceName,
+          image: sessionImageFor(serviceName),
+          nfsVolumes: slotVolumes,
+          ...overrides,
+        });
+      const withSitesPath = (path: string) => devUpsert({ nfsVolumes: [{ ...slotVolumes[0], path }, slotVolumes[1]] });
+      const withPlatformPath = (path: string) => devUpsert({ nfsVolumes: [slotVolumes[0], { ...slotVolumes[1], path }] });
+      const shapeRefusal = new RegExp(`^a ${prefix}- session for "docs-892769" must mount exactly two NFS volumes, `);
+
+      // The paths are exact: the slot's tree read-write, the slot's config dir read-only.
+      expect(siteSessionNfsPathsFor(prefix, "docs-892769")).toEqual([sitesSlot, platformSlot]);
+      expect(siteSessionReadOnlyNfsPathsFor(prefix, "docs-892769")).toEqual([platformSlot]);
+      expect(SESSION_IMAGE_NAMES[prefix]).toBe("dy-run-wp");
+
+      // The valid spec passes and the volumes survive into the signed params unchanged.
+      const verdict = devUpsert({});
+      expect(verdict.ok, serviceName).toBe(true);
+      if (verdict.ok) {
+        expect(verdict.params.serviceName).toBe(serviceName);
+        expect(verdict.params.nfsVolumes).toEqual(slotVolumes);
+      }
+
+      // The live tree and the live public docroot are refused.
+      expectRefused(withSitesPath("/srv/dy-storage/sites/docs-892769"), /may mount only/);
+      expectRefused(withSitesPath("/srv/dy-storage/sites/docs-892769/public"), /may mount only/);
+      // The staging tree and the staging config dir are refused.
+      expectRefused(withSitesPath("/srv/dy-storage/sites/docs-892769/staging"), /may mount only/);
+      expectRefused(withPlatformPath("/srv/dy-storage/platform/docs-892769-staging"), /may mount only/);
+      // The live platform/<slug> (the live DB password) is refused.
+      expectRefused(withPlatformPath("/srv/dy-storage/platform/docs-892769"), /may mount only/);
+      // Another dev slot of the same site is refused, tree and config dir alike.
+      for (const otherPrefix of devPrefixes) {
+        if (otherPrefix === prefix) {
+          continue;
+        }
+        expectRefused(withSitesPath(`/srv/dy-storage/sites/docs-892769/${otherPrefix}`), /may mount only/);
+        expectRefused(withPlatformPath(`/srv/dy-storage/platform/docs-892769-${otherPrefix}`), /may mount only/);
+      }
+      // Another site's slot is refused, the prefix trap too.
+      expectRefused(withSitesPath(`/srv/dy-storage/sites/geelongns/${prefix}`), /may mount only/);
+      expectRefused(withPlatformPath(`/srv/dy-storage/platform/docs-892769-x-${prefix}`), /may mount only/);
+
+      expect(devUpsert({ nfsVolumes: [{ ...slotVolumes[0], readOnly: false }, slotVolumes[1]] }).ok).toBe(true);
+      expectRefused(
+        devUpsert({ nfsVolumes: [{ ...slotVolumes[0], readOnly: true }, slotVolumes[1]] }),
+        new RegExp(`^a ${prefix}- session must mount .* read-write`),
+      );
+
+      // The config dir without readOnly: true is refused (absent means read-write).
+      for (const readOnly of [undefined, false]) {
+        const platformVolume: Record<string, unknown> = { ...slotVolumes[1] };
+        delete platformVolume.readOnly;
+        if (readOnly !== undefined) {
+          platformVolume.readOnly = readOnly;
+        }
+        expectRefused(
+          devUpsert({ nfsVolumes: [slotVolumes[0], platformVolume] }),
+          new RegExp(`^a ${prefix}- session must mount "\\/srv\\/dy-storage\\/platform\\/docs-892769-${prefix}" read-only \\(readOnly: true\\)$`),
+        );
+      }
+
+      // Exactly the two volumes, each once, from one server.
+      expectRefused(devUpsert({ nfsVolumes: [...slotVolumes, { ...slotVolumes[0], name: "extra", mountPath: "/extra" }] }), shapeRefusal);
+      expectRefused(devUpsert({ nfsVolumes: [slotVolumes[0]] }), shapeRefusal);
+      expectRefused(devUpsert({ nfsVolumes: undefined }), shapeRefusal);
+      expectRefused(devUpsert({ nfsVolumes: [slotVolumes[0], { ...slotVolumes[0], name: "again", mountPath: "/again" }] }), shapeRefusal);
+      expectRefused(devUpsert({ nfsVolumes: [slotVolumes[0], { ...slotVolumes[1], server: "10.20.0.9" }] }), /— not from two different servers$/);
+
+      // Only dy-run-wp, pinned by digest, as staging.
+      const digest = "@sha256:" + "a".repeat(64);
+      for (const image of [
+        `${SESSION_IMAGE_REPO_FOR_TESTS}/dy-run-terminal${digest}`,
+        `${SESSION_IMAGE_REPO_FOR_TESTS}/dy-run-pma${digest}`,
+        `docker.io/library/wordpress${digest}`,
+        `${SESSION_IMAGE_REPO_FOR_TESTS}/dy-run-wp:latest`,
+      ]) {
+        expectRefused(devUpsert({ image }), new RegExp(`^a ${prefix}- session service must run .*\\/dy-run-wp@sha256:<64 hex>`));
+      }
+    }
+
+    // dev0-, dev4- and dev- are not session names.
+    for (const serviceName of ["dev0-docs-892769", "dev4-docs-892769", "dev-docs-892769"]) {
+      expect(splitCloudRunSessionServiceName(serviceName), serviceName).toBeNull();
+    }
+    // The 49-character label budget holds: dev1- plus a 44-character slug is the longest name.
+    expect(splitCloudRunSessionServiceName(`dev1-${"d".repeat(44)}`)).toEqual({ prefix: "dev1", slug: "d".repeat(44) });
+    expect(splitCloudRunSessionServiceName(`dev1-${"d".repeat(45)}`)).toBeNull();
+  });
+
   it("cloudrun-service-upsert SESSION (planning/49 Phase 4): pma mounts only platform/<slug>, spma only platform/<slug>-staging, both read-only", () => {
     const volume = (path: string, readOnly?: boolean) => {
       const entry: Record<string, unknown> = { name: "platform", server: "10.20.0.4", path, mountPath: "/platform/docs-892769" };
@@ -3922,7 +4034,16 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     const params = { zone: "sbmstudio.com.au", host: "term-docs-892769.sbmstudio.com.au", project: "sbm-website-272023", region: "australia-southeast2" };
     for (const validate of [validateWorkersRouteUpsertParams, validateWorkersRouteDeleteParams]) {
       expect(validate({ ...params, script: "evil", pattern: "*.sbmstudio.com.au/*" })).toEqual({ ok: true, params });
+      // hub#473: the dev-branch preview hosts dev<N>-<slug>.<zone>.
+      for (const host of ["dev1-docs-892769.sbmstudio.com.au", "dev2-docs-892769.sbmstudio.com.au", "dev3-docs-892769.sbmstudio.com.au"]) {
+        expect(validate({ ...params, host })).toEqual({ ok: true, params: { ...params, host } });
+      }
       for (const host of [
+        "dev0-docs-892769.sbmstudio.com.au",
+        "dev4-docs-892769.sbmstudio.com.au",
+        "dev-docs-892769.sbmstudio.com.au",
+        "dev1-docs-892769.other.com",
+        "a.dev1-docs-892769.sbmstudio.com.au",
         "sbmstudio.com.au",
         "*.sbmstudio.com.au",
         "*-docs.sbmstudio.com.au",
@@ -9558,7 +9679,7 @@ describe("POST /actuate route", () => {
       op: "edge-gate-deploy",
       script: EDGE_GATE_SCRIPT,
       status: "created",
-      gateVersion: 2,
+      gateVersion: 3,
       keyVersion: 1,
       runUrlSuffix: "-123456789012.australia-southeast2.run.app",
       minterWorker: "sbmstudio",

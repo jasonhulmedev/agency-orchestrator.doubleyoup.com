@@ -181,7 +181,7 @@ describe("parseSessionGateAudience: exactly this shape, no network", () => {
       projectNumber: PROJECT_NUMBER,
       region: REGION,
     });
-    for (const serviceName of ["pma-x", "staging-x", "sterm-x", "spma-x"]) {
+    for (const serviceName of ["pma-x", "staging-x", "sterm-x", "spma-x", "dev1-x", "dev2-x", "dev3-x"]) {
       expect(parseSessionGateAudience(`https://${serviceName}-${PROJECT_NUMBER}.${REGION}.run.app`)).toMatchObject({ serviceName });
     }
   });
@@ -369,7 +369,7 @@ describe("mintSessionGateIdToken: the caller proof (gate v2)", () => {
     const projectId = "dy-minter-proof-ok";
     const env = envForProject(projectId);
     mockGoogle({ projectId });
-    for (const serviceName of ["term-a", "sterm-a", "pma-a", "spma-a", "staging-a"]) {
+    for (const serviceName of ["term-a", "sterm-a", "pma-a", "spma-a", "staging-a", "dev1-a", "dev2-a", "dev3-a"]) {
       const result = await mintSessionGateIdToken(env, await validProofRequest(projectId, audienceFor(serviceName)));
       expect(result, serviceName).toMatchObject({ ok: true });
     }
@@ -469,7 +469,7 @@ describe("mintSessionGateIdToken: the transition rule for a call WITHOUT a proof
     const projectId = "dy-minter-keyless";
     const env = envForProject(projectId);
     const calls = mockGoogle({ projectId });
-    for (const serviceName of ["pma-a", "spma-a", "staging-a"]) {
+    for (const serviceName of ["pma-a", "spma-a", "staging-a", "dev1-a", "dev2-a", "dev3-a"]) {
       expect(await mintSessionGateIdToken(env, audienceFor(serviceName)), serviceName).toEqual({ ok: false, reason: "caller-refused" });
     }
     expect(calls).toHaveLength(0);

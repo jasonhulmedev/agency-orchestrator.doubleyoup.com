@@ -1,4 +1,4 @@
-// dy-session-gate v2
+// dy-session-gate v3
 // The FIRST LINE above is the gate's marker and version. edge-gate-deploy (src/actuate-edge-gate.ts)
 // reads it back from the deployed script: a script whose source does not start with "// dy-session-gate v"
 // was not made by this platform, so it is never replaced. Raise the version whenever this file changes
@@ -118,7 +118,7 @@ const SESSION_TOKEN_HEADER = "x-dy-session-token";
 // The query parameter that carries the session token in the URL the app opens.
 const TOKEN_QUERY_PARAMETER = "token";
 // The purposes whose container reads the session token from X-DY-Session-Token: "pma" (pma-, spma-) and
-// "staging" (staging-). The token is not needed in their URL, so these hosts also get the token-strip page
+// "staging" (staging-, dev1-, dev2-, dev3-). The token is not needed in their URL, so these hosts also get the token-strip page
 // and a forwarded query without the token. A "terminal" container (term-, sterm-) reads the token from the
 // query only.
 const HEADER_TOKEN_PURPOSES = ["pma", "staging"];
@@ -141,8 +141,8 @@ const SESSION_LABEL_RE = /^[a-z]([-a-z0-9]{0,47}[a-z0-9])?$/;
 const SITE_SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,44}[a-z0-9])?$/;
 
 // The host PREFIX is the authority for the token's purpose (syd's mapping, unchanged): `term-` and `sterm-`
-// need a "terminal" token, `pma-` and `spma-` a "pma" token, `staging-` a "staging" token. The staging-scoped
-// sessions (hub#37) reuse the stock purposes; only the host tells them apart, and each host has its own key.
+// need a "terminal" token, `pma-` and `spma-` a "pma" token, `staging-`, `dev1-`, `dev2-` and `dev3-` a
+// "staging" token. The staging-scoped sessions (hub#37) and the dev-branch previews (hub#473) reuse the stock purposes; only the host tells them apart, and each host has its own key.
 // No two prefixes overlap once the hyphen is included ("term-" is not a prefix of "sterm-"), so at most one
 // prefix matches a label.
 const SESSION_PREFIXES = [
@@ -151,6 +151,10 @@ const SESSION_PREFIXES = [
   { prefix: "sterm-", purpose: "terminal" },
   { prefix: "spma-", purpose: "pma" },
   { prefix: "staging-", purpose: "staging" },
+  // The dev-branch previews (hub#473) are WordPress previews like staging-, so they take a "staging" token.
+  { prefix: "dev1-", purpose: "staging" },
+  { prefix: "dev2-", purpose: "staging" },
+  { prefix: "dev3-", purpose: "staging" },
 ];
 
 // Per-isolate ID token cache: audience -> { idToken, expiresAt }. An entry exists only after a request with
