@@ -3532,7 +3532,7 @@ export function cellRunServiceAccountFor(project: string): string {
 }
 
 // ── hub#93: per-site Run subnets (one /24 per site) ──────────────────────────────────
-// Every session service of a site (term-, pma-, staging-, sterm-, spma-<slug>) egresses from that
+// Every session service of a site (term-, pma-, staging-, sterm-, spma-, dev1-, dev2-, dev3-<slug>) egresses from that
 // site's OWN subnet, so the file node's exports and the data node's grants can tell one site's
 // session from another's. A site holds ONE Run slot N (0-127, recorded in app as Site.runSlot), and
 // every value below is DERIVED from N, here, on both sides of the boundary:
@@ -4211,7 +4211,9 @@ export function validateGcpProjectQuotaGetParams(raw: unknown): ParamsVerdict<Gc
 // policy. The Worker's own service account gets run.invoker on its project once, at onboarding.
 
 /** The host label of each session purpose. The service name IS the label (planning/49 §3.2). */
-export const CLOUD_RUN_SESSION_SERVICE_PREFIXES = ["term", "pma", "staging", "sterm", "spma"] as const;
+// dev1, dev2 and dev3 are the dev-branch previews of hub#473 (at most three branches per site, one
+// slot each). "dev1-" is shorter than "staging-", so the 49-character label budget still holds.
+export const CLOUD_RUN_SESSION_SERVICE_PREFIXES = ["term", "pma", "staging", "sterm", "spma", "dev1", "dev2", "dev3"] as const;
 /** The ONE service name the Phase 2 premise probe uses. Not a session name, so it cannot collide. */
 export const CLOUD_RUN_PROBE_SERVICE_NAME = "dy-run-probe";
 /**
@@ -4249,6 +4251,10 @@ export const SESSION_IMAGE_NAMES: Readonly<Record<CloudRunSessionServicePrefix, 
   pma: "dy-run-pma",
   spma: "dy-run-pma",
   staging: "dy-run-wp",
+  // A dev-branch preview is a WordPress like the staging preview (hub#473), so it runs the same image.
+  dev1: "dy-run-wp",
+  dev2: "dy-run-wp",
+  dev3: "dy-run-wp",
 };
 /** The ONLY ports the probe may test: MariaDB on the data node and NFS on the file node. */
 export const CLOUD_RUN_PROBE_PORTS = ["2049", "3306"] as const;
@@ -4376,11 +4382,13 @@ export function splitCloudRunSessionServiceName(
  *           and platform/<slug>-staging when it also lists the staging DB (hub#223 D3, see
  *           pmaSessionStagingServerReason)
  *   spma    platform/<slug>-staging
+ *   dev<N>  sites/<slug>/dev<N>, platform/<slug>-dev<N>   (hub#473: a dev-branch preview, N = 1, 2, 3)
  * EXACT paths, not a prefix test: a prefix test on `sites/<slug>` would also admit `sites/<slug>-x`,
  * which is ANOTHER site's tree. A staging service gets no path to the LIVE `platform/<slug>`, which
  * holds the live DB password, and no path to the whole `sites/<slug>`, which holds the LIVE docroot
  * (planning/49 Phase 4, DS10: the host runner's provision-staging.sh mounts the whole tree; the agency
- * path does not). A pma or spma service gets no `sites/` tree: it needs the DB credentials only, never
+ * path does not). A dev<N> service gets its OWN slot only: not the live tree, not the staging tree, not
+ * another dev slot, and not the live `platform/<slug>`. A pma or spma service gets no `sites/` tree: it needs the DB credentials only, never
  * the site's files. siteSessionReadOnlyNfsPathsFor lists the paths that must also be read-only.
  */
 export function siteSessionNfsPathsFor(prefix: CloudRunSessionServicePrefix, slug: string): string[] {
@@ -4399,7 +4407,26 @@ export function siteSessionNfsPathsFor(prefix: CloudRunSessionServicePrefix, slu
   if (prefix === "spma") {
     return [stagingPlatformPath];
   }
+  if (isDevBranchSessionPrefix(prefix)) {
+    return [`${sitesPath}/${prefix}`, `${SITE_STORAGE_ROOT}/platform/${slug}-${prefix}`];
+  }
   return [];
+}
+
+/** True for the dev-branch preview prefixes (dev1, dev2, dev3; hub#473). */
+function isDevBranchSessionPrefix(prefix: CloudRunSessionServicePrefix): boolean {
+  return prefix === "dev1" || prefix === "dev2" || prefix === "dev3";
+}
+
+/**
+ * True for the prefixes that run a WordPress preview (staging and the dev-branch slots). Each mounts
+ * exactly its own tree and its own config dir (wordPressPreviewSessionNfsVolumesReason).
+ */
+function isWordPressPreviewSessionPrefix(prefix: CloudRunSessionServicePrefix): boolean {
+  if (prefix === "staging") {
+    return true;
+  }
+  return isDevBranchSessionPrefix(prefix);
 }
 
 /**
@@ -4411,6 +4438,7 @@ export function siteSessionNfsPathsFor(prefix: CloudRunSessionServicePrefix, slu
  *   term    none (unchanged: the terminal's mounts stay as they are)
  *   pma     platform/<slug> and platform/<slug>-staging
  *   staging, sterm, spma   platform/<slug>-staging (staging and sterm still write sites/<slug>/staging)
+ *   dev<N>  platform/<slug>-dev<N> (it still writes sites/<slug>/dev<N>)
  */
 export function siteSessionReadOnlyNfsPathsFor(prefix: CloudRunSessionServicePrefix, slug: string): string[] {
   const platformPath = `${SITE_STORAGE_ROOT}/platform/${slug}`;
@@ -4421,24 +4449,32 @@ export function siteSessionReadOnlyNfsPathsFor(prefix: CloudRunSessionServicePre
   if (prefix === "staging" || prefix === "sterm" || prefix === "spma") {
     return [stagingPlatformPath];
   }
+  if (isDevBranchSessionPrefix(prefix)) {
+    return [`${SITE_STORAGE_ROOT}/platform/${slug}-${prefix}`];
+  }
   return [];
 }
 
 /**
- * The reason a staging- session's NFS volumes are not its one allowed shape, or null when they are
- * (hub#223, D3). The loop in validateCloudRunServiceUpsertParams already refuses any path that is not
- * one of the two staging paths of this slug. This adds the count and the pairing:
- *   - EXACTLY two volumes. A staging WordPress with no docroot or no config cannot serve, and a third
+ * The reason a WordPress preview session's NFS volumes (staging-, hub#223 D3; dev<N>-, hub#473) are not
+ * its one allowed shape, or null when they are. The loop in validateCloudRunServiceUpsertParams already
+ * refuses any path that is not one of the two paths of this prefix and slug. This adds the count and the
+ * pairing:
+ *   - EXACTLY two volumes. A preview WordPress with no docroot or no config cannot serve, and a third
  *     volume could only repeat an allowed path at a second mount point.
- *   - each staging path exactly ONCE: the staging tree (sites/<slug>/staging) and the staging config
- *     dir (platform/<slug>-staging).
+ *   - each path exactly ONCE: the preview's tree (sites/<slug>/staging or sites/<slug>/dev<N>) and its
+ *     config dir (platform/<slug>-staging or platform/<slug>-dev<N>).
  *   - both from the SAME server. The twin cannot know the cell's file node; app binds each server to it
  *     before it signs. Two different servers would mean one of them is not that file node.
  */
-function stagingSessionNfsVolumesReason(slug: string, nfsVolumes: CloudRunNfsVolume[] | undefined): string | null {
-  const requiredPaths = siteSessionNfsPathsFor("staging", slug);
+function wordPressPreviewSessionNfsVolumesReason(
+  prefix: CloudRunSessionServicePrefix,
+  slug: string,
+  nfsVolumes: CloudRunNfsVolume[] | undefined,
+): string | null {
+  const requiredPaths = siteSessionNfsPathsFor(prefix, slug);
   const shapeRule =
-    `a staging- session for "${slug}" must mount exactly two NFS volumes, ${requiredPaths.join(" and ")}, ` +
+    `a ${prefix}- session for "${slug}" must mount exactly two NFS volumes, ${requiredPaths.join(" and ")}, ` +
     "each once and both from the cell's file node";
   if (nfsVolumes === undefined || nfsVolumes.length !== requiredPaths.length) {
     return shapeRule;
@@ -4777,7 +4813,8 @@ function cleanCloudRunProbe(value: unknown): { ok: true; probe: CloudRunProbeSpe
 //          purpose must be read-only (siteSessionReadOnlyNfsPathsFor). `maxInstances` must be
 //          exactly 1: one writer per NFS mount, and the per-site /24 is sized for one instance per
 //          service (hub#93 G1). hub#223 D3: a staging- session mounts exactly its two staging volumes
-//          from one server (stagingSessionNfsVolumesReason), and a pma- session may list the site's
+//          from one server (wordPressPreviewSessionNfsVolumesReason; a dev<N>- session the same, with
+//          its own slot's two volumes, hub#473), and a pma- session may list the site's
 //          staging DB as a second server entry, on `<slug>_staging` only (pmaSessionStagingServerReason).
 //       2. app ONLY, before it signs (agency-dispatch-site-binding.ts): slug -> Site -> Cell must match
 //          the job's project, region and account, the slot must be Site.runSlot, its subnet must be
@@ -5020,11 +5057,21 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
           reason: `a ${sessionName.prefix}- session must mount "${volume.path}" read-only (readOnly: true)`,
         };
       }
+      if (isDevBranchSessionPrefix(sessionName.prefix) && !mustBeReadOnly && volume.readOnly === true) {
+        return {
+          ok: false,
+          reason: `a ${sessionName.prefix}- session must mount "${volume.path}" read-write (readOnly: false or omitted)`,
+        };
+      }
     }
-    if (sessionName.prefix === "staging") {
-      const stagingVolumesReason = stagingSessionNfsVolumesReason(sessionName.slug, cleanedNfsVolumes.nfsVolumes);
-      if (stagingVolumesReason !== null) {
-        return { ok: false, reason: stagingVolumesReason };
+    if (isWordPressPreviewSessionPrefix(sessionName.prefix)) {
+      const previewVolumesReason = wordPressPreviewSessionNfsVolumesReason(
+        sessionName.prefix,
+        sessionName.slug,
+        cleanedNfsVolumes.nfsVolumes,
+      );
+      if (previewVolumesReason !== null) {
+        return { ok: false, reason: previewVolumesReason };
       }
     }
     if (sessionName.prefix === "pma") {
@@ -5171,7 +5218,7 @@ export function validateCloudRunProbeInvokeParams(raw: unknown): ParamsVerdict<C
 //   4. `region`  — the cell's Compute region.
 // THE SHARP EDGE (planning/49 §8): `*.<zone>/*` would route every site in the zone through the gate.
 // So no wildcard, no bare zone, no extra label, and no host that is not
-// {term,pma,staging,sterm,spma}-<slug>.<zone> can be signed. The script is not a parameter either: it is
+// {term,pma,staging,sterm,spma,dev1,dev2,dev3}-<slug>.<zone> can be signed. The script is not a parameter either: it is
 // DERIVED, `dy-gate-<project>-<region>` (edgeGateScriptNameFor), so each cell has its own edge gate (one
 // session key per cell, planning/49 Phase 3) and a job can never point a route at another script. The
 // actuator never takes over a route that points elsewhere. A region has exactly one hyphen

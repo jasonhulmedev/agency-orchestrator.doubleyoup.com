@@ -25,10 +25,12 @@ import { minterCallerProofMac, verifyMinterCallerProof } from "../src/session-ga
 //
 // v1 is released (planning/49 Phase 3 I6 deployed it on 2026-10-27), so from v1 on the rule above holds
 // without exception. v2 (planning/49 Phase 4 I3) adds the minter caller proof with its version-skew retry,
-// X-DY-Session-Token, the ?token= fallback to the cookie, and the staging token-strip page.
+// X-DY-Session-Token, the ?token= fallback to the cookie, and the staging token-strip page. v3 (hub#473)
+// adds the dev-branch preview hosts dev1-, dev2- and dev3- with the "staging" purpose.
 const GATE_VERSIONS: Record<number, { sha256: string; compatibilityDate: string }> = {
   1: { sha256: "cd5b6e3a661747e5fb4b40713a1fa4b2206cbb6b40ccf35016b54cb04623b5f7", compatibilityDate: "2026-01-01" },
   2: { sha256: "6308b989d3a7814f207e393a21b672a8b7a6b3fec7eaef59ef05f2d34b2f30f7", compatibilityDate: "2026-01-01" },
+  3: { sha256: "a1ce2784b437f6114278a2c9c239235a8415c56636cc5d3ef8ef195d98ac9934", compatibilityDate: "2026-01-01" },
 };
 
 // ── I2 vectors (orchestrator src/session-token.test.ts; the same recipe as app and the container) ──
@@ -261,6 +263,15 @@ describe("session gate: resolveHostTarget", () => {
     expect(resolveHostTarget("sterm-x.sbmstudio.com.au", ZONE_SUFFIX)).toMatchObject({ expectedPurpose: "terminal", slug: "x" });
     expect(resolveHostTarget("spma-x.sbmstudio.com.au", ZONE_SUFFIX)).toMatchObject({ expectedPurpose: "pma", slug: "x" });
     expect(resolveHostTarget("staging-x.sbmstudio.com.au", ZONE_SUFFIX)).toMatchObject({ expectedPurpose: "staging", slug: "x" });
+    // hub#473: the dev-branch previews take a "staging" token, and their label is the Cloud Run service name.
+    for (const devPrefix of ["dev1", "dev2", "dev3"]) {
+      expect(resolveHostTarget(`${devPrefix}-docs-892769.sbmstudio.com.au`, ZONE_SUFFIX)).toEqual({
+        expectedPurpose: "staging",
+        slug: "docs-892769",
+        host: `${devPrefix}-docs-892769.sbmstudio.com.au`,
+        label: `${devPrefix}-docs-892769`,
+      });
+    }
     expect(resolveHostTarget("TERM-X.SBMSTUDIO.COM.AU", ZONE_SUFFIX)).toMatchObject({ host: "term-x.sbmstudio.com.au", label: "term-x" });
   });
 
@@ -274,6 +285,10 @@ describe("session gate: resolveHostTarget", () => {
       "term--x.sbmstudio.com.au",
       "term-x-.sbmstudio.com.au",
       "ssh-x.sbmstudio.com.au",
+      "dev0-x.sbmstudio.com.au",
+      "dev4-x.sbmstudio.com.au",
+      "dev-x.sbmstudio.com.au",
+      "dev1-.sbmstudio.com.au",
       "x.sbmstudio.com.au",
       "agencydoubleyoup.example.workers.dev",
       `term-${"a".repeat(45)}.sbmstudio.com.au`,
@@ -286,7 +301,8 @@ describe("session gate: resolveHostTarget", () => {
   });
 
   it("accepts exactly the labels the twin's splitCloudRunSessionServiceName accepts, with the same purpose", () => {
-    const purposeByPrefix: Record<string, string> = { term: "terminal", sterm: "terminal", pma: "pma", spma: "pma", staging: "staging" };
+    const purposeByPrefix: Record<string, string> = { term: "terminal", sterm: "terminal", pma: "pma", spma: "pma", staging: "staging",
+      dev1: "staging", dev2: "staging", dev3: "staging" };
     const labels = [
       "term-docs-892769",
       "sterm-docs-892769",
@@ -305,6 +321,14 @@ describe("session gate: resolveHostTarget", () => {
       `pma-${"b".repeat(44)}`,
       `staging-${"c".repeat(41)}`,
       `staging-${"c".repeat(42)}`,
+      "dev1-docs-892769",
+      "dev2-a",
+      "dev3-lawnsbydavid",
+      "dev4-docs-892769",
+      "dev-docs-892769",
+      "dev1",
+      `dev1-${"d".repeat(44)}`,
+      `dev3-${"d".repeat(45)}`,
     ];
     for (const label of labels) {
       const twin = splitCloudRunSessionServiceName(label);
@@ -325,6 +349,72 @@ describe("session gate: resolveHostTarget", () => {
       });
     }
   });
+});
+
+describe("session gate v3: dev-branch previews", () => {
+  for (const prefix of ["dev1", "dev2", "dev3"]) {
+    it(`${prefix}- uses a staging token, strips the opening URL, and forwards the verified token only in the header`, async () => {
+      const minter = okMinter();
+      const sent = mockOrigin();
+      const host = `${prefix}-dev-preview${ZONE_SUFFIX}`;
+      const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("dev-preview", { purpose: "staging" }));
+
+      const openingResponse = await gate.fetch(new Request(`https://${host}/wp-admin/?token=${token}&page=edit`), gateEnv(minter));
+      expect(openingResponse.status).toBe(200);
+      expect(openingResponse.headers.get("content-type")).toMatch(/^text\/html/);
+      expect(openingResponse.headers.get("set-cookie")).toContain(`__Host-dy_egt=${token};`);
+      expect(await openingResponse.text()).not.toContain(token);
+      expect(minter.mintIdToken).not.toHaveBeenCalled();
+      expect(sent).toHaveLength(0);
+
+      const cookieResponse = await gate.fetch(
+        new Request(`https://${host}/wp-admin/?page=edit`, {
+          headers: { cookie: `__Host-dy_egt=${token}`, "sec-fetch-site": "same-origin", "x-dy-session-token": "forged" },
+        }),
+        gateEnv(minter),
+      );
+      expect(cookieResponse.status).toBe(200);
+      const audience = `https://${prefix}-dev-preview${RUN_URL_SUFFIX}`;
+      expect(minter.mintIdToken).toHaveBeenCalledWith({ audience, ts: expect.any(Number), mac: expect.any(String) });
+      const forwarded = sent[0] as Request;
+      expect(forwarded.url).toBe(`${audience}/wp-admin/?page=edit`);
+      expect(forwarded.headers.get("x-dy-session-token")).toBe(token);
+      expect(forwarded.headers.get("x-serverless-authorization")).toBe(`Bearer id-token-for:${audience}`);
+      expect(forwarded.headers.has("cookie")).toBe(false);
+
+      const postResponse = await gate.fetch(
+        new Request(`https://${host}/wp-admin/admin-ajax.php?token=${token}&action=save`, { method: "POST" }),
+        gateEnv(minter),
+      );
+      expect(postResponse.status).toBe(200);
+      expect(sent).toHaveLength(2);
+      const forwardedPost = sent[1] as Request;
+      expect(forwardedPost.url).toBe(`${audience}/wp-admin/admin-ajax.php?action=save`);
+      expect(forwardedPost.headers.get("x-dy-session-token")).toBe(token);
+    });
+
+    it(`${prefix}- refuses wrong purposes, wrong slugs, and tokens minted for live, staging or another dev slot`, async () => {
+      const minter = okMinter();
+      const sent = mockOrigin();
+      const host = `${prefix}-dev-refusal${ZONE_SUFFIX}`;
+      for (const overrides of [{ purpose: "terminal" }, { purpose: "pma" }, { slug: "another-site", purpose: "staging" }]) {
+        const token = await signSessionToken(CELL_A_V1_SECRET, host, terminalClaims("dev-refusal", overrides));
+        const response = await gate.fetch(new Request(`https://${host}/?token=${token}`), gateEnv(minter));
+        expect(response.status).toBe(401);
+      }
+      for (const otherPrefix of ["term", "staging", "dev1", "dev2", "dev3"]) {
+        if (otherPrefix === prefix) {
+          continue;
+        }
+        const otherHost = `${otherPrefix}-dev-refusal${ZONE_SUFFIX}`;
+        const token = await signSessionToken(CELL_A_V1_SECRET, otherHost, terminalClaims("dev-refusal", { purpose: "staging" }));
+        const response = await gate.fetch(new Request(`https://${host}/?token=${token}`), gateEnv(minter));
+        expect(response.status, otherHost).toBe(401);
+      }
+      expect(minter.mintIdToken).not.toHaveBeenCalled();
+      expect(sent).toHaveLength(0);
+    });
+  }
 });
 
 describe("session gate: configuration", () => {
@@ -1289,11 +1379,14 @@ describe("session gate v2: version skew (review M1)", () => {
     }
   });
 
-  it("pma-, spma- and staging- never ask without the proof: a bare 503, one minter call, no origin fetch", async () => {
+  it("pma-, spma-, staging- and dev<N>- never ask without the proof: a bare 503, one minter call, no origin fetch", async () => {
     for (const [label, purpose] of [
       ["pma-skew-b", "pma"],
       ["spma-skew-b", "pma"],
       ["staging-skew-b", "staging"],
+      ["dev1-skew-b", "staging"],
+      ["dev2-skew-b", "staging"],
+      ["dev3-skew-b", "staging"],
     ] as const) {
       const minter = rolledBackMinter();
       const sent = mockOrigin();
